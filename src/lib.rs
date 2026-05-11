@@ -46,9 +46,9 @@
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
-// A practical constraint: no regex engine in this crate. We keep the
-// dependency surface small by using fixed-string handling and a tight
-// normalization pass. Enforcement is convention + dependency checks in CI.
+// A practical constraint: no regex engine in this crate. The dependency
+// surface stays small via fixed-string handling and a tight normalization
+// pass. Enforcement is convention + dependency checks in CI.
 
 pub mod cli;
 pub mod config;

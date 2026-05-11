@@ -100,9 +100,9 @@ pub fn unified_diff(expected: &str, actual: &str) -> DiffResult {
     DiffResult::Diff { diff, warn }
 }
 
-/// Split a string into lines without trailing-newline ambiguity. We
-/// `lines()` and then drop a trailing empty produced by a trailing
-/// newline so `"a\nb\n".split_lines() == ["a", "b"]`.
+/// Split a string into lines without trailing-newline ambiguity.
+/// `lines()` is used and a trailing empty produced by a trailing
+/// newline is dropped so `"a\nb\n".split_lines() == ["a", "b"]`.
 fn split_lines(s: &str) -> Vec<&str> {
     s.lines().collect()
 }
@@ -144,9 +144,9 @@ fn myers_diff<'a>(a: &'a [&'a str], b: &'a [&'a str]) -> Vec<Op> {
     if max == 0 {
         return Vec::new();
     }
-    // Single-direction Myers per the original 1986 paper. We track
-    // V[k] = furthest x reached on diagonal k after d edits, and
-    // record the trace per d so we can backtrack.
+    // Single-direction Myers per the original 1986 paper.
+    // V[k] = furthest x reached on diagonal k after d edits;
+    // the trace is recorded per d so backtracking is possible.
     let mut v: Vec<isize> = vec![0; 2 * max + 1];
     let mut trace: Vec<Vec<isize>> = Vec::new();
     let offset = max as isize;

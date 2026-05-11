@@ -26,7 +26,7 @@ pub fn sha256_bytes(bytes: &[u8]) -> String {
     let digest = hasher.finalize();
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        // Hand-rolled hex so we don't need the `hex` dep. Stable lower
+        // Hand-rolled hex to avoid the `hex` dep. Stable lower
         // hex; matches sha256sum byte-for-byte.
         out.push(nibble_to_hex((byte >> 4) & 0xF));
         out.push(nibble_to_hex(byte & 0xF));
@@ -44,8 +44,8 @@ fn nibble_to_hex(n: u8) -> char {
 }
 
 /// Atomic write helper: write to `path.tmp` then rename into place.
-/// `rename` is atomic on POSIX; on Windows we still surface read/readiness
-/// issues through normal session checks.
+/// `rename` is atomic on POSIX; on Windows read/readiness issues
+/// surface through normal session checks.
 ///
 /// The `.tmp` suffix is per-call (not per-process) to avoid collisions
 /// when the same path is rewritten in quick succession.

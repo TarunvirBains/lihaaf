@@ -1,10 +1,10 @@
 //! Toolchain capture (the policy stage 2).
 //!
-//! `rustc --version --verbose` produces a multi-line text block. We parse
-//! it into a [`Toolchain`] struct and persist the release line as the
+//! `rustc --version --verbose` produces a multi-line text block, parsed
+//! into a [`Toolchain`] struct; the release line is persisted as the
 //! drift-detection key for the policy.
 //!
-//! ## Sample output we parse
+//! ## Sample output
 //!
 //! ```text
 //! rustc 1.95.0 (59807616e 2026-04-14)
@@ -17,14 +17,14 @@
 //! ```
 //!
 //! The release line is the first line; the rest are `key: value` pairs.
-//! We tolerate missing or reordered keys — only `release` and `host` are
+//! Missing or reordered keys are tolerated — only `release` and `host` are
 //! load-bearing.
 //!
 //! ## Why parse, not just stash the raw output
 //!
 //! The drift check (the policy) compares release strings, not the full block.
-//! Parsing once at startup and re-running rustc per dispatch lets us
-//! compare scalars instead of normalizing whole blocks repeatedly.
+//! Parsing once at startup and re-running rustc per dispatch allows
+//! comparing scalars instead of normalizing whole blocks repeatedly.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn parse_matches_real_rustc_block_shape() {
-        // We don't actually call rustc in unit tests (call it once in
+        // rustc is not called in unit tests (it is called once in
         // the integration test). This test exercises the parser directly
         // against a captured shape.
         let captured = "\

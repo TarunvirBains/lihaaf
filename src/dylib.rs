@@ -27,7 +27,7 @@
 //!   "-C prefer-dynamic"` is part of cargo's fingerprint hash, so
 //!   alternating between a normal `cargo build` and the lihaaf dylib
 //!   build in the same target dir thrashes the entire dependency graph.
-//!   We unconditionally build into `target/lihaaf-build/` so the
+//!   lihaaf unconditionally builds into `target/lihaaf-build/` so the
 //!   adopter's normal `cargo test` loop doesn't fight lihaaf's
 //!   invocations.
 
@@ -43,7 +43,7 @@ use crate::toolchain::Toolchain;
 /// Result of a successful dylib build.
 #[derive(Debug, Clone)]
 pub struct BuildOutput {
-    /// The cargo-emitted dylib path (in our dedicated lihaaf target
+    /// The cargo-emitted dylib path (in the dedicated lihaaf target
     /// dir — `target/lihaaf-build/release/deps/lib<crate>-<hash>.so`).
     pub cargo_dylib_path: PathBuf,
     /// The `target/release/deps` directory containing the rest of the
@@ -118,9 +118,9 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     };
     cmd.env("RUSTFLAGS", &new_rustflags);
 
-    // Format the invocation for diagnostics. We mirror the Command's
-    // shape (program + args + RUSTFLAGS env) so the adopter can paste
-    // it into a shell verbatim.
+    // Format the invocation for diagnostics. The Command's
+    // shape (program + args + RUSTFLAGS env) is mirrored so the adopter
+    // can paste it into a shell verbatim.
     let invocation = format!(
         "RUSTFLAGS={:?} cargo rustc -p {} --lib --release --crate-type=dylib \
          --message-format=json-render-diagnostics --manifest-path {:?} --target-dir {:?}{}",
@@ -159,14 +159,14 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     // Cargo emits the dylib at `<target>/release/lib<crate>.so` AND
     // hard-links a copy into `<target>/release/deps/lib<crate>.so`.
     // Fixtures need the deps dir on `-L dependency=` so transitive
-    // crates resolve; we point at deps/ rather than the release/ root.
+    // crates resolve; the path points at deps/ rather than the release/ root.
     let deps_dir = dylib_path
         .parent()
         .map(|p| p.join("deps"))
         .unwrap_or_else(|| params.target_dir.join("release/deps"));
 
-    // Toolchain shape is captured separately for drift checks; we
-    // record it on the output for rendering.
+    // Toolchain shape is captured separately for drift checks;
+    // recorded on the output for rendering.
     let _ = params.toolchain;
 
     Ok(BuildOutput {
@@ -177,7 +177,7 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
 }
 
 /// One `compiler-artifact` JSON message line. Cargo emits one per
-/// crate it built; we want the one whose `target.name` matches the
+/// crate it built; the target is the one whose `target.name` matches the
 /// dylib_crate AND whose `target.kind` includes `"dylib"`.
 #[derive(Debug, Deserialize)]
 struct CompilerArtifact {
@@ -245,8 +245,8 @@ pub fn dylib_extensions() -> &'static [&'static str] {
         &["dll"]
     } else {
         // Other Unixes typically use `.so`. Falling through here is
-        // honest; if an adopter targets one we'll learn from the
-        // failure mode rather than guessing wrong silently.
+        // honest; an adopter who targets one will surface the failure
+        // mode rather than getting a silent wrong guess.
         &["so"]
     }
 }
@@ -256,7 +256,7 @@ pub fn dylib_extensions() -> &'static [&'static str] {
 /// `target/lihaaf/lib<crate>-current-<hash>.so` per the policy, with
 /// `<hash>` recovered from the cargo-emitted filename
 /// (`lib<crate>-<hash>.so`). If the filename doesn't carry a hash
-/// (synthetic test paths), we substitute `0`.
+/// (synthetic test paths), `0` is substituted.
 pub fn managed_dylib_path(workspace_target: &Path, cargo_dylib: &Path) -> PathBuf {
     let lihaaf_dir = workspace_target.join("lihaaf");
     let stem = cargo_dylib
@@ -291,8 +291,8 @@ pub fn copy_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
             )
         })?;
     }
-    // Remove any prior file/symlink at the destination so we don't
-    // overwrite a symlink with a copy or vice versa silently.
+    // Remove any prior file/symlink at the destination to avoid
+    // silently overwriting a symlink with a copy or vice versa.
     if managed.exists() || managed.symlink_metadata().is_ok() {
         std::fs::remove_file(managed).map_err(|e| {
             Error::io(
@@ -347,7 +347,7 @@ pub fn symlink_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
     #[cfg(not(any(unix, windows)))]
     {
         // Fall back to a copy on platforms with no symlink primitive.
-        // Honest: we tried.
+        // Honest: symlink was attempted and fell through.
         copy_dylib(cargo_dylib, managed)?;
     }
     Ok(())
@@ -397,7 +397,7 @@ mod tests {
 
     #[test]
     fn parse_dylib_path_picks_dylib_kind_and_extension() {
-        // Linux: `.so`. We bake an artifact line; the parser must pick
+        // Linux: `.so`. The test bakes an artifact line; the parser must pick
         // the first `.so` listed in `filenames`.
         #[cfg(target_os = "linux")]
         let line = r#"{"reason":"compiler-artifact","target":{"name":"consumer","kind":["dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.so"]}"#;
@@ -419,9 +419,9 @@ mod tests {
 {\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"consumer\",\"kind\":[\"lib\"]},\"filenames\":[\"/p/libconsumer.rlib\"]}
 {\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"consumer\",\"kind\":[\"dylib\"]},\"filenames\":[\"/p/libconsumer-abc.so\"]}
 ";
-        // On non-Linux we still want this test to pick the dylib kind
+        // On non-Linux the test still expects the dylib kind to be picked
         // — the extension match guards platform-correctness in the real
-        // path, but for parser unit tests we treat `.so` as accepted
+        // path, but for parser unit tests `.so` is treated as accepted
         // because the test fixture string says so. Skip on Windows.
         #[cfg(target_os = "windows")]
         let _ = stream;

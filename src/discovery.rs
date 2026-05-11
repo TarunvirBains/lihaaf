@@ -129,7 +129,7 @@ pub fn collect(
 /// root) contains the `compile_fail_marker` substring; otherwise
 /// compile_pass.
 ///
-/// We classify by the directory's filename (the leaf segment), not the
+/// Classification is by the directory's filename (the leaf segment), not the
 /// full path — the marker ought to be discriminating at the leaf, and
 /// fixture authors shouldn't accidentally have a parent path
 /// containing the marker (e.g., a `tests/compile_fail/sub/` adopter

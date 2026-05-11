@@ -2,8 +2,8 @@
 
 **lihaaf** ("quilt", Urdu) is a Rust test harness for fast compile-fail
 and compile-pass workflows, built to make local developer iteration feel
-less painful. It started as a practical project: we had too many slow
-`cargo test` cycles, and we wanted a predictable, parallel harness that
+less painful. It started as a practical project: too many slow
+`cargo test` cycles, with a need for a predictable, parallel harness that
 keeps the sharp edges out of the way.
 
 Its workflow is inspired by the compile-fail/compile-pass fixture style
@@ -106,10 +106,10 @@ severe code from the fixture verdicts and session-level outcomes.
   purpose. Each cut has a concrete reason and a future-trigger or
   explicit "never" classification.
 
-## Tradeoffs and choices (a.k.a. what we picked)
+## Tradeoffs and choices
 
-A few implementation spots are intentionally open. We picked the
-paths that felt easiest to keep stable and debuggable in day-to-day use:
+A few implementation spots are intentionally open. The paths below
+felt easiest to keep stable and debuggable in day-to-day use:
 
 - **Cargo invocation for the dylib build**:
   `cargo rustc -p <crate> --lib --release --crate-type=dylib

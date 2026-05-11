@@ -6,9 +6,9 @@
 //!
 //! ## Why only TOML
 //!
-//! We avoid env-vars and auto-discovery fallbacks so configuration is explicit.
-//! If `[package.metadata.lihaaf]` is missing, we fail early with a direct message
-//! instead of inferring behavior from ambient layout.
+//! Env-vars and auto-discovery fallbacks are avoided so configuration is explicit.
+//! If `[package.metadata.lihaaf]` is missing, the harness fails early with a direct
+//! message instead of inferring behavior from ambient layout.
 
 use std::path::{Path, PathBuf};
 
@@ -415,7 +415,7 @@ mod tests {
         )
         .unwrap();
         // The raw metadata is what the manifest will snapshot. It must
-        // include every key the user typed, even ones we also map into
+        // include every key the user typed, even those also mapped into
         // typed fields above.
         let table = cfg.raw_metadata.as_table().unwrap();
         assert!(table.contains_key("dylib_crate"));

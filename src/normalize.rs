@@ -99,21 +99,20 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     let mut intermediate: Vec<String> = Vec::with_capacity(unified_le.lines().count() + 1);
     for line in unified_le.lines() {
         let mut s = line.to_string();
-        // Backslashes inside path-shaped substrings: the policy says we
+        // Backslashes inside path-shaped substrings: the policy says to
         // rewrite "backslashes in paths" — restricted to `--> ` and
         // `::: ` lines (the policy documents the limitation). For the
-        // path-prefix substitution we operate on a copy with the
-        // backslashes pre-converted so the prefix match works on
-        // either OS.
+        // path-prefix substitution, a copy with backslashes pre-converted
+        // is used so the prefix match works on either OS.
         if has_path_marker(&s) {
             s = rewrite_path_separators_in_path_lines(&s);
         }
         for (needle, repl) in &substitutions {
             // Replace every occurrence; the policy just says rewrite
             // matches. Using `str::replace` here would scan repeatedly
-            // for already-replaced content; instead we walk left-to-
-            // right, advancing past each replacement so we never
-            // accidentally match inside the placeholder.
+            // for already-replaced content; instead the walk goes left-to-
+            // right, advancing past each replacement so no accidental
+            // match occurs inside the placeholder.
             s = replace_advancing(&s, needle, repl);
         }
         s = rewrite_type_ids(&s);
@@ -154,7 +153,7 @@ fn push_path(out: &mut Vec<(String, &'static str)>, p: &Path, placeholder: &'sta
 }
 
 /// Replace all occurrences of `needle` with `repl` in `s`, walking
-/// left-to-right so we never re-scan inside the placeholder. Allocates
+/// left-to-right, never re-scanning inside the placeholder. Allocates
 /// once when matches exist; passes through cheaply when none do.
 fn replace_advancing(s: &str, needle: &str, repl: &str) -> String {
     if needle.is_empty() {
@@ -196,7 +195,7 @@ fn rewrite_type_ids(s: &str) -> String {
             i = j;
         } else {
             // Push one char (UTF-8 boundary safe). The byte at `i`
-            // starts a UTF-8 sequence; we copy until the next char
+            // starts a UTF-8 sequence; copy until the next char
             // boundary.
             let mut j = i + 1;
             while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
@@ -248,7 +247,7 @@ fn has_path_marker(line: &str) -> bool {
 }
 
 /// Rewrite backslashes to forward slashes within the path portion of a
-/// `--> ` / `::: ` line. We only touch the substring after the marker
+/// `--> ` / `::: ` line. Only the substring after the marker is touched,
 /// to avoid clobbering Windows-style paths that legitimately appear
 /// inside string literals quoted in the diagnostic.
 fn rewrite_path_separators_in_path_lines(line: &str) -> String {

@@ -110,7 +110,7 @@ pub enum Outcome {
     DylibNotFound {
         /// The cargo invocation, for repro.
         invocation: String,
-        /// The crate name we were searching for.
+        /// The crate name that was searched for.
         crate_name: String,
     },
 
@@ -127,8 +127,8 @@ pub enum Outcome {
     /// per-session snapshot and a dispatch. It maps onto `TOOLCHAIN_DRIFT`
     /// because both indicate stale-cache or stale-toolchain state.
     /// All invariants point to "the dylib or the
-    /// toolchain we built against is no longer the one we're about to
-    /// link"). The `invariant` label names which of the four drifted
+    /// toolchain built against is no longer the one about to
+    /// be linked"). The `invariant` label names which of the four drifted
     /// in stable form (`managed_dylib_path` / `dylib_mtime` /
     /// `dylib_sha256` / `rustc_release`); the `detail` is a
     /// pre-rendered diagnostic body.

@@ -2,13 +2,13 @@
 //!
 //! ## Dispatch choices worth calling out
 //!
-//! - **RSS sampling (Linux for now):** on Linux we read
-//!   `/proc/<pid>/statm` (2nd field × page-size). This is the live
-//!   per-process RSS for a running child — verified by hand on
-//!   `rustc 1.95` on Linux 6.x x86_64. macOS and Windows are documented
-//!   stubs (return `None`); without correct sampling those platforms
-//!   would silently miss the same guardrail, so those platforms currently
-//!   fall back to OS-level OOM attribution (`WORKER_CRASHED`).
+//! - **RSS sampling (Linux for now):** on Linux, `/proc/<pid>/statm`
+//!   (2nd field × page-size) is read. This is the live per-process RSS
+//!   for a running child — verified by hand on `rustc 1.95` on Linux
+//!   6.x x86_64. macOS and Windows are documented stubs (return `None`);
+//!   without correct sampling those platforms would silently miss the same
+//!   guardrail, so they currently fall back to OS-level OOM attribution
+//!   (`WORKER_CRASHED`).
 //!
 //! - **Sampling interval:** 100 ms on Linux. This is short enough to catch
 //!   runaway work before the OS OOMkiller usually triggers, while staying
@@ -237,8 +237,8 @@ impl ParallelismGate {
     fn release(&self) {
         let mut g = self.inner.lock().unwrap();
         // Only credit the release if it doesn't push `available` past
-        // `cap`. A `reduce` between this acquire/release pair means
-        // we've effectively burned the permit; we don't restore it.
+        // `cap`. A `reduce` between this acquire/release pair burns the
+        // permit; it is not restored.
         if g.available < g.cap {
             g.available += 1;
             self.cv.notify_one();
@@ -259,7 +259,7 @@ impl ParallelismGate {
             // The permit count tracks `available` independently of
             // `cap`; if there's an unreleased permit at the moment of
             // reduction (i.e., a worker is still running its fixture),
-            // we leave `available` alone — `release` will refuse to
+            // `available` is left alone — `release` will refuse to
             // credit it back if it would exceed `cap`.
             if g.available > g.cap {
                 g.available = g.cap;
@@ -440,7 +440,7 @@ pub fn dispatch_pool(
                 // If the cap shrank below the number of running
                 // workers, this acquire blocks until peers finish
                 // their current task; if the gate closes (the
-                // dispatch loop is shutting down), we exit cleanly.
+                // dispatch loop is shutting down), exit cleanly.
                 if !g.acquire() {
                     break;
                 }
@@ -578,8 +578,8 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
         MonitorKind::ExternalKill { cause } => (Verdict::WorkerCrashed { cause }, None),
     };
 
-    // Bless path: if we have a SnapshotDiff verdict and bless is on,
-    // overwrite and emit Blessed. The bless transition does not affect
+    // Bless path: a SnapshotDiff verdict with bless on causes
+    // overwrite and Blessed emission. The bless transition does not affect
     // any LARGE_SNAPSHOT warning that may already be attached — the
     // warning is about the input shape, not the verdict.
     if ctx.bless {
@@ -627,8 +627,8 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
 
 /// Recompute the normalized stderr for the bless path. Returns `None`
 /// if rustc surprisingly succeeded between the first run and now (the
-/// adopter's source changed under our feet) or if the rustc output
-/// failed UTF-8 validation — in either case we leave the verdict alone
+/// adopter's source changed between runs) or if the rustc output
+/// failed UTF-8 validation — in either case the verdict is left alone
 /// rather than blessing whatever bytes happened to land.
 fn compute_actual_normalized(fx: &Fixture, ctx: &WorkerContext) -> Option<String> {
     let workdir = ctx.session_temp.join(fixture_workdir_name(fx));
@@ -677,9 +677,9 @@ fn classify_exit(
     stderr_bytes: &[u8],
 ) -> (Verdict, Option<FixtureWarning>) {
     // the policy: a non-UTF-8 byte in rustc's diagnostic stream IS the
-    // verdict. We do not silently substitute replacement characters
-    // and continue — that would erase the signal that adopters need
-    // in order to debug whatever produced the bad bytes.
+    // verdict. Silently substituting replacement characters and
+    // continuing is refused — that would erase the signal adopters
+    // need to debug whatever produced the bad bytes.
     let stderr = match std::str::from_utf8(stderr_bytes) {
         Ok(s) => s,
         Err(e) => {
@@ -703,9 +703,9 @@ fn classify_exit(
             // Diff against snapshot.
             match snapshot::try_read(&fx.path) {
                 Ok(snapshot::ReadOutcome::Found(expected)) => {
-                    // Snapshot lines pre-normalized to LF on read; we
-                    // count post-split lines on the actual side too so
-                    // both numbers match what the diff algorithm sees.
+                    // Snapshot lines pre-normalized to LF on read; post-split
+                    // lines are counted on the actual side too so both
+                    // numbers match what the diff algorithm sees.
                     let expected_lines = expected.lines().count();
                     let actual_lines = normalized.lines().count();
                     let result = crate::diff::unified_diff(&expected, &normalized);
@@ -773,8 +773,8 @@ fn render_json_diagnostics(stderr: &str) -> String {
         // parse to avoid allocating a Value tree per diagnostic line.
         if let Some(rendered) = extract_rendered(line) {
             out.push_str(&rendered);
-            // rustc's `rendered` typically ends in '\n' already; we add
-            // one only if missing.
+            // rustc's `rendered` typically ends in '\n' already; one
+            // is added only if missing.
             if !rendered.ends_with('\n') {
                 out.push('\n');
             }
@@ -788,7 +788,7 @@ fn render_json_diagnostics(stderr: &str) -> String {
 /// decoder; only the substring after `"rendered":` is examined.
 fn extract_rendered(line: &str) -> Option<String> {
     // Find the key token. Two shapes are possible: `"rendered":"…"` and
-    // `"rendered" : "…"`. We scan for the literal key including the
+    // `"rendered" : "…"`. The scan targets the literal key including the
     // leading quote.
     let key = "\"rendered\"";
     let key_idx = line.find(key)?;
@@ -996,7 +996,7 @@ fn spawn_and_monitor(
                     };
                 }
                 // rustc returns 1 for compilation errors, 101 for ICEs.
-                // We treat everything except a signal-kill as a normal
+                // Everything except a signal-kill is treated as a normal
                 // exit; a signal-kill (when not harness-initiated) is
                 // crash territory per the policy.
                 #[cfg(unix)]
@@ -1052,7 +1052,7 @@ fn spawn_and_monitor(
                     harness_killed_memory = true;
                     terminate(&mut child);
                     // Loop back; the next try_wait will pick up the
-                    // exit and we'll classify HarnessKilledMemory.
+                    // exit; the next try_wait will classify HarnessKilledMemory.
                 }
                 thread::sleep(Duration::from_millis(100));
             }
@@ -1140,10 +1140,10 @@ fn sample_rss_kib(pid: u32) -> Option<u64> {
     #[cfg(not(target_os = "linux"))]
     {
         // KR-5: per-platform sampling is implementer's responsibility.
-        // We disable the ceiling check on platforms where we don't have
-        // a verified live-RSS API. The OS OOMkiller still backs us up;
-        // a runaway worker surfaces as WORKER_CRASHED rather than
-        // MEMORY_EXHAUSTED. Documented in the worker module's preamble.
+        // The ceiling check is disabled on platforms without a verified
+        // live-RSS API. The OS OOMkiller still backstops; a runaway
+        // worker surfaces as WORKER_CRASHED rather than MEMORY_EXHAUSTED.
+        // Documented in the worker module's preamble.
         let _ = pid;
         None
     }
@@ -1152,7 +1152,7 @@ fn sample_rss_kib(pid: u32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn page_size_kib() -> u64 {
     // Most Linux platforms run a 4 KiB page. ARM64 servers occasionally
-    // use 16 KiB or 64 KiB. We read the live value via `libc::sysconf`,
+    // use 16 KiB or 64 KiB. The live value is read via `libc::sysconf`,
     // falling back to 4 if anything goes wrong.
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if raw <= 0 { 4 } else { (raw as u64) / 1024 }
@@ -1223,8 +1223,8 @@ plain text line
         let g = Arc::new(ParallelismGate::new(2));
         assert!(g.acquire());
         assert!(g.acquire());
-        // Cap is 2 — third acquire would block. We test the release
-        // path instead by releasing twice and re-acquiring.
+        // Cap is 2 — third acquire would block. The release
+        // path is tested by releasing twice and re-acquiring.
         g.release();
         g.release();
         assert!(g.acquire());
@@ -1246,8 +1246,8 @@ plain text line
 
     #[test]
     fn parallelism_gate_reduce_burns_in_flight_permit() {
-        // Scenario: cap=2, both permits acquired; we reduce. The
-        // currently-acquired permits are not credited back beyond the
+        // Scenario: cap=2, both permits acquired; cap is then reduced.
+        // Currently-acquired permits are not credited back beyond the
         // new cap, so after both `release` calls only `cap=1` permit
         // remains available.
         let g = ParallelismGate::new(2);
@@ -1258,7 +1258,7 @@ plain text line
         g.release();
         g.release();
         // After both releases, available <= cap. Acquire once more
-        // succeeds, second would block — we don't try the second to
+        // succeeds, second would block — the second is not attempted to
         // avoid a hang in the test.
         assert!(g.acquire());
         assert_eq!(g.current_cap(), 1);
@@ -1302,9 +1302,9 @@ plain text line
     fn classify_exit_emits_malformed_diagnostic_with_correct_offset() {
         // the policy: a non-UTF-8 byte in rustc's stderr surfaces as
         // MALFORMED_DIAGNOSTIC with the precise byte offset of the
-        // first invalid byte. We construct a minimal WorkerContext
+        // first invalid byte. A minimal WorkerContext is constructed
         // (no rustc spawn — classify_exit is pure given its inputs)
-        // and feed it bytes containing `0xFE` after 3 valid prefix
+        // and fed bytes containing `0xFE` after 3 valid prefix
         // bytes. Expected: byte_offset == 3.
         let ctx = unit_test_ctx();
         let fx = Fixture {

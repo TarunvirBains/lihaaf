@@ -2,7 +2,7 @@
 //!
 //! Cargo discovers binaries on `PATH` named `cargo-<subcommand>` and
 //! invokes them with the subcommand string as the first positional
-//! argument. We strip that argument, then hand the remainder to
+//! argument. That argument is stripped, then the remainder is handed to
 //! [`lihaaf::cli`] for parsing.
 //!
 //! ## Why a binary, not a library entry point
@@ -40,7 +40,7 @@ fn main() -> ProcessExitCode {
         Ok(p) => p,
         Err(e) => {
             // clap prints its own diagnostic on `--help` / `--version`
-            // and on parse errors; we just propagate the exit code.
+            // and on parse errors; the exit code is propagated directly.
             return ProcessExitCode::from(e.exit_code() as u8);
         }
     };

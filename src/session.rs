@@ -2,8 +2,8 @@
 //!
 //! ## Orchestration
 //!
-//! `run` follows a simple staged flow. If one stage fails, we stop
-//! immediately and report the failure; it keeps behavior predictable.
+//! `run` follows a simple staged flow. Failure in any stage stops
+//! immediately with a report; this keeps behavior predictable.
 //! The flow maps roughly onto:
 //!
 //! 1. Configuration load → [`crate::config::load`].
@@ -18,9 +18,9 @@
 //!
 //! ## Why one function (and not a builder)
 //!
-//! The binary is the main caller and clap is the argument source, so we keep
-//! one entry point. A builder would be extra complexity for the current
-//! usage model. If a second consumer appears later, we can revisit this.
+//! The binary is the main caller and clap is the argument source, so
+//! a single entry point is kept. A builder would be extra complexity for
+//! the current usage model. A second consumer would warrant revisiting this.
 
 use std::path::{Path, PathBuf};
 
@@ -104,8 +104,8 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     // can still produce a stale-feeling artifact if the toml/feature
     // set hasn't drifted; deleting the manifest is the documented
     // "blow the cache" lever ("Equivalent to deleting
-    // target/lihaaf/manifest.json before invocation"). We also remove
-    // the lihaaf-build target dir so cargo's incremental cache is
+    // target/lihaaf/manifest.json before invocation"). The lihaaf-build
+    // target dir is also removed so cargo's incremental cache is
     // fully bypassed — that's what an adopter scripting `--no-cache`
     // is asking for.
     if cli.no_cache {
@@ -229,9 +229,9 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     extra_names.extend(worker_ctx.dev_deps.iter().cloned());
     worker_ctx.extern_paths = worker::resolve_extern_paths(&build_out.deps_dir, &extra_names)?;
 
-    // Mid-session toolchain drift check (the policy). We compare the
-    // captured rustc release against a fresh capture. Cheap; cost is
-    // dwarfed by the per-fixture rustc.
+    // Mid-session toolchain drift check (the policy): the captured
+    // rustc release is compared against a fresh capture. Cheap; cost
+    // is dwarfed by the per-fixture rustc.
     let post_capture = toolchain::capture()?;
     if !toolchain::matches(&toolchain, &post_capture) {
         return Err(Error::Session(Outcome::ToolchainDrift {
@@ -337,7 +337,7 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
 
     // The aggregate line is kept to four buckets (`ok`, `failed`,
     // `summary` above carry every verdict label; this line re-projects
-    // the four buckets we report as `ok`, `failed`, `timeout`,
+    // the four buckets reported as `ok`, `failed`, `timeout`,
     // adopter-friendly shape `<n> ok, <n> failed, <n> timeout, <n>
     // memory_exhausted` so CI greps and dashboards have a single fixed
     // line to anchor on regardless of which exotic verdicts a run
@@ -599,7 +599,7 @@ mod tests {
             use_symlink: false,
             keep_output: false,
         };
-        // Even with an absurd per-fixture cap, we must not return 0.
+        // Even with an absurd per-fixture cap, the result must not be 0.
         let p = compute_parallelism(&cli, &cfg(u32::MAX / 2));
         assert!(p >= 1);
     }

@@ -44,7 +44,7 @@ use crate::util;
 /// Re-checked per fixture dispatch via [`check`]. The snapshot is
 /// constructed once per session from the data already on hand after
 /// stages 2–5 of [`crate::session::run`] (`Toolchain` + dylib copy
-/// outcome); we copy out only the four scalars we need so the snapshot
+/// outcome); only the four scalars needed are copied out so the snapshot
 /// is `Send + Sync + Clone` for the worker pool.
 #[derive(Debug, Clone)]
 pub struct FreshnessSnapshot {
@@ -164,7 +164,7 @@ impl FreshnessFailure {
 ///
 /// The check is intended for the per-dispatch path. Re-running a
 /// short `rustc --version --verbose` per fixture is acceptable — the
-/// cost is dwarfed by the per-fixture rustc compile — and gives us
+/// cost is dwarfed by the per-fixture rustc compile — providing
 /// the only line of defense against an in-session toolchain swap.
 pub fn check(snapshot: &FreshnessSnapshot) -> Result<(), FreshnessFailure> {
     // Invariant 1: existence.
@@ -219,7 +219,7 @@ pub fn check(snapshot: &FreshnessSnapshot) -> Result<(), FreshnessFailure> {
         }
         Err(_) => {
             // A captured toolchain that can no longer be re-captured is
-            // itself a drift. We surface as RustcDrift with an empty
+            // itself a drift. Surfaced as RustcDrift with an empty
             // observed line — better than silently passing the check.
             return Err(FreshnessFailure::RustcDrift {
                 original_release_line: snapshot.original_rustc_release_line.clone(),

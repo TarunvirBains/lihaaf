@@ -42,8 +42,8 @@ Adopters needing other test types should compose lihaaf with the
 right tool for that workload, not stretch lihaaf to fit.
 
 - **Fast** — a 200-fixture run finishes in seconds on a developer laptop,
-  not minutes. The architectural lever (Section 2) gets us there; nothing
-  else does.
+  not minutes. The architectural lever (Section 2) is what makes this
+  possible; nothing else does.
 - **Parallel** — fixtures are mutually isolated and the harness
   saturates available cores up to a RAM-derived cap (Section 5).
 - **Non-flaky** — silent wrong results are worse than loud failures.
@@ -1421,7 +1421,7 @@ scheduling.
 
 Every cut feature below has a specific anchor — a concrete reason and
 a specific future-trigger or "never" classification. None of these are
-"we'll get to it eventually" promises; each is either truly never, or
+"eventually" promises; each is either truly never, or
 truly waiting for a concrete signal.
 
 ### 11.1 Multi-target / cross-compilation

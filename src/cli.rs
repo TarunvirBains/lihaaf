@@ -9,7 +9,7 @@
 //!
 //! The flag set is small enough that hand-rolling argv parsing would
 //! work, but `clap` carries the `--help` / `--version` rendering and
-//! the validation we'd otherwise re-implement (positive integer for
+//! the validation that would otherwise need to be re-implemented (positive integer for
 //! `-j`, etc.).
 
 use std::path::PathBuf;
@@ -98,7 +98,7 @@ pub struct Cli {
 
 /// Reject `-j 0` at parse time. The default
 /// `value_parser` for `u32` accepts any non-negative integer, including
-/// `0`; we tighten that to "positive integer required" so the bad
+/// `0`; this is tightened to "positive integer required" so the bad
 /// invocation fails immediately with a clap error rather than silently
 /// being clamped downstream.
 fn parse_jobs(s: &str) -> Result<u32, String> {
@@ -122,16 +122,16 @@ pub fn parse_from(argv: Vec<String>) -> Result<Cli, Error> {
         Ok(cli) => Ok(cli),
         Err(e) => {
             // For `--help` / `--version`, clap returns a "graceful" error
-            // and we should let it print and exit 0.
+            // and should print and exit 0.
             let kind = e.kind();
             let exit_code = match kind {
                 ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
                 _ => 2,
             };
-            // clap prints the message itself when we call `print()`.
+            // clap prints the message itself when `print()` is called.
             let message = e.to_string();
-            // Pre-print so the user sees the message even though we
-            // bubble through the typed error.
+            // Pre-print so the caller sees the message even when
+            // bubbling through the typed error.
             let _ = e.print();
             Err(Error::Cli {
                 clap_exit_code: exit_code,
@@ -223,9 +223,9 @@ mod tests {
 
     #[test]
     fn bless_via_env_when_flag_absent() {
-        // Env reads happen at call time; we must not pollute other tests.
+        // Env reads happen at call time; pollution across tests must be avoided.
         // SAFETY: `set_var` is `unsafe` in 2024 edition, but tests run
-        // single-threaded by default and we restore the var in `finally`.
+        // single-threaded by default; the var is restored below.
         let prev = std::env::var("LIHAAF_OVERWRITE").ok();
         unsafe {
             std::env::set_var("LIHAAF_OVERWRITE", "1");
