@@ -1,6 +1,6 @@
 [package]
 name = "lihaaf"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Tarunvir Bains"]
@@ -12,8 +12,12 @@ keywords = ["proc-macro", "trybuild", "compile-fail", "testing", "snapshot"]
 categories = ["development-tools::testing"]
 readme = "README.md"
 
-# Pre-1.0; not yet on crates.io. Flip when v0.1 ships.
-publish = false
+# Pre-release alpha — adopters must pin the exact version
+# (`cargo install lihaaf` without a version selector will not pick up
+# pre-release tags by design). The `publish = true` flag activates
+# crates.io upload; do not set unless v0.1.0-alpha.1 (or later) is the
+# intended release.
+publish = true
 
 # Cargo subcommand convention — `cargo-<subcommand>` binary on PATH is
 # discovered by cargo. The binary strips its first argument (`lihaaf`)

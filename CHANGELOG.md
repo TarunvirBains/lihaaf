@@ -4,7 +4,18 @@ All notable changes to lihaaf are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the
 project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — v0.1.0 work-in-progress
+## [Unreleased]
+
+(no changes since 0.1.0-alpha.1)
+
+## [0.1.0-alpha.1] — 2026-05-11
+
+First public release on crates.io. Pre-1.0 alpha — the CLI surface
+(flag names, exit codes, verdict catalog, `manifest.json` schema, and
+`[package.metadata.lihaaf]` schema) is the stable v0.1 contract; the
+library API is non-stable and may shift across v0.1.x. Adopters
+should subprocess-spawn `cargo lihaaf` rather than depend on
+`lihaaf::*` paths from Rust.
 
 ### Added
 - Initial v0.1 implementation per `docs/spec/lihaaf-v0.1.md`:
