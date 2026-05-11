@@ -105,8 +105,6 @@ severe code from the fixture verdicts and session-level outcomes.
 - **Coverage / multi-target / IDE / watch.** Those are deferred on
   purpose. Each cut has a concrete reason and a future-trigger or
   explicit "never" classification.
-- **A regex-engine consumer.** Zero regex-engine deps, ever. The
-  normalizer is hand-rolled byte-level matching.
 
 ## Tradeoffs and choices (a.k.a. what we picked)
 
@@ -158,8 +156,6 @@ paths that felt easiest to keep stable and debuggable in day-to-day use:
 - `libc` 0.2 (Unix only) — `kill(2)` for worker termination and
   `sysconf(_SC_PAGESIZE)` for RSS unit conversion. The canonical curated
   source for POSIX FFI signatures.
-
-No regex engine. No diff library.
 
 ## Stability
 

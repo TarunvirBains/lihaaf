@@ -35,7 +35,7 @@
 //! | [`freshness`] | Per-dispatch the policy invariant re-check (mtime / SHA-256 / rustc). |
 //! | [`discovery`] | Walk `fixture_dirs`, classify pass/fail, sort. |
 //! | [`worker`] | Per-fixture `rustc` spawn, RSS sampling, OOM, timeout. |
-//! | [`normalize`] | Stderr normalization (no regex; stdlib only). |
+//! | [`normalize`] | Stderr normalization (fixed-string, byte-level). |
 //! | [`diff`] | Hand-rolled Myers diff with line granularity. |
 //! | [`snapshot`] | `.stderr` file I/O + `--bless` semantics. |
 //! | [`verdict`] | Per-fixture verdict + session reporter. |

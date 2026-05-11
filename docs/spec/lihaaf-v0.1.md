@@ -217,7 +217,7 @@ and the spike property described next.
 
 ### 2.4 The two-consumer dylib model
 
-lihaaf is one of two planned consumers of the "consumer crate as dylib"
+lihaaf is one of two known consumers of the "consumer crate as dylib"
 pattern. The other is a Rhai-based interactive shell (a separate
 project, not in scope here). Both depend on the same property: when the
 consumer crate is built as a dynamic library, runtime registration
