@@ -467,7 +467,9 @@ mod tests {
             [d]
             e = true
         "#;
-        let v: toml::Value = toml_text.parse().unwrap();
+        // toml 1.x: parse a document via `from_str`, not `parse()`
+        // (the latter now parses a single value).
+        let v: toml::Value = toml::from_str(toml_text).unwrap();
         let j = toml_value_to_json(&v);
         assert_eq!(j["a"], serde_json::json!(1));
         assert_eq!(j["b"], serde_json::json!("two"));

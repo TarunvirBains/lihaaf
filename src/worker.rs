@@ -763,16 +763,14 @@ fn terminate(child: &mut Child) {
     }
 }
 
-// libc::kill via libloading-free direct syscall. Rather than pull in
-// the `libc` crate we use a tiny extern block.
-#[cfg(unix)]
-unsafe extern "C" {
-    fn kill(pid: i32, sig: i32) -> i32;
-}
-
+/// Send a signal to a Unix process via `libc::kill`.
+///
+/// Wrapper kept for call-site clarity — the signal numbers (SIGTERM=15
+/// at the call site above) stay close to the spec §5.4 termination
+/// contract rather than scattering `libc::SIGTERM` across the module.
 #[cfg(unix)]
 unsafe fn libc_kill(pid: i32, sig: i32) {
-    unsafe { kill(pid, sig) };
+    unsafe { libc::kill(pid, sig) };
 }
 
 /// Sample per-process RSS in KiB. Linux-only in v0.1; returns `None`
@@ -805,13 +803,9 @@ fn sample_rss_kib(pid: u32) -> Option<u64> {
 #[cfg(target_os = "linux")]
 fn page_size_kib() -> u64 {
     // Most Linux platforms run a 4 KiB page. ARM64 servers occasionally
-    // use 16 KiB or 64 KiB. We read the live value via sysconf with
-    // a small extern, falling back to 4 if anything goes wrong.
-    unsafe extern "C" {
-        fn sysconf(name: i32) -> i64;
-    }
-    const _SC_PAGESIZE: i32 = 30;
-    let raw = unsafe { sysconf(_SC_PAGESIZE) };
+    // use 16 KiB or 64 KiB. We read the live value via `libc::sysconf`,
+    // falling back to 4 if anything goes wrong.
+    let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if raw <= 0 { 4 } else { (raw as u64) / 1024 }
 }
 

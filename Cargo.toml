@@ -28,8 +28,11 @@ clap = { version = "4", features = ["derive"] }
 
 # Cargo manifest parsing — `[package.metadata.lihaaf]` is read out of the
 # consumer's Cargo.toml. `toml` crate handles parse + value-typing
-# (string / integer / array of strings).
-toml = "0.8"
+# (string / integer / array of strings). 1.x changed the `FromStr for
+# Value` impl to parse a single value rather than a whole document; we
+# go through `toml::from_str::<Value>` instead, which keeps the
+# document-parse path explicit at every call site.
+toml = "1"
 
 # Manifest serialization — `target/lihaaf/manifest.json` is JSON for
 # trivial CLI debuggability (`jq`, etc.). `preserve_order` keeps key
@@ -47,7 +50,16 @@ sha2 = "0.11"
 # it wrong on macOS where the system can rotate temp roots.
 tempfile = "3"
 
+# Unix syscalls — `kill(2)` for spec §5.4 worker termination and
+# `sysconf(_SC_PAGESIZE)` for spec §5.4 RSS conversion. The `libc`
+# crate is the canonical curated source for POSIX FFI signatures and
+# constants; using it instead of hand-rolled `extern "C"` blocks keeps
+# signatures right across glibc/musl/macOS variants and shifts the
+# audit burden to the well-reviewed crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # No regex engine, ever. Spec §6.1. Every string match in this crate
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
-# `/proc/<pid>/statm` directly via stdlib file I/O — no syscall crate.
+# `/proc/<pid>/statm` directly via stdlib file I/O.

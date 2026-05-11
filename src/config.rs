@@ -137,9 +137,11 @@ pub fn load(manifest_path: &Path) -> Result<Config, Error> {
 
 /// Same as [`load`] but reads from a string. Used by tests.
 pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
-    let value: toml::Value = toml_text
-        .parse()
-        .map_err(|e: toml::de::Error| Error::TomlParse {
+    // toml 1.x: `FromStr for Value` parses a single value (not a
+    // document). `toml::from_str::<Value>` keeps the document-parse
+    // path explicit and serde-routed.
+    let value: toml::Value =
+        toml::from_str(toml_text).map_err(|e: toml::de::Error| Error::TomlParse {
             path: manifest_path.to_path_buf(),
             message: e.to_string(),
         })?;
