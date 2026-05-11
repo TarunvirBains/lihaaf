@@ -239,13 +239,33 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
 
     // Print the aggregate report.
     print_aggregate(&results, wall_ms, cleanup_residue);
+
+    // Preserve the per-session temp directory in two cases:
+    //
+    // 1. `--keep-output` is set (local-development escape hatch — spec
+    //    §5.3 / §8.2 #--keep-output).
+    // 2. Any fixture's per-fixture workdir cleanup failed (spec §5.3:
+    //    "the session-temp parent directory is NOT removed at session
+    //    end if it contains residue from a CLEANUP_FAILED fixture —
+    //    leaving the residue visible is more useful than silently
+    //    retrying a removal that already failed once."). Re-emitted as
+    //    spec §10.2 `CLEANUP_RESIDUE` outcome's preserve-on-disk side
+    //    of the contract.
+    //
+    // `tempfile::TempDir` removes the directory on drop; `std::mem::
+    // forget` is the documented way to suppress that drop while
+    // keeping the path alive on disk.
     if cli.keep_output {
         eprintln!(
             "lihaaf: --keep-output set; per-fixture workdirs preserved under {}",
             session_temp_path.display()
         );
-        // Drop the tempfile guard without removal (the tempfile crate
-        // removes on drop). std::mem::forget is the documented way.
+        std::mem::forget(session_temp);
+    } else if cleanup_residue {
+        eprintln!(
+            "lihaaf: CLEANUP_RESIDUE detected; session-temp parent preserved at {}",
+            session_temp_path.display()
+        );
         std::mem::forget(session_temp);
     }
 
