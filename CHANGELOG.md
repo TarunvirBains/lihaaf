@@ -64,6 +64,13 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `toml` crate bumped 0.8 → 1.x.
 - Unix `kill(2)` and `sysconf(_SC_PAGESIZE)` route through the
   `libc` crate instead of hand-rolled `extern "C"` blocks.
+- Spec §4.5 amended to acknowledge the v0.1 hard-fail policy on
+  freshness divergence and to defer the in-session rebuild path to
+  v0.2. The four §4.5 invariants now share §4.6's hard-fail behavior
+  (exit code 67) explicitly. Previously the spec mandated rebuild
+  while the implementation hard-failed; this brings the spec text in
+  line with shipping behavior + the deferral note in
+  `src/freshness.rs` rustdoc. (Codex delta-review A3.)
 
 ### Pending before v0.1.0 release
 - macOS / Windows RSS sampling APIs are not yet wired (KR-5); on
