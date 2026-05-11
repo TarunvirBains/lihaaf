@@ -364,14 +364,20 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
 
 /// Recompute the normalized stderr for the bless path. Returns `None`
 /// if rustc surprisingly succeeded between the first run and now (the
-/// adopter's source changed under our feet); in that case we leave
-/// the verdict alone.
+/// adopter's source changed under our feet) or if the rustc output
+/// failed UTF-8 validation — in either case we leave the verdict alone
+/// rather than blessing whatever bytes happened to land.
 fn compute_actual_normalized(fx: &Fixture, ctx: &WorkerContext) -> Option<String> {
     let workdir = ctx.session_temp.join(fixture_workdir_name(fx));
     let _ = std::fs::create_dir_all(&workdir);
     let outcome = spawn_and_monitor(fx, ctx, &workdir, false);
     if let MonitorKind::Exited { stderr, .. } = outcome.kind {
-        Some(normalize_stderr(&stderr, fx, ctx))
+        // UTF-8 validation parity with `classify_exit`. A bless that
+        // silently used `from_utf8_lossy` here could write a snapshot
+        // file with replacement characters that no rerun would ever
+        // match — refuse to bless if the diagnostic stream is malformed.
+        let s = std::str::from_utf8(&stderr).ok()?;
+        Some(normalize_stderr(s, fx, ctx))
     } else {
         None
     }
@@ -393,16 +399,36 @@ fn fixture_workdir_name(fx: &Fixture) -> String {
 /// The warning (currently only `LARGE_SNAPSHOT`) rides alongside the
 /// verdict — it does not change the exit-code aggregation. See spec
 /// §7.2 complexity ceiling for the soft / hard thresholds.
+///
+/// UTF-8 validation is performed here, exactly once, on the raw
+/// rustc-emitted bytes. Spec §7.2 ("Non-UTF-8 / binary-content
+/// handling"): any byte sequence that fails UTF-8 validation surfaces
+/// as `MALFORMED_DIAGNOSTIC` with the precise byte offset of the first
+/// invalid byte (returned by [`std::str::Utf8Error::valid_up_to`]).
+/// `from_utf8_lossy` is deliberately NOT used as a fallback — the
+/// malformed signal IS the verdict.
 fn classify_exit(
     fx: &Fixture,
     ctx: &WorkerContext,
     ok: bool,
-    stderr: &str,
+    stderr_bytes: &[u8],
 ) -> (Verdict, Option<FixtureWarning>) {
-    // UTF-8 was validated upstream (stderr came back through
-    // String::from_utf8_lossy). The MalformedDiagnostic path triggers
-    // when rustc's JSON `rendered` field has invalid bytes — handled
-    // in the parse layer; here we operate on the rendered text.
+    // Spec §7.2: a non-UTF-8 byte in rustc's diagnostic stream IS the
+    // verdict. We do not silently substitute replacement characters
+    // and continue — that would erase the signal that adopters need
+    // in order to debug whatever produced the bad bytes.
+    let stderr = match std::str::from_utf8(stderr_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                Verdict::MalformedDiagnostic {
+                    byte_offset: e.valid_up_to(),
+                    source: MalformedSource::RustcRendered,
+                },
+                None,
+            );
+        }
+    };
     let normalized = normalize_stderr(stderr, fx, ctx);
     match (fx.kind, ok) {
         (FixtureKind::CompilePass, true) => (Verdict::Ok, None),
@@ -413,7 +439,7 @@ fn classify_exit(
         (FixtureKind::CompileFail, false) => {
             // Diff against snapshot.
             match snapshot::try_read(&fx.path) {
-                Ok(Some(expected)) => {
+                Ok(snapshot::ReadOutcome::Found(expected)) => {
                     // Snapshot lines pre-normalized to LF on read; we
                     // count post-split lines on the actual side too so
                     // both numbers match what the diff algorithm sees.
@@ -438,7 +464,16 @@ fn classify_exit(
                     };
                     (verdict, warning)
                 }
-                Ok(None) => (Verdict::SnapshotMissing { actual: normalized }, None),
+                Ok(snapshot::ReadOutcome::Missing) => {
+                    (Verdict::SnapshotMissing { actual: normalized }, None)
+                }
+                Ok(snapshot::ReadOutcome::Malformed { byte_offset, .. }) => (
+                    Verdict::MalformedDiagnostic {
+                        byte_offset,
+                        source: MalformedSource::Snapshot,
+                    },
+                    None,
+                ),
                 Err(_) => (
                     Verdict::MalformedDiagnostic {
                         byte_offset: 0,
@@ -562,10 +597,21 @@ struct MonitorOutcome {
 }
 
 enum MonitorKind {
-    Exited { ok: bool, stderr: String },
+    /// rustc finished. `stderr` is the raw bytes — UTF-8 validation is
+    /// the caller's responsibility. Spec §7.2 mandates that any
+    /// non-UTF-8 sequence in the diagnostic stream surfaces as a
+    /// `MALFORMED_DIAGNOSTIC` verdict with the precise byte offset of
+    /// the first invalid byte; lossy decoding here would erase that
+    /// signal.
+    Exited {
+        ok: bool,
+        stderr: Vec<u8>,
+    },
     HarnessKilledMemory,
     Timeout,
-    ExternalKill { cause: String },
+    ExternalKill {
+        cause: String,
+    },
 }
 
 fn spawn_and_monitor(
@@ -675,8 +721,7 @@ fn spawn_and_monitor(
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
-                let stderr_bytes = stderr_join.join().unwrap_or_default();
-                let stderr = String::from_utf8_lossy(&stderr_bytes).into_owned();
+                let stderr = stderr_join.join().unwrap_or_default();
                 if harness_killed_memory {
                     return MonitorOutcome {
                         kind: MonitorKind::HarnessKilledMemory,
@@ -891,6 +936,99 @@ plain text line
         assert!(out.contains("error: alpha"));
         assert!(out.contains("error: beta"));
         assert!(out.contains("plain text line"));
+    }
+
+    #[test]
+    fn classify_exit_emits_malformed_diagnostic_with_correct_offset() {
+        // Spec §7.2: a non-UTF-8 byte in rustc's stderr surfaces as
+        // MALFORMED_DIAGNOSTIC with the precise byte offset of the
+        // first invalid byte. We construct a minimal WorkerContext
+        // (no rustc spawn — classify_exit is pure given its inputs)
+        // and feed it bytes containing `0xFE` after 3 valid prefix
+        // bytes. Expected: byte_offset == 3.
+        let ctx = WorkerContext {
+            crate_root: PathBuf::from("/p"),
+            managed_dylib: PathBuf::from("/p/target/lihaaf/lib.so"),
+            deps_dir: PathBuf::from("/p/target/release/deps"),
+            dylib_crate: "consumer".into(),
+            extra_extern_crates: vec![],
+            dev_deps: vec![],
+            features: vec![],
+            edition: "2021".into(),
+            timeout_secs: 90,
+            memory_mb_ceiling: 1024,
+            bless: false,
+            verbose: false,
+            keep_output: false,
+            session_temp: PathBuf::from("/tmp/lihaaf-session"),
+            extern_paths: HashMap::new(),
+            norm_ctx: NormalizationContext {
+                workspace_root: PathBuf::from("/p"),
+                sysroot: PathBuf::from("/r"),
+                cargo_registry: None,
+            },
+            sysroot_lib_dir: PathBuf::from("/r/lib"),
+        };
+        let fx = Fixture {
+            path: PathBuf::from("/p/tests/lihaaf/compile_fail/foo.rs"),
+            relative_path: "tests/lihaaf/compile_fail/foo.rs".into(),
+            stem: "foo".into(),
+            kind: FixtureKind::CompileFail,
+        };
+        let mut bytes: Vec<u8> = b"abc".to_vec();
+        bytes.push(0xFE);
+        bytes.extend_from_slice(b"def");
+        let (verdict, warning) = classify_exit(&fx, &ctx, false, &bytes);
+        assert!(warning.is_none(), "malformed input has no warning");
+        match verdict {
+            Verdict::MalformedDiagnostic {
+                byte_offset,
+                source,
+            } => {
+                assert_eq!(byte_offset, 3, "first invalid byte is at offset 3");
+                assert!(matches!(source, MalformedSource::RustcRendered));
+            }
+            other => panic!("expected MalformedDiagnostic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_exit_malformed_at_offset_zero_when_first_byte_invalid() {
+        let ctx = WorkerContext {
+            crate_root: PathBuf::from("/p"),
+            managed_dylib: PathBuf::from("/p/target/lihaaf/lib.so"),
+            deps_dir: PathBuf::from("/p/target/release/deps"),
+            dylib_crate: "consumer".into(),
+            extra_extern_crates: vec![],
+            dev_deps: vec![],
+            features: vec![],
+            edition: "2021".into(),
+            timeout_secs: 90,
+            memory_mb_ceiling: 1024,
+            bless: false,
+            verbose: false,
+            keep_output: false,
+            session_temp: PathBuf::from("/tmp/lihaaf-session"),
+            extern_paths: HashMap::new(),
+            norm_ctx: NormalizationContext {
+                workspace_root: PathBuf::from("/p"),
+                sysroot: PathBuf::from("/r"),
+                cargo_registry: None,
+            },
+            sysroot_lib_dir: PathBuf::from("/r/lib"),
+        };
+        let fx = Fixture {
+            path: PathBuf::from("/p/tests/lihaaf/compile_fail/x.rs"),
+            relative_path: "tests/lihaaf/compile_fail/x.rs".into(),
+            stem: "x".into(),
+            kind: FixtureKind::CompileFail,
+        };
+        let bytes = vec![0xFE];
+        let (verdict, _) = classify_exit(&fx, &ctx, false, &bytes);
+        match verdict {
+            Verdict::MalformedDiagnostic { byte_offset, .. } => assert_eq!(byte_offset, 0),
+            other => panic!("expected MalformedDiagnostic, got {other:?}"),
+        }
     }
 
     #[test]

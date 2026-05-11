@@ -22,14 +22,46 @@ pub fn snapshot_path(fixture_path: &Path) -> PathBuf {
     fixture_path.with_extension("stderr")
 }
 
-/// Read the snapshot for `fixture_path` if present. Returns `Ok(None)`
-/// when the file does not exist; that is the `SNAPSHOT_MISSING` case
-/// the caller distinguishes.
-pub fn try_read(fixture_path: &Path) -> Result<Option<String>, Error> {
+/// Outcome of reading a snapshot file, distinguishing the three cases
+/// that drive different verdict paths.
+#[derive(Debug)]
+pub enum ReadOutcome {
+    /// File exists, was UTF-8 valid, and was normalized for comparison.
+    Found(String),
+    /// File does not exist on disk. Caller emits `SNAPSHOT_MISSING`.
+    Missing,
+    /// File exists but failed UTF-8 validation. Caller emits
+    /// `MALFORMED_DIAGNOSTIC` with the carried byte offset (the index
+    /// of the first invalid byte, equal to `Utf8Error::valid_up_to()`).
+    Malformed {
+        /// Byte offset of the first invalid byte. `0` means the file
+        /// began with an invalid sequence.
+        byte_offset: usize,
+        /// Total byte length of the file (for the diagnostic line).
+        total_bytes: usize,
+    },
+}
+
+/// Read the snapshot for `fixture_path` and classify the outcome.
+///
+/// Spec §7.2 ("Non-UTF-8 / binary-content handling") is the authority
+/// for the malformed branch — the snapshot file failing UTF-8 is a
+/// `MALFORMED_DIAGNOSTIC` verdict, not a soft fallback. Earlier drafts
+/// of this module returned a generic IO error for malformed files,
+/// which collapsed the byte offset to a useless `0`; the typed
+/// outcome here preserves the offset that `Utf8Error::valid_up_to()`
+/// provides.
+pub fn try_read(fixture_path: &Path) -> Result<ReadOutcome, Error> {
     let p = snapshot_path(fixture_path);
-    match std::fs::read_to_string(&p) {
-        Ok(s) => Ok(Some(normalize_for_compare(&s))),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    match std::fs::read(&p) {
+        Ok(bytes) => match std::str::from_utf8(&bytes) {
+            Ok(s) => Ok(ReadOutcome::Found(normalize_for_compare(s))),
+            Err(e) => Ok(ReadOutcome::Malformed {
+                byte_offset: e.valid_up_to(),
+                total_bytes: bytes.len(),
+            }),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ReadOutcome::Missing),
         Err(e) => Err(Error::io(e, "reading snapshot", Some(p))),
     }
 }
@@ -81,8 +113,10 @@ mod tests {
         assert_eq!(p, tmp.path().join("fixture.stderr"));
         let bytes = std::fs::read(&p).unwrap();
         assert_eq!(bytes, b"alpha\nbeta\n".to_vec());
-        let read = try_read(&fixture).unwrap().unwrap();
-        assert_eq!(read, "alpha\nbeta");
+        match try_read(&fixture).unwrap() {
+            ReadOutcome::Found(s) => assert_eq!(s, "alpha\nbeta"),
+            other => panic!("expected Found, got {other:?}"),
+        }
     }
 
     #[test]
@@ -95,9 +129,12 @@ mod tests {
     }
 
     #[test]
-    fn try_read_returns_none_when_missing() {
+    fn try_read_returns_missing_when_absent() {
         let tmp = tempdir().unwrap();
-        assert!(try_read(&tmp.path().join("absent.rs")).unwrap().is_none());
+        match try_read(&tmp.path().join("absent.rs")).unwrap() {
+            ReadOutcome::Missing => {}
+            other => panic!("expected Missing, got {other:?}"),
+        }
     }
 
     #[test]
@@ -106,7 +143,54 @@ mod tests {
         let fixture = tmp.path().join("crlf.rs");
         let snap = tmp.path().join("crlf.stderr");
         std::fs::write(&snap, b"a\r\nb\r\n").unwrap();
-        let read = try_read(&fixture).unwrap().unwrap();
-        assert_eq!(read, "a\nb");
+        match try_read(&fixture).unwrap() {
+            ReadOutcome::Found(s) => assert_eq!(s, "a\nb"),
+            other => panic!("expected Found, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_read_returns_malformed_with_correct_offset() {
+        // Spec §7.2: snapshot UTF-8 failure surfaces as
+        // MALFORMED_DIAGNOSTIC with the precise byte offset of the
+        // first invalid byte. `0xFE` is invalid as a UTF-8 leading
+        // byte; placing it after 5 valid bytes gives a deterministic
+        // expected offset of 5.
+        let tmp = tempdir().unwrap();
+        let fixture = tmp.path().join("badbytes.rs");
+        let snap = tmp.path().join("badbytes.stderr");
+        let mut payload: Vec<u8> = b"hello".to_vec();
+        payload.push(0xFE);
+        payload.extend_from_slice(b"world");
+        std::fs::write(&snap, &payload).unwrap();
+        match try_read(&fixture).unwrap() {
+            ReadOutcome::Malformed {
+                byte_offset,
+                total_bytes,
+            } => {
+                assert_eq!(byte_offset, 5, "first invalid byte is at offset 5");
+                assert_eq!(total_bytes, payload.len());
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn try_read_malformed_at_offset_zero_when_first_byte_invalid() {
+        // Edge case: `0xFE` at position 0 — `valid_up_to()` returns 0.
+        let tmp = tempdir().unwrap();
+        let fixture = tmp.path().join("badfirst.rs");
+        let snap = tmp.path().join("badfirst.stderr");
+        std::fs::write(&snap, [0xFE]).unwrap();
+        match try_read(&fixture).unwrap() {
+            ReadOutcome::Malformed {
+                byte_offset,
+                total_bytes,
+            } => {
+                assert_eq!(byte_offset, 0);
+                assert_eq!(total_bytes, 1);
+            }
+            other => panic!("expected Malformed, got {other:?}"),
+        }
     }
 }
