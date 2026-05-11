@@ -226,6 +226,11 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
                 r.wall_ms
             );
         }
+        // Emit any non-fatal per-fixture warning on a separate line,
+        // independent of `--quiet` (a warning that the adopter asked
+        // for visibility into shouldn't be hidden by a verdict-only
+        // quiet mode). Spec §7.2 mandates the LARGE_SNAPSHOT line.
+        emit_fixture_warnings(r);
     });
     let wall_ms = dispatch_start.elapsed().as_millis() as u64;
 
@@ -338,6 +343,32 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
                 eprintln!("--- expected head ---\n{expected_head}");
             }
             _ => {}
+        }
+    }
+}
+
+/// Render any non-fatal warnings attached to a fixture result. Today
+/// this is only `LARGE_SNAPSHOT` (spec §7.2 complexity ceiling), but
+/// the emit point is generic so additional warning kinds slot in
+/// without touching the dispatch loop.
+///
+/// Format pinned by spec §7.2:
+/// `lihaaf: LARGE_SNAPSHOT <path> (<expected>/<actual> lines)`.
+/// The line is separate from the verdict line and does NOT alter the
+/// fixture's verdict or the session exit code.
+fn emit_fixture_warnings(r: &FixtureResult) {
+    use crate::verdict::FixtureWarning;
+    if let Some(w) = &r.warning {
+        match w {
+            FixtureWarning::LargeSnapshot {
+                expected_lines,
+                actual_lines,
+            } => {
+                eprintln!(
+                    "lihaaf: LARGE_SNAPSHOT {} ({}/{} lines)",
+                    r.relative_path, expected_lines, actual_lines
+                );
+            }
         }
     }
 }
@@ -515,6 +546,23 @@ mod tests {
     }
 
     #[test]
+    fn fixture_warnings_default_to_none_on_construction() {
+        // The dispatch loop has a hard invariant: no FixtureResult is
+        // constructed in worker.rs without an explicit `warning` field.
+        // This test exercises the default-None case so a future change
+        // that drops the field would fail to compile, signaling intent.
+        use crate::verdict::{FixtureResult, Verdict};
+        let r = FixtureResult {
+            relative_path: "x".into(),
+            verdict: Verdict::Ok,
+            cleanup_failure: None,
+            wall_ms: 0,
+            warning: None,
+        };
+        assert!(r.warning.is_none());
+    }
+
+    #[test]
     fn aggregate_counts_buckets_per_section_3_3() {
         use crate::verdict::{FixtureResult, Verdict};
         let r = |label: &str, v: Verdict| FixtureResult {
@@ -522,6 +570,7 @@ mod tests {
             verdict: v,
             cleanup_failure: None,
             wall_ms: 0,
+            warning: None,
         };
         let results = vec![
             r("a", Verdict::Ok),

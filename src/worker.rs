@@ -44,7 +44,7 @@ use crate::discovery::{Fixture, FixtureKind};
 use crate::error::Error;
 use crate::normalize::{self, NormalizationContext};
 use crate::snapshot;
-use crate::verdict::{CleanupFailure, FixtureResult, MalformedSource, Verdict};
+use crate::verdict::{CleanupFailure, FixtureResult, FixtureWarning, MalformedSource, Verdict};
 
 /// Per-session worker context. Shared (read-only) across all worker
 /// dispatches.
@@ -291,13 +291,14 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
             },
             cleanup_failure: None,
             wall_ms: 0,
+            warning: None,
         };
     }
 
     // First attempt.
     let outcome = spawn_and_monitor(fx, ctx, &workdir, false);
     let mut wall_ms = started.elapsed().as_millis() as u64;
-    let mut verdict = match outcome.kind {
+    let (mut verdict, mut warning) = match outcome.kind {
         MonitorKind::Exited { ok, stderr } => classify_exit(fx, ctx, ok, &stderr),
         MonitorKind::HarnessKilledMemory => {
             // Per §5.4, retry serially once before declaring
@@ -307,18 +308,20 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
             let retry = spawn_and_monitor(fx, ctx, &workdir, true);
             wall_ms = started.elapsed().as_millis() as u64;
             match retry.kind {
-                MonitorKind::HarnessKilledMemory => Verdict::MemoryExhausted,
+                MonitorKind::HarnessKilledMemory => (Verdict::MemoryExhausted, None),
                 MonitorKind::Exited { ok, stderr } => classify_exit(fx, ctx, ok, &stderr),
-                MonitorKind::Timeout => Verdict::Timeout,
-                MonitorKind::ExternalKill { cause } => Verdict::WorkerCrashed { cause },
+                MonitorKind::Timeout => (Verdict::Timeout, None),
+                MonitorKind::ExternalKill { cause } => (Verdict::WorkerCrashed { cause }, None),
             }
         }
-        MonitorKind::Timeout => Verdict::Timeout,
-        MonitorKind::ExternalKill { cause } => Verdict::WorkerCrashed { cause },
+        MonitorKind::Timeout => (Verdict::Timeout, None),
+        MonitorKind::ExternalKill { cause } => (Verdict::WorkerCrashed { cause }, None),
     };
 
     // Bless path: if we have a SnapshotDiff verdict and bless is on,
-    // overwrite and emit Blessed.
+    // overwrite and emit Blessed. The bless transition does not affect
+    // any LARGE_SNAPSHOT warning that may already be attached — the
+    // warning is about the input shape, not the verdict.
     if ctx.bless {
         if let Verdict::SnapshotDiff { .. } = &verdict
             && let Some(actual) = compute_actual_normalized(fx, ctx)
@@ -330,6 +333,10 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
             && let Ok(p) = snapshot::write(&fx.path, actual)
         {
             verdict = Verdict::Blessed { snapshot_path: p };
+            // SnapshotMissing carries no LARGE_SNAPSHOT signal — drop
+            // any incidental warning the prior path may have produced
+            // (in practice none is set on the SnapshotMissing branch).
+            warning = None;
         }
     }
 
@@ -351,6 +358,7 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
         verdict,
         cleanup_failure,
         wall_ms,
+        warning,
     }
 }
 
@@ -380,31 +388,64 @@ fn fixture_workdir_name(fx: &Fixture) -> String {
     s
 }
 
-fn classify_exit(fx: &Fixture, ctx: &WorkerContext, ok: bool, stderr: &str) -> Verdict {
+/// Classify a worker's exit into a verdict plus an optional warning.
+///
+/// The warning (currently only `LARGE_SNAPSHOT`) rides alongside the
+/// verdict — it does not change the exit-code aggregation. See spec
+/// §7.2 complexity ceiling for the soft / hard thresholds.
+fn classify_exit(
+    fx: &Fixture,
+    ctx: &WorkerContext,
+    ok: bool,
+    stderr: &str,
+) -> (Verdict, Option<FixtureWarning>) {
     // UTF-8 was validated upstream (stderr came back through
     // String::from_utf8_lossy). The MalformedDiagnostic path triggers
     // when rustc's JSON `rendered` field has invalid bytes — handled
     // in the parse layer; here we operate on the rendered text.
     let normalized = normalize_stderr(stderr, fx, ctx);
     match (fx.kind, ok) {
-        (FixtureKind::CompilePass, true) => Verdict::Ok,
-        (FixtureKind::CompilePass, false) => Verdict::ExpectedPassButFailed { stderr: normalized },
-        (FixtureKind::CompileFail, true) => Verdict::ExpectedFailButPassed,
+        (FixtureKind::CompilePass, true) => (Verdict::Ok, None),
+        (FixtureKind::CompilePass, false) => {
+            (Verdict::ExpectedPassButFailed { stderr: normalized }, None)
+        }
+        (FixtureKind::CompileFail, true) => (Verdict::ExpectedFailButPassed, None),
         (FixtureKind::CompileFail, false) => {
             // Diff against snapshot.
             match snapshot::try_read(&fx.path) {
                 Ok(Some(expected)) => {
+                    // Snapshot lines pre-normalized to LF on read; we
+                    // count post-split lines on the actual side too so
+                    // both numbers match what the diff algorithm sees.
+                    let expected_lines = expected.lines().count();
+                    let actual_lines = normalized.lines().count();
                     let result = crate::diff::unified_diff(&expected, &normalized);
-                    match crate::diff::diff_to_verdict(result) {
+                    // Capture LARGE_SNAPSHOT before consuming the
+                    // result via diff_to_verdict — the `warn` flag is
+                    // the only place this spec §7.2 condition surfaces.
+                    let warning = match &result {
+                        crate::diff::DiffResult::Diff { warn: true, .. } => {
+                            Some(FixtureWarning::LargeSnapshot {
+                                expected_lines,
+                                actual_lines,
+                            })
+                        }
+                        _ => None,
+                    };
+                    let verdict = match crate::diff::diff_to_verdict(result) {
                         Some(v) => v,
                         None => Verdict::Ok,
-                    }
+                    };
+                    (verdict, warning)
                 }
-                Ok(None) => Verdict::SnapshotMissing { actual: normalized },
-                Err(_) => Verdict::MalformedDiagnostic {
-                    byte_offset: 0,
-                    source: MalformedSource::Snapshot,
-                },
+                Ok(None) => (Verdict::SnapshotMissing { actual: normalized }, None),
+                Err(_) => (
+                    Verdict::MalformedDiagnostic {
+                        byte_offset: 0,
+                        source: MalformedSource::Snapshot,
+                    },
+                    None,
+                ),
             }
         }
     }

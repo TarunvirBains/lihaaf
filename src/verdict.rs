@@ -149,6 +149,30 @@ pub struct FixtureResult {
     pub cleanup_failure: Option<CleanupFailure>,
     /// Wall-clock time the worker took, for the report.
     pub wall_ms: u64,
+    /// Optional non-fatal warning attached to this fixture. The
+    /// canonical case is `LARGE_SNAPSHOT` — the diff exceeded the §7.2
+    /// soft ceiling but stayed under the hard ceiling, so the verdict
+    /// is unaffected (still `Ok` / `SnapshotDiff` / etc.) but the
+    /// session reporter prints a warning line.
+    pub warning: Option<FixtureWarning>,
+}
+
+/// Non-fatal per-fixture warning. Distinct from [`Verdict`] because
+/// warnings ride alongside a verdict rather than replacing one — a
+/// `LARGE_SNAPSHOT` fixture can still pass; the warning surfaces for
+/// adopter visibility without touching the exit-code aggregation.
+#[derive(Debug, Clone)]
+pub enum FixtureWarning {
+    /// The fixture's diff input exceeded the spec §7.2 soft ceiling
+    /// (10K lines) but stayed under the hard ceiling (100K lines). The
+    /// session reporter renders this as
+    /// `lihaaf: LARGE_SNAPSHOT <path> (<expected>/<actual> lines)`.
+    LargeSnapshot {
+        /// Line count on the expected (snapshot) side.
+        expected_lines: usize,
+        /// Line count on the actual (rustc-emitted) side.
+        actual_lines: usize,
+    },
 }
 
 /// One fixture's cleanup error detail.
