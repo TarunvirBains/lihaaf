@@ -1,20 +1,15 @@
 # lihaaf
 
-**lihaaf** ("quilt", Urdu) is a Rust test harness for fast compile-fail
-and compile-pass workflows, built to make local developer iteration feel
-less painful. It started as a practical project: too many slow
-`cargo test` cycles, with a need for a predictable, parallel harness that
-keeps the sharp edges out of the way.
+**lihaaf** ("quilt", Urdu) was inspired by
+[Trybuild](https://github.com/dtolnay/trybuild) but driven by a need for
+quick iteration: the compile-fail/compile-pass fixture style Trybuild made
+practical, combined with a build model that keeps adding fixtures cheap.
 
-Its workflow is inspired by the compile-fail/compile-pass fixture style
-that [Trybuild](https://github.com/dtolnay/trybuild) made practical, while
-shifting the implementation to a
-single-compile shared dylib model for faster local iteration.
-
-`lihaaf` builds the consumer crate as a dynamic library once per session,
-then runs each fixture with `rustc`, linking the prebuilt dylib via
-`--extern`. For larger fixture suites this usually means seconds instead of
-minutes, because fixtures share that one build.
+`lihaaf` is a CLI proc-macro test harness for Rust. It builds the consumer
+crate as a dynamic library once per session, then dispatches each fixture
+to `rustc` individually, linking the prebuilt dylib via `--extern`. For
+larger fixture suites this usually means seconds instead of minutes,
+because fixtures share that one build.
 
 There’s a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
 Most of the code aims to stay readable first, not process-centric.
