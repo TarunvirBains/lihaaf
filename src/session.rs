@@ -269,6 +269,22 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
         summary.push_str("0 results");
     }
     eprintln!("lihaaf: {summary}");
+
+    // Spec §3.3 worked-example aggregate line. The bucketed counts in
+    // `summary` above carry every verdict label; this line re-projects
+    // the four buckets the spec calls out by name into the
+    // adopter-friendly shape `<n> ok, <n> failed, <n> timeout, <n>
+    // memory_exhausted` so CI greps and dashboards have a single fixed
+    // line to anchor on regardless of which exotic verdicts a run
+    // produced. `failed` aggregates everything that is neither pass
+    // nor a "spec-named" bucket (timeout / memory_exhausted) — matches
+    // the worked-example wording in §3.3.
+    let aggregate = aggregate_counts(results);
+    eprintln!(
+        "lihaaf: {} ok, {} failed, {} timeout, {} memory_exhausted",
+        aggregate.ok, aggregate.failed, aggregate.timeout, aggregate.memory_exhausted
+    );
+
     eprintln!("lihaaf: total wall-clock: {:.1}s", wall_ms as f64 / 1000.0);
     if cleanup_residue {
         eprintln!("lihaaf: CLEANUP_RESIDUE — one or more workdirs could not be removed:");
@@ -324,6 +340,42 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
             _ => {}
         }
     }
+}
+
+/// Bucketed counts for the spec §3.3 aggregate line. Captures the four
+/// names the worked example calls out (`ok`, `failed`, `timeout`,
+/// `memory_exhausted`); every other verdict folds into `failed` so the
+/// line stays at four buckets regardless of how exotic a run got.
+#[derive(Debug, Default, Clone, Copy)]
+struct AggregateCounts {
+    ok: usize,
+    failed: usize,
+    timeout: usize,
+    memory_exhausted: usize,
+}
+
+/// Bucket per-fixture verdicts into the four §3.3 aggregate names.
+///
+/// `Ok` and `Blessed` count as `ok` (verdict-table footnote: "Treated as
+/// OK for exit-code purposes"). `Timeout` and `MemoryExhausted` are
+/// dedicated buckets per §3.3. Everything else (`SnapshotDiff`,
+/// `SnapshotMissing`, `WorkerCrashed`, `MalformedDiagnostic`,
+/// `SnapshotDiffTooLarge`, `ExpectedFailButPassed`,
+/// `ExpectedPassButFailed`) folds into `failed` — the §3.3 worked
+/// example's "failed" bucket is the catch-all for "fixture did not pass
+/// for a reason other than timeout or memory_exhausted."
+fn aggregate_counts(results: &[FixtureResult]) -> AggregateCounts {
+    use crate::verdict::Verdict;
+    let mut a = AggregateCounts::default();
+    for r in results {
+        match &r.verdict {
+            Verdict::Ok | Verdict::Blessed { .. } => a.ok += 1,
+            Verdict::Timeout => a.timeout += 1,
+            Verdict::MemoryExhausted => a.memory_exhausted += 1,
+            _ => a.failed += 1,
+        }
+    }
+    a
 }
 
 fn compute_parallelism(cli: &Cli, config: &config::Config) -> usize {
@@ -460,6 +512,49 @@ mod tests {
         // Even with an absurd per-fixture cap, we must not return 0.
         let p = compute_parallelism(&cli, &cfg(u32::MAX / 2));
         assert!(p >= 1);
+    }
+
+    #[test]
+    fn aggregate_counts_buckets_per_section_3_3() {
+        use crate::verdict::{FixtureResult, Verdict};
+        let r = |label: &str, v: Verdict| FixtureResult {
+            relative_path: label.to_string(),
+            verdict: v,
+            cleanup_failure: None,
+            wall_ms: 0,
+        };
+        let results = vec![
+            r("a", Verdict::Ok),
+            r(
+                "b",
+                Verdict::Blessed {
+                    snapshot_path: PathBuf::from("/tmp/x.stderr"),
+                },
+            ),
+            r("c", Verdict::Timeout),
+            r("d", Verdict::Timeout),
+            r("e", Verdict::MemoryExhausted),
+            r(
+                "f",
+                Verdict::SnapshotDiff {
+                    diff: "diff".into(),
+                },
+            ),
+            r("g", Verdict::ExpectedFailButPassed),
+            r(
+                "h",
+                Verdict::WorkerCrashed {
+                    cause: "signal: 11".into(),
+                },
+            ),
+        ];
+        let agg = aggregate_counts(&results);
+        // Ok + Blessed → 2 ok. SnapshotDiff + ExpectedFailButPassed +
+        // WorkerCrashed → 3 failed. Two Timeout, one MemoryExhausted.
+        assert_eq!(agg.ok, 2);
+        assert_eq!(agg.failed, 3);
+        assert_eq!(agg.timeout, 2);
+        assert_eq!(agg.memory_exhausted, 1);
     }
 
     #[test]
