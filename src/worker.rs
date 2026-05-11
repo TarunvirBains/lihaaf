@@ -35,7 +35,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -163,6 +163,132 @@ pub struct DispatchOutcome {
     pub freshness_failure: Option<FreshnessFailure>,
 }
 
+/// Permit pool for the spec §5.4 dynamic-parallelism rule.
+///
+/// Spec §5.4: "If RSS exceeds `per_fixture_memory_mb`, the worker is
+/// terminated … The fixture is marked needs-retry; parallelism is
+/// dynamically reduced (floor: 1); the fixture re-dispatches
+/// serially. If the serial retry also OOMs … the verdict is
+/// `MEMORY_EXHAUSTED` and the run continues at the reduced
+/// parallelism."
+///
+/// The gate is a counted semaphore. Workers acquire a permit before
+/// pulling a fixture; release after running it. On a harness-initiated
+/// OOM kill, the worker calls [`Self::reduce`] which permanently
+/// removes one permit from the pool (down to a floor of 1). After the
+/// reduction, peer workers that try to acquire find no permit
+/// available and block on the condvar; once enough workers have
+/// finished their current task, the pool runs at the new (lower) cap.
+///
+/// Why a gate rather than killing extra worker threads: live worker
+/// threads holding permits can be in the middle of a fixture, and
+/// killing the OS thread mid-rustc would orphan a child process.
+/// Letting them complete naturally and re-blocking on permit
+/// acquisition is cheap and correct.
+#[derive(Debug)]
+struct ParallelismGate {
+    inner: Mutex<GateInner>,
+    cv: Condvar,
+}
+
+#[derive(Debug)]
+struct GateInner {
+    /// Permits currently available for acquisition. Starts at `cap`,
+    /// decreases on `acquire`, increases on `release`, and decreases
+    /// permanently on `reduce` (which also drops `cap`).
+    available: usize,
+    /// Current parallelism cap. Permanently reduced by `reduce` on
+    /// OOM, never increased. Floor: 1.
+    cap: usize,
+    /// True once the producer (dispatch loop) closes the gate, so
+    /// blocked workers wake up and exit.
+    closed: bool,
+}
+
+impl ParallelismGate {
+    /// Create a gate with `n` initial permits. `n.max(1)` enforces the
+    /// floor at construction time.
+    fn new(n: usize) -> Self {
+        let n = n.max(1);
+        Self {
+            inner: Mutex::new(GateInner {
+                available: n,
+                cap: n,
+                closed: false,
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Acquire a permit, blocking if none is available. Returns
+    /// `false` if the gate has been closed (the dispatch loop is
+    /// shutting down). The caller must call [`Self::release`] after
+    /// each successful acquire.
+    fn acquire(&self) -> bool {
+        let mut g = self.inner.lock().unwrap();
+        loop {
+            if g.closed {
+                return false;
+            }
+            if g.available > 0 {
+                g.available -= 1;
+                return true;
+            }
+            g = self.cv.wait(g).unwrap();
+        }
+    }
+
+    /// Release a permit. Wakes one waiting acquirer.
+    fn release(&self) {
+        let mut g = self.inner.lock().unwrap();
+        // Only credit the release if it doesn't push `available` past
+        // `cap`. A `reduce` between this acquire/release pair means
+        // we've effectively burned the permit; we don't restore it.
+        if g.available < g.cap {
+            g.available += 1;
+            self.cv.notify_one();
+        }
+    }
+
+    /// Permanently reduce the cap by 1 (floor: 1). Spec §5.4: "first
+    /// OOM, parallelism drops by 1 (floor: 1) for ALL subsequent
+    /// dispatches."
+    ///
+    /// Returns the new cap after the reduction. Idempotent at the
+    /// floor — calling `reduce` on a gate already at cap=1 is a no-op
+    /// and returns 1.
+    fn reduce(&self) -> usize {
+        let mut g = self.inner.lock().unwrap();
+        if g.cap > 1 {
+            g.cap -= 1;
+            // The permit count tracks `available` independently of
+            // `cap`; if there's an unreleased permit at the moment of
+            // reduction (i.e., a worker is still running its fixture),
+            // we leave `available` alone — `release` will refuse to
+            // credit it back if it would exceed `cap`.
+            if g.available > g.cap {
+                g.available = g.cap;
+            }
+            self.cv.notify_all();
+        }
+        g.cap
+    }
+
+    /// Close the gate. Wakes all blocked acquirers; subsequent
+    /// `acquire` calls return `false` immediately.
+    fn close(&self) {
+        let mut g = self.inner.lock().unwrap();
+        g.closed = true;
+        self.cv.notify_all();
+    }
+
+    /// Snapshot current cap, for tests + diagnostics.
+    #[cfg(test)]
+    fn current_cap(&self) -> usize {
+        self.inner.lock().unwrap().cap
+    }
+}
+
 /// Resolve `--extern` paths for crates other than the dylib_crate.
 ///
 /// Looks under `deps_dir` for an `.rlib` matching each name. The
@@ -239,7 +365,9 @@ pub fn resolve_extern_paths(
 /// partial).
 ///
 /// Used both for `-j 1` and as the fallback when parallelism reduces
-/// to 1 mid-session.
+/// to 1 mid-session. Serial mode is already at the spec §5.4 floor;
+/// OOM events still observe the retry path inside `run_one` but the
+/// "reduce parallelism by 1" rule is a no-op at the floor.
 pub fn dispatch_serial(
     fixtures: &[Fixture],
     ctx: &WorkerContext,
@@ -254,9 +382,9 @@ pub fn dispatch_serial(
                 freshness_failure: Some(failure),
             };
         }
-        let r = run_one(fx, ctx);
-        progress(&r);
-        results.push(r);
+        let outcome = run_one(fx, ctx);
+        progress(&outcome.result);
+        results.push(outcome.result);
     }
     DispatchOutcome {
         results,
@@ -277,10 +405,19 @@ pub fn dispatch_serial(
 /// its next loop iteration and exits without dispatching new work.
 /// In-flight rustc invocations are NOT cancelled (their results are
 /// reported normally); the contract is "no NEW dispatches once the
-/// drift is detected." The first failure to reach the mutex wins;
-/// subsequent failures (e.g., a different invariant tripped on a
-/// different worker) are silently dropped, matching the §4.5 "ANY
-/// divergence" framing.
+/// drift is detected."
+///
+/// Spec §5.4 dynamic-parallelism reduction: the pool is governed by a
+/// [`ParallelismGate`] permit pool. On every harness-attributed OOM
+/// kill (the worker observes `MonitorKind::HarnessKilledMemory` on
+/// the initial attempt — NOT external OS OOMkills, which surface as
+/// `WORKER_CRASHED` per the §5.4 attribution heuristic), the worker
+/// calls [`ParallelismGate::reduce`] to permanently drop the cap by
+/// 1 (floor: 1). Subsequent dispatches across all workers run at the
+/// reduced cap. The reduction is on the FIRST OOM, not the
+/// double-OOM `MEMORY_EXHAUSTED` case — this matches "parallelism is
+/// dynamically reduced (floor: 1); the fixture re-dispatches
+/// serially."
 pub fn dispatch_pool(
     fixtures: &[Fixture],
     ctx: &WorkerContext,
@@ -294,6 +431,7 @@ pub fn dispatch_pool(
     let queue: Arc<Mutex<std::collections::VecDeque<Fixture>>> =
         Arc::new(Mutex::new(fixtures.iter().cloned().collect()));
     let freshness_failure: Arc<Mutex<Option<FreshnessFailure>>> = Arc::new(Mutex::new(None));
+    let gate = Arc::new(ParallelismGate::new(parallelism));
     let ctx = Arc::new(ctx.clone());
     let mut handles = Vec::with_capacity(parallelism);
     for _ in 0..parallelism {
@@ -301,12 +439,22 @@ pub fn dispatch_pool(
         let c = Arc::clone(&ctx);
         let t = tx.clone();
         let ff = Arc::clone(&freshness_failure);
+        let g = Arc::clone(&gate);
         let h = thread::spawn(move || {
             loop {
+                // Permit acquisition is the dynamic parallelism gate.
+                // If the cap shrank below the number of running
+                // workers, this acquire blocks until peers finish
+                // their current task; if the gate closes (the
+                // dispatch loop is shutting down), we exit cleanly.
+                if !g.acquire() {
+                    break;
+                }
                 // Spec §4.5: re-check before pulling. If a peer worker
                 // already recorded a failure, exit promptly without
                 // pulling more work.
                 if ff.lock().unwrap().is_some() {
+                    g.release();
                     break;
                 }
                 if let Err(failure) = freshness::check(&c.freshness_snapshot) {
@@ -317,20 +465,32 @@ pub fn dispatch_pool(
                     // Drain the queue so other workers don't pull
                     // anything new after observing the failure.
                     q.lock().unwrap().clear();
+                    g.release();
                     break;
                 }
                 let next = {
-                    let mut g = q.lock().unwrap();
-                    g.pop_front()
+                    let mut g_q = q.lock().unwrap();
+                    g_q.pop_front()
                 };
                 match next {
                     Some(fx) => {
-                        let r = run_one(&fx, &c);
-                        if t.send(r).is_err() {
+                        let outcome = run_one(&fx, &c);
+                        // Spec §5.4: every harness-attributed OOM
+                        // event reduces the cap by 1, on every
+                        // subsequent dispatch across all workers.
+                        if outcome.harness_oom_observed {
+                            g.reduce();
+                        }
+                        if t.send(outcome.result).is_err() {
+                            g.release();
                             break;
                         }
+                        g.release();
                     }
-                    None => break,
+                    None => {
+                        g.release();
+                        break;
+                    }
                 }
             }
         });
@@ -343,6 +503,10 @@ pub fn dispatch_pool(
         progress(&r);
         results.push(r);
     }
+    // Wake any worker still blocked on permit acquisition (e.g., a
+    // worker that observed `g.cap` shrink below the number of live
+    // threads and was waiting for a permit that will never come).
+    gate.close();
     for h in handles {
         let _ = h.join();
     }
@@ -354,30 +518,55 @@ pub fn dispatch_pool(
     }
 }
 
+/// Per-fixture run outcome — the published `FixtureResult` plus an
+/// internal `harness_oom_observed` flag the dispatch loop consumes to
+/// drive the spec §5.4 dynamic-parallelism reduction.
+struct RunOneOutcome {
+    result: FixtureResult,
+    /// True iff the harness initiated an OOM kill on this fixture (on
+    /// either the initial attempt or the serial retry). Spec §5.4
+    /// requires parallelism to drop by 1 (floor: 1) on EVERY OOM-
+    /// attributed kill, not just on `MEMORY_EXHAUSTED` (the "double
+    /// OOM" case). External kills (OS OOMkiller, signal from outside,
+    /// etc.) do NOT set this flag — they surface as `WORKER_CRASHED`
+    /// per the OOM-attribution heuristic in spec §5.4.
+    harness_oom_observed: bool,
+}
+
 /// Run one fixture: spawn rustc, monitor RSS + timeout, capture
 /// stderr, classify, normalize, diff, optionally bless. Cleanup is
 /// unconditional (spec §5.3) unless `keep_output` is set.
-fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
+fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
     let started = Instant::now();
     let workdir = ctx.session_temp.join(fixture_workdir_name(fx));
     if let Err(e) = std::fs::create_dir_all(&workdir) {
-        return FixtureResult {
-            relative_path: fx.relative_path.clone(),
-            verdict: Verdict::WorkerCrashed {
-                cause: format!("could not create workdir: {e}"),
+        return RunOneOutcome {
+            result: FixtureResult {
+                relative_path: fx.relative_path.clone(),
+                verdict: Verdict::WorkerCrashed {
+                    cause: format!("could not create workdir: {e}"),
+                },
+                cleanup_failure: None,
+                wall_ms: 0,
+                warning: None,
             },
-            cleanup_failure: None,
-            wall_ms: 0,
-            warning: None,
+            harness_oom_observed: false,
         };
     }
 
     // First attempt.
     let outcome = spawn_and_monitor(fx, ctx, &workdir, false);
     let mut wall_ms = started.elapsed().as_millis() as u64;
+    let mut harness_oom_observed = false;
     let (mut verdict, mut warning) = match outcome.kind {
         MonitorKind::Exited { ok, stderr } => classify_exit(fx, ctx, ok, &stderr),
         MonitorKind::HarnessKilledMemory => {
+            // Spec §5.4 first OOM. Mark the OOM observation BEFORE
+            // the retry so the dispatch loop reduces parallelism
+            // regardless of whether the retry succeeds, fails, or
+            // double-OOMs. The reduction is on the first OOM, not the
+            // double-OOM case.
+            harness_oom_observed = true;
             // Per §5.4, retry serially once before declaring
             // MEMORY_EXHAUSTED.
             let _ = std::fs::remove_dir_all(&workdir);
@@ -430,12 +619,15 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> FixtureResult {
         }
     };
 
-    FixtureResult {
-        relative_path: fx.relative_path.clone(),
-        verdict,
-        cleanup_failure,
-        wall_ms,
-        warning,
+    RunOneOutcome {
+        result: FixtureResult {
+            relative_path: fx.relative_path.clone(),
+            verdict,
+            cleanup_failure,
+            wall_ms,
+            warning,
+        },
+        harness_oom_observed,
     }
 }
 
@@ -1013,6 +1205,69 @@ plain text line
         assert!(out.contains("error: alpha"));
         assert!(out.contains("error: beta"));
         assert!(out.contains("plain text line"));
+    }
+
+    #[test]
+    fn parallelism_gate_starts_at_cap() {
+        let g = ParallelismGate::new(4);
+        assert_eq!(g.current_cap(), 4);
+    }
+
+    #[test]
+    fn parallelism_gate_reduce_drops_cap_with_floor_one() {
+        let g = ParallelismGate::new(4);
+        assert_eq!(g.reduce(), 3);
+        assert_eq!(g.reduce(), 2);
+        assert_eq!(g.reduce(), 1);
+        // Floor: subsequent reduce calls are no-ops at cap=1.
+        assert_eq!(g.reduce(), 1);
+        assert_eq!(g.current_cap(), 1);
+    }
+
+    #[test]
+    fn parallelism_gate_acquire_release_round_trips() {
+        let g = Arc::new(ParallelismGate::new(2));
+        assert!(g.acquire());
+        assert!(g.acquire());
+        // Cap is 2 — third acquire would block. We test the release
+        // path instead by releasing twice and re-acquiring.
+        g.release();
+        g.release();
+        assert!(g.acquire());
+        assert!(g.acquire());
+    }
+
+    #[test]
+    fn parallelism_gate_close_unblocks_waiters() {
+        let g = Arc::new(ParallelismGate::new(1));
+        assert!(g.acquire()); // hold the only permit
+        let g2 = Arc::clone(&g);
+        let waiter = thread::spawn(move || g2.acquire());
+        // Give the waiter a moment to block, then close the gate.
+        thread::sleep(Duration::from_millis(50));
+        g.close();
+        // The waiter must have woken with `false`.
+        assert!(!waiter.join().unwrap());
+    }
+
+    #[test]
+    fn parallelism_gate_reduce_burns_in_flight_permit() {
+        // Scenario: cap=2, both permits acquired; we reduce. The
+        // currently-acquired permits are not credited back beyond the
+        // new cap, so after both `release` calls only `cap=1` permit
+        // remains available.
+        let g = ParallelismGate::new(2);
+        assert!(g.acquire());
+        assert!(g.acquire());
+        let new_cap = g.reduce();
+        assert_eq!(new_cap, 1);
+        g.release();
+        g.release();
+        // After both releases, available <= cap. Acquire once more
+        // succeeds, second would block — we don't try the second to
+        // avoid a hang in the test.
+        assert!(g.acquire());
+        assert_eq!(g.current_cap(), 1);
     }
 
     /// Minimal `WorkerContext` for unit tests of pure-function logic
