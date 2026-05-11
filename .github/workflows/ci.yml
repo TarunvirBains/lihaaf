@@ -48,6 +48,19 @@ jobs:
       - name: Test
         run: cargo test
 
+      - name: Self-test corpus end-to-end
+        # Build cargo-lihaaf and run it against the in-tree
+        # `tests/lihaaf/{compile_pass,compile_fail}/` corpus. The
+        # corpus is `[package.metadata.lihaaf]` self-references —
+        # lihaaf builds itself as the dylib_crate and links each
+        # fixture against it. A non-zero exit fails CI; the success
+        # path proves the full session pipeline (config load →
+        # toolchain capture → dylib build → manifest refresh →
+        # discovery → worker pool dispatch with §4.5 freshness
+        # checks → §3.3 aggregate report) works end-to-end on the
+        # current toolchain.
+        run: cargo run --release --bin cargo-lihaaf -- lihaaf
+
   docs:
     name: cargo doc
     runs-on: ubuntu-latest

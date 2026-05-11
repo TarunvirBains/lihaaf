@@ -63,3 +63,14 @@ libc = "0.2"
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
 # `/proc/<pid>/statm` directly via stdlib file I/O.
+
+# Self-test corpus. lihaaf consumes itself as the dylib_crate so the
+# end-to-end dispatch pipeline exercises against a real fixture set in
+# CI without depending on any downstream consumer crate. The fixture
+# corpus lives under `tests/lihaaf/` (compile_pass + compile_fail
+# subdirectories per spec §3.2). The CI workflow builds `cargo-lihaaf`
+# and runs it against this corpus from the crate root.
+[package.metadata.lihaaf]
+dylib_crate = "lihaaf"
+extern_crates = ["lihaaf"]
+edition = "2024"
