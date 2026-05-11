@@ -50,7 +50,11 @@ pub struct Cli {
 
     /// Override the worker parallelism cap. The harness still applies
     /// the RAM cap on top — the override does not bypass it. Spec §5.2.
-    #[arg(short = 'j', long = "jobs")]
+    ///
+    /// `-j 0` is rejected at parse time per spec §5.2: "no implicit
+    /// 'cargo-style' 'use all cores' semantics; explicit is better."
+    /// Adopters who want the platform default omit the flag entirely.
+    #[arg(short = 'j', long = "jobs", value_parser = parse_jobs)]
     pub jobs: Option<u32>,
 
     /// Force a fresh dylib build, ignoring any existing manifest.
@@ -91,6 +95,24 @@ pub struct Cli {
     /// Spec §5.3.
     #[arg(long)]
     pub keep_output: bool,
+}
+
+/// Reject `-j 0` at parse time per spec §5.2. The default
+/// `value_parser` for `u32` accepts any non-negative integer, including
+/// `0`; we tighten that to "positive integer required" so the bad
+/// invocation fails immediately with a clap error rather than silently
+/// being clamped downstream.
+fn parse_jobs(s: &str) -> Result<u32, String> {
+    let n: u32 = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a non-negative integer"))?;
+    if n == 0 {
+        return Err(
+            "must be a positive integer (spec §5.2: `-j 0` is rejected; omit `-j` to use the default)"
+                .to_string(),
+        );
+    }
+    Ok(n)
 }
 
 /// Parse `argv` (already stripped of the cargo subcommand prefix) into a
@@ -169,6 +191,36 @@ mod tests {
     fn jobs_short_long() {
         assert_eq!(parse(&["-j", "4"]).jobs, Some(4));
         assert_eq!(parse(&["--jobs", "8"]).jobs, Some(8));
+    }
+
+    #[test]
+    fn jobs_zero_is_rejected_per_spec_section_5_2() {
+        // Spec §5.2: "`-j 0` is rejected (no implicit 'cargo-style'
+        // 'use all cores' semantics; explicit is better)." The clap
+        // value parser must hard-fail rather than silently coerce.
+        let argv: Vec<String> = ["cargo-lihaaf", "-j", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = parse_from(argv).expect_err("`-j 0` must be rejected");
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(
+                    message.contains("positive integer"),
+                    "diagnostic must explain the requirement: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jobs_long_form_zero_also_rejected() {
+        let argv: Vec<String> = ["cargo-lihaaf", "--jobs", "0"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(parse_from(argv).is_err());
     }
 
     #[test]

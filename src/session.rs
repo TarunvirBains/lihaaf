@@ -337,8 +337,12 @@ fn compute_parallelism(cli: &Cli, config: &config::Config) -> usize {
         }
         None => cpu_cap, // honest fallback when the platform doesn't expose RAM
     };
+    // `cli.jobs` is guaranteed positive: the clap value parser rejects
+    // `-j 0` per spec §5.2. The platform-derived `cpu_cap` and `ram_cap`
+    // both clamp to >= 1 above. No defensive `max(1)` here — the spec
+    // forbids the silent-zero coercion.
     let cli_cap: usize = cli.jobs.map(|n| n as usize).unwrap_or(cpu_cap);
-    cli_cap.min(ram_cap).max(1)
+    cli_cap.min(ram_cap)
 }
 
 fn resolve_manifest_path(cli: &Cli) -> Result<PathBuf, Error> {
