@@ -1,25 +1,26 @@
-//! Dylib build + copy (spec §4.1 stages 3 + 4, §4.2, §4.3).
+//! Dylib build + copy (notable implementation notes: build, copy, and
+//! platform-safe paths).
 //!
 //! ## Implementer choices recorded here
 //!
-//! Three spec-softened decisions live in this module. Each is explained
-//! inline with its rationale anchored to the spec section that allowed
+//! Three implementation decisions live in this module. Each is explained
+//! inline with its rationale anchored to the checks here.
 //! the choice:
 //!
-//! - **Cargo invocation** (§4.2 — "implementer chooses the specific
+//! - **Cargo invocation** (the policy — "implementer chooses the specific
 //!   cargo subcommand"): `cargo rustc -p <crate> --lib --release
 //!   --crate-type=dylib --message-format=json` with
 //!   `RUSTFLAGS="-C prefer-dynamic"`. Validated end-to-end by the
-//!   inventory-on-dylib spike (verdict `GO_NATIVE`; spec §13).
+//!   inventory-on-dylib spike (verdict `GO_NATIVE`; the policy).
 //!   `cargo rustc` is the only subcommand whose `--crate-type=dylib`
 //!   flag overrides the consumer's `[lib]` declaration without
 //!   modifying its `Cargo.toml`. The `prefer-dynamic` flag is required
 //!   for compile-time-link consumers per the spike's findings.
 //!
-//! - **File copy primitive** (§4.3 — "implementer chooses the file-copy
+//! - **File copy primitive** (the policy — "implementer chooses the file-copy
 //!   primitive"): `std::fs::copy`. POSIX semantics on Linux/macOS,
 //!   `CopyFileW` on Windows. The cost (~few hundred ms on a warm cache
-//!   per the spec) is acceptable; the v0.2 reflink optimization is
+//!   is acceptable; the v0.2 reflink optimization is
 //!   anchored deferral.
 //!
 //! - **Dedicated `CARGO_TARGET_DIR`** (spike note): `RUSTFLAGS=
@@ -74,7 +75,7 @@ pub struct BuildParams<'a> {
 ///
 /// Returns the path of the cargo-emitted artifact in the dedicated
 /// lihaaf target dir. The caller copies (or symlinks) this artifact to
-/// `target/lihaaf/lib<crate>-current-<hash>.so` per spec §4.3.
+/// `target/lihaaf/lib<crate>-current-<hash>.so` per the policy.
 pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     std::fs::create_dir_all(params.target_dir).map_err(|e| {
         Error::io(
@@ -87,7 +88,7 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     // Compose the cargo invocation. `cargo rustc` is the subcommand
     // because it's the only one whose `--crate-type=dylib` overrides
     // `[lib]` without modifying the consumer's Cargo.toml — confirmed
-    // by the inventory-on-dylib spike (spec §13).
+    // by the inventory-on-dylib spike (the policy).
     let mut cmd = Command::new("cargo");
     cmd.arg("rustc")
         .arg("-p")
@@ -195,7 +196,7 @@ struct ArtifactTarget {
 /// for the cargo invocation and recover the dylib path matching
 /// `crate_name`.
 ///
-/// Spec §4.2: "lihaaf finds the `compiler-artifact` message whose
+/// the policy: "lihaaf finds the `compiler-artifact` message whose
 /// `target.name` equals `dylib_crate` and whose `target.kind` includes
 /// `"dylib"`, reads the `filenames` array, and selects the first entry
 /// matching the platform's dynamic-library extension. If multiple
@@ -252,7 +253,7 @@ pub fn dylib_extensions() -> &'static [&'static str] {
 
 /// Where the lihaaf-managed copy lives.
 ///
-/// `target/lihaaf/lib<crate>-current-<hash>.so` per spec §4.3, with
+/// `target/lihaaf/lib<crate>-current-<hash>.so` per the policy, with
 /// `<hash>` recovered from the cargo-emitted filename
 /// (`lib<crate>-<hash>.so`). If the filename doesn't carry a hash
 /// (synthetic test paths), we substitute `0`.
@@ -277,8 +278,8 @@ pub fn managed_dylib_path(workspace_target: &Path, cargo_dylib: &Path) -> PathBu
     lihaaf_dir.join(format!("lib{crate_part}-current-{hash_part}.{ext}"))
 }
 
-/// Copy the cargo-emitted dylib to the lihaaf-managed location. Spec
-/// §4.3: copy is unconditional on every session start; the implementer
+/// Copy the cargo-emitted dylib to the lihaaf-managed location.
+/// the policy: copy is unconditional on every session start; the implementer
 /// chooses the file-copy primitive (here: `std::fs::copy`).
 pub fn copy_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
     if let Some(parent) = managed.parent() {
@@ -312,7 +313,7 @@ pub fn copy_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
 }
 
 /// Symlink the cargo-emitted dylib at the lihaaf-managed location.
-/// Spec §8.2 / §4.3 `--use-symlink` opt-in. Unsafe-by-default — the
+/// the policy `--use-symlink` opt-in. Unsafe-by-default — the
 /// caller asserts no concurrent cargo build will modify `target/`.
 pub fn symlink_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
     if let Some(parent) = managed.parent() {

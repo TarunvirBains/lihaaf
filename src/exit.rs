@@ -1,9 +1,8 @@
-//! Exit codes per spec §10.3.
+//! Exit codes for the v0.1 stable contract.
 //!
-//! These are part of the v0.1 stable surface (§8.5). Adding a new failure
-//! mode produces a new code; an existing code's meaning does not change.
-//! When multiple verdicts are present in a single run, the binary's exit
-//! code is the maximum (most severe) one — see [`ExitCode::merge`].
+//! Adding a new failure mode produces a new code; existing codes keep
+//! their meaning. Multiple verdicts in one run map to the maximum
+//! severity exit code — see [`ExitCode::merge`].
 //!
 //! ## Numbering
 //!
@@ -16,7 +15,7 @@
 //! outcomes — disk hygiene is worse than a normal fixture failure but
 //! does not invalidate the verdict signal.
 
-/// Spec §10.3 exit codes. `repr(u8)` is the wire shape.
+/// Exit codes exposed by the process. `repr(u8)` is the public wire shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
 pub enum ExitCode {
@@ -50,7 +49,7 @@ pub enum ExitCode {
 }
 
 impl ExitCode {
-    /// Take the maximum (most severe) of two exit codes per spec §10.3.
+    /// Take the maximum (most severe) of two exit codes.
     ///
     /// The ordering is the explicit numeric ordering: `1 < 2 < 3 < 4 <
     /// 5 < 6 < 7 < 8 < 64 < 65 < 66 < 67`. `Ok` (`0`) is the identity.
@@ -62,9 +61,9 @@ impl ExitCode {
         }
     }
 
-    /// The textual name as it appears in spec tables, for diagnostic
-    /// rendering. Distinct from [`std::fmt::Debug`] only because the
-    /// spec's verdict catalog uses `SCREAMING_SNAKE_CASE`.
+    /// The textual name for diagnostic rendering. Distinct from
+    /// [`std::fmt::Debug`] only because CI tooling expects
+    /// `SCREAMING_SNAKE_CASE`.
     pub fn name(self) -> &'static str {
         match self {
             Self::Ok => "OK",
@@ -88,9 +87,8 @@ impl ExitCode {
 mod tests {
     use super::*;
 
-    /// The exact numbering in spec §10.3 — pinned so accidental
-    /// reordering of variants fails the test rather than silently
-    /// shipping a renumbered surface.
+    /// Numbering is pinned so accidental reordering of variants fails
+    /// tests rather than silently changing the CLI contract.
     #[test]
     fn spec_numbering_is_stable() {
         assert_eq!(ExitCode::Ok as u8, 0);

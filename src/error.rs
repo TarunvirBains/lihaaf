@@ -1,25 +1,22 @@
 //! Crate-wide error type.
 //!
-//! Two distinct categories live here:
+//! Two categories are represented:
 //!
-//! - **Internal errors** — I/O failures, parse failures, malformed
-//!   invocations the binary has to handle but does not classify as a
-//!   spec-level session outcome. These are flat string-style errors with
-//!   enough context for a developer to debug.
-//! - **Session outcomes** — the `Outcome::*` codes from spec §10.2
+//! - **Internal errors** — I/O failures, parse failures, and malformed
+//!   invocations that are not fixture-level outcomes. These keep enough
+//!   context for a developer to debug quickly.
+//! - **Session outcomes** — the `Outcome::*` values surfaced to users
 //!   (`CONFIG_INVALID`, `DYLIB_BUILD_FAILED`, `DYLIB_NOT_FOUND`,
-//!   `TOOLCHAIN_DRIFT`, `MANIFEST_CORRUPT`, `CLEANUP_RESIDUE`). These
-//!   carry an [`crate::exit::ExitCode`] mapping and a human-readable
-//!   diagnostic that the binary surfaces verbatim before exiting.
+//!   `TOOLCHAIN_DRIFT`, `MANIFEST_CORRUPT`, `CLEANUP_RESIDUE`).
+//!   These map to an [`crate::exit::ExitCode`] and a stable diagnostic message
+//!   that `main` prints before exiting.
 //!
 //! ## Why one type
 //!
-//! `cargo-lihaaf` is one process per invocation, with one `main` that has
-//! to translate failures into exit codes per spec §10.3. Splitting into
-//! per-module error types and re-exporting through `From` impls would
-//! buy nothing — every call site converges on the same `main` anyway.
-//! A single `enum Error` with explicit variants for the
-//! session-classification path keeps the conversion one match wide.
+//! `cargo-lihaaf` is one process per invocation with one `main` that has to
+//! convert failures into exit codes. Splitting into per-module types adds plumbing
+//! without simplifying control flow. A single `enum Error` keeps the conversion
+//! straightforward and explicit.
 
 use std::fmt;
 use std::io;
@@ -27,12 +24,12 @@ use std::path::PathBuf;
 
 /// Crate-wide error type.
 ///
-/// `Session(_)` is the spec-level path. Everything else is an internal
+/// `Session(_)` is the session-level path. Everything else is an internal
 /// failure that bubbles up through `?` and is rendered to stderr by
 /// `main` before exiting.
 #[derive(Debug)]
 pub enum Error {
-    /// A spec-level session outcome (§10.2). The binary's exit code is
+    /// A session-level outcome. The binary's exit code is
     /// derived from the wrapped `Outcome::exit_code()`; the diagnostic
     /// is printed to stderr verbatim.
     Session(Outcome),
@@ -49,8 +46,8 @@ pub enum Error {
     },
 
     /// `Cargo.toml` could not be parsed as TOML. This is distinct from
-    /// `Outcome::ConfigInvalid` because the latter assumes the TOML
-    /// parsed and a specific key was wrong.
+    /// `Outcome::ConfigInvalid` because the latter assumes TOML parsing
+    /// succeeded and points to a specific key-level issue.
     TomlParse {
         /// The path that failed to parse.
         path: PathBuf,
@@ -88,21 +85,19 @@ pub enum Error {
     },
 }
 
-/// Spec §10.2 session outcomes.
+/// Session outcomes reported before fixture verdicts can run.
 ///
-/// These are the "session-level" failures: things that happen before any
-/// per-fixture verdict could be reported, plus the post-session
-/// `CleanupResidue` flag.
+/// These cover startup/setup failures plus the post-session cleanup residue flag.
 #[derive(Debug, Clone)]
 pub enum Outcome {
-    /// `[package.metadata.lihaaf]` missing or invalid (§3.4).
+    /// `[package.metadata.lihaaf]` missing or invalid.
     ConfigInvalid {
         /// Human-readable diagnostic naming the offending key + the
         /// allowed shape.
         message: String,
     },
 
-    /// The dylib build (§4.2) returned non-zero.
+    /// The dylib build returned non-zero.
     DylibBuildFailed {
         /// The cargo invocation as a single line for the user to copy.
         invocation: String,
@@ -120,7 +115,7 @@ pub enum Outcome {
     },
 
     /// rustc release at fixture-dispatch time differs from the version
-    /// captured at dylib-build time (§4.6).
+    /// captured at dylib build time.
     ToolchainDrift {
         /// The version captured at startup.
         original: String,
@@ -128,10 +123,10 @@ pub enum Outcome {
         current: String,
     },
 
-    /// One of the spec §4.5 freshness invariants drifted between the
-    /// per-session snapshot and a per-fixture dispatch. Maps onto the
-    /// existing `TOOLCHAIN_DRIFT` exit code (67) — the four invariants
-    /// are categorical kin (all four indicate "the dylib or the
+    /// One of the tracked freshness invariants drifted between the
+    /// per-session snapshot and a dispatch. It maps onto `TOOLCHAIN_DRIFT`
+    /// because both indicate stale-cache or stale-toolchain state.
+    /// All invariants point to "the dylib or the
     /// toolchain we built against is no longer the one we're about to
     /// link"). The `invariant` label names which of the four drifted
     /// in stable form (`managed_dylib_path` / `dylib_mtime` /
@@ -147,19 +142,16 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// Map the outcome to its exit code per spec §10.3.
+    /// Map the outcome to its exit code.
     pub fn exit_code(&self) -> crate::exit::ExitCode {
         match self {
             Self::ConfigInvalid { .. } => crate::exit::ExitCode::ConfigInvalid,
             Self::DylibBuildFailed { .. } => crate::exit::ExitCode::DylibBuildFailed,
             Self::DylibNotFound { .. } => crate::exit::ExitCode::DylibNotFound,
             Self::ToolchainDrift { .. } => crate::exit::ExitCode::ToolchainDrift,
-            // Freshness drift maps to the same exit code as
-            // TOOLCHAIN_DRIFT (67) — the four §4.5 invariants are
-            // categorically the same class of failure (the dylib or
-            // toolchain shifted under us mid-session), and adopters'
-            // CI scripts already key on 67 for "blow the cache and
-            // re-run."
+            // Freshness drift maps to the same exit code as TOOLCHAIN_DRIFT:
+            // both indicate the dylib/toolchain state changed mid-session and
+            // CI scripts usually treat this as "rebuild cache and re-run."
             Self::FreshnessDrift { .. } => crate::exit::ExitCode::ToolchainDrift,
         }
     }
@@ -195,7 +187,7 @@ impl fmt::Display for Outcome {
             Self::FreshnessDrift { invariant, detail } => {
                 write!(
                     f,
-                    "lihaaf: freshness invariant `{invariant}` drifted mid-session.\n  {detail}\nRe-run `cargo lihaaf` to rebuild against the current dylib + toolchain. (Spec §4.5)"
+                    "lihaaf: freshness invariant `{invariant}` drifted mid-session.\n  {detail}\nRe-run `cargo lihaaf` to rebuild against the current dylib + toolchain."
                 )
             }
         }

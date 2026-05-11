@@ -1,21 +1,19 @@
-//! Per-fixture verdict catalog (spec §10.1).
+//! Per-fixture verdict catalog.
 //!
 //! Every fixture produces exactly one [`Verdict`]. The verdict is the
-//! authoritative result for that fixture in the run. Verdict names match
-//! the spec table verbatim — adopters and CI consume the printed names.
+//! authoritative result for that fixture in the run. Verdict names are
+//! kept stable so adopters and CI can key on them.
 //!
 //! ## Why an enum, not a string
 //!
-//! The verdict catalog is closed. Adding new verdicts is a v0.x decision,
-//! and the exit-code merge rule (`max(per-fixture verdict mapped to exit
-//! code)`) only works on a typed value. A string-typed verdict would
-//! make the spec §10.3 ordering impossible to enforce in code.
+//! The verdict catalog is closed. Exit-code ordering (`max`) is easier
+//! and safer with a typed enum than a free-form string.
 
 use std::path::PathBuf;
 
 use crate::exit::ExitCode;
 
-/// Per-fixture verdicts (spec §10.1).
+/// Per-fixture verdicts.
 #[derive(Debug, Clone)]
 pub enum Verdict {
     /// Fixture matched expectation. Compile_pass: rustc exited 0.
@@ -93,7 +91,7 @@ pub enum MalformedSource {
 }
 
 impl Verdict {
-    /// Map this verdict to its exit code per spec §10.3.
+    /// Map this verdict to its exit code severity bucket.
     ///
     /// `Ok` and `Blessed` both map to `ExitCode::Ok`.
     pub fn exit_code(&self) -> ExitCode {
@@ -150,7 +148,7 @@ pub struct FixtureResult {
     /// Wall-clock time the worker took, for the report.
     pub wall_ms: u64,
     /// Optional non-fatal warning attached to this fixture. The
-    /// canonical case is `LARGE_SNAPSHOT` — the diff exceeded the §7.2
+    /// canonical case is `LARGE_SNAPSHOT` — the diff exceeded the warning
     /// soft ceiling but stayed under the hard ceiling, so the verdict
     /// is unaffected (still `Ok` / `SnapshotDiff` / etc.) but the
     /// session reporter prints a warning line.
@@ -160,10 +158,10 @@ pub struct FixtureResult {
 /// Non-fatal per-fixture warning. Distinct from [`Verdict`] because
 /// warnings ride alongside a verdict rather than replacing one — a
 /// `LARGE_SNAPSHOT` fixture can still pass; the warning surfaces for
-/// adopter visibility without touching the exit-code aggregation.
+/// user visibility without touching the exit-code aggregation.
 #[derive(Debug, Clone)]
 pub enum FixtureWarning {
-    /// The fixture's diff input exceeded the spec §7.2 soft ceiling
+    /// The fixture's diff input exceeded the warning soft ceiling
     /// (10K lines) but stayed under the hard ceiling (100K lines). The
     /// session reporter renders this as
     /// `lihaaf: LARGE_SNAPSHOT <path> (<expected>/<actual> lines)`.

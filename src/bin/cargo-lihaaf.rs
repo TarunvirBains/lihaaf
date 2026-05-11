@@ -7,18 +7,16 @@
 //!
 //! ## Why a binary, not a library entry point
 //!
-//! Spec §8.1 commits to the cargo-subcommand convention. The semver story
-//! (§8.5) only covers the CLI surface, not any Rust API; shipping a
-//! `cargo-lihaaf` binary keeps the contract on the surface adopters
-//! actually consume.
+//! This crate ships as a Cargo subcommand binary because users interact through
+//! CLI anyway; keeping that as the primary entry keeps compatibility and semver
+//! expectations straightforward.
 //!
 //! ## Exit codes
 //!
-//! All exit-code mapping lives in [`lihaaf::exit::ExitCode`]. This binary
-//! is responsible only for converting an [`lihaaf::error::Error`] (a
-//! session-level startup failure) into the corresponding session-outcome
-//! exit code. Per-fixture verdict aggregation runs inside
-//! [`lihaaf::session::run`] and bubbles up as part of the success path's
+//! Exit-code mapping lives in [`lihaaf::exit::ExitCode`]. This binary turns an
+//! [`lihaaf::error::Error`] into the matching session exit code.
+//! Per-fixture verdict aggregation runs inside [`lihaaf::session::run`]
+//! and is returned as part of the success path’s report.
 //! [`lihaaf::session::Report`].
 
 use std::process::ExitCode as ProcessExitCode;

@@ -1,6 +1,6 @@
-//! Per-dispatch freshness validation (spec §4.5).
+//! Per-dispatch freshness validation (the policy).
 //!
-//! Spec §4.5: "Before each fixture worker dispatches, the harness
+//! the policy: "Before each fixture worker dispatches, the harness
 //! re-checks four invariants against the in-memory manifest captured at
 //! startup":
 //!
@@ -10,12 +10,12 @@
 //! 3. Its SHA-256 still matches `dylib_sha256`.
 //! 4. `rustc --version --verbose` still produces the same release line.
 //!
-//! Spec §4.5: "ANY divergence → blow the cache, re-run from stage 3
+//! the policy: "ANY divergence → blow the cache, re-run from stage 3
 //! (dylib build), re-copy, re-validate, then proceed. No 'try anyway'
 //! fallback."
 //!
 //! In practice — and per the dispatch-orchestrator brief — v0.1 hard-
-//! fails with a diagnostic similar in shape to §4.6 `TOOLCHAIN_DRIFT`
+//! fails with a diagnostic similar in shape to the policy `TOOLCHAIN_DRIFT`
 //! rather than attempting a mid-session rebuild. The mid-session
 //! rebuild is anchored deferral: it requires re-issuing the dylib
 //! build under whatever rustc is currently active, re-copying, and
@@ -27,7 +27,7 @@
 //! A long-running session can outlive a `rustup update`, a sibling
 //! cargo build that touches `target/lihaaf/`, or a clock skew event.
 //! The freshness check is the only line of defense against silent ABI
-//! mismatch (per §4.6: "load-time crash (loud, survivable) or silent
+//! mismatch (per the policy: "load-time crash (loud, survivable) or silent
 //! miscompilation (quiet, catastrophic)"). The per-dispatch cost is
 //! dominated by the SHA-256 over a page-cache-warm artifact (~30 ms
 //! for a 10–50 MB dylib on a laptop) plus a short `rustc --version
@@ -48,26 +48,26 @@ use crate::util;
 /// is `Send + Sync + Clone` for the worker pool.
 #[derive(Debug, Clone)]
 pub struct FreshnessSnapshot {
-    /// Absolute path of the lihaaf-managed dylib copy. Spec §4.5
+    /// Absolute path of the lihaaf-managed dylib copy. This is
     /// invariant 1 (existence) plus the input to invariants 2 + 3.
     pub managed_dylib_path: PathBuf,
-    /// mtime of the managed dylib at copy time, in Unix seconds. Spec
-    /// §4.5 invariant 2 — a backward jump triggers the failure path.
+    /// mtime of the managed dylib at copy time, in Unix seconds.
+    /// Invariant 2 — a backward jump triggers the failure path.
     pub original_mtime_unix_secs: i64,
-    /// SHA-256 of the managed dylib at copy time. Spec §4.5 invariant
+    /// SHA-256 of the managed dylib at copy time. Invariant 3 —
     /// 3 — a hash mismatch triggers the failure path even if mtime is
     /// stable (defensive against in-place edits that preserve the
     /// timestamp).
     pub original_sha256: String,
     /// First line of `rustc --version --verbose` captured at session
-    /// startup. Spec §4.5 invariant 4 + §4.6 — re-runs `rustc
+    /// startup. Invariant 4 + the policy — re-runs `rustc
     /// --version --verbose` and compares the release line. Same key
-    /// as the §4.6 mid-session check at session-startup boundary;
+    /// as the policy mid-session check at session-startup boundary;
     /// freshness wraps it into the per-dispatch loop.
     pub original_rustc_release_line: String,
 }
 
-/// One of the four §4.5 invariants and its drift detail.
+/// One of the four policy invariants and its drift detail.
 #[derive(Debug, Clone)]
 pub enum FreshnessFailure {
     /// Invariant 1: the managed dylib no longer exists at the captured
@@ -100,7 +100,7 @@ pub enum FreshnessFailure {
         observed_sha256: String,
     },
     /// Invariant 4: rustc release line drifted between session startup
-    /// and this dispatch. Same shape as §4.6 `TOOLCHAIN_DRIFT`, but
+    /// and this dispatch. Same shape as the policy `TOOLCHAIN_DRIFT`, but
     /// fired from the per-dispatch path rather than the one-shot
     /// pre-dispatch check.
     RustcDrift {
@@ -157,9 +157,9 @@ impl FreshnessFailure {
     }
 }
 
-/// Re-check the four §4.5 invariants against `snapshot`. Returns
+/// Re-check the four policy invariants against `snapshot`. Returns
 /// `Ok(())` when all four still hold; otherwise returns the first
-/// invariant that drifted (checked in spec order: existence → mtime →
+/// invariant that drifted (checked in a fixed order: existence → mtime →
 /// SHA-256 → rustc).
 ///
 /// The check is intended for the per-dispatch path. Re-running a

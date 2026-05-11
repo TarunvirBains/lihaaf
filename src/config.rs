@@ -1,19 +1,14 @@
 //! `[package.metadata.lihaaf]` parsing + validation.
 //!
-//! The schema is fixed by spec §3.2; the validation rules are §3.4. This
-//! module is the single point at which raw TOML becomes a typed [`Config`]
-//! the rest of the harness consumes. Any new key requires both a field
-//! here and a corresponding update to the manifest snapshot in
-//! `manifest.rs` (verbatim copy of `[package.metadata.lihaaf]` per
-//! §4.4).
+//! This module is the single point where raw TOML becomes the typed [`Config`]
+//! used by the rest of the harness. If you add a new key, add it here and in
+//! `manifest.rs` so snapshot behavior stays aligned.
 //!
-//! ## Why only TOML, no env, no auto-discovery
+//! ## Why only TOML
 //!
-//! Spec §3.1: "auto-discovery hides build-graph decisions in non-obvious
-//! places and produces 'works on my machine' pathologies the moment two
-//! adopters have slightly different layouts." A missing
-//! `[package.metadata.lihaaf]` table is a hard error with the exact
-//! message shape the spec dictates.
+//! We avoid env-vars and auto-discovery fallbacks so configuration is explicit.
+//! If `[package.metadata.lihaaf]` is missing, we fail early with a direct message
+//! instead of inferring behavior from ambient layout.
 
 use std::path::{Path, PathBuf};
 
@@ -21,47 +16,41 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Outcome};
 
-/// Default value for `fixture_dirs` when the adopter omits it (spec
-/// §3.2). Adopters whose layouts differ override the key.
+/// Default value for `fixture_dirs` when omitted. Callers with custom
+/// layouts should override this key.
 pub const DEFAULT_FIXTURE_DIRS: &[&str] =
     &["tests/lihaaf/compile_fail", "tests/lihaaf/compile_pass"];
 
-/// Default value for `compile_fail_marker` when the adopter omits it
-/// (spec §3.2).
+/// Default value for `compile_fail_marker` when omitted.
 pub const DEFAULT_COMPILE_FAIL_MARKER: &str = "compile_fail";
 
-/// Default value for `edition` when the adopter omits it (spec §3.2).
+/// Default value for `edition` when omitted.
 pub const DEFAULT_EDITION: &str = "2021";
 
-/// Default value for `fixture_timeout_secs` when the adopter omits it
-/// (spec §3.2).
+/// Default value for `fixture_timeout_secs` when omitted.
 pub const DEFAULT_FIXTURE_TIMEOUT_SECS: u32 = 90;
 
-/// Default value for `per_fixture_memory_mb` when the adopter omits it
-/// (spec §3.2). Picked to give a generic-heavy proc-macro fixture
-/// substantial headroom while still firing the OOM guard before the
-/// OS OOMkiller would.
+/// Default value for `per_fixture_memory_mb` when omitted. Chosen to give
+/// heavy proc-macro fixtures headroom while still tripping the OOM guard
+/// before the OS does.
 pub const DEFAULT_PER_FIXTURE_MEMORY_MB: u32 = 1024;
 
-/// Allowed editions (spec §3.4 — "edition not in the allowed set").
+/// Allowed editions.
 pub const ALLOWED_EDITIONS: &[&str] = &["2015", "2018", "2021", "2024"];
 
 /// Parsed and validated `[package.metadata.lihaaf]` table.
 ///
-/// All fields are non-`Option` after validation; defaults from §3.2
-/// have been substituted into the optional keys.
+/// After validation, all fields are concrete values with defaults filled in.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
-    /// REQUIRED. Workspace member crate to build as the dylib.
+    /// Required workspace member crate to build as the dylib.
     pub dylib_crate: String,
 
-    /// REQUIRED. Crate names fixtures may `use` from. One `--extern`
-    /// flag is emitted per entry. `extern_crates[0]` MUST equal
-    /// `dylib_crate` per §3.4.
+    /// Required crate names fixtures may `use` from. One `--extern` flag is
+    /// emitted per entry. `extern_crates[0]` must equal `dylib_crate`.
     pub extern_crates: Vec<String>,
 
-    /// Directories scanned for `*.rs` fixtures (non-recursive within
-    /// each). Defaults from §3.2.
+    /// Directories scanned for `*.rs` fixtures (non-recursive within each).
     pub fixture_dirs: Vec<PathBuf>,
 
     /// Cargo features enabled for both dylib build and per-fixture
@@ -89,10 +78,9 @@ pub struct Config {
     pub per_fixture_memory_mb: u32,
 
     /// Verbatim copy of the raw `[package.metadata.lihaaf]` table for
-    /// the manifest snapshot (spec §4.4). Always populated by [`parse`];
-    /// the explicit `default` keeps round-tripping through serde
-    /// possible for tests that synthesize a `Config` without going
-    /// through the parser.
+    /// the manifest snapshot. Always populated by [`parse`]; `default`
+    /// keeps serde round-tripping possible for tests that synthesize
+    /// a `Config` without parsing text first.
     #[serde(default = "empty_toml_table")]
     pub raw_metadata: toml::Value,
 }
@@ -102,8 +90,8 @@ fn empty_toml_table() -> toml::Value {
 }
 
 /// The intermediate "as parsed before validation" shape. `Option` fields
-/// allow defaults from §3.2 to be applied uniformly. This struct never
-/// escapes [`load`].
+/// allow defaults to be applied uniformly. This struct never escapes
+/// [`load`].
 #[derive(Debug, Default, Deserialize)]
 struct RawMetadata {
     dylib_crate: Option<String>,
@@ -118,9 +106,9 @@ struct RawMetadata {
 }
 
 /// Load the consumer crate's `Cargo.toml`, extract
-/// `[package.metadata.lihaaf]`, and validate per spec §3.4.
+/// `[package.metadata.lihaaf]`, and validate it.
 ///
-/// `manifest_path` MUST point at the consumer crate's `Cargo.toml`
+/// `manifest_path` should point at the consumer crate's `Cargo.toml`
 /// (not a workspace root). Caller is responsible for resolving
 /// `--manifest-path` overrides and the cargo "current dir + parent
 /// walk" default.
@@ -146,8 +134,8 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
             message: e.to_string(),
         })?;
 
-    // Walk to `package.metadata.lihaaf`. Missing at any step is the
-    // spec §3.1 hard-error.
+    // Walk to `package.metadata.lihaaf`. Missing at any step is a hard config
+    // failure; keep the failure direct and actionable.
     let raw_metadata_value = value
         .get("package")
         .and_then(|v| v.get("metadata"))
@@ -166,7 +154,7 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
             .map_err(|e: toml::de::Error| {
                 Error::Session(Outcome::ConfigInvalid {
                     message: format!(
-                        "[package.metadata.lihaaf] could not be parsed against the v0.1 schema:\n  {e}\nWhy this matters: the harness needs typed values to dispatch fixtures."
+                        "[package.metadata.lihaaf] could not be parsed.\n  {e}\nWhy this matters: the harness needs typed values to dispatch fixtures."
                     ),
                 })
             })?;
@@ -187,7 +175,7 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
         return Err(Error::Session(Outcome::ConfigInvalid {
             message: format_invalid_key(
                 "extern_crates",
-                "a non-empty array of crate names; the first MUST equal `dylib_crate`",
+                "a non-empty array of crate names; the first must equal `dylib_crate`",
                 "every fixture compiles with one --extern <name>=<path> per entry",
             ),
         }));
@@ -244,11 +232,9 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
         }));
     }
 
-    // `fixture_dirs` validation deferred until session startup — at this
-    // point we don't yet know the crate root the relative paths resolve
-    // against. `discovery::collect` performs the existence check against
-    // the resolved paths and emits a `ConfigInvalid` outcome if zero
-    // exist.
+    // `fixture_dirs` validation is deferred until session startup because
+    // relative paths are resolved against a discovered crate root. `discovery::collect`
+    // performs the existence check and emits a config failure if none exist.
 
     Ok(Config {
         dylib_crate,
@@ -429,7 +415,7 @@ mod tests {
         )
         .unwrap();
         // The raw metadata is what the manifest will snapshot. It must
-        // include every key the adopter typed, even ones we read into
+        // include every key the user typed, even ones we also map into
         // typed fields above.
         let table = cfg.raw_metadata.as_table().unwrap();
         assert!(table.contains_key("dylib_crate"));

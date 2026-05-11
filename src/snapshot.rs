@@ -1,16 +1,15 @@
-//! `.stderr` snapshot file I/O + `--bless` semantics (spec §7.3, §7.4).
+//! `.stderr` snapshot file I/O + `--bless` semantics.
 //!
 //! ## Byte-determinism
 //!
-//! Spec §7.4: snapshots are written with LF line endings on every
-//! platform and a final newline. They are rewritten in full (no append;
-//! no in-place edit). [`write()`] enforces both invariants.
+//! Snapshots are written with LF line endings on every platform and a
+//! final newline. They are rewritten in full (no append; no in-place
+//! edit). [`write()`] enforces both invariants.
 //!
 //! ## `--bless` is destructive
 //!
-//! Spec §7.3 + KR-4: bless overwrites checked-in `.stderr` files. The
-//! harness assumes adopters have version control and review diffs
-//! before committing. There is no sidecar mode in v0.1.
+//! Bless overwrites checked-in `.stderr` files. The harness expects
+//! snapshot edits to flow through normal code review.
 
 use std::path::{Path, PathBuf};
 
@@ -44,13 +43,9 @@ pub enum ReadOutcome {
 
 /// Read the snapshot for `fixture_path` and classify the outcome.
 ///
-/// Spec §7.2 ("Non-UTF-8 / binary-content handling") is the authority
-/// for the malformed branch — the snapshot file failing UTF-8 is a
-/// `MALFORMED_DIAGNOSTIC` verdict, not a soft fallback. Earlier drafts
-/// of this module returned a generic IO error for malformed files,
-/// which collapsed the byte offset to a useless `0`; the typed
-/// outcome here preserves the offset that `Utf8Error::valid_up_to()`
-/// provides.
+/// Snapshot UTF-8 validation:
+/// valid bytes normalize into `Found`, while invalid UTF-8 stays a typed
+/// `Malformed` outcome with the exact `Utf8Error::valid_up_to()` offset.
 pub fn try_read(fixture_path: &Path) -> Result<ReadOutcome, Error> {
     let p = snapshot_path(fixture_path);
     match std::fs::read(&p) {
@@ -66,8 +61,8 @@ pub fn try_read(fixture_path: &Path) -> Result<ReadOutcome, Error> {
     }
 }
 
-/// Write `normalized_stderr` to `fixture_path`'s sibling `.stderr` per
-/// spec §7.4 (LF, final newline, full rewrite).
+/// Write `normalized_stderr` to `fixture_path`'s sibling `.stderr` with
+/// LF line endings, a final newline, and full rewrite.
 pub fn write(fixture_path: &Path, normalized_stderr: &str) -> Result<PathBuf, Error> {
     let p = snapshot_path(fixture_path);
     let mut bytes: Vec<u8> = normalized_stderr.bytes().collect();
@@ -82,8 +77,8 @@ pub fn write(fixture_path: &Path, normalized_stderr: &str) -> Result<PathBuf, Er
 
 /// Snapshot-side normalization for COMPARISON only: unify line endings
 /// to LF and strip a single trailing LF if present. Mirrors the
-/// `normalize::normalize` final shape so adopters with mixed line
-/// endings on disk see clean diffs.
+/// `normalize::normalize` final shape so mixed line endings on disk stay
+/// easy to compare.
 fn normalize_for_compare(s: &str) -> String {
     let mut s = s.replace("\r\n", "\n").replace('\r', "\n");
     while s.ends_with('\n') {
@@ -151,7 +146,7 @@ mod tests {
 
     #[test]
     fn try_read_returns_malformed_with_correct_offset() {
-        // Spec §7.2: snapshot UTF-8 failure surfaces as
+        // Snapshot UTF-8 failure surfaces as
         // MALFORMED_DIAGNOSTIC with the precise byte offset of the
         // first invalid byte. `0xFE` is invalid as a UTF-8 leading
         // byte; placing it after 5 valid bytes gives a deterministic

@@ -1,9 +1,5 @@
-//! Small cross-module helpers — atomic file write, sha256, path
-//! normalization to forward-slash form for snapshot byte determinism.
-//!
-//! These are kept in one module rather than scattered because they each
-//! support a single load-bearing spec invariant and the tests that
-//! exercise them belong together.
+//! Small cross-module helpers: atomic file writes, SHA-256, and path
+//! normalization helpers used by snapshot comparisons.
 
 use std::fs::File;
 use std::io::Write;
@@ -14,8 +10,8 @@ use sha2::{Digest, Sha256};
 use crate::error::Error;
 
 /// SHA-256 of a file's bytes, formatted as a 64-character lowercase
-/// hex string. Spec §4.5 requires this for the freshness check; the
-/// representation matches `sha256sum`'s default for grep-friendliness.
+/// hex string. The representation matches `sha256sum`'s default for
+/// grep-friendliness.
 pub fn sha256_file(path: &Path) -> Result<String, Error> {
     let bytes = std::fs::read(path)
         .map_err(|e| Error::io(e, "reading file for sha256", Some(path.to_path_buf())))?;
@@ -47,10 +43,9 @@ fn nibble_to_hex(n: u8) -> char {
     }
 }
 
-/// Atomic file write per spec §4.4 + §7.4 — write to `path.tmp` then
-/// rename. `rename` is atomic on POSIX; Windows pre-NTFS guarantees
-/// don't apply but the freshness check (§10.2 `MANIFEST_CORRUPT`)
-/// catches a torn read on the next read attempt.
+/// Atomic write helper: write to `path.tmp` then rename into place.
+/// `rename` is atomic on POSIX; on Windows we still surface read/readiness
+/// issues through normal session checks.
 ///
 /// The `.tmp` suffix is per-call (not per-process) to avoid collisions
 /// when the same path is rewritten in quick succession.
@@ -97,9 +92,7 @@ pub fn write_file_atomic(path: &Path, contents: &[u8]) -> Result<(), Error> {
 }
 
 /// Convert a path's separators to forward-slash form. Used by the
-/// stderr normalizer (spec §6.2 — backslashes in paths become forward
-/// slashes for byte determinism across OS) and by relative-path
-/// reporting.
+/// stderr normalizer and by relative-path reporting.
 pub fn to_forward_slash(s: &str) -> String {
     if !s.contains('\\') {
         return s.to_string();
@@ -110,7 +103,7 @@ pub fn to_forward_slash(s: &str) -> String {
 /// Compute a path relative to `base`, returning the path verbatim if
 /// it cannot be made relative. Used for fixture display paths.
 ///
-/// The result is always forward-slash form (spec §7.4 byte determinism).
+/// The result is always forward-slash form for stable report output.
 pub fn relative_to(path: &Path, base: &Path) -> String {
     match path.strip_prefix(base) {
         Ok(rel) => to_forward_slash(&rel.to_string_lossy()),
@@ -123,11 +116,10 @@ pub fn relative_to(path: &Path, base: &Path) -> String {
 /// Linux: `/proc/meminfo`'s `MemTotal:` line in KiB.
 /// macOS: `sysctl hw.memsize` (bytes) — invoked via subprocess to keep
 ///   the dep tree libc-free.
-/// Windows: returns `None` until v0.x adds the platform path.
+/// Windows: returns `None` until a platform path is added.
 ///
-/// On Linux this is what the spec §5.2 RAM cap formula consumes. A
-/// failure to read returns `None`; the caller falls back to the CPU
-/// cap alone.
+/// A read failure returns `None`; the caller falls back to CPU
+/// limit alone.
 pub fn total_ram_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {

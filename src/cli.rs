@@ -1,8 +1,9 @@
 //! CLI argument parsing.
 //!
-//! Spec §8.2 lists every flag in the v0.1 stable surface. The struct
-//! below covers each one with its spec-mandated semantics. Each field's
-//! rustdoc cites the spec section it derives from.
+//! CLI parsing for the `cargo lihaaf` command.
+//!
+//! Each field maps directly to a subcommand flag and preserves the
+//! documented default behavior.
 //!
 //! ## Why clap derive
 //!
@@ -19,9 +20,9 @@ use crate::error::Error;
 
 /// Parsed CLI arguments.
 ///
-/// Each field maps 1:1 to a spec §8.2 flag. Defaults preserve the
-/// "non-`--bless`, non-`--keep-output`, non-`--use-symlink`" posture
-/// that the spec calls out as the default safe operating mode.
+/// Each field maps directly to a CLI flag.
+/// Defaults preserve the conservative "non-`--bless`,
+/// non-`--keep-output`, non-`--use-symlink`" posture.
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "cargo-lihaaf",
@@ -38,28 +39,27 @@ use crate::error::Error;
 )]
 pub struct Cli {
     /// Overwrite `.stderr` snapshots whose normalized output differs
-    /// from disk. Equivalent env: `LIHAAF_OVERWRITE=1`. Spec §7.3.
+    /// from disk. Equivalent env: `LIHAAF_OVERWRITE=1`.
     #[arg(long)]
     pub bless: bool,
 
     /// Run only fixtures whose relative path contains the substring.
-    /// Multiple `--filter` flags are OR'd. Substring match
-    /// (case-sensitive). Spec §8.2.
+    /// Multiple `--filter` flags are OR'd. Substring match is
+    /// case-sensitive.
     #[arg(long)]
     pub filter: Vec<String>,
 
-    /// Override the worker parallelism cap. The harness still applies
-    /// the RAM cap on top — the override does not bypass it. Spec §5.2.
+    /// Override the worker parallelism cap. The RAM cap still applies —
+    /// this override does not bypass it.
     ///
-    /// `-j 0` is rejected at parse time per spec §5.2: "no implicit
-    /// 'cargo-style' 'use all cores' semantics; explicit is better."
-    /// Adopters who want the platform default omit the flag entirely.
+    /// `-j 0` is rejected at parse time; explicit values are required.
+    /// Omit the flag to use the default.
     #[arg(short = 'j', long = "jobs", value_parser = parse_jobs)]
     pub jobs: Option<u32>,
 
     /// Force a fresh dylib build, ignoring any existing manifest.
     /// Equivalent to deleting `target/lihaaf/manifest.json` before
-    /// invocation. Spec §8.2.
+    /// invocation.
     #[arg(long)]
     pub no_cache: bool,
 
@@ -69,8 +69,8 @@ pub struct Cli {
     pub manifest_path: Option<PathBuf>,
 
     /// Print the fixtures the harness would run, one relative path per
-    /// line, and exit 0. Does not build the dylib, does not invoke
-    /// rustc. Composable with `--filter`. Spec §8.2.
+    /// line, and exit 0. Does not build the dylib or invoke rustc.
+    /// Composable with `--filter`.
     #[arg(long)]
     pub list: bool,
 
@@ -86,18 +86,17 @@ pub struct Cli {
 
     /// Skip the lihaaf-managed dylib copy; create a symbolic link
     /// instead. Saves ~30 MB disk + ~few hundred ms; the caller asserts
-    /// no concurrent cargo activity will modify `target/`. Spec §4.3.
+    /// no concurrent cargo activity will modify `target/`.
     #[arg(long)]
     pub use_symlink: bool,
 
     /// Preserve per-fixture work directories after verdict capture.
     /// Local-development escape hatch only — never set in CI.
-    /// Spec §5.3.
     #[arg(long)]
     pub keep_output: bool,
 }
 
-/// Reject `-j 0` at parse time per spec §5.2. The default
+/// Reject `-j 0` at parse time. The default
 /// `value_parser` for `u32` accepts any non-negative integer, including
 /// `0`; we tighten that to "positive integer required" so the bad
 /// invocation fails immediately with a clap error rather than silently
@@ -108,7 +107,7 @@ fn parse_jobs(s: &str) -> Result<u32, String> {
         .map_err(|_| format!("`{s}` is not a non-negative integer"))?;
     if n == 0 {
         return Err(
-            "must be a positive integer (spec §5.2: `-j 0` is rejected; omit `-j` to use the default)"
+            "must be a positive integer (`-j 0` is rejected; omit `-j` to use the default)"
                 .to_string(),
         );
     }
@@ -144,7 +143,7 @@ pub fn parse_from(argv: Vec<String>) -> Result<Cli, Error> {
 
 impl Cli {
     /// True when the env var `LIHAAF_OVERWRITE=1` should be honored as
-    /// equivalent to `--bless` (spec §7.3).
+    /// equivalent to `--bless`.
     pub fn effective_bless(&self) -> bool {
         if self.bless {
             return true;
@@ -195,9 +194,8 @@ mod tests {
 
     #[test]
     fn jobs_zero_is_rejected_per_spec_section_5_2() {
-        // Spec §5.2: "`-j 0` is rejected (no implicit 'cargo-style'
-        // 'use all cores' semantics; explicit is better)." The clap
-        // value parser must hard-fail rather than silently coerce.
+        // `-j 0` is rejected. The clap value parser hard-fails rather
+        // than silently coercing.
         let argv: Vec<String> = ["cargo-lihaaf", "-j", "0"]
             .iter()
             .map(|s| s.to_string())

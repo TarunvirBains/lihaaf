@@ -1,22 +1,19 @@
 //! `target/lihaaf/manifest.json` schema + atomic refresh.
 //!
-//! Spec §4.4 dictates the exact field set. The manifest is written
-//! atomically (write `.tmp`, rename) per spec §4.1 stage 5, and the
-//! freshness check (§4.5) re-reads it on every fixture dispatch.
+//! The manifest is written atomically (`.tmp` + rename), then re-read on each
+//! fixture dispatch so stale cache state is detected before linking continues.
 //!
 //! ## Why JSON, not TOML
 //!
-//! TOML is harder to script in CI environments that lean on `jq` and
-//! similar tools. Adopters debugging `MANIFEST_CORRUPT` (§10.2) reach
-//! for `cat target/lihaaf/manifest.json | jq .dylib_sha256` and that
-//! is a much shorter path with JSON.
+//! TOML is harder to script in CI environments that lean on `jq` and similar
+//! tooling. During `MANIFEST_CORRUPT` debugging, `cat target/lihaaf/manifest.json`
+//! into `jq .dylib_sha256` is usually the shortest path.
 //!
 //! ## Schema versioning
 //!
-//! `lihaaf_version` is the harness's own version. Adding fields to the
-//! manifest is non-breaking (adopters reading older manifests see
-//! defaults via `serde(default)`). Removing or renaming fields is a
-//! v1.0 break.
+//! `lihaaf_version` is the harness's own version marker. Adding fields is
+//! non-breaking because older readers get `serde(default)` values. Removing or
+//! renaming fields is a breaking change.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::Error;
 use crate::util;
 
-/// `target/lihaaf/manifest.json` shape (spec §4.4).
+/// `target/lihaaf/manifest.json` shape.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     /// The lihaaf release that wrote this manifest. Pinned to
@@ -33,8 +30,7 @@ pub struct Manifest {
     /// tolerated via `serde(default)` on additive fields.
     pub lihaaf_version: String,
 
-    /// Verbatim first line of `rustc --version --verbose` (the
-    /// drift-detection key — spec §4.6).
+    /// Verbatim first line of `rustc --version --verbose` (drift-detection key).
     pub rustc_release: String,
 
     /// `commit-hash:` value if rustc reported one; empty string for
@@ -60,9 +56,8 @@ pub struct Manifest {
     /// link against this, never the cargo-managed original.
     pub managed_dylib_path: PathBuf,
 
-    /// SHA-256 of the managed dylib at the moment of copy. The
-    /// freshness check (§4.5) re-hashes on every dispatch and a
-    /// mismatch triggers the rebuild path.
+    /// SHA-256 of the managed dylib at the moment of copy. The freshness
+    /// check re-hashes on every dispatch and a mismatch triggers rebuild.
     pub dylib_sha256: String,
 
     /// The managed dylib's mtime in Unix seconds. A backward jump is
@@ -84,28 +79,27 @@ pub struct Manifest {
     /// Verbatim copy of `edition` from the metadata.
     pub edition: String,
 
-    /// Verbatim copy of the entire `[package.metadata.lihaaf]` table
-    /// — spec §4.4. Stored as JSON value for cross-tool readability.
+    /// Verbatim copy of the entire `[package.metadata.lihaaf]` table.
+    /// Stored as JSON value for cross-tool readability.
     pub metadata_snapshot: serde_json::Value,
 }
 
 impl Manifest {
     /// Read an existing manifest from disk. A failure to read or parse
-    /// returns `None` rather than an error — spec §10.2 treats unreadable
-    /// manifests as stale-cache events that simply trigger a rebuild.
+    /// returns `None`; callers treat that as a stale-cache event and rebuild.
     pub fn try_read(path: &Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
     }
 
-    /// Write the manifest atomically per spec §4.1 stage 5.
+    /// Write the manifest atomically.
     pub fn write(&self, path: &Path) -> Result<(), Error> {
         let text = serde_json::to_vec_pretty(self).map_err(|e| Error::JsonParse {
             context: "serializing manifest".into(),
             message: e.to_string(),
         })?;
         let mut text = text;
-        // Final newline so adopters running `cat` get a clean prompt.
+        // Final newline so `cat` output stays readable.
         text.push(b'\n');
         util::write_file_atomic(path, &text)
     }

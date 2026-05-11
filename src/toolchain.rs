@@ -1,8 +1,8 @@
-//! Toolchain capture (spec §4.1 stage 2).
+//! Toolchain capture (the policy stage 2).
 //!
 //! `rustc --version --verbose` produces a multi-line text block. We parse
 //! it into a [`Toolchain`] struct and persist the release line as the
-//! drift-detection key for spec §4.6.
+//! drift-detection key for the policy.
 //!
 //! ## Sample output we parse
 //!
@@ -22,7 +22,7 @@
 //!
 //! ## Why parse, not just stash the raw output
 //!
-//! The drift check (§4.6) compares release strings, not the full block.
+//! The drift check (the policy) compares release strings, not the full block.
 //! Parsing once at startup and re-running rustc per dispatch lets us
 //! compare scalars instead of normalizing whole blocks repeatedly.
 
@@ -35,7 +35,7 @@ use crate::error::Error;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Toolchain {
     /// First line verbatim (`rustc 1.95.0 (...)`). The drift-detection
-    /// key — spec §4.6 compares this line.
+    /// key — the policy compares this line.
     pub release_line: String,
     /// `release: 1.95.0` parsed value.
     pub release: String,
@@ -137,7 +137,7 @@ pub fn capture() -> Result<Toolchain, Error> {
 }
 
 /// True if `current` matches `original`'s drift-detection key (the
-/// release line). Spec §4.6 compares release line equality.
+/// release line). the policy compares release line equality.
 pub fn matches(original: &Toolchain, current: &Toolchain) -> bool {
     original.release_line == current.release_line
 }
@@ -199,7 +199,7 @@ LLVM version: 22.1.2";
         let mut b = a.clone();
         assert!(matches(&a, &b));
         b.sysroot = PathBuf::from("/b");
-        // Sysroot drift is not part of the §4.6 key.
+        // Sysroot drift is not part of the policy key.
         assert!(matches(&a, &b));
         b.release_line = "rustc 1.96.0 (def 2026-04-14)".into();
         assert!(!matches(&a, &b));

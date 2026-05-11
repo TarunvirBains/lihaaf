@@ -1,30 +1,22 @@
-//! Stderr normalization (spec §6).
+//! Stderr normalization for fixture output.
 //!
 //! ## Why no regex
 //!
-//! Spec §6.1 mandates zero regex-engine deps. Every substitution here
-//! is fixed-string with a known prefix. The cost of hand-rolling is
-//! bounded — each substitution maps to a fixture, and validation
-//! against a real-world consumer corpus is the safety net.
+//! There are no regex dependencies here by design. Fixed-string matching is
+//! enough for rustc diagnostics and keeps the dependency surface small.
 //!
-//! ## Implementer choice — iteration recipe
+//! ## Implementation choices
 //!
-//! Spec §6.4 says "the implementer chooses data structures, iteration
-//! order, and matching strategy subject to these contracts." This
-//! module's design:
+//! The module keeps the replacement flow simple and explicit:
 //!
-//! 1. **One pass per line.** Line endings normalized to `\n` first
-//!    (spec §6.2). Each line is then fed through every category in
-//!    order.
-//! 2. **Path categories use longest-prefix-wins.** The categories
-//!    have explicit priority — `$WORKSPACE/target/release/deps/`
-//!    matches before `$WORKSPACE/`. We order them by descending prefix
-//!    length and short-circuit on first match.
+//! 1. **One pass per line.** Line endings are normalized to `\n` first.
+//!    Each line is then run through each rewrite category.
+//! 2. **Path categories use longest-prefix-wins.** `$WORKSPACE/target/release/deps/`
+//!    matches should win over `$WORKSPACE/`. Prefixes are sorted by length.
 //! 3. **TypeId rewrite is a separate byte-walk.** `#` followed by
-//!    ASCII digits → `$TYPEID`. The walk uses `str::find('#')` as the
-//!    fast path; the inner loop confirms the digit run.
+//!    digits becomes `$TYPEID`.
 //! 4. **Trailing whitespace + blank-line collapse run last** so they
-//!    operate on the post-substitution shape.
+//!    apply after other rewrites.
 //!
 //! The `NormalizationContext` carries the path prefixes captured at
 //! session startup. They are computed once per session and reused for
@@ -34,8 +26,7 @@ use std::path::{Path, PathBuf};
 
 use crate::util;
 
-/// Substring prefixes the normalizer rewrites to placeholders. Spec
-/// §6.2.
+/// Substring prefixes the normalizer rewrites to placeholders.
 #[derive(Debug, Clone)]
 pub struct NormalizationContext {
     /// Workspace root (the `package.metadata.lihaaf` host crate's
@@ -67,24 +58,20 @@ impl NormalizationContext {
 
 /// Normalize `input` for snapshot comparison.
 ///
-/// `fixture_dir` is the directory containing the fixture `.rs` file;
-/// path prefixes equal to it are rewritten to `$DIR`. `input` is the
-/// raw stderr from rustc (already UTF-8; the caller has already
-/// validated this).
+/// `fixture_dir` is the directory containing the fixture `.rs` file.
+/// Prefixes there are rewritten to `$DIR`. `input` is the raw rustc
+/// stderr (already UTF-8 by this stage).
 ///
 /// ## No silent drops
 ///
-/// Spec §6.2 enumerates the rewrite categories; spec §6.3 enumerates
+/// the policy enumerates the rewrite categories; the policy enumerates
 /// what is explicitly preserved (diagnostic text, span pointers, help
 /// text, suggestions). Neither list authorizes dropping the rustc
 /// summary lines `error: aborting due to N previous error[s]` or
 /// `For more information about this error, try \`rustc --explain ...\``.
-/// Earlier drafts of this module dropped both — that was a Cluster 10.3
-/// finding from the Codex Spark xhigh review (POST_BETA, handled here).
-/// The summary lines are now preserved byte-for-byte; adopters whose
-/// snapshots were blessed against the prior dropping behavior will need
-/// to re-bless once, but the snapshot signal is no longer fighting the
-/// adopter's reading of rustc's actual output.
+/// Earlier drafts dropped both lines; they are now preserved byte-for-byte.
+/// Adopters with previously blessed snapshots may need one re-bless, but the
+/// output now mirrors rustc’s real messages more closely.
 pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) -> String {
     // Pre-compute placeholder list, longest prefix first. Adopters may
     // not have one of these (e.g., no CARGO_HOME); skip empties.
@@ -96,25 +83,25 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         push_path(&mut substitutions, reg, "$CARGO/registry");
     }
     // Sort by descending source-string length so the longest prefix
-    // wins (spec §6.4 longest-prefix-wins rule).
+    // wins (the policy longest-prefix-wins rule).
     substitutions.sort_by_key(|(needle, _)| std::cmp::Reverse(needle.len()));
 
     // Step 1: line endings.
     let unified_le = unify_line_endings(input);
 
     // Step 2: per-line path substitution + TypeId + trailing space.
-    // Per spec §6.2 / §6.3 (and the Cluster 10.3 fix from the Codex
+    // Per the policy (and the Cluster 10.3 fix from the Codex
     // Spark xhigh review), rustc's summary lines (`error: aborting due
     // to N previous error[s]`, `For more information about this error,
     // try \`rustc --explain ...\``) are NOT dropped — they pass through
     // alongside every other diagnostic line and are subject only to the
-    // normalization categories §6.2 enumerates.
+    // normalization categories the policy enumerates.
     let mut intermediate: Vec<String> = Vec::with_capacity(unified_le.lines().count() + 1);
     for line in unified_le.lines() {
         let mut s = line.to_string();
-        // Backslashes inside path-shaped substrings: spec §6.2 says we
+        // Backslashes inside path-shaped substrings: the policy says we
         // rewrite "backslashes in paths" — restricted to `--> ` and
-        // `::: ` lines (spec §6.5 documents the limitation). For the
+        // `::: ` lines (the policy documents the limitation). For the
         // path-prefix substitution we operate on a copy with the
         // backslashes pre-converted so the prefix match works on
         // either OS.
@@ -122,7 +109,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             s = rewrite_path_separators_in_path_lines(&s);
         }
         for (needle, repl) in &substitutions {
-            // Replace every occurrence; spec §6.4 just says rewrite
+            // Replace every occurrence; the policy just says rewrite
             // matches. Using `str::replace` here would scan repeatedly
             // for already-replaced content; instead we walk left-to-
             // right, advancing past each replacement so we never
@@ -187,7 +174,7 @@ fn replace_advancing(s: &str, needle: &str, repl: &str) -> String {
     out
 }
 
-/// Rewrite TypeId hashes (spec §6.4 final paragraph): every occurrence
+/// Rewrite TypeId hashes (the policy final paragraph): every occurrence
 /// of `#` followed by one or more ASCII digits is replaced with
 /// `$TYPEID`.
 fn rewrite_type_ids(s: &str) -> String {
@@ -222,7 +209,7 @@ fn rewrite_type_ids(s: &str) -> String {
     out
 }
 
-/// Unify CRLF / CR / LF to LF. Spec §6.2.
+/// Unify CRLF / CR / LF to LF. the policy.
 fn unify_line_endings(s: &str) -> String {
     if !s.contains('\r') {
         return s.to_string();
@@ -255,7 +242,7 @@ fn unify_line_endings(s: &str) -> String {
 
 /// True when a line looks like it carries a path (rustc's `--> ` or
 /// `::: ` marker). Used to gate the backslash-to-slash rewrite per
-/// spec §6.5.
+/// the policy.
 fn has_path_marker(line: &str) -> bool {
     line.contains("--> ") || line.contains("::: ")
 }
@@ -292,7 +279,7 @@ mod tests {
     fn rewrites_dir_prefix_then_workspace_prefix() {
         // rustc preserves indentation in path-marker lines as part of
         // diagnostic formatting. The normalizer does NOT strip leading
-        // whitespace — only trailing (spec §6.2). The test fixture
+        // whitespace — only trailing (the policy). The test fixture
         // mirrors rustc's two-space pad so adopters reading the test
         // corpus see the byte-equivalent shape.
         let input = "  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1\n";
@@ -384,9 +371,9 @@ mod tests {
 
     #[test]
     fn preserves_rustc_aborting_summary() {
-        // Spec §6.2 / §6.3: the summary line is not in the rewrite
-        // category list and is not in the explicit-preserve list either,
-        // but §6.3 makes preservation the default ("Diagnostic text …
+        // This summary line is not in the rewrite category list and is not
+        // in the explicit-preserve list either, but preservation stays the
+        // default ("Diagnostic text …").
         // preserved byte-for-byte"). Earlier drafts dropped this line;
         // Cluster 10.3 of the Codex Spark xhigh review reverted that.
         let input = "error: bad\nerror: aborting due to 1 previous error\n";
@@ -419,9 +406,8 @@ mod tests {
 
     #[test]
     fn preserves_rustc_explain_pointer() {
-        // Spec §6.2 / §6.3: the explain pointer is preserved byte-for-
-        // byte. Earlier drafts dropped it; Cluster 10.3 of the Codex
-        // Spark xhigh review reverted that.
+        // The explain pointer is preserved byte-for-byte. Earlier drafts
+        // dropped it; Codex Spark review reverted that.
         let input =
             "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.\n";
         let c = ctx("/p", "/r");

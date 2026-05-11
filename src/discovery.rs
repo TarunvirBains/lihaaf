@@ -1,20 +1,18 @@
-//! Fixture discovery (spec §4.1 stage 6).
+//! Fixture discovery.
 //!
 //! Walk `fixture_dirs` non-recursively, collect `*.rs` files, classify
-//! each as compile_pass or compile_fail by the directory-name marker,
-//! sort lexicographically for deterministic output (spec §5.7).
+//! each as compile_pass or compile_fail by directory marker, and sort
+//! results lexicographically for deterministic output.
 //!
 //! ## Why non-recursive
 //!
-//! Spec §3.2 says "non-recursive within each" `fixture_dir`. Adopters
-//! who want deep trees list each sub-directory in `fixture_dirs`. The
-//! flat layout matches the trybuild convention adopters already use,
-//! and avoids ambiguity about which directory's name carries the
-//! `compile_fail_marker`.
+//! The flat walk keeps fixture intent obvious and avoids ambiguity in
+//! marker handling. If a project wants deep fixture trees, each sub-dir
+//! is listed explicitly in `fixture_dirs`.
 //!
 //! ## Filtering
 //!
-//! `--filter <substr>` (spec §8.2) is applied here. Multiple filters
+//! `--filter <substr>` is applied here. Multiple filters
 //! are OR'd. Substring match against the relative path from the
 //! crate root (forward-slash form for cross-OS determinism).
 
@@ -116,7 +114,7 @@ pub fn collect(
     }
 
     // Sort lexicographically by relative path for deterministic
-    // emission (spec §5.7).
+    // emission (the policy).
     fixtures.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
 
     if !filters.is_empty() {
@@ -126,7 +124,7 @@ pub fn collect(
     Ok(fixtures)
 }
 
-/// Classify a fixture directory by name. Spec §3.2: a fixture is
+/// Classify a fixture directory by name. the policy: a fixture is
 /// compile_fail if its enclosing directory name (relative to crate
 /// root) contains the `compile_fail_marker` substring; otherwise
 /// compile_pass.

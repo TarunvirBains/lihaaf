@@ -1,22 +1,15 @@
-//! Hand-rolled line-granularity unified diff (spec §7.2).
+//! Hand-rolled line-granularity unified diff.
 //!
 //! ## Why hand-rolled
 //!
-//! Spec §7.2 forbids a heavy diff dep and a regex dep. The line-count
-//! range we expect (10s to low hundreds, occasionally low thousands)
-//! makes the algorithmic constants matter less than the dep-tree cost.
-//! `imara-diff` and `dissimilar` are reasonable picks but each adds
-//! over 100KB to the build; for a workload this small the in-tree
-//! implementation pays itself off in build time.
+//! This stays in-tree to avoid pulling extra dependencies for a tiny amount of
+//! output. For this workload (typically tens to low thousands of lines) the
+//! in-tree implementation is cheap and predictable.
 //!
 //! ## Implementer choice — Myers
 //!
-//! Spec §7.2: "the algorithm choice is the implementer's. A
-//! hand-rolled Myers diff is likely to remain the right pick…"
-//! We pick Myers (Eugene W. Myers, 1986: "An O(ND) Difference
-//! Algorithm and Its Variations"). Worst-case time is O((N+M)·D)
-//! where D is the edit-script length; for our workload (small inputs,
-//! low edit distance when something changed) this is microseconds.
+//! Myers is a good fit here: it performs well for small-ish snapshots and stays
+//! easy enough to audit in this repo.
 //!
 //! ## Output format
 //!
@@ -33,20 +26,20 @@
 //!
 //! Three lines of context around each hunk (the GNU diff `-U3` default).
 //!
-//! ## Complexity ceiling (spec §7.2)
+//! ## Size guardrails
 //!
-//! - Soft ceiling (10K lines per side): full diff runs, no warning.
-//! - Between soft and hard ceiling: full diff runs, [`DiffResult::Diff`]
-//!   carries `warn = true` so the caller can emit `LARGE_SNAPSHOT`.
-//! - Above hard (100K lines): we return [`DiffResult::TooLarge`] without
-//!   running the algorithm; the caller maps to `SNAPSHOT_DIFF_TOO_LARGE`.
+//! - Soft ceiling (10K lines per side): run full diff, no warning.
+//! - Between soft and hard: run full diff and emit a warning so callers can
+//!   mark snapshots as large.
+//! - Above hard (100K lines): return [`DiffResult::TooLarge`] without running
+//!   the full algorithm.
 
 use crate::verdict::Verdict;
 
-/// Soft input ceiling per spec §7.2.
+/// Soft input ceiling.
 pub const SOFT_LINE_CEILING: usize = 10_000;
 
-/// Hard input ceiling per spec §7.2.
+/// Hard input ceiling.
 pub const HARD_LINE_CEILING: usize = 100_000;
 
 /// Diff outcome. The `caller` consumes this and produces a [`Verdict`]:
@@ -67,8 +60,7 @@ pub enum DiffResult {
         /// ceiling — caller emits `LARGE_SNAPSHOT` warning.
         warn: bool,
     },
-    /// Inputs exceed the hard ceiling. Carries the head of each side
-    /// per spec §7.2.
+    /// Inputs exceed the hard ceiling. Carries the head of each side.
     TooLarge {
         /// Actual line count.
         actual_lines: usize,

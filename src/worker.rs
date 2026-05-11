@@ -1,29 +1,24 @@
-//! Per-fixture worker dispatch (spec §5).
+//! Per-fixture worker dispatch.
 //!
-//! ## Implementer choices recorded here
+//! ## Dispatch choices worth calling out
 //!
-//! - **Per-platform RSS sampling API** (KR-5): on Linux we read
+//! - **RSS sampling (Linux for now):** on Linux we read
 //!   `/proc/<pid>/statm` (2nd field × page-size). This is the live
 //!   per-process RSS for a running child — verified by hand on
 //!   `rustc 1.95` on Linux 6.x x86_64. macOS and Windows are documented
 //!   stubs (return `None`); without correct sampling those platforms
-//!   would silently fail KR-5's mitigation requirement, so v0.1 turns
-//!   off the RSS-ceiling check on those platforms and the OOM
-//!   attribution heuristic falls back to the OS OOMkiller path
-//!   (verdict: `WORKER_CRASHED`). v0.x adds proper macOS / Windows
-//!   sampling.
+//!   would silently miss the same guardrail, so those platforms currently
+//!   fall back to OS-level OOM attribution (`WORKER_CRASHED`).
 //!
-//! - **Sampling interval** (§5.4 — implementer chooses): 100 ms on
-//!   Linux. Short enough to catch a runaway monomorphization before
-//!   the OS OOMkiller fires (which typically takes seconds of
-//!   sustained pressure on a desktop kernel), long enough that the
-//!   sampler thread stays out of the worker's way.
+//! - **Sampling interval:** 100 ms on Linux. This is short enough to catch
+//!   runaway work before the OS OOMkiller usually triggers, while staying
+//!   out of the worker's critical path.
 //!
-//! - **Termination signal pair** (§5.4): SIGTERM, then SIGKILL after
-//!   a 2-second grace. SIGTERM lets rustc clean up its temp files;
-//!   SIGKILL is the backstop for ICEs that ignore SIGTERM.
+//! - **Termination signal pair:** SIGTERM, then SIGKILL after
+//!   a 2-second grace. SIGTERM gives rustc a chance to clean up, while
+//!   SIGKILL is the hard fallback.
 //!
-//! ## Determinism (§5.7)
+//! ## Determinism
 //!
 //! Within a single invocation with `-j 1`, fixture verdicts are
 //! emitted in lexicographic order. With `-j > 1`, verdicts are emitted
@@ -53,7 +48,7 @@ use crate::verdict::{CleanupFailure, FixtureResult, FixtureWarning, MalformedSou
 pub struct WorkerContext {
     /// Resolved consumer-crate root (parent of Cargo.toml).
     pub crate_root: PathBuf,
-    /// Path to the lihaaf-managed dylib (spec §4.3).
+    /// Path to the lihaaf-managed dylib (the policy).
     pub managed_dylib: PathBuf,
     /// `target/release/deps` containing the rest of the link tree.
     pub deps_dir: PathBuf,
@@ -91,7 +86,7 @@ pub struct WorkerContext {
     /// uses `-C prefer-dynamic` (it depends on `libstd.so` from the
     /// toolchain).
     pub sysroot_lib_dir: PathBuf,
-    /// Snapshot of the four spec §4.5 invariants captured at session
+    /// Snapshot of the four the policy invariants captured at session
     /// startup. Re-checked before every per-fixture dispatch via
     /// [`crate::freshness::check`]; on drift, [`dispatch_pool`] /
     /// [`dispatch_serial`] short-circuit and bubble back a
@@ -149,7 +144,7 @@ impl WorkerContext {
 /// Result of a worker-pool dispatch.
 ///
 /// Carries the per-fixture results PLUS an optional freshness failure
-/// — if any fixture's per-dispatch §4.5 check fails, the pool stops
+/// — if any fixture's per-dispatch the policy check fails, the pool stops
 /// dispatching new work, drains the in-flight fixtures, and bubbles
 /// the failure back to [`crate::session::run`] for conversion to a
 /// session-level `Outcome::FreshnessDrift` exit.
@@ -158,14 +153,14 @@ pub struct DispatchOutcome {
     /// Per-fixture results in deterministic (lexicographic) order.
     /// Will be a partial set if `freshness_failure` is Some.
     pub results: Vec<FixtureResult>,
-    /// `Some` if a per-dispatch §4.5 invariant drifted; `None` on a
+    /// `Some` if a per-dispatch the policy invariant drifted; `None` on a
     /// clean run.
     pub freshness_failure: Option<FreshnessFailure>,
 }
 
-/// Permit pool for the spec §5.4 dynamic-parallelism rule.
+/// Permit pool for the policy dynamic-parallelism rule.
 ///
-/// Spec §5.4: "If RSS exceeds `per_fixture_memory_mb`, the worker is
+/// the policy: "If RSS exceeds `per_fixture_memory_mb`, the worker is
 /// terminated … The fixture is marked needs-retry; parallelism is
 /// dynamically reduced (floor: 1); the fixture re-dispatches
 /// serially. If the serial retry also OOMs … the verdict is
@@ -250,7 +245,7 @@ impl ParallelismGate {
         }
     }
 
-    /// Permanently reduce the cap by 1 (floor: 1). Spec §5.4: "first
+    /// Permanently reduce the cap by 1 (floor: 1). the policy: "first
     /// OOM, parallelism drops by 1 (floor: 1) for ALL subsequent
     /// dispatches."
     ///
@@ -360,12 +355,12 @@ pub fn resolve_extern_paths(
 
 /// Run all fixtures serially. Returns one [`FixtureResult`] per
 /// fixture in the input order, plus an optional freshness failure if
-/// the spec §4.5 per-dispatch check tripped on any fixture (in which
+/// the policy per-dispatch check tripped on any fixture (in which
 /// case the iteration short-circuits and the result vector is
 /// partial).
 ///
 /// Used both for `-j 1` and as the fallback when parallelism reduces
-/// to 1 mid-session. Serial mode is already at the spec §5.4 floor;
+/// to 1 mid-session. Serial mode is already at the policy floor;
 /// OOM events still observe the retry path inside `run_one` but the
 /// "reduce parallelism by 1" rule is a no-op at the floor.
 pub fn dispatch_serial(
@@ -375,7 +370,7 @@ pub fn dispatch_serial(
 ) -> DispatchOutcome {
     let mut results: Vec<FixtureResult> = Vec::with_capacity(fixtures.len());
     for fx in fixtures {
-        // Spec §4.5: re-check the four invariants before each dispatch.
+        // the policy: re-check the four invariants before each dispatch.
         if let Err(failure) = freshness::check(&ctx.freshness_snapshot) {
             return DispatchOutcome {
                 results,
@@ -395,9 +390,9 @@ pub fn dispatch_serial(
 /// Run all fixtures in a worker pool of up to `parallelism` threads.
 /// Verdicts emit in completion order via `progress`; the returned vec
 /// is sorted lexicographically by `relative_path` for the deterministic
-/// final report (spec §5.7).
+/// final report (the policy).
 ///
-/// Each worker thread re-checks the four spec §4.5 invariants
+/// Each worker thread re-checks the four the policy invariants
 /// (existence / mtime / SHA-256 / rustc release) before pulling its
 /// next fixture from the queue. On the first detected failure, the
 /// failure is recorded into a shared `Mutex<Option<FreshnessFailure>>`
@@ -407,11 +402,11 @@ pub fn dispatch_serial(
 /// reported normally); the contract is "no NEW dispatches once the
 /// drift is detected."
 ///
-/// Spec §5.4 dynamic-parallelism reduction: the pool is governed by an
+/// the policy dynamic-parallelism reduction: the pool is governed by an
 /// internal permit gate. On every harness-attributed OOM kill (the
 /// worker observes a harness-initiated kill on the initial attempt —
 /// NOT external OS OOMkills, which surface as `WORKER_CRASHED` per
-/// the §5.4 attribution heuristic), the gate's cap drops by 1
+/// the policy attribution heuristic), the gate's cap drops by 1
 /// permanently (floor: 1). Subsequent dispatches across all workers
 /// run at the reduced cap. The reduction is on the FIRST OOM, not
 /// the double-OOM `MEMORY_EXHAUSTED` case — this matches
@@ -449,7 +444,7 @@ pub fn dispatch_pool(
                 if !g.acquire() {
                     break;
                 }
-                // Spec §4.5: re-check before pulling. If a peer worker
+                // the policy: re-check before pulling. If a peer worker
                 // already recorded a failure, exit promptly without
                 // pulling more work.
                 if ff.lock().unwrap().is_some() {
@@ -474,7 +469,7 @@ pub fn dispatch_pool(
                 match next {
                     Some(fx) => {
                         let outcome = run_one(&fx, &c);
-                        // Spec §5.4: every harness-attributed OOM
+                        // the policy: every harness-attributed OOM
                         // event reduces the cap by 1, on every
                         // subsequent dispatch across all workers.
                         if outcome.harness_oom_observed {
@@ -519,22 +514,22 @@ pub fn dispatch_pool(
 
 /// Per-fixture run outcome — the published `FixtureResult` plus an
 /// internal `harness_oom_observed` flag the dispatch loop consumes to
-/// drive the spec §5.4 dynamic-parallelism reduction.
+/// drive the policy dynamic-parallelism reduction.
 struct RunOneOutcome {
     result: FixtureResult,
     /// True iff the harness initiated an OOM kill on this fixture (on
-    /// either the initial attempt or the serial retry). Spec §5.4
+    /// either the initial attempt or the serial retry). the policy
     /// requires parallelism to drop by 1 (floor: 1) on EVERY OOM-
     /// attributed kill, not just on `MEMORY_EXHAUSTED` (the "double
     /// OOM" case). External kills (OS OOMkiller, signal from outside,
     /// etc.) do NOT set this flag — they surface as `WORKER_CRASHED`
-    /// per the OOM-attribution heuristic in spec §5.4.
+    /// per the OOM-attribution heuristic in the policy.
     harness_oom_observed: bool,
 }
 
 /// Run one fixture: spawn rustc, monitor RSS + timeout, capture
 /// stderr, classify, normalize, diff, optionally bless. Cleanup is
-/// unconditional (spec §5.3) unless `keep_output` is set.
+/// unconditional (the policy) unless `keep_output` is set.
 fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
     let started = Instant::now();
     let workdir = ctx.session_temp.join(fixture_workdir_name(fx));
@@ -560,13 +555,13 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
     let (mut verdict, mut warning) = match outcome.kind {
         MonitorKind::Exited { ok, stderr } => classify_exit(fx, ctx, ok, &stderr),
         MonitorKind::HarnessKilledMemory => {
-            // Spec §5.4 first OOM. Mark the OOM observation BEFORE
+            // the policy first OOM. Mark the OOM observation BEFORE
             // the retry so the dispatch loop reduces parallelism
             // regardless of whether the retry succeeds, fails, or
             // double-OOMs. The reduction is on the first OOM, not the
             // double-OOM case.
             harness_oom_observed = true;
-            // Per §5.4, retry serially once before declaring
+            // Per the policy, retry serially once before declaring
             // MEMORY_EXHAUSTED.
             let _ = std::fs::remove_dir_all(&workdir);
             let _ = std::fs::create_dir_all(&workdir);
@@ -605,7 +600,7 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
         }
     }
 
-    // Cleanup. Per §5.3 + cleanup-failure policy.
+    // Cleanup. Per the policy + cleanup-failure policy.
     let cleanup_failure = if ctx.keep_output {
         None
     } else {
@@ -665,11 +660,11 @@ fn fixture_workdir_name(fx: &Fixture) -> String {
 /// Classify a worker's exit into a verdict plus an optional warning.
 ///
 /// The warning (currently only `LARGE_SNAPSHOT`) rides alongside the
-/// verdict — it does not change the exit-code aggregation. See spec
-/// §7.2 complexity ceiling for the soft / hard thresholds.
+/// verdict — it does not change the exit-code aggregation. See
+/// the policy complexity ceiling for the soft / hard thresholds.
 ///
 /// UTF-8 validation is performed here, exactly once, on the raw
-/// rustc-emitted bytes. Spec §7.2 ("Non-UTF-8 / binary-content
+/// rustc-emitted bytes. the policy ("Non-UTF-8 / binary-content
 /// handling"): any byte sequence that fails UTF-8 validation surfaces
 /// as `MALFORMED_DIAGNOSTIC` with the precise byte offset of the first
 /// invalid byte (returned by [`std::str::Utf8Error::valid_up_to`]).
@@ -681,7 +676,7 @@ fn classify_exit(
     ok: bool,
     stderr_bytes: &[u8],
 ) -> (Verdict, Option<FixtureWarning>) {
-    // Spec §7.2: a non-UTF-8 byte in rustc's diagnostic stream IS the
+    // the policy: a non-UTF-8 byte in rustc's diagnostic stream IS the
     // verdict. We do not silently substitute replacement characters
     // and continue — that would erase the signal that adopters need
     // in order to debug whatever produced the bad bytes.
@@ -716,7 +711,7 @@ fn classify_exit(
                     let result = crate::diff::unified_diff(&expected, &normalized);
                     // Capture LARGE_SNAPSHOT before consuming the
                     // result via diff_to_verdict — the `warn` flag is
-                    // the only place this spec §7.2 condition surfaces.
+                    // the only place this the policy condition surfaces.
                     let warning = match &result {
                         crate::diff::DiffResult::Diff { warn: true, .. } => {
                             Some(FixtureWarning::LargeSnapshot {
@@ -866,7 +861,7 @@ struct MonitorOutcome {
 
 enum MonitorKind {
     /// rustc finished. `stderr` is the raw bytes — UTF-8 validation is
-    /// the caller's responsibility. Spec §7.2 mandates that any
+    /// the caller's responsibility. the policy mandates that any
     /// non-UTF-8 sequence in the diagnostic stream surfaces as a
     /// `MALFORMED_DIAGNOSTIC` verdict with the precise byte offset of
     /// the first invalid byte; lossy decoding here would erase that
@@ -1003,7 +998,7 @@ fn spawn_and_monitor(
                 // rustc returns 1 for compilation errors, 101 for ICEs.
                 // We treat everything except a signal-kill as a normal
                 // exit; a signal-kill (when not harness-initiated) is
-                // crash territory per §5.5.
+                // crash territory per the policy.
                 #[cfg(unix)]
                 let signal = std::os::unix::process::ExitStatusExt::signal(&status);
                 #[cfg(not(unix))]
@@ -1120,7 +1115,7 @@ fn terminate(child: &mut Child) {
 /// Send a signal to a Unix process via `libc::kill`.
 ///
 /// Wrapper kept for call-site clarity — the signal numbers (SIGTERM=15
-/// at the call site above) stay close to the spec §5.4 termination
+/// at the call site above) stay close to the policy termination
 /// contract rather than scattering `libc::SIGTERM` across the module.
 #[cfg(unix)]
 unsafe fn libc_kill(pid: i32, sig: i32) {
@@ -1305,7 +1300,7 @@ plain text line
 
     #[test]
     fn classify_exit_emits_malformed_diagnostic_with_correct_offset() {
-        // Spec §7.2: a non-UTF-8 byte in rustc's stderr surfaces as
+        // the policy: a non-UTF-8 byte in rustc's stderr surfaces as
         // MALFORMED_DIAGNOSTIC with the precise byte offset of the
         // first invalid byte. We construct a minimal WorkerContext
         // (no rustc spawn — classify_exit is pure given its inputs)

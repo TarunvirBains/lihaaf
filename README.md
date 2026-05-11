@@ -1,18 +1,23 @@
 # lihaaf
 
-> **lihaaf** ("quilt", Urdu) — a Rust test harness purpose-built for
-> fast, parallel, non-flaky compile-fail and compile-pass testing of
-> proc-macros and macro-emitted code. Named after Ismat Chughtai's 1942
-> short story.
+**lihaaf** ("quilt", Urdu) is a Rust test harness for fast compile-fail
+and compile-pass workflows, built to make local developer iteration feel
+less painful. It started as a practical project: we had too many slow
+`cargo test` cycles, and we wanted a predictable, parallel harness that
+keeps the sharp edges out of the way.
 
-`lihaaf` builds the consumer crate **once** as a Rust dynamic library
-at session startup, then dispatches each fixture as a per-fixture
-`rustc` invocation that links the dylib via `--extern`. Per-fixture
-cost drops from cargo's full per-project rebuild (5–15 minutes on a
-200-fixture corpus) to seconds because fixtures don't rebuild the
-consumer; they link to it.
+Its workflow is inspired by the compile-fail/compile-pass fixture style
+that [Trybuild](https://github.com/dtolnay/trybuild) made practical, while
+shifting the implementation to a
+single-compile shared dylib model for faster local iteration.
 
-The full v0.1 specification lives at [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
+`lihaaf` builds the consumer crate as a dynamic library once per session,
+then runs each fixture with `rustc`, linking the prebuilt dylib via
+`--extern`. For larger fixture suites this usually means seconds instead of
+minutes, because fixtures share that one build.
+
+There’s a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
+Most of the code aims to stay readable first, not process-centric.
 
 ## Quick start
 
@@ -68,13 +73,12 @@ laptop).
 | `--use-symlink` | Skip the lihaaf-managed dylib copy; symlink instead. Saves disk + time, but unsafe under concurrent cargo activity. |
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
 
-Full flag reference: spec §8.
+Flag behavior aligns with the v0.1 contract documented in the spec companion.
 
 ## Verdicts and exit codes
 
-Per spec §10. Every fixture produces exactly one verdict. The binary's
-exit code is the maximum (most severe) of all per-fixture verdicts
-plus session-level outcomes.
+Every fixture produces exactly one verdict. The run exits with the most
+severe code from the fixture verdicts and session-level outcomes.
 
 | Verdict | Exit code |
 |---|---|
@@ -95,35 +99,34 @@ plus session-level outcomes.
 ## What lihaaf is not
 
 - **A `cargo test` replacement.** lihaaf ships as a separate `cargo
-  lihaaf` subcommand. There is no `#[test]` integration (spec §11.5);
+  lihaaf` subcommand. There is no `#[test]` integration yet;
   the `cargo test` scheduler would compromise lihaaf's parallelism +
   OOM containment + drift detection.
-- **Coverage / multi-target / IDE / watch.** All anchored deferrals in
-  spec §11. Each cut has a concrete reason and a future-trigger or
-  "never" classification.
-- **A regex-engine consumer.** Zero regex-engine deps, ever (spec
-  §6.1). The normalizer is hand-rolled byte-level matching.
+- **Coverage / multi-target / IDE / watch.** Those are deferred on
+  purpose. Each cut has a concrete reason and a future-trigger or
+  explicit "never" classification.
+- **A regex-engine consumer.** Zero regex-engine deps, ever. The
+  normalizer is hand-rolled byte-level matching.
 
-## Implementer choices recorded in v0.1
+## Tradeoffs and choices (a.k.a. what we picked)
 
-The spec deliberately softened four sections so the implementer could
-make calls. Here is what landed:
+A few implementation spots are intentionally open. We picked the
+paths that felt easiest to keep stable and debuggable in day-to-day use:
 
-- **Cargo invocation for the dylib build** (§4.2):
+- **Cargo invocation for the dylib build**:
   `cargo rustc -p <crate> --lib --release --crate-type=dylib
   --message-format=json-render-diagnostics --target-dir=<lihaaf-build>`
   with `RUSTFLAGS="-C prefer-dynamic"`. Validated end-to-end by the
-  inventory-on-dylib spike (verdict `GO_NATIVE`; see spec §13). A
-  dedicated target dir
-  (`target/lihaaf-build/`) avoids thrashing the adopter's normal
+  inventory-on-dylib spike (verdict `GO_NATIVE`). A dedicated target dir
+  (`target/lihaaf-build/`) avoids thrashing the normal
   `cargo build` cache, since `RUSTFLAGS` is part of cargo's
   fingerprint.
 
-- **File copy primitive** (§4.3): `std::fs::copy`. POSIX semantics on
-  Linux/macOS, `CopyFileW` on Windows. The v0.2 reflink optimization
-  remains an anchored deferral (spec §4.3 final paragraph).
+- **File copy primitive**: `std::fs::copy`. It’s plain and predictable:
+  POSIX semantics on Linux/macOS, `CopyFileW` on Windows. Reflink is
+  still deferred for v0.2.
 
-- **Per-platform RSS sampling API** (§5.4 / KR-5):
+- **Per-platform RSS sampling**:
   - Linux: `/proc/<pid>/statm` (2nd field × `sysconf(_SC_PAGESIZE)`).
     Verified against rustc child processes on `rustc 1.95.0` on Linux
     6.x x86_64.
@@ -133,14 +136,14 @@ make calls. Here is what landed:
     `MEMORY_EXHAUSTED`. v0.x lands proper macOS / Windows sampling
     APIs.
 
-- **Sampling interval** (§5.4): 100 ms. Short enough to catch a
+- **Sampling interval**: 100 ms. Short enough to catch a
   runaway monomorphization before the OS OOMkiller fires; long enough
   that the sampler thread stays out of the worker's way.
 
-- **Termination signal pair** (§5.4): SIGTERM, then SIGKILL after a
-  2-second grace.
+- **Termination signal pair**: SIGTERM, then SIGKILL after a 2-second
+  grace.
 
-- **Diff algorithm** (§7.2): hand-rolled Myers diff (Eugene W. Myers,
+- **Diff algorithm**: hand-rolled Myers diff (Eugene W. Myers,
   1986). Worst-case O((N+M)·D) where D is the edit-script length; for
   proc-macro stderr (10s–100s of lines, low edit distance when
   something changed) this is microseconds.
@@ -150,18 +153,18 @@ make calls. Here is what landed:
 - `clap` 4 — CLI parsing.
 - `toml` 1 — `[package.metadata.lihaaf]` parsing.
 - `serde` + `serde_json` — manifest write/read.
-- `sha2` — dylib SHA-256 for the freshness check (spec §4.5).
+- `sha2` — dylib SHA-256 for stale-state checks.
 - `tempfile` — per-session temporary directory.
-- `libc` 0.2 (Unix only) — `kill(2)` for spec §5.4 worker
-  termination and `sysconf(_SC_PAGESIZE)` for spec §5.4 RSS unit
-  conversion. The canonical curated source for POSIX FFI signatures.
+- `libc` 0.2 (Unix only) — `kill(2)` for worker termination and
+  `sysconf(_SC_PAGESIZE)` for RSS unit conversion. The canonical curated
+  source for POSIX FFI signatures.
 
 No regex engine. No diff library.
 
 ## Stability
 
-The CLI surface (every flag in spec §8.2), exit codes (§10.3), and
-snapshot byte format (§7.4) are part of the v0.1 stable surface.
+The CLI surface, exit codes, and snapshot byte format are part of the
+v0.1 stable contract.
 Adding new flags / verdicts / normalization rules is non-breaking
 across minor versions; removals or semantics changes are reserved for
 v1.0.

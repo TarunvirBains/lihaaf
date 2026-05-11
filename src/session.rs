@@ -1,9 +1,10 @@
-//! Session lifecycle (spec §4.1 stages 1–9).
+//! Session lifecycle and command flow.
 //!
 //! ## Orchestration
 //!
-//! `run` walks the spec's stages in order. Any stage's failure is
-//! terminal — we do not skip ahead. The eight stages map onto:
+//! `run` follows a simple staged flow. If one stage fails, we stop
+//! immediately and report the failure; it keeps behavior predictable.
+//! The flow maps roughly onto:
 //!
 //! 1. Configuration load → [`crate::config::load`].
 //! 2. Toolchain capture → [`crate::toolchain::capture`].
@@ -15,11 +16,11 @@
 //! 8. Result aggregation → [`Report`].
 //! 9. Exit → caller maps [`Report::exit_code`] to a process exit code.
 //!
-//! ## Why a single function (and not a builder)
+//! ## Why one function (and not a builder)
 //!
-//! v0.1's caller is the binary. There's exactly one entry point, the
-//! arguments come from clap. A builder would over-design the surface
-//! for one consumer. v0.x revisits if a second consumer materializes.
+//! The binary is the main caller and clap is the argument source, so we keep
+//! one entry point. A builder would be extra complexity for the current
+//! usage model. If a second consumer appears later, we can revisit this.
 
 use std::path::{Path, PathBuf};
 
@@ -50,7 +51,7 @@ pub struct Report {
 }
 
 impl Report {
-    /// Compute the binary's exit code per spec §10.3 (max-severity rule).
+    /// Compute the binary's exit code per the policy (max-severity rule).
     pub fn exit_code(&self) -> ExitCode {
         let mut code = ExitCode::Ok;
         for r in &self.results {
@@ -81,7 +82,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     // Stage 2 — toolchain capture.
     let toolchain = toolchain::capture()?;
 
-    // List mode short-circuits before the dylib build (spec §8.2).
+    // List mode short-circuits before the dylib build (the policy).
     if cli.list {
         let fixtures = discovery::collect(&config, &crate_root, &cli.filter)?;
         for f in &fixtures {
@@ -97,7 +98,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     let workspace_target = dylib::workspace_target_dir(&manifest_path);
     let lihaaf_build_dir = workspace_target.join("lihaaf-build");
 
-    // `--no-cache` (spec §8.2): force a fresh dylib build by removing
+    // `--no-cache` (the policy): force a fresh dylib build by removing
     // any existing manifest BEFORE stage 3. The dylib build below
     // unconditionally re-issues `cargo rustc`, but cargo's own cache
     // can still produce a stale-feeling artifact if the toml/feature
@@ -165,7 +166,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     };
     let manifest_dest = workspace_target.join("lihaaf/manifest.json");
     manifest.write(&manifest_dest)?;
-    // Capture the four spec §4.5 invariants from session-startup state.
+    // Capture the four the policy invariants from session-startup state.
     // Re-checked per-fixture inside the worker pool dispatch loop.
     let freshness_snapshot = FreshnessSnapshot {
         managed_dylib_path: managed_path.clone(),
@@ -188,7 +189,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         );
     }
 
-    // Parallelism cap (spec §5.2).
+    // Parallelism cap (the policy).
     let parallelism = compute_parallelism(&cli, &config);
     if !cli.quiet {
         eprintln!("lihaaf: parallelism = {parallelism}");
@@ -228,7 +229,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     extra_names.extend(worker_ctx.dev_deps.iter().cloned());
     worker_ctx.extern_paths = worker::resolve_extern_paths(&build_out.deps_dir, &extra_names)?;
 
-    // Mid-session toolchain drift check (spec §4.6). We compare the
+    // Mid-session toolchain drift check (the policy). We compare the
     // captured rustc release against a fresh capture. Cheap; cost is
     // dwarfed by the per-fixture rustc.
     let post_capture = toolchain::capture()?;
@@ -258,14 +259,14 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         // Emit any non-fatal per-fixture warning on a separate line,
         // independent of `--quiet` (a warning that the adopter asked
         // for visibility into shouldn't be hidden by a verdict-only
-        // quiet mode). Spec §7.2 mandates the LARGE_SNAPSHOT line.
+        // quiet mode). the policy mandates the LARGE_SNAPSHOT line.
         emit_fixture_warnings(r);
     });
     let wall_ms = dispatch_start.elapsed().as_millis() as u64;
 
-    // Spec §4.5: a per-dispatch freshness failure is a session-level
+    // the policy: a per-dispatch freshness failure is a session-level
     // hard fail. Convert to the typed outcome and let main() map it
-    // onto exit code 67 (same as §4.6 TOOLCHAIN_DRIFT).
+    // onto exit code 67 (same as the policy TOOLCHAIN_DRIFT).
     if let Some(failure) = dispatch_outcome.freshness_failure {
         return Err(Error::Session(Outcome::FreshnessDrift {
             invariant: failure.invariant_label().to_string(),
@@ -282,14 +283,13 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
 
     // Preserve the per-session temp directory in two cases:
     //
-    // 1. `--keep-output` is set (local-development escape hatch — spec
-    //    §5.3 / §8.2 #--keep-output).
-    // 2. Any fixture's per-fixture workdir cleanup failed (spec §5.3:
+    // 1. `--keep-output` is set (local-development escape hatch).
+    // 2. Any fixture's per-fixture workdir cleanup failed (`CLEANUP_RESIDUE` case):
     //    "the session-temp parent directory is NOT removed at session
     //    end if it contains residue from a CLEANUP_FAILED fixture —
     //    leaving the residue visible is more useful than silently
     //    retrying a removal that already failed once."). Re-emitted as
-    //    spec §10.2 `CLEANUP_RESIDUE` outcome's preserve-on-disk side
+    //    outcome's preserve-on-disk side
     //    of the contract.
     //
     // `tempfile::TempDir` removes the directory on drop; `std::mem::
@@ -335,15 +335,14 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
     }
     eprintln!("lihaaf: {summary}");
 
-    // Spec §3.3 worked-example aggregate line. The bucketed counts in
+    // The aggregate line is kept to four buckets (`ok`, `failed`,
     // `summary` above carry every verdict label; this line re-projects
-    // the four buckets the spec calls out by name into the
+    // the four buckets we report as `ok`, `failed`, `timeout`,
     // adopter-friendly shape `<n> ok, <n> failed, <n> timeout, <n>
     // memory_exhausted` so CI greps and dashboards have a single fixed
     // line to anchor on regardless of which exotic verdicts a run
     // produced. `failed` aggregates everything that is neither pass
-    // nor a "spec-named" bucket (timeout / memory_exhausted) — matches
-    // the worked-example wording in §3.3.
+    // nor the named timeout/memory_exhausted buckets.
     let aggregate = aggregate_counts(results);
     eprintln!(
         "lihaaf: {} ok, {} failed, {} timeout, {} memory_exhausted",
@@ -408,11 +407,11 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
 }
 
 /// Render any non-fatal warnings attached to a fixture result. Today
-/// this is only `LARGE_SNAPSHOT` (spec §7.2 complexity ceiling), but
+/// this is only `LARGE_SNAPSHOT` (the policy complexity ceiling), but
 /// the emit point is generic so additional warning kinds slot in
 /// without touching the dispatch loop.
 ///
-/// Format pinned by spec §7.2:
+/// Format pinned by the policy:
 /// `lihaaf: LARGE_SNAPSHOT <path> (<expected>/<actual> lines)`.
 /// The line is separate from the verdict line and does NOT alter the
 /// fixture's verdict or the session exit code.
@@ -433,7 +432,7 @@ fn emit_fixture_warnings(r: &FixtureResult) {
     }
 }
 
-/// Bucketed counts for the spec §3.3 aggregate line. Captures the four
+/// Bucketed counts for the policy aggregate line. Captures the four
 /// names the worked example calls out (`ok`, `failed`, `timeout`,
 /// `memory_exhausted`); every other verdict folds into `failed` so the
 /// line stays at four buckets regardless of how exotic a run got.
@@ -445,14 +444,14 @@ struct AggregateCounts {
     memory_exhausted: usize,
 }
 
-/// Bucket per-fixture verdicts into the four §3.3 aggregate names.
+/// Bucket per-fixture verdicts into the four the policy aggregate names.
 ///
 /// `Ok` and `Blessed` count as `ok` (verdict-table footnote: "Treated as
 /// OK for exit-code purposes"). `Timeout` and `MemoryExhausted` are
-/// dedicated buckets per §3.3. Everything else (`SnapshotDiff`,
+/// dedicated buckets per the policy. Everything else (`SnapshotDiff`,
 /// `SnapshotMissing`, `WorkerCrashed`, `MalformedDiagnostic`,
 /// `SnapshotDiffTooLarge`, `ExpectedFailButPassed`,
-/// `ExpectedPassButFailed`) folds into `failed` — the §3.3 worked
+/// `ExpectedPassButFailed`) folds into `failed` — the policy worked
 /// example's "failed" bucket is the catch-all for "fixture did not pass
 /// for a reason other than timeout or memory_exhausted."
 fn aggregate_counts(results: &[FixtureResult]) -> AggregateCounts {
@@ -481,8 +480,8 @@ fn compute_parallelism(cli: &Cli, config: &config::Config) -> usize {
         None => cpu_cap, // honest fallback when the platform doesn't expose RAM
     };
     // `cli.jobs` is guaranteed positive: the clap value parser rejects
-    // `-j 0` per spec §5.2. The platform-derived `cpu_cap` and `ram_cap`
-    // both clamp to >= 1 above. No defensive `max(1)` here — the spec
+    // `-j 0` per the policy. The platform-derived `cpu_cap` and `ram_cap`
+    // both clamp to >= 1 above. No defensive `max(1)` here — the
     // forbids the silent-zero coercion.
     let cli_cap: usize = cli.jobs.map(|n| n as usize).unwrap_or(cpu_cap);
     cli_cap.min(ram_cap)
