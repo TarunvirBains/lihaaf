@@ -2,10 +2,10 @@
 //!
 //! ## Why no regex
 //!
-//! Spec §6.1 + djogi-wide policy: zero regex-engine deps. Every
-//! substitution here is fixed-string with a known prefix. The cost of
-//! hand-rolling is bounded — each substitution maps to a fixture, and
-//! validation against the trybuild corpus is the safety net.
+//! Spec §6.1 mandates zero regex-engine deps. Every substitution here
+//! is fixed-string with a known prefix. The cost of hand-rolling is
+//! bounded — each substitution maps to a fixture, and validation
+//! against a real-world consumer corpus is the safety net.
 //!
 //! ## Implementer choice — iteration recipe
 //!

@@ -9,13 +9,12 @@
 //! - **Cargo invocation** (§4.2 — "implementer chooses the specific
 //!   cargo subcommand"): `cargo rustc -p <crate> --lib --release
 //!   --crate-type=dylib --message-format=json` with
-//!   `RUSTFLAGS="-C prefer-dynamic"`. Validated by the 2026-05-10 spike
-//!   (`docs/research/2026-05-10-inventory-on-dylib-spike.md`,
-//!   verdict `GO_NATIVE`). `cargo rustc` is the only subcommand whose
-//!   `--crate-type=dylib` flag overrides the consumer's `[lib]`
-//!   declaration without modifying its `Cargo.toml`. The `prefer-dynamic`
-//!   flag is required for compile-time-link consumers per the spike's Q1
-//!   results (path 1b).
+//!   `RUSTFLAGS="-C prefer-dynamic"`. Validated end-to-end by the
+//!   inventory-on-dylib spike (verdict `GO_NATIVE`; spec §13).
+//!   `cargo rustc` is the only subcommand whose `--crate-type=dylib`
+//!   flag overrides the consumer's `[lib]` declaration without
+//!   modifying its `Cargo.toml`. The `prefer-dynamic` flag is required
+//!   for compile-time-link consumers per the spike's findings.
 //!
 //! - **File copy primitive** (§4.3 — "implementer chooses the file-copy
 //!   primitive"): `std::fs::copy`. POSIX semantics on Linux/macOS,
@@ -88,7 +87,7 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     // Compose the cargo invocation. `cargo rustc` is the subcommand
     // because it's the only one whose `--crate-type=dylib` overrides
     // `[lib]` without modifying the consumer's Cargo.toml — confirmed
-    // by the 2026-05-10 inventory-on-dylib spike.
+    // by the inventory-on-dylib spike (spec §13).
     let mut cmd = Command::new("cargo");
     cmd.arg("rustc")
         .arg("-p")
@@ -107,9 +106,9 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     }
 
     // `-C prefer-dynamic` is required for compile-time-link consumers
-    // (spike path 1b). RUSTFLAGS is part of cargo's fingerprint hash;
-    // a dedicated target dir avoids thrashing the adopter's normal
-    // `cargo build` cache.
+    // (per the spike's findings). RUSTFLAGS is part of cargo's
+    // fingerprint hash; a dedicated target dir avoids thrashing the
+    // adopter's normal `cargo build` cache.
     let prior_rustflags = std::env::var("RUSTFLAGS").unwrap_or_default();
     let new_rustflags = if prior_rustflags.is_empty() {
         "-C prefer-dynamic".to_string()

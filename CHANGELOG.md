@@ -16,11 +16,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   sampling), snapshot bless mode, `[package.metadata.lihaaf]` config
   parsing, fixture discovery with `compile_fail_marker` directory
   classification, full rustdoc on every public item.
-- The full v0.1 specification at `docs/spec/lihaaf-v0.1.md`.
-- The inventory-on-dylib spike research artifact at
-  `docs/research/2026-05-10-inventory-on-dylib-spike.md` (validated
-  the dylib propagation path before any v0.1 code was written;
-  outcome: GO_NATIVE).
+- The full v0.1 specification at `docs/spec/lihaaf-v0.1.md`. The
+  underlying mechanism (inventory propagation across the dylib
+  boundary) was validated end-to-end in a research spike before any
+  v0.1 code was written; outcome `GO_NATIVE`. The spec's §13 appendix
+  records the contingency catalog for revalidation cadence.
 
 ### Pending before v0.1.0 release
 - Codex Spark xhigh review identified four BLOCK findings and three

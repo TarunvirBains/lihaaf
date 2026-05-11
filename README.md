@@ -112,9 +112,9 @@ make calls. Here is what landed:
 - **Cargo invocation for the dylib build** (§4.2):
   `cargo rustc -p <crate> --lib --release --crate-type=dylib
   --message-format=json-render-diagnostics --target-dir=<lihaaf-build>`
-  with `RUSTFLAGS="-C prefer-dynamic"`. Validated by the 2026-05-10
-  inventory-on-dylib spike (`docs/research/2026-05-10-inventory-on-dylib-spike.md`,
-  verdict `GO_NATIVE`). A dedicated target dir
+  with `RUSTFLAGS="-C prefer-dynamic"`. Validated end-to-end by the
+  inventory-on-dylib spike (verdict `GO_NATIVE`; see spec §13). A
+  dedicated target dir
   (`target/lihaaf-build/`) avoids thrashing the adopter's normal
   `cargo build` cache, since `RUSTFLAGS` is part of cargo's
   fingerprint.

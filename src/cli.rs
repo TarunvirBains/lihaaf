@@ -9,7 +9,7 @@
 //! The flag set is small enough that hand-rolling argv parsing would
 //! work, but `clap` carries the `--help` / `--version` rendering and
 //! the validation we'd otherwise re-implement (positive integer for
-//! `-j`, etc.). `clap` is already a workspace-pinned dep through djogi-cli.
+//! `-j`, etc.).
 
 use std::path::PathBuf;
 

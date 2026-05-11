@@ -251,7 +251,7 @@ framework consumer, each fixture binary is roughly 50–100 MB. For a
 237-fixture corpus this totals approximately 12–24 GB of persistent
 disk from a single trybuild run. That is large enough to exhaust GitHub
 Actions' default runner disk in one CI job — hence the "Free disk space"
-step that djogi-sized projects add to their GHA workflows.
+step that large-corpus projects add to their GHA workflows.
 
 **Lihaaf with copy-default.** The lihaaf-managed dylib copy is
 approximately the size of one such binary (~30 MB for a typical consumer
@@ -1713,11 +1713,9 @@ The spike validated end-to-end whether:
 
 **Spike status: resolved 2026-05-10 with outcome `GO_NATIVE`.**
 
-Both (a) and (b) succeed. `cargo rustc -p djogi --lib --release
+Both (a) and (b) succeed. `cargo rustc -p <consumer> --lib --release
 --crate-type=dylib` works, and inventory submissions propagate across
 the dylib boundary natively. The spec's main body holds verbatim.
-The full research note is at
-`docs/research/2026-05-10-inventory-on-dylib-spike.md`.
 
 This appendix retains the full contingency catalog for two purposes:
 (1) revalidation cadence — if the dylib ABI or inventory behavior
