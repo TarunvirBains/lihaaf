@@ -72,20 +72,19 @@ impl NormalizationContext {
 /// raw stderr from rustc (already UTF-8; the caller has already
 /// validated this).
 ///
-/// ## Implicit drop: `error: aborting due to N previous error`
+/// ## No silent drops
 ///
-/// rustc emits a summary diagnostic at the end of every failed
-/// compilation. trybuild filters this (it adds nothing — the per-error
-/// diagnostics already conveyed the failure) and adopters bless
-/// snapshots accordingly. lihaaf matches trybuild's behavior here so
-/// migration off trybuild does not require touching every snapshot
-/// solely to drop the summary line.
-///
-/// The category is not in spec §6.2's list, but spec §6.3 does not
-/// forbid additional drops. Treating this as a lihaaf-side default
-/// rather than a configurable choice keeps the snapshot byte-shape
-/// reachable without per-adopter normalization config; v0.x can add
-/// `--keep-rustc-summary` if an adopter ever needs the line back.
+/// Spec §6.2 enumerates the rewrite categories; spec §6.3 enumerates
+/// what is explicitly preserved (diagnostic text, span pointers, help
+/// text, suggestions). Neither list authorizes dropping the rustc
+/// summary lines `error: aborting due to N previous error[s]` or
+/// `For more information about this error, try \`rustc --explain ...\``.
+/// Earlier drafts of this module dropped both — that was a Cluster 10.3
+/// finding from the Codex Spark xhigh review (POST_BETA, handled here).
+/// The summary lines are now preserved byte-for-byte; adopters whose
+/// snapshots were blessed against the prior dropping behavior will need
+/// to re-bless once, but the snapshot signal is no longer fighting the
+/// adopter's reading of rustc's actual output.
 pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) -> String {
     // Pre-compute placeholder list, longest prefix first. Adopters may
     // not have one of these (e.g., no CARGO_HOME); skip empties.
@@ -104,20 +103,14 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     let unified_le = unify_line_endings(input);
 
     // Step 2: per-line path substitution + TypeId + trailing space.
+    // Per spec §6.2 / §6.3 (and the Cluster 10.3 fix from the Codex
+    // Spark xhigh review), rustc's summary lines (`error: aborting due
+    // to N previous error[s]`, `For more information about this error,
+    // try \`rustc --explain ...\``) are NOT dropped — they pass through
+    // alongside every other diagnostic line and are subject only to the
+    // normalization categories §6.2 enumerates.
     let mut intermediate: Vec<String> = Vec::with_capacity(unified_le.lines().count() + 1);
     for line in unified_le.lines() {
-        // Drop the rustc summary line (see module rustdoc). Match the
-        // shape "error: aborting due to N previous error" / "errors".
-        if is_rustc_aborting_summary(line) {
-            continue;
-        }
-        // Drop the `For more information about this error, try
-        // `rustc --explain ...` follow-up — same rationale as the
-        // aborting line: trybuild filters; matching keeps byte shape
-        // consistent across migrations.
-        if line.starts_with("For more information about this error") {
-            continue;
-        }
         let mut s = line.to_string();
         // Backslashes inside path-shaped substrings: spec §6.2 says we
         // rewrite "backslashes in paths" — restricted to `--> ` and
@@ -227,29 +220,6 @@ fn rewrite_type_ids(s: &str) -> String {
         }
     }
     out
-}
-
-/// True when the line is rustc's "aborting due to N previous error"
-/// summary (see normalizer rustdoc for rationale).
-fn is_rustc_aborting_summary(line: &str) -> bool {
-    // Shape: `error: aborting due to <N> previous error[s]` where N is
-    // an ASCII digit run. Stdlib byte checks; no regex.
-    let prefix = "error: aborting due to ";
-    let rest = match line.strip_prefix(prefix) {
-        Some(r) => r,
-        None => return false,
-    };
-    // Skip the digit run.
-    let bytes = rest.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() && bytes[i].is_ascii_digit() {
-        i += 1;
-    }
-    if i == 0 {
-        return false;
-    }
-    let tail = &rest[i..];
-    tail == " previous error" || tail == " previous errors"
 }
 
 /// Unify CRLF / CR / LF to LF. Spec §6.2.
@@ -413,25 +383,33 @@ mod tests {
     }
 
     #[test]
-    fn drops_rustc_aborting_summary() {
+    fn preserves_rustc_aborting_summary() {
+        // Spec §6.2 / §6.3: the summary line is not in the rewrite
+        // category list and is not in the explicit-preserve list either,
+        // but §6.3 makes preservation the default ("Diagnostic text …
+        // preserved byte-for-byte"). Earlier drafts dropped this line;
+        // Cluster 10.3 of the Codex Spark xhigh review reverted that.
         let input = "error: bad\nerror: aborting due to 1 previous error\n";
         let c = ctx("/p", "/r");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "error: bad");
+        assert_eq!(out, "error: bad\nerror: aborting due to 1 previous error");
     }
 
     #[test]
-    fn drops_rustc_aborting_plural() {
+    fn preserves_rustc_aborting_plural() {
         let input = "error: a\nerror: b\nerror: aborting due to 42 previous errors\n";
         let c = ctx("/p", "/r");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "error: a\nerror: b");
+        assert_eq!(
+            out,
+            "error: a\nerror: b\nerror: aborting due to 42 previous errors"
+        );
     }
 
     #[test]
-    fn does_not_drop_unrelated_aborting_text() {
+    fn preserves_unrelated_aborting_text() {
         let input = "error: aborting due to user request\n";
         let c = ctx("/p", "/r");
         let dir = PathBuf::from("/p/x");
@@ -440,13 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn drops_rustc_explain_pointer() {
+    fn preserves_rustc_explain_pointer() {
+        // Spec §6.2 / §6.3: the explain pointer is preserved byte-for-
+        // byte. Earlier drafts dropped it; Cluster 10.3 of the Codex
+        // Spark xhigh review reverted that.
         let input =
             "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.\n";
         let c = ctx("/p", "/r");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "error: bad");
+        assert_eq!(
+            out,
+            "error: bad\n\nFor more information about this error, try `rustc --explain E0463`."
+        );
     }
 
     #[test]
