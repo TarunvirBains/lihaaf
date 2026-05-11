@@ -1,0 +1,53 @@
+[package]
+name = "lihaaf"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Tarunvir Bains"]
+rust-version = "1.95"
+repository = "https://github.com/TarunvirBains/lihaaf"
+homepage = "https://github.com/TarunvirBains/lihaaf"
+description = "Fast, parallel, non-flaky proc-macro test harness — single-dylib build, per-fixture rustc dispatch"
+keywords = ["proc-macro", "trybuild", "compile-fail", "testing", "snapshot"]
+categories = ["development-tools::testing"]
+readme = "README.md"
+
+# Pre-1.0; not yet on crates.io. Flip when v0.1 ships.
+publish = false
+
+# Cargo subcommand convention — `cargo-<subcommand>` binary on PATH is
+# discovered by cargo. The binary strips its first argument (`lihaaf`)
+# before dispatching.
+[[bin]]
+name = "cargo-lihaaf"
+path = "src/bin/cargo-lihaaf.rs"
+
+[dependencies]
+# CLI parsing — derive feature for the typed argument struct in `cli.rs`.
+clap = { version = "4", features = ["derive"] }
+
+# Cargo manifest parsing — `[package.metadata.lihaaf]` is read out of the
+# consumer's Cargo.toml. `toml` crate handles parse + value-typing
+# (string / integer / array of strings).
+toml = "0.8"
+
+# Manifest serialization — `target/lihaaf/manifest.json` is JSON for
+# trivial CLI debuggability (`jq`, etc.). `preserve_order` keeps key
+# ordering stable across rewrites.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# SHA-256 over the dylib bytes. The freshness check (Section 4.5)
+# re-hashes on every fixture dispatch.
+sha2 = "0.11"
+
+# Per-session temp directory. Stable, dep-tree light, handles
+# cross-platform temp roots correctly. The alternative is hand-rolling
+# `std::env::temp_dir() + random suffix + cleanup` and silently getting
+# it wrong on macOS where the system can rotate temp roots.
+tempfile = "3"
+
+# No regex engine, ever. Spec §6.1. Every string match in this crate
+# goes through stdlib `str::find`, `split_once`, `starts_with`, byte
+# iteration, or sorted-slice lookup. Linux per-process RSS uses
+# `/proc/<pid>/statm` directly via stdlib file I/O — no syscall crate.

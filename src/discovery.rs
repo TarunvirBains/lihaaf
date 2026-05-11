@@ -1,0 +1,249 @@
+//! Fixture discovery (spec §4.1 stage 6).
+//!
+//! Walk `fixture_dirs` non-recursively, collect `*.rs` files, classify
+//! each as compile_pass or compile_fail by the directory-name marker,
+//! sort lexicographically for deterministic output (spec §5.7).
+//!
+//! ## Why non-recursive
+//!
+//! Spec §3.2 says "non-recursive within each" `fixture_dir`. Adopters
+//! who want deep trees list each sub-directory in `fixture_dirs`. The
+//! flat layout matches the trybuild convention adopters already use,
+//! and avoids ambiguity about which directory's name carries the
+//! `compile_fail_marker`.
+//!
+//! ## Filtering
+//!
+//! `--filter <substr>` (spec §8.2) is applied here. Multiple filters
+//! are OR'd. Substring match against the relative path from the
+//! crate root (forward-slash form for cross-OS determinism).
+
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+use crate::error::{Error, Outcome};
+use crate::util;
+
+/// One discovered fixture.
+#[derive(Debug, Clone)]
+pub struct Fixture {
+    /// Absolute path to the `.rs` file.
+    pub path: PathBuf,
+    /// Relative path from the crate root, forward-slash form. Used for
+    /// `--filter`, the report, and the snapshot's relative-path
+    /// rendering.
+    pub relative_path: String,
+    /// Stem (filename without extension), for naming the per-fixture
+    /// output binary.
+    pub stem: String,
+    /// Whether the fixture is compile_pass or compile_fail (per the
+    /// directory-name marker).
+    pub kind: FixtureKind,
+}
+
+/// Compile-pass vs compile-fail classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureKind {
+    /// Adopter expects rustc to exit 0.
+    CompilePass,
+    /// Adopter expects rustc to exit non-zero AND the normalized stderr
+    /// to match the sibling `.stderr` snapshot.
+    CompileFail,
+}
+
+/// Collect all fixtures under `fixture_dirs`, sort lexicographically,
+/// apply `--filter` if non-empty.
+///
+/// `crate_root` is the directory containing the consumer crate's
+/// `Cargo.toml`. Relative `fixture_dirs` resolve against it.
+pub fn collect(
+    config: &Config,
+    crate_root: &Path,
+    filters: &[String],
+) -> Result<Vec<Fixture>, Error> {
+    let mut existing_dirs: Vec<PathBuf> = Vec::new();
+    for dir in &config.fixture_dirs {
+        let resolved = if dir.is_absolute() {
+            dir.clone()
+        } else {
+            crate_root.join(dir)
+        };
+        if resolved.is_dir() {
+            existing_dirs.push(resolved);
+        }
+    }
+
+    if existing_dirs.is_empty() {
+        return Err(Error::Session(Outcome::ConfigInvalid {
+            message: format!(
+                "fixture_dirs resolves to zero existing directories under {}.\nWhy this matters: nothing to test.\n  Configured: {:?}",
+                crate_root.display(),
+                config.fixture_dirs
+            ),
+        }));
+    }
+
+    let marker = config.compile_fail_marker.as_str();
+    let mut fixtures: Vec<Fixture> = Vec::new();
+
+    for dir in &existing_dirs {
+        let kind = classify_dir(dir, marker);
+        let entries = std::fs::read_dir(dir)
+            .map_err(|e| Error::io(e, "reading fixture_dirs", Some(dir.clone())))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|e| Error::io(e, "iterating fixture_dirs", Some(dir.clone())))?;
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let stem = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("")
+                .to_string();
+            let rel = util::relative_to(&p, crate_root);
+            fixtures.push(Fixture {
+                path: p,
+                relative_path: rel,
+                stem,
+                kind,
+            });
+        }
+    }
+
+    // Sort lexicographically by relative path for deterministic
+    // emission (spec §5.7).
+    fixtures.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+
+    if !filters.is_empty() {
+        fixtures.retain(|f| filters.iter().any(|sub| f.relative_path.contains(sub)));
+    }
+
+    Ok(fixtures)
+}
+
+/// Classify a fixture directory by name. Spec §3.2: a fixture is
+/// compile_fail if its enclosing directory name (relative to crate
+/// root) contains the `compile_fail_marker` substring; otherwise
+/// compile_pass.
+///
+/// We classify by the directory's filename (the leaf segment), not the
+/// full path — the marker ought to be discriminating at the leaf, and
+/// fixture authors shouldn't accidentally have a parent path
+/// containing the marker (e.g., a `tests/compile_fail/sub/` adopter
+/// who wants the `sub/` to be compile_pass).
+fn classify_dir(dir: &Path, marker: &str) -> FixtureKind {
+    let leaf = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    if leaf.contains(marker) {
+        FixtureKind::CompileFail
+    } else {
+        FixtureKind::CompilePass
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    fn cfg(dirs: Vec<&str>, marker: &str) -> Config {
+        Config {
+            dylib_crate: "consumer".into(),
+            extern_crates: vec!["consumer".into()],
+            fixture_dirs: dirs.into_iter().map(PathBuf::from).collect(),
+            features: vec![],
+            edition: "2021".into(),
+            dev_deps: vec![],
+            compile_fail_marker: marker.to_string(),
+            fixture_timeout_secs: 90,
+            per_fixture_memory_mb: 1024,
+            raw_metadata: toml::Value::Table(toml::map::Map::new()),
+        }
+    }
+
+    #[test]
+    fn classification_matches_directory_marker() {
+        let tmp = tempdir().unwrap();
+        let cf = tmp.path().join("tests/lihaaf/compile_fail");
+        let cp = tmp.path().join("tests/lihaaf/compile_pass");
+        fs::create_dir_all(&cf).unwrap();
+        fs::create_dir_all(&cp).unwrap();
+        fs::write(cf.join("a.rs"), "").unwrap();
+        fs::write(cp.join("b.rs"), "").unwrap();
+
+        let c = cfg(
+            vec!["tests/lihaaf/compile_fail", "tests/lihaaf/compile_pass"],
+            "compile_fail",
+        );
+        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        assert_eq!(fixtures.len(), 2);
+        let a = fixtures.iter().find(|f| f.stem == "a").unwrap();
+        let b = fixtures.iter().find(|f| f.stem == "b").unwrap();
+        assert_eq!(a.kind, FixtureKind::CompileFail);
+        assert_eq!(b.kind, FixtureKind::CompilePass);
+    }
+
+    #[test]
+    fn sort_is_lexicographic() {
+        let tmp = tempdir().unwrap();
+        let cf = tmp.path().join("tests/lihaaf/compile_fail");
+        fs::create_dir_all(&cf).unwrap();
+        for name in ["zeta.rs", "alpha.rs", "mu.rs"] {
+            fs::write(cf.join(name), "").unwrap();
+        }
+        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        let stems: Vec<_> = fixtures.iter().map(|f| f.stem.clone()).collect();
+        assert_eq!(stems, vec!["alpha".to_string(), "mu".into(), "zeta".into()]);
+    }
+
+    #[test]
+    fn filter_or_match_against_relative_path() {
+        let tmp = tempdir().unwrap();
+        let cf = tmp.path().join("tests/lihaaf/compile_fail");
+        fs::create_dir_all(&cf).unwrap();
+        fs::write(cf.join("phase7_aaa.rs"), "").unwrap();
+        fs::write(cf.join("phase8_bbb.rs"), "").unwrap();
+        fs::write(cf.join("unrelated.rs"), "").unwrap();
+        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(
+            &c,
+            tmp.path(),
+            &["phase7".to_string(), "phase8".to_string()],
+        )
+        .unwrap();
+        assert_eq!(fixtures.len(), 2);
+    }
+
+    #[test]
+    fn empty_fixture_dirs_is_session_outcome() {
+        let tmp = tempdir().unwrap();
+        let c = cfg(vec!["nope/never/exists", "also/missing"], "compile_fail");
+        let err = collect(&c, tmp.path(), &[]).unwrap_err();
+        match err {
+            Error::Session(Outcome::ConfigInvalid { message }) => {
+                assert!(message.contains("zero existing directories"));
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_recursive_within_each_dir() {
+        let tmp = tempdir().unwrap();
+        let cf = tmp.path().join("tests/lihaaf/compile_fail");
+        let nested = cf.join("subdir");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(cf.join("flat.rs"), "").unwrap();
+        fs::write(nested.join("deep.rs"), "").unwrap();
+        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        let stems: Vec<_> = fixtures.iter().map(|f| f.stem.clone()).collect();
+        assert_eq!(stems, vec!["flat".to_string()]);
+    }
+}

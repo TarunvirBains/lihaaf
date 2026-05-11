@@ -1,0 +1,25 @@
+# Local-only working docs (mirrors sister-repo convention)
+docs/superpowers/
+
+# Rust build artifacts
+/target
+
+# lihaaf-managed dylib copies and per-session temp dirs (when adopters
+# point lihaaf at their own tree from this repo's root, which they
+# shouldn't but might during local dev)
+/target/lihaaf
+/target/lihaaf-build
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environment files
+.env
+.env.local
+
+# Claude Code working state (per-session, not source)
+.claude/
