@@ -36,8 +36,8 @@
 //! ## Complexity ceiling (spec §7.2)
 //!
 //! - Soft ceiling (10K lines per side): full diff runs, no warning.
-//! - Between soft and hard ceiling: full diff runs, [`DiffResult::warn`]
-//!   carries the line counts so the caller can emit `LARGE_SNAPSHOT`.
+//! - Between soft and hard ceiling: full diff runs, [`DiffResult::Diff`]
+//!   carries `warn = true` so the caller can emit `LARGE_SNAPSHOT`.
 //! - Above hard (100K lines): we return [`DiffResult::TooLarge`] without
 //!   running the algorithm; the caller maps to `SNAPSHOT_DIFF_TOO_LARGE`.
 

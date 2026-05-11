@@ -148,13 +148,15 @@ make calls. Here is what landed:
 ## Dependencies
 
 - `clap` 4 — CLI parsing.
-- `toml` 0.8 — `[package.metadata.lihaaf]` parsing.
+- `toml` 1 — `[package.metadata.lihaaf]` parsing.
 - `serde` + `serde_json` — manifest write/read.
 - `sha2` — dylib SHA-256 for the freshness check (spec §4.5).
 - `tempfile` — per-session temporary directory.
+- `libc` 0.2 (Unix only) — `kill(2)` for spec §5.4 worker
+  termination and `sysconf(_SC_PAGESIZE)` for spec §5.4 RSS unit
+  conversion. The canonical curated source for POSIX FFI signatures.
 
-No regex engine. No diff library. No `libc` crate (we use a tiny
-`unsafe extern "C"` block for `kill(2)` / `sysconf(_SC_PAGESIZE)`).
+No regex engine. No diff library.
 
 ## Stability
 

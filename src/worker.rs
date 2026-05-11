@@ -407,17 +407,16 @@ pub fn dispatch_serial(
 /// reported normally); the contract is "no NEW dispatches once the
 /// drift is detected."
 ///
-/// Spec §5.4 dynamic-parallelism reduction: the pool is governed by a
-/// [`ParallelismGate`] permit pool. On every harness-attributed OOM
-/// kill (the worker observes `MonitorKind::HarnessKilledMemory` on
-/// the initial attempt — NOT external OS OOMkills, which surface as
-/// `WORKER_CRASHED` per the §5.4 attribution heuristic), the worker
-/// calls [`ParallelismGate::reduce`] to permanently drop the cap by
-/// 1 (floor: 1). Subsequent dispatches across all workers run at the
-/// reduced cap. The reduction is on the FIRST OOM, not the
-/// double-OOM `MEMORY_EXHAUSTED` case — this matches "parallelism is
-/// dynamically reduced (floor: 1); the fixture re-dispatches
-/// serially."
+/// Spec §5.4 dynamic-parallelism reduction: the pool is governed by an
+/// internal permit gate. On every harness-attributed OOM kill (the
+/// worker observes a harness-initiated kill on the initial attempt —
+/// NOT external OS OOMkills, which surface as `WORKER_CRASHED` per
+/// the §5.4 attribution heuristic), the gate's cap drops by 1
+/// permanently (floor: 1). Subsequent dispatches across all workers
+/// run at the reduced cap. The reduction is on the FIRST OOM, not
+/// the double-OOM `MEMORY_EXHAUSTED` case — this matches
+/// "parallelism is dynamically reduced (floor: 1); the fixture
+/// re-dispatches serially."
 pub fn dispatch_pool(
     fixtures: &[Fixture],
     ctx: &WorkerContext,

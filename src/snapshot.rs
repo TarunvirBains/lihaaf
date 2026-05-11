@@ -4,7 +4,7 @@
 //!
 //! Spec §7.4: snapshots are written with LF line endings on every
 //! platform and a final newline. They are rewritten in full (no append;
-//! no in-place edit). [`write`] enforces both invariants.
+//! no in-place edit). [`write()`] enforces both invariants.
 //!
 //! ## `--bless` is destructive
 //!
