@@ -127,6 +127,23 @@ pub enum Outcome {
         /// The version observed at dispatch.
         current: String,
     },
+
+    /// One of the spec §4.5 freshness invariants drifted between the
+    /// per-session snapshot and a per-fixture dispatch. Maps onto the
+    /// existing `TOOLCHAIN_DRIFT` exit code (67) — the four invariants
+    /// are categorical kin (all four indicate "the dylib or the
+    /// toolchain we built against is no longer the one we're about to
+    /// link"). The `invariant` label names which of the four drifted
+    /// in stable form (`managed_dylib_path` / `dylib_mtime` /
+    /// `dylib_sha256` / `rustc_release`); the `detail` is a
+    /// pre-rendered diagnostic body.
+    FreshnessDrift {
+        /// Stable identifier for the invariant that drifted.
+        invariant: String,
+        /// Pre-rendered diagnostic body — see
+        /// [`crate::freshness::FreshnessFailure::detail`].
+        detail: String,
+    },
 }
 
 impl Outcome {
@@ -137,6 +154,13 @@ impl Outcome {
             Self::DylibBuildFailed { .. } => crate::exit::ExitCode::DylibBuildFailed,
             Self::DylibNotFound { .. } => crate::exit::ExitCode::DylibNotFound,
             Self::ToolchainDrift { .. } => crate::exit::ExitCode::ToolchainDrift,
+            // Freshness drift maps to the same exit code as
+            // TOOLCHAIN_DRIFT (67) — the four §4.5 invariants are
+            // categorically the same class of failure (the dylib or
+            // toolchain shifted under us mid-session), and adopters'
+            // CI scripts already key on 67 for "blow the cache and
+            // re-run."
+            Self::FreshnessDrift { .. } => crate::exit::ExitCode::ToolchainDrift,
         }
     }
 }
@@ -166,6 +190,12 @@ impl fmt::Display for Outcome {
                 write!(
                     f,
                     "lihaaf: rustc version drifted mid-session.\n  original (at dylib build): {original}\n  current (at dispatch):     {current}\nRe-run `cargo lihaaf` to rebuild against the current toolchain."
+                )
+            }
+            Self::FreshnessDrift { invariant, detail } => {
+                write!(
+                    f,
+                    "lihaaf: freshness invariant `{invariant}` drifted mid-session.\n  {detail}\nRe-run `cargo lihaaf` to rebuild against the current dylib + toolchain. (Spec §4.5)"
                 )
             }
         }

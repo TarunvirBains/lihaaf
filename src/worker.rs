@@ -42,6 +42,7 @@ use std::time::{Duration, Instant};
 use crate::config::Config;
 use crate::discovery::{Fixture, FixtureKind};
 use crate::error::Error;
+use crate::freshness::{self, FreshnessFailure, FreshnessSnapshot};
 use crate::normalize::{self, NormalizationContext};
 use crate::snapshot;
 use crate::verdict::{CleanupFailure, FixtureResult, FixtureWarning, MalformedSource, Verdict};
@@ -90,6 +91,13 @@ pub struct WorkerContext {
     /// uses `-C prefer-dynamic` (it depends on `libstd.so` from the
     /// toolchain).
     pub sysroot_lib_dir: PathBuf,
+    /// Snapshot of the four spec §4.5 invariants captured at session
+    /// startup. Re-checked before every per-fixture dispatch via
+    /// [`crate::freshness::check`]; on drift, [`dispatch_pool`] /
+    /// [`dispatch_serial`] short-circuit and bubble back a
+    /// [`FreshnessFailure`] for [`crate::session::run`] to convert
+    /// into an `Outcome::FreshnessDrift` exit.
+    pub freshness_snapshot: FreshnessSnapshot,
 }
 
 impl WorkerContext {
@@ -107,6 +115,7 @@ impl WorkerContext {
         session_temp: PathBuf,
         norm_ctx: NormalizationContext,
         sysroot: &Path,
+        freshness_snapshot: FreshnessSnapshot,
     ) -> Self {
         let extra_extern_crates = config
             .extern_crates
@@ -132,8 +141,26 @@ impl WorkerContext {
             extern_paths: HashMap::new(),
             norm_ctx,
             sysroot_lib_dir: sysroot.join("lib"),
+            freshness_snapshot,
         }
     }
+}
+
+/// Result of a worker-pool dispatch.
+///
+/// Carries the per-fixture results PLUS an optional freshness failure
+/// — if any fixture's per-dispatch §4.5 check fails, the pool stops
+/// dispatching new work, drains the in-flight fixtures, and bubbles
+/// the failure back to [`crate::session::run`] for conversion to a
+/// session-level `Outcome::FreshnessDrift` exit.
+#[derive(Debug)]
+pub struct DispatchOutcome {
+    /// Per-fixture results in deterministic (lexicographic) order.
+    /// Will be a partial set if `freshness_failure` is Some.
+    pub results: Vec<FixtureResult>,
+    /// `Some` if a per-dispatch §4.5 invariant drifted; `None` on a
+    /// clean run.
+    pub freshness_failure: Option<FreshnessFailure>,
 }
 
 /// Resolve `--extern` paths for crates other than the dylib_crate.
@@ -206,46 +233,92 @@ pub fn resolve_extern_paths(
 }
 
 /// Run all fixtures serially. Returns one [`FixtureResult`] per
-/// fixture, in the input order. Used both for `-j 1` and as the
-/// fallback when parallelism reduces to 1 mid-session.
+/// fixture in the input order, plus an optional freshness failure if
+/// the spec §4.5 per-dispatch check tripped on any fixture (in which
+/// case the iteration short-circuits and the result vector is
+/// partial).
+///
+/// Used both for `-j 1` and as the fallback when parallelism reduces
+/// to 1 mid-session.
 pub fn dispatch_serial(
     fixtures: &[Fixture],
     ctx: &WorkerContext,
     progress: impl Fn(&FixtureResult),
-) -> Vec<FixtureResult> {
+) -> DispatchOutcome {
     let mut results: Vec<FixtureResult> = Vec::with_capacity(fixtures.len());
     for fx in fixtures {
+        // Spec §4.5: re-check the four invariants before each dispatch.
+        if let Err(failure) = freshness::check(&ctx.freshness_snapshot) {
+            return DispatchOutcome {
+                results,
+                freshness_failure: Some(failure),
+            };
+        }
         let r = run_one(fx, ctx);
         progress(&r);
         results.push(r);
     }
-    results
+    DispatchOutcome {
+        results,
+        freshness_failure: None,
+    }
 }
 
 /// Run all fixtures in a worker pool of up to `parallelism` threads.
 /// Verdicts emit in completion order via `progress`; the returned vec
 /// is sorted lexicographically by `relative_path` for the deterministic
 /// final report (spec §5.7).
+///
+/// Each worker thread re-checks the four spec §4.5 invariants
+/// (existence / mtime / SHA-256 / rustc release) before pulling its
+/// next fixture from the queue. On the first detected failure, the
+/// failure is recorded into a shared `Mutex<Option<FreshnessFailure>>`
+/// and the queue is drained — every worker observes the failure on
+/// its next loop iteration and exits without dispatching new work.
+/// In-flight rustc invocations are NOT cancelled (their results are
+/// reported normally); the contract is "no NEW dispatches once the
+/// drift is detected." The first failure to reach the mutex wins;
+/// subsequent failures (e.g., a different invariant tripped on a
+/// different worker) are silently dropped, matching the §4.5 "ANY
+/// divergence" framing.
 pub fn dispatch_pool(
     fixtures: &[Fixture],
     ctx: &WorkerContext,
     parallelism: usize,
     progress: impl Fn(&FixtureResult) + Send + Sync + 'static,
-) -> Vec<FixtureResult> {
+) -> DispatchOutcome {
     if parallelism <= 1 {
         return dispatch_serial(fixtures, ctx, |r| progress(r));
     }
     let (tx, rx) = mpsc::channel::<FixtureResult>();
     let queue: Arc<Mutex<std::collections::VecDeque<Fixture>>> =
         Arc::new(Mutex::new(fixtures.iter().cloned().collect()));
+    let freshness_failure: Arc<Mutex<Option<FreshnessFailure>>> = Arc::new(Mutex::new(None));
     let ctx = Arc::new(ctx.clone());
     let mut handles = Vec::with_capacity(parallelism);
     for _ in 0..parallelism {
         let q = Arc::clone(&queue);
         let c = Arc::clone(&ctx);
         let t = tx.clone();
+        let ff = Arc::clone(&freshness_failure);
         let h = thread::spawn(move || {
             loop {
+                // Spec §4.5: re-check before pulling. If a peer worker
+                // already recorded a failure, exit promptly without
+                // pulling more work.
+                if ff.lock().unwrap().is_some() {
+                    break;
+                }
+                if let Err(failure) = freshness::check(&c.freshness_snapshot) {
+                    let mut slot = ff.lock().unwrap();
+                    if slot.is_none() {
+                        *slot = Some(failure);
+                    }
+                    // Drain the queue so other workers don't pull
+                    // anything new after observing the failure.
+                    q.lock().unwrap().clear();
+                    break;
+                }
                 let next = {
                     let mut g = q.lock().unwrap();
                     g.pop_front()
@@ -274,7 +347,11 @@ pub fn dispatch_pool(
         let _ = h.join();
     }
     results.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    results
+    let failure = freshness_failure.lock().unwrap().take();
+    DispatchOutcome {
+        results,
+        freshness_failure: failure,
+    }
 }
 
 /// Run one fixture: spawn rustc, monitor RSS + timeout, capture
@@ -938,15 +1015,10 @@ plain text line
         assert!(out.contains("plain text line"));
     }
 
-    #[test]
-    fn classify_exit_emits_malformed_diagnostic_with_correct_offset() {
-        // Spec §7.2: a non-UTF-8 byte in rustc's stderr surfaces as
-        // MALFORMED_DIAGNOSTIC with the precise byte offset of the
-        // first invalid byte. We construct a minimal WorkerContext
-        // (no rustc spawn — classify_exit is pure given its inputs)
-        // and feed it bytes containing `0xFE` after 3 valid prefix
-        // bytes. Expected: byte_offset == 3.
-        let ctx = WorkerContext {
+    /// Minimal `WorkerContext` for unit tests of pure-function logic
+    /// (e.g., `classify_exit`). Synthetic paths; no rustc spawn.
+    fn unit_test_ctx() -> WorkerContext {
+        WorkerContext {
             crate_root: PathBuf::from("/p"),
             managed_dylib: PathBuf::from("/p/target/lihaaf/lib.so"),
             deps_dir: PathBuf::from("/p/target/release/deps"),
@@ -968,7 +1040,24 @@ plain text line
                 cargo_registry: None,
             },
             sysroot_lib_dir: PathBuf::from("/r/lib"),
-        };
+            freshness_snapshot: FreshnessSnapshot {
+                managed_dylib_path: PathBuf::from("/p/target/lihaaf/lib.so"),
+                original_mtime_unix_secs: 0,
+                original_sha256: "0".repeat(64),
+                original_rustc_release_line: "rustc 1.95.0 (test 2026-01-01)".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn classify_exit_emits_malformed_diagnostic_with_correct_offset() {
+        // Spec §7.2: a non-UTF-8 byte in rustc's stderr surfaces as
+        // MALFORMED_DIAGNOSTIC with the precise byte offset of the
+        // first invalid byte. We construct a minimal WorkerContext
+        // (no rustc spawn — classify_exit is pure given its inputs)
+        // and feed it bytes containing `0xFE` after 3 valid prefix
+        // bytes. Expected: byte_offset == 3.
+        let ctx = unit_test_ctx();
         let fx = Fixture {
             path: PathBuf::from("/p/tests/lihaaf/compile_fail/foo.rs"),
             relative_path: "tests/lihaaf/compile_fail/foo.rs".into(),
@@ -994,29 +1083,7 @@ plain text line
 
     #[test]
     fn classify_exit_malformed_at_offset_zero_when_first_byte_invalid() {
-        let ctx = WorkerContext {
-            crate_root: PathBuf::from("/p"),
-            managed_dylib: PathBuf::from("/p/target/lihaaf/lib.so"),
-            deps_dir: PathBuf::from("/p/target/release/deps"),
-            dylib_crate: "consumer".into(),
-            extra_extern_crates: vec![],
-            dev_deps: vec![],
-            features: vec![],
-            edition: "2021".into(),
-            timeout_secs: 90,
-            memory_mb_ceiling: 1024,
-            bless: false,
-            verbose: false,
-            keep_output: false,
-            session_temp: PathBuf::from("/tmp/lihaaf-session"),
-            extern_paths: HashMap::new(),
-            norm_ctx: NormalizationContext {
-                workspace_root: PathBuf::from("/p"),
-                sysroot: PathBuf::from("/r"),
-                cargo_registry: None,
-            },
-            sysroot_lib_dir: PathBuf::from("/r/lib"),
-        };
+        let ctx = unit_test_ctx();
         let fx = Fixture {
             path: PathBuf::from("/p/tests/lihaaf/compile_fail/x.rs"),
             relative_path: "tests/lihaaf/compile_fail/x.rs".into(),

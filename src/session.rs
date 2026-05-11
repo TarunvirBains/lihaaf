@@ -29,6 +29,7 @@ use crate::discovery;
 use crate::dylib;
 use crate::error::{Error, Outcome};
 use crate::exit::ExitCode;
+use crate::freshness::FreshnessSnapshot;
 use crate::manifest::Manifest;
 use crate::normalize::NormalizationContext;
 use crate::toolchain;
@@ -96,6 +97,29 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     let workspace_target = dylib::workspace_target_dir(&manifest_path);
     let lihaaf_build_dir = workspace_target.join("lihaaf-build");
 
+    // `--no-cache` (spec §8.2): force a fresh dylib build by removing
+    // any existing manifest BEFORE stage 3. The dylib build below
+    // unconditionally re-issues `cargo rustc`, but cargo's own cache
+    // can still produce a stale-feeling artifact if the toml/feature
+    // set hasn't drifted; deleting the manifest is the documented
+    // "blow the cache" lever ("Equivalent to deleting
+    // target/lihaaf/manifest.json before invocation"). We also remove
+    // the lihaaf-build target dir so cargo's incremental cache is
+    // fully bypassed — that's what an adopter scripting `--no-cache`
+    // is asking for.
+    if cli.no_cache {
+        let manifest_dest = workspace_target.join("lihaaf/manifest.json");
+        if manifest_dest.exists() {
+            let _ = std::fs::remove_file(&manifest_dest);
+        }
+        if lihaaf_build_dir.exists() {
+            let _ = std::fs::remove_dir_all(&lihaaf_build_dir);
+        }
+        if !cli.quiet {
+            eprintln!("lihaaf: --no-cache: removed any prior manifest + lihaaf-build dir");
+        }
+    }
+
     // Stage 3 — dylib build.
     let build_started = std::time::Instant::now();
     let build_out = dylib::build(&dylib::BuildParams {
@@ -141,10 +165,14 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     };
     let manifest_dest = workspace_target.join("lihaaf/manifest.json");
     manifest.write(&manifest_dest)?;
-    // `--no-cache` forces a fresh dylib build but does not change any
-    // other behavior; the rebuild already happened above. The flag is
-    // honored simply by not consulting any prior manifest.
-    let _ = cli.no_cache;
+    // Capture the four spec §4.5 invariants from session-startup state.
+    // Re-checked per-fixture inside the worker pool dispatch loop.
+    let freshness_snapshot = FreshnessSnapshot {
+        managed_dylib_path: managed_path.clone(),
+        original_mtime_unix_secs: dylib_mtime,
+        original_sha256: dylib_sha.clone(),
+        original_rustc_release_line: toolchain.release_line.clone(),
+    };
 
     // Stage 6 — fixture discovery.
     let fixtures = discovery::collect(&config, &crate_root, &cli.filter)?;
@@ -192,6 +220,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         session_temp_path.clone(),
         norm_ctx,
         &toolchain.sysroot,
+        freshness_snapshot,
     );
 
     // Resolve `--extern` paths for the non-dylib crates.
@@ -213,7 +242,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     // Stage 7 — worker pool dispatch.
     let dispatch_start = std::time::Instant::now();
     let progress_quiet = cli.quiet;
-    let results = worker::dispatch_pool(&fixtures, &worker_ctx, parallelism, move |r| {
+    let dispatch_outcome = worker::dispatch_pool(&fixtures, &worker_ctx, parallelism, move |r| {
         if progress_quiet {
             if !r.verdict.is_pass() {
                 eprintln!("lihaaf: {} {}", r.verdict.label(), r.relative_path);
@@ -233,6 +262,17 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         emit_fixture_warnings(r);
     });
     let wall_ms = dispatch_start.elapsed().as_millis() as u64;
+
+    // Spec §4.5: a per-dispatch freshness failure is a session-level
+    // hard fail. Convert to the typed outcome and let main() map it
+    // onto exit code 67 (same as §4.6 TOOLCHAIN_DRIFT).
+    if let Some(failure) = dispatch_outcome.freshness_failure {
+        return Err(Error::Session(Outcome::FreshnessDrift {
+            invariant: failure.invariant_label().to_string(),
+            detail: failure.detail(),
+        }));
+    }
+    let results = dispatch_outcome.results;
 
     // Stage 8 — result aggregation.
     let cleanup_residue = results.iter().any(|r| r.cleanup_failure.is_some());

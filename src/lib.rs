@@ -34,6 +34,7 @@
 //! | [`toolchain`] | Capture `rustc --version --verbose` for drift checks. |
 //! | [`dylib`] | `cargo rustc --crate-type=dylib` invocation, copy mechanic. |
 //! | [`manifest`] | `target/lihaaf/manifest.json` schema + atomic write. |
+//! | [`freshness`] | Per-dispatch §4.5 invariant re-check (mtime / SHA-256 / rustc). |
 //! | [`discovery`] | Walk `fixture_dirs`, classify pass/fail, sort. |
 //! | [`worker`] | Per-fixture `rustc` spawn, RSS sampling, OOM, timeout. |
 //! | [`normalize`] | Stderr normalization (no regex; stdlib only). |
@@ -60,6 +61,7 @@ pub mod discovery;
 pub mod dylib;
 pub mod error;
 pub mod exit;
+pub mod freshness;
 pub mod manifest;
 pub mod normalize;
 pub mod session;
