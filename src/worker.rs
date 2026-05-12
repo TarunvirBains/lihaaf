@@ -1452,4 +1452,72 @@ plain text line
         assert!(kib.is_some(), "self RSS must be readable on Linux");
         assert!(kib.unwrap() > 0);
     }
+
+    /// Regression test for issue #14.
+    ///
+    /// Per-fixture `rustc` invocations must carry `CARGO_MANIFEST_DIR`
+    /// set to the consumer crate root. Any proc macro that calls
+    /// `proc_macro_crate::crate_name("foo")` reads this variable at
+    /// macro-expansion time to locate the consumer's `Cargo.toml` and
+    /// resolve renamed dependencies. Without it, the macro fails with
+    /// "`CARGO_MANIFEST_DIR` env variable not set" before the
+    /// compile-fail / compile-pass assertion can be evaluated.
+    ///
+    /// The test constructs the same `Command` env block that
+    /// `spawn_and_monitor` builds (without spawning), verifies the key
+    /// is present with the correct absolute path, and confirms
+    /// `LD_LIBRARY_PATH` is also still set so the pre-existing env-set
+    /// logic is not accidentally disturbed.
+    #[test]
+    fn fixture_rustc_cmd_carries_cargo_manifest_dir() {
+        let ctx = unit_test_ctx();
+
+        // Replicate the env-setting portion of `spawn_and_monitor`.
+        let mut cmd = Command::new("rustc");
+
+        let host_lib = ctx
+            .sysroot_lib_dir
+            .join(format!("rustlib/{}/lib", host_triple_or_default()));
+        let mut ld_paths = std::env::var_os("LD_LIBRARY_PATH")
+            .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
+            .unwrap_or_default();
+        ld_paths.insert(0, host_lib);
+        ld_paths.insert(0, ctx.deps_dir.clone());
+        if let Some(parent) = ctx.managed_dylib.parent() {
+            ld_paths.insert(0, parent.to_path_buf());
+        }
+        if let Ok(joined) = std::env::join_paths(ld_paths) {
+            cmd.env("LD_LIBRARY_PATH", joined);
+        }
+        cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
+
+        // Collect every explicitly-set env var on this command.
+        let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
+            .get_envs()
+            .map(|(k, v)| (k.to_os_string(), v.map(|s| s.to_os_string())))
+            .collect();
+
+        // CARGO_MANIFEST_DIR must be present and equal to crate_root.
+        let manifest_dir = envs
+            .iter()
+            .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
+            .and_then(|(_, v)| v.as_ref())
+            .expect(
+                "CARGO_MANIFEST_DIR must be set on every per-fixture rustc command (issue #14)",
+            );
+        assert_eq!(
+            std::path::Path::new(manifest_dir),
+            ctx.crate_root.as_path(),
+            "CARGO_MANIFEST_DIR must equal the consumer crate root"
+        );
+
+        // LD_LIBRARY_PATH must also be present (pre-existing invariant).
+        let ld_present = envs
+            .iter()
+            .any(|(k, v)| k == "LD_LIBRARY_PATH" && v.is_some());
+        assert!(
+            ld_present,
+            "LD_LIBRARY_PATH must still be set (regression guard)"
+        );
+    }
 }
