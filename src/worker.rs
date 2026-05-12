@@ -921,6 +921,21 @@ fn spawn_and_monitor(
         cmd.env("LD_LIBRARY_PATH", joined);
     }
 
+    // CARGO_MANIFEST_DIR: proc-macro crates that call
+    // `proc_macro_crate::crate_name("foo")` (e.g. any macro using the
+    // `proc-macro-crate` crate for renamed-dep resolution) read this
+    // env var at macro-expansion time to locate the consumer's
+    // `Cargo.toml`. Without it the macro cannot resolve renamed
+    // dependencies and fails with
+    // "`CARGO_MANIFEST_DIR` env variable not set."
+    //
+    // `cargo` sets this automatically during `cargo build` / `cargo
+    // test`, but because lihaaf's per-fixture rustc invocations bypass
+    // cargo, it must be supplied explicitly here.  The consumer crate
+    // root (the directory containing the consumer's Cargo.toml) is
+    // already tracked in `ctx.crate_root`; that is the correct value.
+    cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
+
     if ctx.verbose {
         eprintln!("lihaaf: rustc invocation:\n  {cmd:?}");
     }
