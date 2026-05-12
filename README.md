@@ -14,6 +14,26 @@ because fixtures share that one build.
 There’s a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
 Most of the code aims to stay readable first, not process-centric.
 
+## Measured adopter result
+
+`djogi-macros` is the canonical adopter that drove the v0.1 design. In
+the Phase 8.5 integration work, the same 237 proc-macro fixtures ran
+through lihaaf successfully:
+
+- `cargo lihaaf --list`: 237 fixtures discovered.
+- `cargo lihaaf --filter compile_pass`: 99 OK in 27.5 seconds.
+- `cargo lihaaf --filter compile_fail`: 138 OK in 15.0 seconds after
+  blessing lihaaf-owned snapshots.
+- Full lihaaf sweep: 237 OK in 31.8 seconds.
+
+The existing trybuild fallback still passed on the same source corpus
+(`trybuild_spatial_tests`: 1/1; `trybuild_tests`: 34/34), but the main
+trybuild suite took 1942.56 seconds in the same validation pass. Exact
+timings depend on hardware, target-dir state, and fixture shape; the
+important result is that lihaaf preserves the compile-fail/compile-pass
+workflow while making local iteration practical on large proc-macro
+suites.
+
 ## Quick start
 
 In the consumer crate's `Cargo.toml`:

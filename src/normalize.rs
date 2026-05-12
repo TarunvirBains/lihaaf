@@ -107,6 +107,13 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         if has_path_marker(&s) {
             s = rewrite_path_separators_in_path_lines(&s);
         }
+        // rustc's "long-type written to" note carries a target-dir +
+        // session-dir absolute path with a per-type hash in the
+        // filename. Collapse the whole quoted path to a single
+        // placeholder BEFORE path-prefix substitution so the inner
+        // path is replaced atomically and partial `$WORKSPACE` /
+        // `$DIR` matches don't leak through.
+        s = rewrite_long_type_note_path(&s);
         for (needle, repl) in &substitutions {
             // Replace every occurrence; the policy just says rewrite
             // matches. Using `str::replace` here would scan repeatedly
@@ -244,6 +251,61 @@ fn unify_line_endings(s: &str) -> String {
 /// the policy.
 fn has_path_marker(line: &str) -> bool {
     line.contains("--> ") || line.contains("::: ")
+}
+
+/// Rewrite the volatile path inside rustc's "long-type written to"
+/// note to a stable `$LONGTYPE_FILE` placeholder.
+///
+/// rustc emits this note when a type is too large to render inline:
+///
+/// ```text
+///     = note: the full name for the type has been written to '<path>'
+/// ```
+///
+/// (newer rustc versions phrase the same note as `the full type name
+/// has been written to '<path>'`). The path points at a spillover file
+/// inside lihaaf's per-session target sub-tree
+/// (`<target>/lihaaf-session-<rand>/<fixture-name>/<fixture>.long-type-<u64-hash>.txt`).
+/// Every component after the target root — the session-dir random
+/// suffix and the per-type hash in the filename — changes every run,
+/// so the raw note diff-fails against any blessed snapshot.
+///
+/// This rewrite collapses the entire quoted path to `$LONGTYPE_FILE`,
+/// preserving the surrounding note text (so adopters still see what
+/// rustc reported). Both note phrasings are accepted so a rustc
+/// release that swaps the wording doesn't force a re-bless.
+///
+/// The path is unreachable from the snapshot anyway (it lives only in
+/// the originating session's tempdir, often already cleaned up by the
+/// time anyone reads the snapshot), so collapsing it loses no
+/// actionable information.
+fn rewrite_long_type_note_path(line: &str) -> String {
+    // Two phrasings rustc has emitted historically. Match order is
+    // longest-first so a future variant that extends the prefix won't
+    // accidentally shadow a shorter match.
+    const MARKERS: &[&str] = &[
+        "the full name for the type has been written to '",
+        "the full type name has been written to '",
+    ];
+    for marker in MARKERS {
+        let Some(prefix_idx) = line.find(marker) else {
+            continue;
+        };
+        let after_quote = prefix_idx + marker.len();
+        // Find the closing single quote that terminates the path.
+        // If rustc ever emits an unterminated quote, pass the line
+        // through unchanged rather than guess where the path ends.
+        let Some(close_rel) = line[after_quote..].find('\'') else {
+            return line.to_string();
+        };
+        let close_abs = after_quote + close_rel;
+        let mut out = String::with_capacity(line.len());
+        out.push_str(&line[..after_quote]);
+        out.push_str("$LONGTYPE_FILE");
+        out.push_str(&line[close_abs..]);
+        return out;
+    }
+    line.to_string()
 }
 
 /// Rewrite backslashes to forward slashes within the path portion of a
@@ -426,5 +488,154 @@ mod tests {
         let a = normalize(input, &c, &dir);
         let b = normalize(input, &c, &dir);
         assert_eq!(a, b);
+    }
+
+    // ---- rustc "long-type written to" note normalization ----
+    //
+    // When a Rust type is too large to render inline, rustc spills the
+    // full type name into a sibling text file in its build target dir
+    // and emits a note pointing at it:
+    //
+    //   = note: the full name for the type has been written to
+    //     '<target>/.../<fixture>.long-type-<hash>.txt'
+    //
+    // Both the path prefix (target dir + lihaaf session-scoped sub-dir
+    // with a random suffix) and the trailing `<hash>` are session-local
+    // and change every run, so the raw note byte-diffs against any
+    // blessed snapshot. The normalizer collapses the whole quoted path
+    // to a single stable placeholder so adopters can bless once and
+    // re-run the suite anywhere — different target dir, different
+    // session, different rustc build of the type table — without
+    // re-blessing.
+
+    #[test]
+    fn long_type_note_two_sessions_normalize_to_same_bytes() {
+        // Reproduces the exact failure from the djogi validation rerun:
+        // two real lihaaf sessions produced two different paths for the
+        // same fixture's long-type spillover note (different target
+        // root, different session dir suffix, different type hash).
+        // After normalization both inputs must be byte-identical.
+        let session_a = "     = note: the full name for the type has been written to '/tmp/phase85-orchestration/lihaaf-djogi-validation/target/lihaaf-session-NqO1Du/tests_lihaaf_compile_fail_sealed_into_distinct_columns.rs/sealed_into_distinct_columns.long-type-13784649802967031202.txt'\n";
+        let session_b = "     = note: the full name for the type has been written to '/tmp/phase85-targets/djogi-lihaaf/lihaaf-session-b8ldWS/tests_lihaaf_compile_fail_sealed_into_distinct_columns.rs/sealed_into_distinct_columns.long-type-3815226114102655174.txt'\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
+        let out_a = normalize(session_a, &c, &dir);
+        let out_b = normalize(session_b, &c, &dir);
+        assert_eq!(
+            out_a, out_b,
+            "two sessions' long-type notes must normalize identically:\n  a = {out_a:?}\n  b = {out_b:?}",
+        );
+        // Placeholder is embedded; raw volatile substrings are gone.
+        assert!(
+            out_a.contains("$LONGTYPE_FILE"),
+            "expected $LONGTYPE_FILE placeholder, got: {out_a:?}",
+        );
+        assert!(
+            !out_a.contains("lihaaf-session-"),
+            "session-dir suffix must be normalized away, got: {out_a:?}",
+        );
+        assert!(
+            !out_a.contains("13784649802967031202"),
+            "type-hash digits from session a must be normalized away: {out_a:?}",
+        );
+        assert!(
+            !out_b.contains("3815226114102655174"),
+            "type-hash digits from session b must be normalized away: {out_b:?}",
+        );
+        // The note prefix stays so the snapshot remains legible.
+        assert!(
+            out_a.contains("the full name for the type has been written to"),
+            "primary note text must be preserved, got: {out_a:?}",
+        );
+    }
+
+    #[test]
+    fn long_type_note_normalizes_alternative_phrasing() {
+        // Some rustc versions phrase the note as "the full type name has
+        // been written to ..." instead. Both forms must collapse to the
+        // same placeholder so adopters don't re-bless on a rustc upgrade
+        // that only swaps the wording.
+        let line = "     = note: the full type name has been written to '/var/folders/abc/T/lihaaf-session-xyz/foo.long-type-9999.txt'\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(line, &c, &dir);
+        assert!(
+            out.contains("$LONGTYPE_FILE"),
+            "expected $LONGTYPE_FILE placeholder, got: {out:?}",
+        );
+        assert!(
+            !out.contains("lihaaf-session-xyz"),
+            "session-dir suffix must be normalized away: {out:?}",
+        );
+        assert!(
+            !out.contains("9999"),
+            "type-hash digits must be normalized away: {out:?}",
+        );
+        assert!(
+            out.contains("the full type name has been written to"),
+            "alt-phrasing note text must be preserved: {out:?}",
+        );
+    }
+
+    #[test]
+    fn long_type_note_preserves_surrounding_diagnostic() {
+        // Primary diagnostic and the secondary `--verbose` hint must
+        // survive byte-for-byte (spec §6.3 — preserve diagnostic text).
+        // Only the quoted path is rewritten.
+        let input = "\
+error[E0277]: the trait bound is not satisfied
+  --> /p/tests/foo.rs:1:1
+   |
+1  | bad code here
+   | ^^^
+   = note: the full name for the type has been written to '/tmp/x/lihaaf-session-AbCdEf/foo.long-type-12345.txt'
+   = note: consider using `--verbose` to print the full type name to the console
+
+error: aborting due to 1 previous error
+";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/tests");
+        let out = normalize(input, &c, &dir);
+        assert!(
+            out.contains("error[E0277]: the trait bound is not satisfied"),
+            "primary error code+message must be preserved: {out:?}",
+        );
+        assert!(
+            out.contains("consider using `--verbose`"),
+            "secondary `--verbose` hint must be preserved: {out:?}",
+        );
+        assert!(
+            out.contains("error: aborting due to 1 previous error"),
+            "rustc summary line must be preserved: {out:?}",
+        );
+        assert!(
+            out.contains("$LONGTYPE_FILE"),
+            "long-type path must be normalized to placeholder: {out:?}",
+        );
+        assert!(
+            !out.contains("lihaaf-session-AbCdEf"),
+            "volatile session dir must be normalized away: {out:?}",
+        );
+        assert!(
+            !out.contains("long-type-12345"),
+            "type-hash digits must be normalized away: {out:?}",
+        );
+    }
+
+    #[test]
+    fn long_type_note_left_intact_when_no_match() {
+        // Note lines that *don't* carry the long-type marker pass
+        // through untouched. Specifically, the `--verbose` hint that
+        // rustc emits on the same diagnostic must not be confused with
+        // a long-type note even though it shares the "note:" prefix.
+        let input =
+            "   = note: consider using `--verbose` to print the full type name to the console\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "   = note: consider using `--verbose` to print the full type name to the console",
+        );
     }
 }

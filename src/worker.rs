@@ -769,8 +769,6 @@ fn render_json_diagnostics(stderr: &str) -> String {
             out.push('\n');
             continue;
         }
-        // Manually pull "rendered":"<…>" without serde_json's full
-        // parse to avoid allocating a Value tree per diagnostic line.
         if let Some(rendered) = extract_rendered(line) {
             out.push_str(&rendered);
             // rustc's `rendered` typically ends in '\n' already; one
@@ -783,75 +781,51 @@ fn render_json_diagnostics(stderr: &str) -> String {
     out
 }
 
-/// Extract the value of `"rendered":"…"` from a JSON line. Returns
-/// `None` if the field is absent or unparseable. Hand-rolled JSON-string
-/// decoder; only the substring after `"rendered":` is examined.
+/// Extract the value of the OUTERMOST `"rendered"` string field from a
+/// JSON line. Returns `None` if the field is absent, `null`, or
+/// non-string, or if the line is not valid JSON.
+///
+/// rustc emits each diagnostic as one JSON object. That object's
+/// `message` contains a `children` array (help/note sub-diagnostics,
+/// each carrying its own `rendered` field that is typically `null`)
+/// AND a top-level `rendered` string. Both the rustc-direct shape
+/// (`{"$message_type":"diagnostic","rendered":"…",…}`) and the
+/// cargo-wrapped shape
+/// (`{"reason":"compiler-message","message":{"rendered":"…",…}}`)
+/// are accepted; the rustc direct form is what `cargo-lihaaf` itself
+/// produces (see `spawn_and_monitor`) but adopters may pipe in either.
+///
+/// Implementation uses `serde_json` (already a hard dep via
+/// `manifest.json`) rather than a hand-rolled substring scan — the
+/// previous scan found the first `"rendered"` token textually and so
+/// latched onto a `null` from `children[0]` whenever children were
+/// serialized before the parent's own `rendered`, silently dropping
+/// the parent diagnostic. See issue #5 for the bless-snapshot failure
+/// mode this caused.
+///
+/// Spec §6.1's no-regex rule is preserved: `serde_json` is not a
+/// regex engine.
 fn extract_rendered(line: &str) -> Option<String> {
-    // Find the key token. Two shapes are possible: `"rendered":"…"` and
-    // `"rendered" : "…"`. The scan targets the literal key including the
-    // leading quote.
-    let key = "\"rendered\"";
-    let key_idx = line.find(key)?;
-    let mut i = key_idx + key.len();
-    let bytes = line.as_bytes();
-    // Skip optional whitespace, then ':', whitespace, then '"'.
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
+    let v: serde_json::Value = serde_json::from_str(line).ok()?;
+    // Cargo `--message-format=json` wrap: the diagnostic object is
+    // nested under `message`, and `message.rendered` is the parent
+    // rendered text. Note that this branch never matches the bare
+    // rustc shape because in that shape `message` is a string
+    // ("error[E…]: …"), not an object — `Value::get` on a string
+    // returns `None`.
+    if let Some(s) = v
+        .get("message")
+        .and_then(|m| m.get("rendered"))
+        .and_then(serde_json::Value::as_str)
+    {
+        return Some(s.to_owned());
     }
-    if i >= bytes.len() || bytes[i] != b':' {
-        return None;
-    }
-    i += 1;
-    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-        i += 1;
-    }
-    if i >= bytes.len() || bytes[i] != b'"' {
-        // Could be `null` — return None.
-        return None;
-    }
-    i += 1;
-    let mut out = String::new();
-    while i < bytes.len() {
-        let b = bytes[i];
-        if b == b'"' {
-            return Some(out);
-        }
-        if b == b'\\' && i + 1 < bytes.len() {
-            let next = bytes[i + 1];
-            match next {
-                b'n' => out.push('\n'),
-                b't' => out.push('\t'),
-                b'r' => out.push('\r'),
-                b'\\' => out.push('\\'),
-                b'/' => out.push('/'),
-                b'"' => out.push('"'),
-                b'u' => {
-                    if i + 5 < bytes.len() {
-                        let hex = std::str::from_utf8(&bytes[i + 2..i + 6]).ok()?;
-                        let code = u32::from_str_radix(hex, 16).ok()?;
-                        if let Some(c) = char::from_u32(code) {
-                            out.push(c);
-                        }
-                        i += 6;
-                        continue;
-                    } else {
-                        return None;
-                    }
-                }
-                _ => out.push(next as char),
-            }
-            i += 2;
-        } else {
-            // Single UTF-8 char.
-            let mut j = i + 1;
-            while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
-                j += 1;
-            }
-            out.push_str(&line[i..j]);
-            i = j;
-        }
-    }
-    None
+    // Bare rustc `--error-format=json` form (and the legacy "single
+    // object with `rendered` at the top level" shape that existing
+    // tests cover).
+    v.get("rendered")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned)
 }
 
 /// Outcome of a single rustc spawn + monitor pass.
@@ -1186,6 +1160,102 @@ mod tests {
     fn extract_rendered_returns_none_when_field_absent() {
         let line = r#"{"message":"no rendered key"}"#;
         assert!(extract_rendered(line).is_none());
+    }
+
+    #[test]
+    fn extract_rendered_preserves_parent_when_child_rendered_is_null_bare_rustc() {
+        // Regression test for issue #5. rustc `--error-format=json` emits
+        // one object per diagnostic; `children` (help/note sub-diagnostics
+        // whose own `rendered` is typically `null`) is serialized BEFORE
+        // the parent's `rendered`. A naive "find the first `\"rendered\"`
+        // token" scan latches onto the child's `null` and drops the
+        // entire parent diagnostic. The fix must return the outermost
+        // (parent) `rendered`, not the first one it sees textually.
+        let line = concat!(
+            r#"{"$message_type":"diagnostic",""#,
+            r#"message":"not all trait items implemented","#,
+            r#""code":{"code":"E0046","explanation":null},"#,
+            r#""level":"error","#,
+            r#""spans":[],"#,
+            r#""children":[{"message":"`bar` from trait","code":null,"#,
+            r#""level":"help","spans":[],"children":[],"rendered":null}],"#,
+            r#""rendered":"error[E0046]: not all trait items implemented\n   --> a.rs:1:1\n"}"#,
+        );
+        let r = extract_rendered(line)
+            .expect("parent rendered must survive a null child rendered field");
+        assert!(
+            r.contains("E0046"),
+            "expected parent E0046 rendered text, got: {r:?}",
+        );
+        assert!(
+            r.contains("not all trait items implemented"),
+            "expected parent diagnostic body, got: {r:?}",
+        );
+    }
+
+    #[test]
+    fn extract_rendered_preserves_parent_when_child_rendered_is_null_cargo_wrap() {
+        // Same regression, cargo `--message-format=json` wrapped form:
+        // the diagnostic object is nested under `message`. Both shapes
+        // are covered by `extract_rendered`'s existing tests, so both
+        // shapes must survive the fix.
+        let line = concat!(
+            r#"{"reason":"compiler-message","message":{"#,
+            r#""message":"no method named `foo` found","#,
+            r#""children":[{"message":"consider using ...","level":"help","rendered":null}],"#,
+            r#""rendered":"error[E0599]: no method named `foo` found\n"}}"#,
+        );
+        let r = extract_rendered(line)
+            .expect("cargo-wrapped parent rendered must survive a null child rendered field");
+        assert!(
+            r.contains("E0599"),
+            "expected parent E0599 rendered text, got: {r:?}",
+        );
+    }
+
+    #[test]
+    fn render_json_diagnostics_does_not_reduce_primary_to_abort_only_footer() {
+        // End-to-end shape: rustc stream of a compile_fail fixture that
+        // produces a primary diagnostic with a help child (whose
+        // `rendered` is null), followed by the standard
+        // "aborting due to N previous error" + `rustc --explain` footer
+        // lines. Pre-fix, the primary was silently dropped and only the
+        // footer survived; `--bless` would write a snapshot containing
+        // ONLY the footer. Post-fix, the primary must survive in the
+        // rendered output so that `.stderr` snapshots stay honest.
+        let stderr = concat!(
+            r#"{"$message_type":"diagnostic","message":"primary","#,
+            r#""code":{"code":"E0046","explanation":null},"#,
+            r#""level":"error","children":[{"#,
+            r#""message":"help","code":null,"level":"help",""#,
+            r#"spans":[],"children":[],"rendered":null}],"#,
+            r#""rendered":"error[E0046]: not all trait items implemented\n   --> a.rs:1:1\n"}"#,
+            "\n",
+            r#"{"$message_type":"diagnostic","message":"aborting due to 1 previous error","#,
+            r#""level":"error","rendered":"error: aborting due to 1 previous error\n"}"#,
+            "\n",
+            r#"{"$message_type":"diagnostic","message":"For more information about this error, try `rustc --explain E0046`.","#,
+            r#""level":"failure-note","rendered":"For more information about this error, try `rustc --explain E0046`.\n"}"#,
+            "\n",
+        );
+        let out = render_json_diagnostics(stderr);
+        assert!(
+            out.contains("E0046"),
+            "primary E0046 diagnostic must be preserved, got: {out:?}",
+        );
+        assert!(
+            out.contains("not all trait items implemented"),
+            "primary rendered body must be preserved, got: {out:?}",
+        );
+        // Defensive: catch a regression where only the rustc footer
+        // ("aborting due to" + `rustc --explain`) survives. Concretely,
+        // if the primary is dropped the entire `out` reduces to those
+        // two trailing lines.
+        let abort_only_footer = "error: aborting due to 1 previous error\nFor more information about this error, try `rustc --explain E0046`.\n";
+        assert_ne!(
+            out, abort_only_footer,
+            "rendered output must not be reduced to the abort+explain footer",
+        );
     }
 
     #[test]
