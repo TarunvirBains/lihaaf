@@ -851,6 +851,58 @@ enum MonitorKind {
     },
 }
 
+/// Apply the per-fixture rustc env block to `cmd`.
+///
+/// Two variables are propagated:
+///
+/// * **`LD_LIBRARY_PATH`** — the dylib is linked with `-C
+///   prefer-dynamic`, so the loader needs the directory holding the
+///   managed dylib, `target/release/deps`, and the sysroot's
+///   `rustlib/<host>/lib` (for `libstd-<hash>.so`). Pre-existing
+///   `LD_LIBRARY_PATH` entries are preserved at the back so the parent
+///   process's env is not lost.
+///
+/// * **`CARGO_MANIFEST_DIR`** — proc macros that call
+///   [`proc_macro_crate::crate_name`] read this at expansion time to
+///   locate the consumer's `Cargo.toml` and resolve renamed
+///   dependencies. `cargo` sets it automatically during `cargo build` /
+///   `cargo test`, but because lihaaf's per-fixture rustc invocations
+///   bypass cargo, it must be supplied explicitly here. Without it the
+///   macro fails with `` `CARGO_MANIFEST_DIR` env variable not set ``
+///   before the compile-fail / compile-pass assertion can be evaluated.
+///   The consumer crate root (the directory containing the consumer's
+///   `Cargo.toml`, resolved in [`crate::session::run`]) is the value
+///   cargo would set; it is already tracked in `ctx.crate_root`.
+///
+/// Extracted as a discrete helper so the regression test for issue #14
+/// drives the same code path as production rather than asserting
+/// against a hand-rolled copy — removing or mutating either `cmd.env`
+/// call below trips the unit test.
+///
+/// [`proc_macro_crate::crate_name`]: https://docs.rs/proc-macro-crate/latest/proc_macro_crate/fn.crate_name.html
+fn apply_rustc_env(cmd: &mut Command, ctx: &WorkerContext) {
+    // LD_LIBRARY_PATH so the dylib's `-C prefer-dynamic` link can find
+    // libstd.so. The sysroot lib dir contains
+    // `rustlib/<host>/lib/libstd-<hash>.so`.
+    let host_lib = ctx
+        .sysroot_lib_dir
+        .join(format!("rustlib/{}/lib", host_triple_or_default()));
+    let mut ld_paths = std::env::var_os("LD_LIBRARY_PATH")
+        .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
+        .unwrap_or_default();
+    ld_paths.insert(0, host_lib);
+    ld_paths.insert(0, ctx.deps_dir.clone());
+    if let Some(parent) = ctx.managed_dylib.parent() {
+        ld_paths.insert(0, parent.to_path_buf());
+    }
+    if let Ok(joined) = std::env::join_paths(ld_paths) {
+        cmd.env("LD_LIBRARY_PATH", joined);
+    }
+
+    // CARGO_MANIFEST_DIR — see function-level rustdoc. Issue #14.
+    cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
+}
+
 fn spawn_and_monitor(
     fx: &Fixture,
     ctx: &WorkerContext,
@@ -903,38 +955,7 @@ fn spawn_and_monitor(
     cmd.stderr(Stdio::piped());
     cmd.stdout(Stdio::null());
 
-    // LD_LIBRARY_PATH so the dylib's `-C prefer-dynamic` link can find
-    // libstd.so. The sysroot lib dir contains
-    // `rustlib/<host>/lib/libstd-<hash>.so`.
-    let host_lib = ctx
-        .sysroot_lib_dir
-        .join(format!("rustlib/{}/lib", host_triple_or_default()));
-    let mut ld_paths = std::env::var_os("LD_LIBRARY_PATH")
-        .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
-        .unwrap_or_default();
-    ld_paths.insert(0, host_lib);
-    ld_paths.insert(0, ctx.deps_dir.clone());
-    if let Some(parent) = ctx.managed_dylib.parent() {
-        ld_paths.insert(0, parent.to_path_buf());
-    }
-    if let Ok(joined) = std::env::join_paths(ld_paths) {
-        cmd.env("LD_LIBRARY_PATH", joined);
-    }
-
-    // CARGO_MANIFEST_DIR: proc-macro crates that call
-    // `proc_macro_crate::crate_name("foo")` (e.g. any macro using the
-    // `proc-macro-crate` crate for renamed-dep resolution) read this
-    // env var at macro-expansion time to locate the consumer's
-    // `Cargo.toml`. Without it the macro cannot resolve renamed
-    // dependencies and fails with
-    // "`CARGO_MANIFEST_DIR` env variable not set."
-    //
-    // `cargo` sets this automatically during `cargo build` / `cargo
-    // test`, but because lihaaf's per-fixture rustc invocations bypass
-    // cargo, it must be supplied explicitly here.  The consumer crate
-    // root (the directory containing the consumer's Cargo.toml) is
-    // already tracked in `ctx.crate_root`; that is the correct value.
-    cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
+    apply_rustc_env(&mut cmd, ctx);
 
     if ctx.verbose {
         eprintln!("lihaaf: rustc invocation:\n  {cmd:?}");
@@ -1463,33 +1484,18 @@ plain text line
     /// "`CARGO_MANIFEST_DIR` env variable not set" before the
     /// compile-fail / compile-pass assertion can be evaluated.
     ///
-    /// The test constructs the same `Command` env block that
-    /// `spawn_and_monitor` builds (without spawning), verifies the key
-    /// is present with the correct absolute path, and confirms
-    /// `LD_LIBRARY_PATH` is also still set so the pre-existing env-set
-    /// logic is not accidentally disturbed.
+    /// The test invokes [`apply_rustc_env`] — the same helper that
+    /// `spawn_and_monitor` calls before every per-fixture spawn — so
+    /// any future regression that drops the `CARGO_MANIFEST_DIR` line
+    /// trips here without needing to spawn rustc. The test also
+    /// asserts that `LD_LIBRARY_PATH` is still set, guarding the
+    /// pre-existing dylib-loader invariant from accidental removal in
+    /// the same edit.
     #[test]
     fn fixture_rustc_cmd_carries_cargo_manifest_dir() {
         let ctx = unit_test_ctx();
-
-        // Replicate the env-setting portion of `spawn_and_monitor`.
         let mut cmd = Command::new("rustc");
-
-        let host_lib = ctx
-            .sysroot_lib_dir
-            .join(format!("rustlib/{}/lib", host_triple_or_default()));
-        let mut ld_paths = std::env::var_os("LD_LIBRARY_PATH")
-            .map(|s| std::env::split_paths(&s).collect::<Vec<_>>())
-            .unwrap_or_default();
-        ld_paths.insert(0, host_lib);
-        ld_paths.insert(0, ctx.deps_dir.clone());
-        if let Some(parent) = ctx.managed_dylib.parent() {
-            ld_paths.insert(0, parent.to_path_buf());
-        }
-        if let Ok(joined) = std::env::join_paths(ld_paths) {
-            cmd.env("LD_LIBRARY_PATH", joined);
-        }
-        cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
+        apply_rustc_env(&mut cmd, &ctx);
 
         // Collect every explicitly-set env var on this command.
         let envs: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)> = cmd
@@ -1519,5 +1525,32 @@ plain text line
             ld_present,
             "LD_LIBRARY_PATH must still be set (regression guard)"
         );
+    }
+
+    /// Per-fixture rustc env propagation must not silently clear an
+    /// explicit override the parent process injected.
+    ///
+    /// `Command::env` last-write-wins, so a higher-precedence override
+    /// (such as one a future feature flag may set after
+    /// [`apply_rustc_env`]) is honored. The test confirms that
+    /// behavior by re-setting `CARGO_MANIFEST_DIR` after the helper
+    /// runs and verifying the post-helper value wins. This pins the
+    /// invariant so a future "set the env once, freeze the command"
+    /// refactor cannot regress it without surfacing here.
+    #[test]
+    fn apply_rustc_env_does_not_lock_out_later_overrides() {
+        let ctx = unit_test_ctx();
+        let mut cmd = Command::new("rustc");
+        apply_rustc_env(&mut cmd, &ctx);
+
+        let override_path = std::path::PathBuf::from("/tmp/lihaaf-override");
+        cmd.env("CARGO_MANIFEST_DIR", &override_path);
+
+        let manifest_dir = cmd
+            .get_envs()
+            .find_map(|(k, v)| (k == "CARGO_MANIFEST_DIR").then_some(v))
+            .flatten()
+            .expect("CARGO_MANIFEST_DIR still present after override");
+        assert_eq!(std::path::Path::new(manifest_dir), override_path.as_path());
     }
 }

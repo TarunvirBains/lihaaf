@@ -6,7 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-(no changes since 0.1.0-alpha.1)
+### Fixed
+- Per-fixture `rustc` invocations now set `CARGO_MANIFEST_DIR` to the
+  consumer crate root (the directory containing the consumer's
+  `Cargo.toml`). Cargo sets this automatically on `cargo build` /
+  `cargo test`, but lihaaf's per-fixture rustc spawns bypass cargo,
+  so it had to be supplied explicitly. Without it, any proc macro
+  that calls `proc_macro_crate::crate_name("...")` (the dominant
+  pattern for renamed-dependency resolution — used by `serde`,
+  `inventory`, and most modern derive macros) failed at
+  macro-expansion time with `` `CARGO_MANIFEST_DIR` env variable not
+  set ``, blocking the compile-fail / compile-pass assertion before
+  it could run. Issue #14.
 
 ## [0.1.0-alpha.1] — 2026-05-11
 
