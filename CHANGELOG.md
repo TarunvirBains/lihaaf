@@ -6,7 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-(no changes since 0.1.0-alpha.1)
+### Fixed
+- Per-fixture `rustc` invocations now set `CARGO_MANIFEST_DIR` to the
+  consumer crate root (the directory containing the consumer's
+  `Cargo.toml`). Cargo sets this automatically on `cargo build` /
+  `cargo test`, but lihaaf's per-fixture rustc spawns bypass cargo,
+  so it had to be supplied explicitly. Without it, any proc macro
+  that calls `proc_macro_crate::crate_name("...")` (the dominant
+  pattern for renamed-dependency resolution — used by `serde`,
+  `inventory`, and most modern derive macros) failed at
+  macro-expansion time with `` `CARGO_MANIFEST_DIR` env variable not
+  set ``, blocking the compile-fail / compile-pass assertion before
+  it could run. Issue #14.
+- Relative `--manifest-path` values (notably the bare
+  `--manifest-path Cargo.toml`) are now absolutized at session
+  startup before the crate-root derivation runs. Previously,
+  `Path::parent` of a single-component relative path returned
+  `Some("")` instead of `None`, so the
+  `.unwrap_or_else(|| ".".into())` fallback was bypassed and
+  `CARGO_MANIFEST_DIR=""` could propagate to the per-fixture rustc —
+  a path shape Cargo itself never emits. The fix matches Cargo's
+  shape exactly (absolute, no symlink resolution). Issue #14 follow-up.
 
 ## [0.1.0-alpha.1] — 2026-05-11
 
