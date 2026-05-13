@@ -18,6 +18,15 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   macro-expansion time with `` `CARGO_MANIFEST_DIR` env variable not
   set ``, blocking the compile-fail / compile-pass assertion before
   it could run. Issue #14.
+- Relative `--manifest-path` values (notably the bare
+  `--manifest-path Cargo.toml`) are now absolutized at session
+  startup before the crate-root derivation runs. Previously,
+  `Path::parent` of a single-component relative path returned
+  `Some("")` instead of `None`, so the
+  `.unwrap_or_else(|| ".".into())` fallback was bypassed and
+  `CARGO_MANIFEST_DIR=""` could propagate to the per-fixture rustc —
+  a path shape Cargo itself never emits. The fix matches Cargo's
+  shape exactly (absolute, no symlink resolution). Issue #14 follow-up.
 
 ## [0.1.0-alpha.1] — 2026-05-11
 

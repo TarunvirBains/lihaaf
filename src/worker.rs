@@ -1527,6 +1527,39 @@ plain text line
         );
     }
 
+    /// `apply_rustc_env` must overwrite a stale `CARGO_MANIFEST_DIR`
+    /// that an earlier caller or the inherited parent environment may
+    /// have set to a wrong value. This is the "earlier-leg" companion
+    /// to [`apply_rustc_env_does_not_lock_out_later_overrides`], which
+    /// only pins the later-write-wins precedence. Without this guard
+    /// a future refactor that conditionally skips the
+    /// `cmd.env("CARGO_MANIFEST_DIR", …)` line (e.g. "only set it when
+    /// the parent process hasn't already") could regress issue #14:
+    /// the per-fixture rustc would inherit a `CARGO_MANIFEST_DIR`
+    /// pointing at the lihaaf binary's own crate root, not the
+    /// consumer's, and `proc_macro_crate::crate_name` would resolve
+    /// against the wrong manifest. Added per gpt-5.5 xhigh PR-15
+    /// review §"Open questions/assumptions".
+    #[test]
+    fn apply_rustc_env_overwrites_inherited_cargo_manifest_dir() {
+        let ctx = unit_test_ctx();
+        let mut cmd = Command::new("rustc");
+        // Simulate a wrong value an earlier hop (parent process,
+        // inherited env, prior helper) might have left on the command.
+        cmd.env("CARGO_MANIFEST_DIR", "/the/wrong/crate");
+        apply_rustc_env(&mut cmd, &ctx);
+        let manifest_dir = cmd
+            .get_envs()
+            .find_map(|(k, v)| (k == "CARGO_MANIFEST_DIR").then_some(v))
+            .flatten()
+            .expect("CARGO_MANIFEST_DIR must remain set after apply_rustc_env");
+        assert_eq!(
+            std::path::Path::new(manifest_dir),
+            ctx.crate_root.as_path(),
+            "apply_rustc_env must overwrite a stale CARGO_MANIFEST_DIR with the consumer crate root (issue #14)"
+        );
+    }
+
     /// Per-fixture rustc env propagation must not silently clear an
     /// explicit override the parent process injected.
     ///

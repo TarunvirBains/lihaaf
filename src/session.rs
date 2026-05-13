@@ -73,10 +73,7 @@ impl Report {
 pub fn run(cli: Cli) -> Result<Report, Error> {
     // Stage 1 — configuration load.
     let manifest_path = resolve_manifest_path(&cli)?;
-    let crate_root = manifest_path
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("."));
+    let crate_root = derive_crate_root(&manifest_path);
     let config = config::load(&manifest_path)?;
 
     // Stage 2 — toolchain capture.
@@ -497,9 +494,23 @@ fn resolve_manifest_path(cli: &Cli) -> Result<PathBuf, Error> {
                 ),
             }));
         }
-        return Ok(p.clone());
+        // Absolutize relative manifest paths so downstream
+        // [`derive_crate_root`] never falls into the
+        // single-component-relative trap: `Path::parent` of
+        // `PathBuf::from("Cargo.toml")` is `Some("")`, not `None`, so
+        // a naive `parent().unwrap_or_else(|| ".".into())` would set
+        // `CARGO_MANIFEST_DIR=""` for the bare `--manifest-path
+        // Cargo.toml` invocation, which is not Cargo-equivalent.
+        // Cargo's own `CARGO_MANIFEST_DIR` is absolute, so we match
+        // that shape by joining against `current_dir()` (lexical
+        // absolutization, no symlink resolution — Cargo itself does
+        // not canonicalize). Issue #14, gpt-5.5 xhigh PR-15 review.
+        return absolutize_manifest_path(p);
     }
-    // Walk up from CWD looking for Cargo.toml.
+    // Walk up from CWD looking for Cargo.toml. `current_dir()` is
+    // always absolute on the platforms we target, so candidates
+    // produced here are already absolute and need no further
+    // normalization.
     let mut dir =
         std::env::current_dir().map_err(|e| Error::io(e, "reading current directory", None))?;
     loop {
@@ -514,6 +525,45 @@ fn resolve_manifest_path(cli: &Cli) -> Result<PathBuf, Error> {
                         .into(),
             }));
         }
+    }
+}
+
+/// Lexically absolutize a manifest path supplied via `--manifest-path`.
+///
+/// If the path is already absolute, return it unchanged. Otherwise,
+/// join it against the process's current working directory. Symlinks
+/// are not resolved — Cargo's own manifest-path handling is lexical,
+/// and resolving symlinks here would produce a `CARGO_MANIFEST_DIR`
+/// that diverges from what `cargo build --manifest-path …` would set.
+fn absolutize_manifest_path(p: &Path) -> Result<PathBuf, Error> {
+    if p.is_absolute() {
+        return Ok(p.to_path_buf());
+    }
+    let cwd =
+        std::env::current_dir().map_err(|e| Error::io(e, "reading current directory", None))?;
+    Ok(cwd.join(p))
+}
+
+/// Derive the consumer-crate root from a (preferably absolute)
+/// manifest path.
+///
+/// Production callers route through [`resolve_manifest_path`], which
+/// absolutizes `--manifest-path` inputs, so `manifest_path.parent()`
+/// is always non-empty on that path. The defensive `is_empty` guard
+/// below pins the issue-14 invariant for direct callers and for any
+/// future refactor that bypasses the absolutize step: a single-component
+/// relative path like `PathBuf::from("Cargo.toml")` has
+/// `parent() == Some("")` (not `None`), so the bare
+/// `.unwrap_or_else(|| ".".into())` fallback never fires and the env
+/// var would be set to the empty string. Falling back to `.` keeps
+/// downstream `cmd.env("CARGO_MANIFEST_DIR", &crate_root)` working
+/// against the rustc child's current working directory rather than
+/// silently emitting an empty value — itself a non-Cargo-equivalent
+/// path shape. Issue #14, gpt-5.5 xhigh PR-15 review.
+fn derive_crate_root(manifest_path: &Path) -> PathBuf {
+    match manifest_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
     }
 }
 
@@ -663,6 +713,100 @@ mod tests {
         assert_eq!(agg.failed, 3);
         assert_eq!(agg.timeout, 2);
         assert_eq!(agg.memory_exhausted, 1);
+    }
+
+    /// Regression for the issue-14 follow-up (gpt-5.5 xhigh PR-15 review):
+    /// the single-component-relative manifest path
+    /// `PathBuf::from("Cargo.toml")` must not yield an empty
+    /// crate-root. `Path::parent()` returns `Some("")` for such inputs,
+    /// not `None`, so the original
+    /// `.parent().unwrap_or_else(|| ".".into())` fallback was bypassed
+    /// and `CARGO_MANIFEST_DIR=""` propagated to the per-fixture rustc.
+    /// `derive_crate_root` keeps the invariant intact even when callers
+    /// skip the absolutize step.
+    #[test]
+    fn derive_crate_root_handles_bare_cargo_toml() {
+        let root = derive_crate_root(&PathBuf::from("Cargo.toml"));
+        assert_eq!(root, PathBuf::from("."));
+        assert!(
+            !root.as_os_str().is_empty(),
+            "crate root must never be the empty path (issue #14 / xhigh PR-15 review)"
+        );
+    }
+
+    /// A `parent()` of `None` (the original assumed case) must also
+    /// resolve to `.`. The empty path itself is the trivial input that
+    /// produces this shape.
+    #[test]
+    fn derive_crate_root_falls_back_for_parentless_input() {
+        let root = derive_crate_root(&PathBuf::new());
+        assert_eq!(root, PathBuf::from("."));
+        assert!(!root.as_os_str().is_empty());
+    }
+
+    /// Absolute manifest paths produce absolute crate roots — the
+    /// Cargo-equivalent shape adopters expect.
+    #[test]
+    fn derive_crate_root_returns_parent_of_absolute_manifest() {
+        #[cfg(unix)]
+        {
+            let root = derive_crate_root(&PathBuf::from("/abs/pkg/Cargo.toml"));
+            assert_eq!(root, PathBuf::from("/abs/pkg"));
+        }
+        #[cfg(windows)]
+        {
+            let root = derive_crate_root(&PathBuf::from(r"C:\abs\pkg\Cargo.toml"));
+            assert_eq!(root, PathBuf::from(r"C:\abs\pkg"));
+        }
+    }
+
+    /// Multi-component relative paths already had a non-empty
+    /// `parent()`, but the invariant is pinned here so a future
+    /// refactor cannot regress them either.
+    #[test]
+    fn derive_crate_root_returns_parent_of_relative_workspace_member() {
+        let root = derive_crate_root(&PathBuf::from("member/Cargo.toml"));
+        assert_eq!(root, PathBuf::from("member"));
+    }
+
+    /// `resolve_manifest_path` must absolutize a relative
+    /// `--manifest-path` so the derived crate root has Cargo's
+    /// absolute shape rather than a relative `.`/empty fragment.
+    /// The session-startup path then feeds an absolute
+    /// `CARGO_MANIFEST_DIR` to every per-fixture rustc — matching what
+    /// `cargo build --manifest-path Cargo.toml` would set.
+    #[test]
+    fn absolutize_manifest_path_promotes_bare_cargo_toml_to_absolute() {
+        let abs = absolutize_manifest_path(&PathBuf::from("Cargo.toml"))
+            .expect("current_dir is readable in this test");
+        assert!(
+            abs.is_absolute(),
+            "absolutized manifest path must be absolute, got {abs:?}"
+        );
+        let root = derive_crate_root(&abs);
+        assert!(
+            root.is_absolute(),
+            "derived crate root must be absolute, got {root:?}"
+        );
+        assert!(
+            !root.as_os_str().is_empty(),
+            "derived crate root must never be empty"
+        );
+        // The crate root is precisely the cwd in which the test runs,
+        // because `Cargo.toml` is a single-segment file name.
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(root, cwd);
+    }
+
+    /// An already-absolute `--manifest-path` round-trips unchanged.
+    #[test]
+    fn absolutize_manifest_path_preserves_absolute_input() {
+        #[cfg(unix)]
+        let input = PathBuf::from("/etc/Cargo.toml");
+        #[cfg(windows)]
+        let input = PathBuf::from(r"C:\etc\Cargo.toml");
+        let out = absolutize_manifest_path(&input).unwrap();
+        assert_eq!(out, input);
     }
 
     #[test]
