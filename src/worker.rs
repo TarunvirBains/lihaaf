@@ -1417,7 +1417,13 @@ plain text line
                 managed_dylib_path: PathBuf::from("/p/target/lihaaf/lib.so"),
                 original_mtime_unix_secs: 0,
                 original_sha256: "0".repeat(64),
-                original_rustc_release_line: "rustc 1.95.0 (test 2026-01-01)".into(),
+                original_toolchain: crate::toolchain::Toolchain {
+                    release_line: "rustc 1.95.0 (test 2026-01-01)".into(),
+                    release: "1.95.0".into(),
+                    host: "x86_64-unknown-linux-gnu".into(),
+                    commit_hash: "0000000000000000000000000000000000000000".into(),
+                    sysroot: PathBuf::from("/r"),
+                },
             },
         }
     }

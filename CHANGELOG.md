@@ -78,6 +78,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-suite identity is what the worker now closes over.
 
 ### Fixed
+- Toolchain drift comparator now widens its key to
+  `(release_line, host, commit_hash, sysroot)`. The previous
+  comparator compared only `release_line`, so two materially different
+  toolchains — e.g. rustup stable rustc 1.95.0 vs. a custom local
+  build with the same release line, or the same release line on a
+  different host triple — compared equal and bypassed the policy
+  §4.5 hard-fail. The widening only catches MORE drift, never less,
+  so existing pass cases stay passing. Known caveat: when `rustc` is
+  a custom local build, `commit-hash:` is absent and `commit_hash`
+  is the empty string; two such builds with the same other fields
+  still compare equal on that field. Users running custom rustc
+  builds operate outside the stable-channel safety net by design;
+  the `sysroot` comparison usually catches this in practice. Issue
+  #4.
 - Session temp directory creation now creates the workspace target
   parent directory first. Clean CI checkouts that run lihaaf before any
   other crate-local Cargo command no longer fail with
