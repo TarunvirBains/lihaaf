@@ -1,33 +1,52 @@
 //! Multi-suite end-to-end coverage. Compile_pass fixture for the
 //! `[[package.metadata.lihaaf.suite]]` named "suite_demo".
 //!
-//! `lihaaf::SUITE_DEMO_MARKER` is only exposed when lihaaf is built
-//! with `--features suite_demo`. The `suite_demo` named suite enables
-//! that feature for its dedicated dylib build AND propagates `--cfg
-//! feature="suite_demo"` to this fixture's per-fixture rustc
-//! invocation, so the body below compiles and links against the
-//! const.
+//! Two-sided regression guard. Each side fails independently:
 //!
-//! Regression guard: if a future change drops the `--features` flag on
-//! the per-suite dylib build OR fails to propagate the per-fixture cfg,
-//! this fixture fails to compile with one of:
+//! 1. **Per-fixture `--cfg feature="suite_demo"` propagation**
+//!    (`worker::spawn_and_monitor` → `apply_feature_cfgs`). If the
+//!    per-fixture rustc invocation does NOT receive
+//!    `--cfg feature="suite_demo"`, the `#[cfg(feature = "suite_demo")]`
+//!    branch is elided and the `#[cfg(not(feature = "suite_demo"))]`
+//!    `compile_error!` below fires with a fixed, greppable message —
+//!    failing compilation of this compile_pass fixture and flipping CI red.
 //!
-//!   error[E0432]: unresolved import `lihaaf::SUITE_DEMO_MARKER`
-//!   error[E0425]: cannot find value `SUITE_DEMO_MARKER` in crate `lihaaf`
+//! 2. **Dylib feature propagation** (`dylib::build` →
+//!    `BuildParams::features`). `lihaaf::SUITE_DEMO_MARKER` is exported
+//!    only when the dylib was built with `--features suite_demo`
+//!    (see `src/lib.rs` — the const is `#[cfg(feature = "suite_demo")]`).
+//!    If the dylib build omits the feature, the marker is absent from
+//!    the dylib's symbol table and rustc emits
+//!    `error[E0432]: unresolved import lihaaf::SUITE_DEMO_MARKER` (or
+//!    `error[E0425]: cannot find value ...`). The fixture fails and
+//!    CI flips red.
 //!
-//! and lihaaf's own CI run fails — the multi-suite capability has a
-//! self-bite test without needing a downstream adopter.
+//! Either failure surfaces without needing a downstream adopter to
+//! report the regression. The two `#[cfg]` branches are deliberately
+//! complementary so the file ALWAYS produces a compile-time signal:
+//! the only way for this fixture to compile is for BOTH halves to be
+//! intact (correct dylib build AND correct per-fixture cfg
+//! propagation).
+//!
+//! A source-level shape check in `tests/lihaaf_fixture_shape.rs`
+//! pins the dual-bite design itself so a future maintainer cannot
+//! silently revert this file to a one-sided guard.
 
 #[cfg(feature = "suite_demo")]
 fn main() {
     let _ = lihaaf::SUITE_DEMO_MARKER;
 }
 
-// Without the cfg gate, the fixture would fail under the default suite's
-// no-feature build (where SUITE_DEMO_MARKER is not exported). Lihaaf's
-// disjoint-fixture-dirs invariant ensures this file only ever runs in the
-// suite that enables the feature, but the cfg keeps it honest if a future
-// adopter copy-pastes the fixture and forgets to point it at a feature-
-// enabled suite.
+// Per-fixture cfg propagation regression guard. Fires when this
+// fixture's rustc invocation is missing `--cfg feature="suite_demo"`.
+// The fixed message is greppable by CI / triage scripts.
 #[cfg(not(feature = "suite_demo"))]
-fn main() {}
+compile_error!(
+    "lihaaf multi-suite regression: this fixture must be compiled with \
+     --cfg feature=\"suite_demo\". The suite_demo named suite \
+     ([[package.metadata.lihaaf.suite]] in lihaaf's own Cargo.toml) is \
+     responsible for propagating the suite's features to per-fixture \
+     rustc invocations. If you see this error, the propagation has \
+     regressed — re-check worker::spawn_and_monitor and \
+     apply_feature_cfgs."
+);

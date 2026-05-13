@@ -355,6 +355,12 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     // Parallelism cap (the policy). Recomputed per-suite because the
     // RAM cap is derived from the suite's `per_fixture_memory_mb`, which
     // adopters may set higher for a heavier feature set.
+    //
+    // v0.1.0-alpha.3 intentionally does not carry `ParallelismGate`
+    // OOM reductions across suite boundaries: each suite gets a fresh
+    // dispatch pool and a fresh gate. Sharing that state would require
+    // plumbing a mutable gate through `worker::dispatch_pool`; defer
+    // until a real adopter reports cross-suite OOM cascades.
     let parallelism = compute_parallelism(cli, suite);
     if !cli.quiet {
         eprintln!("lihaaf: parallelism = {parallelism}");

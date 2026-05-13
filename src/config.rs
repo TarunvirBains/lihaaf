@@ -27,7 +27,7 @@
 //! `fixture_dirs` so snapshot files cannot collide between suites).
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -286,7 +286,7 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
 
     // Cross-suite invariants.
     validate_unique_suite_names(&suites)?;
-    validate_disjoint_fixture_dirs(&suites)?;
+    validate_disjoint_fixture_dirs(manifest_path, &suites)?;
 
     Ok(Config {
         dylib_crate,
@@ -524,33 +524,72 @@ fn validate_unique_suite_names(suites: &[Suite]) -> Result<(), Error> {
     Ok(())
 }
 
-fn validate_disjoint_fixture_dirs(suites: &[Suite]) -> Result<(), Error> {
+fn validate_disjoint_fixture_dirs(manifest_path: &Path, suites: &[Suite]) -> Result<(), Error> {
     // O(N²) in the number of (suite, dir) pairs; acceptable because
     // suites are small (single-digit) and fixture_dirs per suite are
-    // also small. PathBuf equality is the literal-string check we want
-    // — relative paths get resolved once against crate_root downstream
-    // in discovery; the conflict at this layer is on the as-declared
-    // path string (`tests/foo` and `./tests/foo` would both pass here
-    // and then collide when resolved, which is fine — the discovery
-    // layer surfaces a clear "duplicate fixture" error in that case).
-    let mut seen: Vec<(&str, &Path)> = Vec::new();
+    // also small. Compare lexical keys resolved against the manifest
+    // root, not raw strings: `tests/foo`, `./tests/foo`, and
+    // `/crate/tests/foo` all point at the same snapshot siblings and
+    // must not be accepted in different suites.
+    let crate_root = derive_manifest_root(manifest_path);
+    let mut seen: Vec<(&str, PathBuf, PathBuf)> = Vec::new();
     for suite in suites {
         for dir in &suite.fixture_dirs {
-            for (other_suite, other_dir) in &seen {
-                if *other_dir == dir.as_path() {
+            let key = fixture_dir_key(&crate_root, dir);
+            for (other_suite, other_dir, other_key) in &seen {
+                if *other_key == key {
                     return Err(Error::Session(Outcome::ConfigInvalid {
                         message: format!(
-                            "fixture_dirs path \"{}\" appears in both suite \"{other_suite}\" and suite \"{}\".\nWhy this matters: snapshot files (.stderr) live next to the .rs fixtures; two suites sharing a directory would write conflicting snapshots.",
+                            "fixture_dirs path \"{}\" in suite \"{}\" resolves to the same directory as \"{}\" in suite \"{other_suite}\".\nWhy this matters: snapshot files (.stderr) live next to the .rs fixtures; two suites sharing a directory would write conflicting snapshots.",
                             dir.display(),
-                            suite.name
+                            suite.name,
+                            other_dir.display()
                         ),
                     }));
                 }
             }
-            seen.push((suite.name.as_str(), dir.as_path()));
+            seen.push((suite.name.as_str(), dir.clone(), key));
         }
     }
     Ok(())
+}
+
+fn derive_manifest_root(manifest_path: &Path) -> PathBuf {
+    match manifest_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+fn fixture_dir_key(crate_root: &Path, dir: &Path) -> PathBuf {
+    let joined = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        crate_root.join(dir)
+    };
+    lexical_normalize(&joined)
+}
+
+fn lexical_normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push(component.as_os_str());
+                }
+            }
+            Component::Normal(_) | Component::RootDir | Component::Prefix(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 fn format_invalid_key(key: &str, expected: &str, why: &str) -> String {
@@ -943,6 +982,51 @@ mod tests {
         .unwrap_err();
         let msg = unwrap_invalid(err);
         assert!(msg.contains("shared"));
+        assert!(msg.contains("default"));
+        assert!(msg.contains("spatial"));
+    }
+
+    #[test]
+    fn fixture_dirs_must_be_disjoint_after_dot_normalization() {
+        let err = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            fixture_dirs = ["tests/lihaaf/shared"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "spatial"
+            fixture_dirs = ["./tests/lihaaf/shared"]
+        "#,
+        )
+        .unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(msg.contains("resolves to the same directory"));
+        assert!(msg.contains("default"));
+        assert!(msg.contains("spatial"));
+    }
+
+    #[test]
+    fn fixture_dirs_must_be_disjoint_after_absolute_resolution() {
+        let root = std::env::current_dir().unwrap();
+        let abs = root.join("tests/lihaaf/shared");
+        let toml = format!(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            fixture_dirs = ["tests/lihaaf/shared"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "spatial"
+            fixture_dirs = ['{}']
+        "#,
+            abs.display()
+        );
+        let err = parse(&toml, &root.join("Cargo.toml")).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(msg.contains("resolves to the same directory"));
         assert!(msg.contains("default"));
         assert!(msg.contains("spatial"));
     }

@@ -912,6 +912,12 @@ fn apply_rustc_env(cmd: &mut Command, ctx: &WorkerContext) {
     cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
 }
 
+fn apply_feature_cfgs(cmd: &mut Command, features: &[String]) {
+    for feat in features {
+        cmd.arg("--cfg").arg(format!("feature=\"{feat}\""));
+    }
+}
+
 fn spawn_and_monitor(
     fx: &Fixture,
     ctx: &WorkerContext,
@@ -954,10 +960,13 @@ fn spawn_and_monitor(
         }
     }
 
-    // Features as `--cfg feature="<f>"`.
-    for feat in &ctx.features {
-        cmd.arg("--cfg").arg(format!("feature=\"{feat}\""));
-    }
+    // Features as `--cfg feature="<f>"`. Extracted helper so the
+    // multi-suite regression guard (the `suite_demo` fixture and
+    // `tests/lihaaf_fixture_shape.rs`) drives the same code path as
+    // production — removing the loop, dropping the `--cfg` arg shape,
+    // or stripping the quoted-feature-name format trips the
+    // `apply_feature_cfgs_*` unit tests without needing to spawn rustc.
+    apply_feature_cfgs(&mut cmd, &ctx.features);
 
     cmd.arg(&fx.path);
 
@@ -1594,5 +1603,31 @@ plain text line
             .flatten()
             .expect("CARGO_MANIFEST_DIR still present after override");
         assert_eq!(std::path::Path::new(manifest_dir), override_path.as_path());
+    }
+
+    #[test]
+    fn apply_feature_cfgs_emits_quoted_feature_cfgs() {
+        let mut cmd = Command::new("rustc");
+        apply_feature_cfgs(&mut cmd, &["suite_demo".to_string(), "spatial".to_string()]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--cfg",
+                "feature=\"suite_demo\"",
+                "--cfg",
+                "feature=\"spatial\""
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_feature_cfgs_is_noop_for_empty_feature_set() {
+        let mut cmd = Command::new("rustc");
+        apply_feature_cfgs(&mut cmd, &[]);
+        assert_eq!(cmd.get_args().count(), 0);
     }
 }
