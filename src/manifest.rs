@@ -23,12 +23,27 @@ use crate::error::Error;
 use crate::util;
 
 /// `target/lihaaf/manifest.json` shape.
+///
+/// One manifest is written per suite: the default suite uses
+/// `target/lihaaf/manifest.json` (backward-compatible name), and each
+/// named suite writes to `target/lihaaf/manifest-<suite>.json`. The
+/// [`Self::suite_name`] field carries the suite name explicitly so
+/// out-of-band tooling reading the manifest does not need to derive the
+/// name from the file path.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Manifest {
     /// The lihaaf release that wrote this manifest. Pinned to
     /// [`crate::VERSION`] on write; reads of older versions are
     /// tolerated via `serde(default)` on additive fields.
     pub lihaaf_version: String,
+
+    /// Suite name. `"default"` for the implicit suite built from the
+    /// top-level `[package.metadata.lihaaf]` table; otherwise the named
+    /// `[[package.metadata.lihaaf.suite]].name`. Defaulted to the
+    /// reserved `"default"` so manifests written by lihaaf <0.1.0-alpha.3
+    /// (which had no suite concept) keep deserializing.
+    #[serde(default = "default_suite_name_field")]
+    pub suite_name: String,
 
     /// Verbatim first line of `rustc --version --verbose` (drift-detection key).
     pub rustc_release: String,
@@ -84,6 +99,32 @@ pub struct Manifest {
     pub metadata_snapshot: serde_json::Value,
 }
 
+/// Default for the [`Manifest::suite_name`] field on legacy manifests.
+/// `serde` uses this when deserializing a manifest from a lihaaf
+/// release that predated the suite concept. Kept in sync with
+/// [`crate::config::DEFAULT_SUITE_NAME`].
+fn default_suite_name_field() -> String {
+    crate::config::DEFAULT_SUITE_NAME.to_string()
+}
+
+/// Compute the on-disk path for a per-suite manifest under
+/// `<workspace_target>/lihaaf/`.
+///
+/// The default suite uses the legacy unsuffixed name (`manifest.json`)
+/// to keep manifest paths stable across the suite-introducing release;
+/// named suites get a `manifest-<name>.json` filename. The suite name
+/// is validated by [`crate::config::parse`] to contain only ASCII
+/// alphanumerics, hyphens, and underscores, so this string substitution
+/// is safe to use as a filename component on every supported platform.
+pub fn manifest_path_for_suite(workspace_target: &Path, suite_name: &str) -> PathBuf {
+    let lihaaf_dir = workspace_target.join("lihaaf");
+    if suite_name == crate::config::DEFAULT_SUITE_NAME {
+        lihaaf_dir.join("manifest.json")
+    } else {
+        lihaaf_dir.join(format!("manifest-{suite_name}.json"))
+    }
+}
+
 impl Manifest {
     /// Read an existing manifest from disk. A failure to read or parse
     /// returns `None`; callers treat that as a stale-cache event and rebuild.
@@ -114,6 +155,7 @@ mod tests {
     fn sample() -> Manifest {
         Manifest {
             lihaaf_version: "0.1.0".into(),
+            suite_name: crate::config::DEFAULT_SUITE_NAME.into(),
             rustc_release: "rustc 1.95.0 (abc 2026-01-01)".into(),
             rustc_commit_hash: "abc".into(),
             host_triple: "x86_64-unknown-linux-gnu".into(),
@@ -154,5 +196,44 @@ mod tests {
         let tmp = tempdir().unwrap();
         let path = tmp.path().join("nope.json");
         assert!(Manifest::try_read(&path).is_none());
+    }
+
+    #[test]
+    fn legacy_manifest_without_suite_name_round_trips_with_default() {
+        // Manifests written by lihaaf <0.1.0-alpha.3 (pre-suite) had no
+        // `suite_name` field. The `serde(default)` annotation must
+        // backfill the reserved "default" name so older on-disk state
+        // continues to deserialize without manual migration.
+        let legacy_json = r#"{
+            "lihaaf_version": "0.1.0-alpha.2",
+            "rustc_release": "rustc 1.95.0 (abc 2026-01-01)",
+            "rustc_commit_hash": "abc",
+            "host_triple": "x86_64-unknown-linux-gnu",
+            "sysroot": "/r",
+            "dylib_crate": "consumer",
+            "cargo_dylib_path": "/p/target/release/deps/libconsumer-abc.so",
+            "managed_dylib_path": "/p/target/lihaaf/libconsumer-current-abc.so",
+            "dylib_sha256": "deadbeef",
+            "dylib_mtime_unix_secs": 1746883200,
+            "use_symlink": false,
+            "features": [],
+            "extern_crates": ["consumer"],
+            "edition": "2021",
+            "metadata_snapshot": {"dylib_crate": "consumer"}
+        }"#;
+        let m: Manifest = serde_json::from_str(legacy_json).expect("legacy manifest must parse");
+        assert_eq!(m.suite_name, crate::config::DEFAULT_SUITE_NAME);
+    }
+
+    #[test]
+    fn manifest_path_for_default_suite_uses_legacy_name() {
+        let p = manifest_path_for_suite(Path::new("/p/target"), crate::config::DEFAULT_SUITE_NAME);
+        assert_eq!(p, PathBuf::from("/p/target/lihaaf/manifest.json"));
+    }
+
+    #[test]
+    fn manifest_path_for_named_suite_includes_name() {
+        let p = manifest_path_for_suite(Path::new("/p/target"), "spatial");
+        assert_eq!(p, PathBuf::from("/p/target/lihaaf/manifest-spatial.json"));
     }
 }

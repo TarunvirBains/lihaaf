@@ -57,6 +57,18 @@ pub struct Cli {
     #[arg(short = 'j', long = "jobs", value_parser = parse_jobs)]
     pub jobs: Option<u32>,
 
+    /// Limit the run to the named suite(s). Repeatable. Without
+    /// `--suite`, every defined suite runs in declared metadata order
+    /// (the implicit `default` suite first, then each
+    /// `[[package.metadata.lihaaf.suite]]` entry in source order).
+    ///
+    /// `--suite default` selects the implicit suite built from the
+    /// top-level `[package.metadata.lihaaf]` table; named suites use
+    /// their declared `name`. Unknown names are rejected at session
+    /// startup with the list of valid names.
+    #[arg(long, value_name = "NAME")]
+    pub suite: Vec<String>,
+
     /// Force a fresh dylib build, ignoring any existing manifest.
     /// Equivalent to deleting `target/lihaaf/manifest.json` before
     /// invocation.

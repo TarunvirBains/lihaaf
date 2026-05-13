@@ -18,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::Config;
+use crate::config::Suite;
 use crate::error::{Error, Outcome};
 use crate::util;
 
@@ -49,18 +49,22 @@ pub enum FixtureKind {
     CompileFail,
 }
 
-/// Collect all fixtures under `fixture_dirs`, sort lexicographically,
-/// apply `--filter` if non-empty.
+/// Collect all fixtures under `suite.fixture_dirs`, sort
+/// lexicographically, apply `--filter` if non-empty.
 ///
 /// `crate_root` is the directory containing the consumer crate's
 /// `Cargo.toml`. Relative `fixture_dirs` resolve against it.
+///
+/// Each suite's discovery runs independently — fixtures from different
+/// suites never appear in the same returned vector. The session orchestrator
+/// loops over suites and aggregates per-suite results into a final report.
 pub fn collect(
-    config: &Config,
+    suite: &Suite,
     crate_root: &Path,
     filters: &[String],
 ) -> Result<Vec<Fixture>, Error> {
     let mut existing_dirs: Vec<PathBuf> = Vec::new();
-    for dir in &config.fixture_dirs {
+    for dir in &suite.fixture_dirs {
         let resolved = if dir.is_absolute() {
             dir.clone()
         } else {
@@ -74,14 +78,15 @@ pub fn collect(
     if existing_dirs.is_empty() {
         return Err(Error::Session(Outcome::ConfigInvalid {
             message: format!(
-                "fixture_dirs resolves to zero existing directories under {}.\nWhy this matters: nothing to test.\n  Configured: {:?}",
+                "suite \"{}\".fixture_dirs resolves to zero existing directories under {}.\nWhy this matters: nothing to test.\n  Configured: {:?}",
+                suite.name,
                 crate_root.display(),
-                config.fixture_dirs
+                suite.fixture_dirs
             ),
         }));
     }
 
-    let marker = config.compile_fail_marker.as_str();
+    let marker = suite.compile_fail_marker.as_str();
     let mut fixtures: Vec<Fixture> = Vec::new();
 
     for dir in &existing_dirs {
@@ -149,9 +154,9 @@ mod tests {
     use std::fs;
     use tempfile::tempdir;
 
-    fn cfg(dirs: Vec<&str>, marker: &str) -> Config {
-        Config {
-            dylib_crate: "consumer".into(),
+    fn suite(name: &str, dirs: Vec<&str>, marker: &str) -> Suite {
+        Suite {
+            name: name.to_string(),
             extern_crates: vec!["consumer".into()],
             fixture_dirs: dirs.into_iter().map(PathBuf::from).collect(),
             features: vec![],
@@ -160,7 +165,6 @@ mod tests {
             compile_fail_marker: marker.to_string(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: 1024,
-            raw_metadata: toml::Value::Table(toml::map::Map::new()),
         }
     }
 
@@ -174,11 +178,12 @@ mod tests {
         fs::write(cf.join("a.rs"), "").unwrap();
         fs::write(cp.join("b.rs"), "").unwrap();
 
-        let c = cfg(
+        let s = suite(
+            "default",
             vec!["tests/lihaaf/compile_fail", "tests/lihaaf/compile_pass"],
             "compile_fail",
         );
-        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        let fixtures = collect(&s, tmp.path(), &[]).unwrap();
         assert_eq!(fixtures.len(), 2);
         let a = fixtures.iter().find(|f| f.stem == "a").unwrap();
         let b = fixtures.iter().find(|f| f.stem == "b").unwrap();
@@ -194,8 +199,8 @@ mod tests {
         for name in ["zeta.rs", "alpha.rs", "mu.rs"] {
             fs::write(cf.join(name), "").unwrap();
         }
-        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
-        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        let s = suite("default", vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(&s, tmp.path(), &[]).unwrap();
         let stems: Vec<_> = fixtures.iter().map(|f| f.stem.clone()).collect();
         assert_eq!(stems, vec!["alpha".to_string(), "mu".into(), "zeta".into()]);
     }
@@ -208,9 +213,9 @@ mod tests {
         fs::write(cf.join("phase7_aaa.rs"), "").unwrap();
         fs::write(cf.join("phase8_bbb.rs"), "").unwrap();
         fs::write(cf.join("unrelated.rs"), "").unwrap();
-        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let s = suite("default", vec!["tests/lihaaf/compile_fail"], "compile_fail");
         let fixtures = collect(
-            &c,
+            &s,
             tmp.path(),
             &["phase7".to_string(), "phase8".to_string()],
         )
@@ -221,11 +226,35 @@ mod tests {
     #[test]
     fn empty_fixture_dirs_is_session_outcome() {
         let tmp = tempdir().unwrap();
-        let c = cfg(vec!["nope/never/exists", "also/missing"], "compile_fail");
-        let err = collect(&c, tmp.path(), &[]).unwrap_err();
+        let s = suite(
+            "default",
+            vec!["nope/never/exists", "also/missing"],
+            "compile_fail",
+        );
+        let err = collect(&s, tmp.path(), &[]).unwrap_err();
         match err {
             Error::Session(Outcome::ConfigInvalid { message }) => {
                 assert!(message.contains("zero existing directories"));
+                // The diagnostic names the offending suite so multi-suite
+                // adopters can locate the typo without grepping.
+                assert!(message.contains("\"default\""));
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_fixture_dirs_diagnostic_includes_named_suite() {
+        // Multi-suite diagnostic surface: when a NAMED suite's
+        // fixture_dirs resolve to zero existing directories, the failure
+        // message must include that suite's name so adopters know where
+        // to look.
+        let tmp = tempdir().unwrap();
+        let s = suite("spatial", vec!["tests/spatial/missing"], "compile_fail");
+        let err = collect(&s, tmp.path(), &[]).unwrap_err();
+        match err {
+            Error::Session(Outcome::ConfigInvalid { message }) => {
+                assert!(message.contains("\"spatial\""));
             }
             other => panic!("expected ConfigInvalid, got {other:?}"),
         }
@@ -239,8 +268,8 @@ mod tests {
         fs::create_dir_all(&nested).unwrap();
         fs::write(cf.join("flat.rs"), "").unwrap();
         fs::write(nested.join("deep.rs"), "").unwrap();
-        let c = cfg(vec!["tests/lihaaf/compile_fail"], "compile_fail");
-        let fixtures = collect(&c, tmp.path(), &[]).unwrap();
+        let s = suite("default", vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(&s, tmp.path(), &[]).unwrap();
         let stems: Vec<_> = fixtures.iter().map(|f| f.stem.clone()).collect();
         assert_eq!(stems, vec!["flat".to_string()]);
     }

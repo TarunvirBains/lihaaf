@@ -50,15 +50,29 @@ jobs:
 
       - name: Self-test corpus end-to-end
         # Build cargo-lihaaf and run it against the in-tree
-        # `tests/lihaaf/{compile_pass,compile_fail}/` corpus. The
-        # corpus is `[package.metadata.lihaaf]` self-references —
-        # lihaaf builds itself as the dylib_crate and links each
-        # fixture against it. A non-zero exit fails CI; the success
-        # path proves the full session pipeline (config load →
-        # toolchain capture → dylib build → manifest refresh →
-        # discovery → worker pool dispatch with §4.5 freshness
-        # checks → §3.3 aggregate report) works end-to-end on the
-        # current toolchain.
+        # `tests/lihaaf/{compile_pass,compile_fail,compile_pass_suite_demo}/`
+        # corpus. The corpus is `[package.metadata.lihaaf]` self-
+        # references — lihaaf builds itself as the dylib_crate and links
+        # each fixture against it.
+        #
+        # `cargo lihaaf` (no `--suite`) runs every defined suite in
+        # declared metadata order: the implicit `default` suite over
+        # `compile_fail/` + `compile_pass/`, then the named
+        # `suite_demo` suite over `compile_pass_suite_demo/` with
+        # `--features suite_demo` activated. The named suite proves
+        # the v0.1.0-alpha.3 multi-suite capability propagates the
+        # feature set to BOTH the dylib build AND the per-fixture rustc
+        # invocation: the demo fixture references
+        # `lihaaf::SUITE_DEMO_MARKER` (only exposed under the feature),
+        # so any regression that drops feature propagation fails to
+        # link and CI flips red.
+        #
+        # A non-zero exit fails CI; the success path proves the full
+        # session pipeline (config load → toolchain capture → per-suite
+        # dylib build → per-suite manifest refresh → discovery → worker
+        # pool dispatch with §4.5 freshness checks → §3.3 aggregate
+        # report) works end-to-end on the current toolchain across two
+        # independent suites.
         run: cargo run --release --bin cargo-lihaaf -- lihaaf
 
   docs:

@@ -80,13 +80,61 @@ laptop).
 | `--bless` | Overwrite `.stderr` snapshots whose normalized output differs. Equivalent: `LIHAAF_OVERWRITE=1`. |
 | `--filter <substr>` | Run only fixtures whose relative path contains the substring (multiple flags OR'd). |
 | `-j <n>` / `--jobs <n>` | Override worker parallelism. The harness still applies the RAM cap on top. |
+| `--suite <NAME>` | Limit the run to the named suite(s) (repeatable). Without `--suite`, every defined suite runs in declared metadata order. See "Multi-suite". |
 | `--list` | Print the fixtures that would run and exit, without building the dylib. Composable with `--filter`; for CI sharding. |
-| `--no-cache` | Force a fresh dylib build, ignoring any existing manifest. |
+| `--no-cache` | Force a fresh dylib build, ignoring any existing manifest (across every suite). |
 | `--manifest-path <path>` | Override the consumer `Cargo.toml` location. |
 | `--quiet` / `-q` | Suppress per-fixture progress; only show non-OK verdicts. |
 | `--verbose` / `-v` | Print each fixture's `rustc` command + captured stderr. |
 | `--use-symlink` | Skip the lihaaf-managed dylib copy; symlink instead. Saves disk + time, but unsafe under concurrent cargo activity. |
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
+
+## Multi-suite
+
+Some adopters need to compile a SUBSET of their fixtures against a
+DIFFERENT Cargo-feature set than the rest of the corpus — e.g. a
+handful of `#[cfg(feature = "spatial")]`-gated compile-pass fixtures
+that need `--features spatial` enabled, while the other ~233 fixtures
+must continue to compile against the default no-feature set so
+unrelated diagnostics stay deterministic.
+
+Lihaaf supports this with named suites. The top-level
+`[package.metadata.lihaaf]` table is always the implicit "default"
+suite. Adopters add additional suites with
+`[[package.metadata.lihaaf.suite]]` entries:
+
+```toml
+[package.metadata.lihaaf]
+dylib_crate = "consumer"
+extern_crates = ["consumer", "consumer-macros"]
+fixture_dirs = ["tests/lihaaf/compile_fail", "tests/lihaaf/compile_pass"]
+features = []  # default suite: no Cargo features
+
+[[package.metadata.lihaaf.suite]]
+name = "spatial"
+features = ["spatial"]
+fixture_dirs = ["tests/lihaaf/compile_pass_spatial"]
+```
+
+Each suite triggers an independent dylib build with its own feature
+set. Per-suite manifest paths (`target/lihaaf/manifest-<name>.json`)
+and per-suite cargo target dirs (`target/lihaaf-build-<name>/`) keep
+incremental caches isolated. `cargo lihaaf` (no `--suite`) runs every
+defined suite in declared order; `cargo lihaaf --suite spatial`
+restricts to the named subset.
+
+Constraints (validated at config parse time):
+- Suite names must be `[A-Za-z0-9_-]` and not equal to `default`.
+- `fixture_dirs` must be disjoint across suites (no shared snapshot files).
+- `dylib_crate` is not per-suite — one consumer crate per session.
+- `features` does not inherit (a named suite that omits `features`
+  gets `[]`, not the default suite's features).
+- Other keys (`extern_crates`, `dev_deps`, `edition`,
+  `compile_fail_marker`, `fixture_timeout_secs`,
+  `per_fixture_memory_mb`) inherit from the top-level table when
+  omitted on a named suite.
+
+See `docs/spec/lihaaf-v0.1.md` §3.6 for the full design.
 
 Flag behavior aligns with the v0.1 contract documented in the spec companion.
 
