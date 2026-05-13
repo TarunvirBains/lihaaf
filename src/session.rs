@@ -167,16 +167,7 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     // Per-session temp dir (shared across suites). Each fixture's
     // workdir lives underneath; cleanup-residue / --keep-output behavior
     // applies to the whole session-temp parent, not per-suite.
-    let session_temp = tempfile::Builder::new()
-        .prefix("lihaaf-session-")
-        .tempdir_in(&workspace_target)
-        .map_err(|e| {
-            Error::io(
-                e,
-                "creating session temp dir",
-                Some(workspace_target.clone()),
-            )
-        })?;
+    let session_temp = create_session_temp_dir(&workspace_target)?;
     let session_temp_path = session_temp.path().to_path_buf();
 
     let total_dispatch_start = std::time::Instant::now();
@@ -243,6 +234,43 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         wall_ms,
         suites_run,
     })
+}
+
+fn create_session_temp_dir(workspace_target: &std::path::Path) -> Result<tempfile::TempDir, Error> {
+    std::fs::create_dir_all(workspace_target).map_err(|e| {
+        Error::io(
+            e,
+            "creating session temp parent dir",
+            Some(workspace_target.to_path_buf()),
+        )
+    })?;
+
+    tempfile::Builder::new()
+        .prefix("lihaaf-session-")
+        .tempdir_in(workspace_target)
+        .map_err(|e| {
+            Error::io(
+                e,
+                "creating session temp dir",
+                Some(workspace_target.to_path_buf()),
+            )
+        })
+}
+
+#[cfg(test)]
+mod session_temp_parent_tests {
+    use super::create_session_temp_dir;
+
+    #[test]
+    fn creates_missing_target_parent_before_session_tempdir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("fixture-crate").join("target");
+
+        let session_temp = create_session_temp_dir(&target).unwrap();
+
+        assert!(target.is_dir());
+        assert!(session_temp.path().starts_with(&target));
+    }
 }
 
 /// Bundle of inputs for [`run_one_suite`]. Grouped into a struct so the

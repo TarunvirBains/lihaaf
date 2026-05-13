@@ -59,6 +59,11 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-suite identity is what the worker now closes over.
 
 ### Fixed
+- Session temp directory creation now creates the workspace target
+  parent directory first. Clean CI checkouts that run lihaaf before any
+  other crate-local Cargo command no longer fail with
+  `No such file or directory` while creating
+  `<crate>/target/lihaaf-session-*`.
 - Per-fixture `rustc` invocations now set `CARGO_MANIFEST_DIR` to the
   consumer crate root (the directory containing the consumer's
   `Cargo.toml`). Cargo sets this automatically on `cargo build` /
