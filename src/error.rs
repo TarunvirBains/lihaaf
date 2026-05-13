@@ -136,7 +136,7 @@ pub enum Outcome {
         /// Stable identifier for the invariant that drifted.
         invariant: String,
         /// Pre-rendered diagnostic body — see
-        /// [`crate::freshness::FreshnessFailure::detail`].
+        /// `freshness::FreshnessFailure::detail` for the upstream renderer.
         detail: String,
     },
 }
@@ -259,4 +259,5 @@ impl Error {
 }
 
 /// `Result` alias used throughout the crate.
+#[allow(dead_code)] // exported convenience alias; callers spell `Result<_, Error>` directly.
 pub type Result<T> = std::result::Result<T, Error>;

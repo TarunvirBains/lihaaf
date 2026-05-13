@@ -38,6 +38,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multi-suite invariant without needing a downstream adopter.
 
 ### Changed
+- Narrowed the public Rust library surface to a documented CLI-shape.
+  The following modules — previously `pub mod` — are now `pub(crate)`:
+  `diff`, `discovery`, `dylib`, `error`, `freshness`, `manifest`,
+  `normalize`, `session`, `snapshot`, `toolchain`, `util`, `worker`.
+  The `cli`, `config`, `exit`, and `verdict` modules remain `pub` (they
+  define the v0.1 stable schema/catalog/argument-parsing contracts).
+  Adopters who want a Rust-callable surface should use the new
+  crate-root re-exports: `Cli`, `Config`, `Verdict`, `ExitCode`,
+  `Error`, `Outcome`, `run`, `Report`. `Outcome` is part of the v0.1
+  stable Rust surface because `Error::Session(Outcome)` is a public
+  variant of the re-exported `Error` enum; Rust's E0446 rule (private
+  type in public interface) makes `Outcome`'s public visibility
+  load-bearing, so the re-export ratifies the de-facto contract.
+  Pre-1.0 alpha precedent: v0.1.0-alpha.4 is the only published
+  version and the CHANGELOG header already states the library API is
+  non-stable across v0.1.x; adopters who imported internal module
+  paths (`lihaaf::dylib::*`, `lihaaf::worker::*`, etc.) should switch
+  to subprocess-spawning `cargo lihaaf` or to the crate-root
+  re-exports above. Issue #3.
 - The session reporter prints `lihaaf: === suite "<name>" ===` headers
   and per-suite aggregate lines (`lihaaf: suite "<name>": …`) when
   more than one suite runs in a session. Single-suite runs (adopters

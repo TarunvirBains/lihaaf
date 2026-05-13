@@ -128,6 +128,7 @@ pub fn manifest_path_for_suite(workspace_target: &Path, suite_name: &str) -> Pat
 impl Manifest {
     /// Read an existing manifest from disk. A failure to read or parse
     /// returns `None`; callers treat that as a stale-cache event and rebuild.
+    #[allow(dead_code)] // retained for symmetry with `write_atomic`; future cache-aware paths.
     pub fn try_read(path: &Path) -> Option<Self> {
         let text = std::fs::read_to_string(path).ok()?;
         serde_json::from_str(&text).ok()
