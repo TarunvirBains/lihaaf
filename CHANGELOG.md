@@ -6,6 +6,58 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Multi-suite configuration. Adopters can declare additional named
+  feature-subset suites with `[[package.metadata.lihaaf.suite]]` array
+  entries (each with `name`, `features`, `fixture_dirs`, and optional
+  `extern_crates` / `dev_deps` / `edition` / `compile_fail_marker` /
+  `fixture_timeout_secs` / `per_fixture_memory_mb` overrides), and
+  each suite triggers an independent dylib build with that suite's
+  feature set propagated to per-fixture rustc invocations. Per-suite
+  manifests live at `target/lihaaf/manifest-<name>.json` and per-suite
+  cargo target dirs live at `target/lihaaf-build-<name>/`. The default
+  suite (built from the top-level `[package.metadata.lihaaf]` table)
+  retains the legacy `target/lihaaf/manifest.json` and
+  `target/lihaaf-build/` paths so adopters who never add a named suite
+  see no cache-key change. New CLI flag `--suite NAME` (repeatable)
+  limits the run to the named subset; without `--suite`, every defined
+  suite runs in declared metadata order. Fixture directories must be
+  disjoint across suites — validated at config parse time so two
+  suites cannot collide on snapshot files. The new
+  `Manifest::suite_name` field carries the suite identity for
+  out-of-band tooling; manifests written by lihaaf <0.1.0-alpha.3
+  default the field to `"default"` on read so legacy on-disk state
+  keeps deserializing.
+- Self-test corpus addition: a new `tests/lihaaf/compile_pass_suite_demo/`
+  fixture and `[[package.metadata.lihaaf.suite]] name = "suite_demo"`
+  entry in lihaaf's own Cargo.toml. The fixture references
+  `lihaaf::SUITE_DEMO_MARKER` (a const exposed only when lihaaf is
+  built with `--features suite_demo`); CI runs lihaaf against itself
+  and any regression that drops feature propagation between the dylib
+  build and the per-fixture rustc fails to link, biting the
+  multi-suite invariant without needing a downstream adopter.
+
+### Changed
+- The session reporter prints `lihaaf: === suite "<name>" ===` headers
+  and per-suite aggregate lines (`lihaaf: suite "<name>": …`) when
+  more than one suite runs in a session. Single-suite runs (adopters
+  who never add a `[[suite]]` entry) keep their legacy output
+  byte-identical: no header, no per-suite line, just the existing
+  `lihaaf: <n> ok, …` final aggregate.
+- `Err(Error::Session(outcome))` paths in `cargo-lihaaf` now print the
+  outcome's diagnostic message to stderr before the exit-code mapping.
+  Pre-v0.1.0-alpha.3 the binary exited with the right code but
+  silently dropped the diagnostic body — adopters had to consult the
+  exit-code table to interpret a session-level failure. The fix is
+  behavior-only; the message bodies are unchanged from the existing
+  `Display` impl on `Outcome`.
+- `WorkerContext::new` signature changed: it now takes
+  `dylib_crate: &str` and `suite: &Suite` in place of `&Config`.
+  Library API (pre-1.0) — adopters who subprocess-spawn `cargo
+  lihaaf` are unaffected. Adopters wiring lihaaf as a library
+  (currently lihaaf's own bin and tests) update their call sites; the
+  per-suite identity is what the worker now closes over.
+
 ### Fixed
 - Per-fixture `rustc` invocations now set `CARGO_MANIFEST_DIR` to the
   consumer crate root (the directory containing the consumer's

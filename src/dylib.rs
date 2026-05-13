@@ -36,7 +36,7 @@ use std::process::Command;
 
 use serde::Deserialize;
 
-use crate::config::Config;
+use crate::config::Suite;
 use crate::error::{Error, Outcome};
 use crate::toolchain::Toolchain;
 
@@ -382,9 +382,28 @@ pub fn workspace_target_dir(manifest_path: &Path) -> PathBuf {
     crate_dir.join("target")
 }
 
+/// Per-suite cargo target directory under `<workspace_target>/`.
+///
+/// The default suite uses `<workspace_target>/lihaaf-build` (the legacy
+/// path, kept stable so adopters who never add a named suite see no
+/// cache-key change across the suite-introducing release). Named suites
+/// use `<workspace_target>/lihaaf-build-<suite>` so each suite's
+/// `--features` set lives in its own cargo cache and never thrashes a
+/// sibling suite's build artifacts. Suite names are validated by
+/// [`crate::config::parse`] to contain only ASCII alphanumerics, hyphens,
+/// and underscores, so the substitution is filename-safe on every
+/// supported platform.
+pub fn build_dir_for_suite(workspace_target: &Path, suite_name: &str) -> PathBuf {
+    if suite_name == crate::config::DEFAULT_SUITE_NAME {
+        workspace_target.join("lihaaf-build")
+    } else {
+        workspace_target.join(format!("lihaaf-build-{suite_name}"))
+    }
+}
+
 /// True when the build params look usable. Cheap pre-flight check.
 #[allow(dead_code)]
-pub fn validate_params(_params: &BuildParams<'_>, _config: &Config) -> Result<(), Error> {
+pub fn validate_params(_params: &BuildParams<'_>, _suite: &Suite) -> Result<(), Error> {
     // Reserved for future invariants (e.g., dylib_crate is in the
     // workspace's metadata). v0.1 leaves this as a no-op; cargo itself
     // rejects unknown -p targets clearly.
@@ -449,5 +468,20 @@ mod tests {
             Path::new("/p/target/release/deps/libconsumer.so"),
         );
         assert!(p.ends_with("libconsumer-current-0.so"));
+    }
+
+    #[test]
+    fn build_dir_for_default_suite_uses_legacy_name() {
+        let p = build_dir_for_suite(Path::new("/p/target"), crate::config::DEFAULT_SUITE_NAME);
+        // Backward compat: an adopter who never adds a named suite
+        // hashes against the same cargo target dir as before the suite
+        // concept existed.
+        assert_eq!(p, PathBuf::from("/p/target/lihaaf-build"));
+    }
+
+    #[test]
+    fn build_dir_for_named_suite_includes_name() {
+        let p = build_dir_for_suite(Path::new("/p/target"), "spatial");
+        assert_eq!(p, PathBuf::from("/p/target/lihaaf-build-spatial"));
     }
 }

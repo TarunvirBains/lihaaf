@@ -8,13 +8,32 @@
 //!
 //! 1. Configuration load → [`crate::config::load`].
 //! 2. Toolchain capture → [`crate::toolchain::capture`].
-//! 3. Dylib build → [`crate::dylib::build`].
-//! 4. Dylib copy → [`crate::dylib::copy_dylib`] / `symlink_dylib`.
-//! 5. Manifest refresh → [`crate::manifest::Manifest::write`].
-//! 6. Fixture discovery → [`crate::discovery::collect`].
-//! 7. Worker pool dispatch → [`crate::worker::dispatch_pool`].
-//! 8. Result aggregation → [`Report`].
-//! 9. Exit → caller maps [`Report::exit_code`] to a process exit code.
+//! 3. Suite selection — apply `--suite` filtering across `config.suites`.
+//! 4. For each selected suite (in declared metadata order):
+//!    a. Dylib build for the suite's feature set → [`crate::dylib::build`].
+//!    b. Dylib copy → [`crate::dylib::copy_dylib`] / `symlink_dylib`.
+//!    c. Manifest refresh — per-suite manifest path under
+//!    `target/lihaaf/manifest{,-<suite>}.json`.
+//!    d. Fixture discovery → [`crate::discovery::collect`].
+//!    e. Worker pool dispatch → [`crate::worker::dispatch_pool`].
+//!    f. Per-suite result aggregation.
+//! 5. Cross-suite result aggregation → [`Report`].
+//! 6. Exit → caller maps [`Report::exit_code`] to a process exit code.
+//!
+//! ## Multi-suite
+//!
+//! A session always runs at least one suite (the implicit "default"
+//! suite from the top-level `[package.metadata.lihaaf]` table). Adopters
+//! that declare `[[package.metadata.lihaaf.suite]]` entries get an
+//! independent dylib build per suite — `cargo lihaaf` without
+//! `--suite` runs every defined suite in declared metadata order, and
+//! `--suite NAME` (repeatable) restricts the run to the named subset.
+//!
+//! Each suite's build artifacts live under a suite-namespaced
+//! `target/lihaaf-build{-<name>}` cargo target dir so different feature
+//! sets do not thrash each other's incremental cache. The default suite
+//! retains the legacy `target/lihaaf-build/` and `target/lihaaf/manifest.json`
+//! paths so adopters who never add a named suite see no cache-key change.
 //!
 //! ## Why one function (and not a builder)
 //!
@@ -25,15 +44,15 @@
 use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
-use crate::config;
+use crate::config::{self, Config, Suite};
 use crate::discovery;
 use crate::dylib;
 use crate::error::{Error, Outcome};
 use crate::exit::ExitCode;
 use crate::freshness::FreshnessSnapshot;
-use crate::manifest::Manifest;
+use crate::manifest::{self, Manifest};
 use crate::normalize::NormalizationContext;
-use crate::toolchain;
+use crate::toolchain::{self, Toolchain};
 use crate::util;
 use crate::verdict::FixtureResult;
 use crate::worker::{self, WorkerContext};
@@ -41,13 +60,21 @@ use crate::worker::{self, WorkerContext};
 /// Aggregate result of a session run.
 #[derive(Debug)]
 pub struct Report {
-    /// Per-fixture results in deterministic (lexicographic) order.
+    /// Per-fixture results across every suite that ran. Ordered by
+    /// suite-execution order, then lexicographically within each suite.
     pub results: Vec<FixtureResult>,
     /// True when at least one cleanup error accumulated. Maps onto the
     /// `CLEANUP_RESIDUE` outcome.
     pub cleanup_residue: bool,
-    /// Total wall-clock for the worker pool, in milliseconds.
+    /// Total wall-clock for the worker pool dispatch loop across every
+    /// suite that ran, in milliseconds. Excludes per-suite dylib build
+    /// time and discovery so the value is comparable to the legacy
+    /// single-suite report.
     pub wall_ms: u64,
+    /// Names of suites that actually ran, in execution order. Useful
+    /// for tests and CI scripts that want to confirm a `--suite NAME`
+    /// invocation routed correctly.
+    pub suites_run: Vec<String>,
 }
 
 impl Report {
@@ -79,120 +106,67 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     // Stage 2 — toolchain capture.
     let toolchain = toolchain::capture()?;
 
+    // Stage 3 — suite selection.
+    let selected_indexes = select_suites_by_cli(&config.suites, &cli.suite)?;
+    let multi_suite = selected_indexes.len() > 1;
+
     // List mode short-circuits before the dylib build (the policy).
+    // Multi-suite list mode walks each selected suite and prints its
+    // fixtures; the per-suite header is only emitted when more than
+    // one suite is selected so the single-suite output stays
+    // byte-identical to v0.1.0-alpha.2.
     if cli.list {
-        let fixtures = discovery::collect(&config, &crate_root, &cli.filter)?;
-        for f in &fixtures {
-            println!("{}", f.relative_path);
+        for &idx in &selected_indexes {
+            let suite = &config.suites[idx];
+            if multi_suite {
+                eprintln!("# suite \"{}\"", suite.name);
+            }
+            let fixtures = discovery::collect(suite, &crate_root, &cli.filter)?;
+            for f in &fixtures {
+                println!("{}", f.relative_path);
+            }
         }
         return Ok(Report {
             results: Vec::new(),
             cleanup_residue: false,
             wall_ms: 0,
+            suites_run: selected_indexes
+                .iter()
+                .map(|&i| config.suites[i].name.clone())
+                .collect(),
         });
     }
 
     let workspace_target = dylib::workspace_target_dir(&manifest_path);
-    let lihaaf_build_dir = workspace_target.join("lihaaf-build");
 
     // `--no-cache` (the policy): force a fresh dylib build by removing
-    // any existing manifest BEFORE stage 3. The dylib build below
-    // unconditionally re-issues `cargo rustc`, but cargo's own cache
-    // can still produce a stale-feeling artifact if the toml/feature
-    // set hasn't drifted; deleting the manifest is the documented
-    // "blow the cache" lever ("Equivalent to deleting
-    // target/lihaaf/manifest.json before invocation"). The lihaaf-build
-    // target dir is also removed so cargo's incremental cache is
-    // fully bypassed — that's what an adopter scripting `--no-cache`
-    // is asking for.
+    // every per-suite manifest AND every per-suite lihaaf-build target
+    // dir BEFORE stage 4. Removing across all suites (not just the
+    // selected ones) keeps `--no-cache` semantics simple: the user asked
+    // for a clean slate, they get a clean slate.
     if cli.no_cache {
-        let manifest_dest = workspace_target.join("lihaaf/manifest.json");
-        if manifest_dest.exists() {
-            let _ = std::fs::remove_file(&manifest_dest);
-        }
-        if lihaaf_build_dir.exists() {
-            let _ = std::fs::remove_dir_all(&lihaaf_build_dir);
+        for suite in &config.suites {
+            let manifest_dest = manifest::manifest_path_for_suite(&workspace_target, &suite.name);
+            if manifest_dest.exists() {
+                let _ = std::fs::remove_file(&manifest_dest);
+            }
+            let build_dir = dylib::build_dir_for_suite(&workspace_target, &suite.name);
+            if build_dir.exists() {
+                let _ = std::fs::remove_dir_all(&build_dir);
+            }
         }
         if !cli.quiet {
-            eprintln!("lihaaf: --no-cache: removed any prior manifest + lihaaf-build dir");
+            let n = config.suites.len();
+            let plural = if n == 1 { "" } else { "s" };
+            eprintln!(
+                "lihaaf: --no-cache: removed any prior manifest + lihaaf-build dir across {n} suite{plural}"
+            );
         }
     }
 
-    // Stage 3 — dylib build.
-    let build_started = std::time::Instant::now();
-    let build_out = dylib::build(&dylib::BuildParams {
-        crate_name: &config.dylib_crate,
-        features: &config.features,
-        manifest_path: &manifest_path,
-        target_dir: &lihaaf_build_dir,
-        toolchain: &toolchain,
-    })?;
-    if !cli.quiet {
-        let secs = build_started.elapsed().as_secs_f64();
-        eprintln!("lihaaf: built {} dylib in {:.1}s", config.dylib_crate, secs);
-    }
-
-    // Stage 4 — dylib copy (or symlink).
-    let managed_path = dylib::managed_dylib_path(&workspace_target, &build_out.cargo_dylib_path);
-    if cli.use_symlink {
-        dylib::symlink_dylib(&build_out.cargo_dylib_path, &managed_path)?;
-    } else {
-        dylib::copy_dylib(&build_out.cargo_dylib_path, &managed_path)?;
-    }
-
-    // Stage 5 — manifest refresh.
-    let dylib_sha = util::sha256_file(&managed_path)?;
-    let dylib_mtime = dylib::mtime_unix_secs(&managed_path)?;
-    let metadata_snapshot = toml_value_to_json(&config.raw_metadata);
-    let manifest = Manifest {
-        lihaaf_version: crate::VERSION.to_string(),
-        rustc_release: toolchain.release_line.clone(),
-        rustc_commit_hash: toolchain.commit_hash.clone(),
-        host_triple: toolchain.host.clone(),
-        sysroot: toolchain.sysroot.clone(),
-        dylib_crate: config.dylib_crate.clone(),
-        cargo_dylib_path: build_out.cargo_dylib_path.clone(),
-        managed_dylib_path: managed_path.clone(),
-        dylib_sha256: dylib_sha.clone(),
-        dylib_mtime_unix_secs: dylib_mtime,
-        use_symlink: cli.use_symlink,
-        features: config.features.clone(),
-        extern_crates: config.extern_crates.clone(),
-        edition: config.edition.clone(),
-        metadata_snapshot,
-    };
-    let manifest_dest = workspace_target.join("lihaaf/manifest.json");
-    manifest.write(&manifest_dest)?;
-    // Capture the four the policy invariants from session-startup state.
-    // Re-checked per-fixture inside the worker pool dispatch loop.
-    let freshness_snapshot = FreshnessSnapshot {
-        managed_dylib_path: managed_path.clone(),
-        original_mtime_unix_secs: dylib_mtime,
-        original_sha256: dylib_sha.clone(),
-        original_rustc_release_line: toolchain.release_line.clone(),
-    };
-
-    // Stage 6 — fixture discovery.
-    let fixtures = discovery::collect(&config, &crate_root, &cli.filter)?;
-    if !cli.quiet {
-        let cf = fixtures
-            .iter()
-            .filter(|f| matches!(f.kind, discovery::FixtureKind::CompileFail))
-            .count();
-        let cp = fixtures.len() - cf;
-        eprintln!(
-            "lihaaf: {} fixtures discovered (compile_fail: {cf}, compile_pass: {cp})",
-            fixtures.len()
-        );
-    }
-
-    // Parallelism cap (the policy).
-    let parallelism = compute_parallelism(&cli, &config);
-    if !cli.quiet {
-        eprintln!("lihaaf: parallelism = {parallelism}");
-    }
-
-    // Per-session temp dir.
+    // Per-session temp dir (shared across suites). Each fixture's
+    // workdir lives underneath; cleanup-residue / --keep-output behavior
+    // applies to the whole session-temp parent, not per-suite.
     let session_temp = tempfile::Builder::new()
         .prefix("lihaaf-session-")
         .tempdir_in(&workspace_target)
@@ -205,17 +179,205 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         })?;
     let session_temp_path = session_temp.path().to_path_buf();
 
-    // Build the worker context.
-    let norm_ctx = NormalizationContext::new(crate_root.clone(), toolchain.sysroot.clone());
+    let total_dispatch_start = std::time::Instant::now();
+    let mut all_results: Vec<FixtureResult> = Vec::new();
+    let mut suites_run: Vec<String> = Vec::with_capacity(selected_indexes.len());
+
+    for &idx in &selected_indexes {
+        let suite = &config.suites[idx];
+        if multi_suite && !cli.quiet {
+            eprintln!("lihaaf: === suite \"{}\" ===", suite.name);
+        }
+        let suite_results = run_one_suite(SuiteRunInput {
+            suite,
+            config: &config,
+            cli: &cli,
+            crate_root: &crate_root,
+            manifest_path: &manifest_path,
+            workspace_target: &workspace_target,
+            toolchain: &toolchain,
+            session_temp: &session_temp_path,
+        })?;
+        if multi_suite {
+            print_per_suite_aggregate(suite, &suite_results);
+        }
+        all_results.extend(suite_results);
+        suites_run.push(suite.name.clone());
+    }
+
+    let wall_ms = total_dispatch_start.elapsed().as_millis() as u64;
+
+    let cleanup_residue = all_results.iter().any(|r| r.cleanup_failure.is_some());
+
+    // Print the cross-suite aggregate report. Same shape as the v0.1.0-alpha.2
+    // single-suite aggregate so CI scripts that grep on the existing
+    // `lihaaf: N ok, N failed, N timeout, N memory_exhausted` line keep
+    // working.
+    print_aggregate(&all_results, wall_ms, cleanup_residue);
+
+    // Preserve the per-session temp directory in two cases:
+    //
+    // 1. `--keep-output` is set (local-development escape hatch).
+    // 2. Any fixture's per-fixture workdir cleanup failed (`CLEANUP_RESIDUE` case).
+    //
+    // `tempfile::TempDir` removes the directory on drop; `std::mem::
+    // forget` is the documented way to suppress that drop while
+    // keeping the path alive on disk.
+    if cli.keep_output {
+        eprintln!(
+            "lihaaf: --keep-output set; per-fixture workdirs preserved under {}",
+            session_temp_path.display()
+        );
+        std::mem::forget(session_temp);
+    } else if cleanup_residue {
+        eprintln!(
+            "lihaaf: CLEANUP_RESIDUE detected; session-temp parent preserved at {}",
+            session_temp_path.display()
+        );
+        std::mem::forget(session_temp);
+    }
+
+    Ok(Report {
+        results: all_results,
+        cleanup_residue,
+        wall_ms,
+        suites_run,
+    })
+}
+
+/// Bundle of inputs for [`run_one_suite`]. Grouped into a struct so the
+/// signature stays readable as the per-suite stage list grows.
+struct SuiteRunInput<'a> {
+    suite: &'a Suite,
+    config: &'a Config,
+    cli: &'a Cli,
+    crate_root: &'a Path,
+    manifest_path: &'a Path,
+    workspace_target: &'a Path,
+    toolchain: &'a Toolchain,
+    session_temp: &'a Path,
+}
+
+/// Stages 4a–4f for one suite. Returns the per-suite fixture results.
+/// Session-level failures (dylib build, freshness drift, etc.) bubble
+/// up via `Result::Err` and short-circuit the outer suite loop.
+fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> {
+    let SuiteRunInput {
+        suite,
+        config,
+        cli,
+        crate_root,
+        manifest_path,
+        workspace_target,
+        toolchain,
+        session_temp,
+    } = input;
+
+    // Per-suite cargo target dir. The default suite uses the legacy
+    // `target/lihaaf-build/` for cache-key stability; named suites get
+    // `target/lihaaf-build-<suite>/` so different feature sets do not
+    // thrash each other's incremental cache.
+    let lihaaf_build_dir = dylib::build_dir_for_suite(workspace_target, &suite.name);
+
+    // Stage 4a — dylib build with this suite's features.
+    let build_started = std::time::Instant::now();
+    let build_out = dylib::build(&dylib::BuildParams {
+        crate_name: &config.dylib_crate,
+        features: &suite.features,
+        manifest_path,
+        target_dir: &lihaaf_build_dir,
+        toolchain,
+    })?;
+    if !cli.quiet {
+        let secs = build_started.elapsed().as_secs_f64();
+        eprintln!("lihaaf: built {} dylib in {:.1}s", config.dylib_crate, secs);
+    }
+
+    // Stage 4b — dylib copy (or symlink).
+    let managed_path = dylib::managed_dylib_path(workspace_target, &build_out.cargo_dylib_path);
+    if cli.use_symlink {
+        dylib::symlink_dylib(&build_out.cargo_dylib_path, &managed_path)?;
+    } else {
+        dylib::copy_dylib(&build_out.cargo_dylib_path, &managed_path)?;
+    }
+
+    // Stage 4c — manifest refresh. Per-suite path so different suite
+    // builds do not stomp on each other's cached state.
+    let dylib_sha = util::sha256_file(&managed_path)?;
+    let dylib_mtime = dylib::mtime_unix_secs(&managed_path)?;
+    let metadata_snapshot = toml_value_to_json(&config.raw_metadata);
+    let manifest_obj = Manifest {
+        lihaaf_version: crate::VERSION.to_string(),
+        suite_name: suite.name.clone(),
+        rustc_release: toolchain.release_line.clone(),
+        rustc_commit_hash: toolchain.commit_hash.clone(),
+        host_triple: toolchain.host.clone(),
+        sysroot: toolchain.sysroot.clone(),
+        dylib_crate: config.dylib_crate.clone(),
+        cargo_dylib_path: build_out.cargo_dylib_path.clone(),
+        managed_dylib_path: managed_path.clone(),
+        dylib_sha256: dylib_sha.clone(),
+        dylib_mtime_unix_secs: dylib_mtime,
+        use_symlink: cli.use_symlink,
+        features: suite.features.clone(),
+        extern_crates: suite.extern_crates.clone(),
+        edition: suite.edition.clone(),
+        metadata_snapshot,
+    };
+    let manifest_dest = manifest::manifest_path_for_suite(workspace_target, &suite.name);
+    manifest_obj.write(&manifest_dest)?;
+
+    // Capture the four policy invariants from per-suite startup state.
+    // Re-checked per-fixture inside the worker pool dispatch loop. The
+    // snapshot is per-suite because each suite has its own managed dylib
+    // (different feature sets produce different SHA-256s).
+    let freshness_snapshot = FreshnessSnapshot {
+        managed_dylib_path: managed_path.clone(),
+        original_mtime_unix_secs: dylib_mtime,
+        original_sha256: dylib_sha.clone(),
+        original_rustc_release_line: toolchain.release_line.clone(),
+    };
+
+    // Stage 4d — fixture discovery for this suite.
+    let fixtures = discovery::collect(suite, crate_root, &cli.filter)?;
+    if !cli.quiet {
+        let cf = fixtures
+            .iter()
+            .filter(|f| matches!(f.kind, discovery::FixtureKind::CompileFail))
+            .count();
+        let cp = fixtures.len() - cf;
+        eprintln!(
+            "lihaaf: {} fixtures discovered (compile_fail: {cf}, compile_pass: {cp})",
+            fixtures.len()
+        );
+    }
+
+    // Parallelism cap (the policy). Recomputed per-suite because the
+    // RAM cap is derived from the suite's `per_fixture_memory_mb`, which
+    // adopters may set higher for a heavier feature set.
+    //
+    // v0.1.0-alpha.3 intentionally does not carry `ParallelismGate`
+    // OOM reductions across suite boundaries: each suite gets a fresh
+    // dispatch pool and a fresh gate. Sharing that state would require
+    // plumbing a mutable gate through `worker::dispatch_pool`; defer
+    // until a real adopter reports cross-suite OOM cascades.
+    let parallelism = compute_parallelism(cli, suite);
+    if !cli.quiet {
+        eprintln!("lihaaf: parallelism = {parallelism}");
+    }
+
+    // Build the worker context for this suite.
+    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone());
     let mut worker_ctx = WorkerContext::new(
-        crate_root.clone(),
+        crate_root.to_path_buf(),
         managed_path.clone(),
         build_out.deps_dir.clone(),
-        &config,
+        &config.dylib_crate,
+        suite,
         cli.effective_bless(),
         cli.verbose,
         cli.keep_output,
-        session_temp_path.clone(),
+        session_temp.to_path_buf(),
         norm_ctx,
         &toolchain.sysroot,
         freshness_snapshot,
@@ -226,19 +388,18 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     extra_names.extend(worker_ctx.dev_deps.iter().cloned());
     worker_ctx.extern_paths = worker::resolve_extern_paths(&build_out.deps_dir, &extra_names)?;
 
-    // Mid-session toolchain drift check (the policy): the captured
+    // Mid-suite toolchain drift check (the policy): the captured
     // rustc release is compared against a fresh capture. Cheap; cost
     // is dwarfed by the per-fixture rustc.
     let post_capture = toolchain::capture()?;
-    if !toolchain::matches(&toolchain, &post_capture) {
+    if !toolchain::matches(toolchain, &post_capture) {
         return Err(Error::Session(Outcome::ToolchainDrift {
             original: toolchain.release_line.clone(),
             current: post_capture.release_line.clone(),
         }));
     }
 
-    // Stage 7 — worker pool dispatch.
-    let dispatch_start = std::time::Instant::now();
+    // Stage 4e — worker pool dispatch.
     let progress_quiet = cli.quiet;
     let dispatch_outcome = worker::dispatch_pool(&fixtures, &worker_ctx, parallelism, move |r| {
         if progress_quiet {
@@ -259,7 +420,6 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
         // quiet mode). the policy mandates the LARGE_SNAPSHOT line.
         emit_fixture_warnings(r);
     });
-    let wall_ms = dispatch_start.elapsed().as_millis() as u64;
 
     // the policy: a per-dispatch freshness failure is a session-level
     // hard fail. Convert to the typed outcome and let main() map it
@@ -270,47 +430,47 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
             detail: failure.detail(),
         }));
     }
-    let results = dispatch_outcome.results;
 
-    // Stage 8 — result aggregation.
-    let cleanup_residue = results.iter().any(|r| r.cleanup_failure.is_some());
+    Ok(dispatch_outcome.results)
+}
 
-    // Print the aggregate report.
-    print_aggregate(&results, wall_ms, cleanup_residue);
-
-    // Preserve the per-session temp directory in two cases:
-    //
-    // 1. `--keep-output` is set (local-development escape hatch).
-    // 2. Any fixture's per-fixture workdir cleanup failed (`CLEANUP_RESIDUE` case):
-    //    "the session-temp parent directory is NOT removed at session
-    //    end if it contains residue from a CLEANUP_FAILED fixture —
-    //    leaving the residue visible is more useful than silently
-    //    retrying a removal that already failed once."). Re-emitted as
-    //    outcome's preserve-on-disk side
-    //    of the contract.
-    //
-    // `tempfile::TempDir` removes the directory on drop; `std::mem::
-    // forget` is the documented way to suppress that drop while
-    // keeping the path alive on disk.
-    if cli.keep_output {
-        eprintln!(
-            "lihaaf: --keep-output set; per-fixture workdirs preserved under {}",
-            session_temp_path.display()
-        );
-        std::mem::forget(session_temp);
-    } else if cleanup_residue {
-        eprintln!(
-            "lihaaf: CLEANUP_RESIDUE detected; session-temp parent preserved at {}",
-            session_temp_path.display()
-        );
-        std::mem::forget(session_temp);
+/// Resolve the user's `--suite` selection against the parsed
+/// [`Config::suites`] list. Returns indices in declared metadata order
+/// — explicitly NOT in CLI argument order, so a multi-suite invocation
+/// produces deterministic suite ordering regardless of how the user
+/// arranged their `--suite` flags.
+///
+/// An empty CLI selection (the user passed no `--suite`) selects every
+/// suite. An unknown name (no match in `config.suites`) is rejected
+/// with the list of valid names so the adopter can fix the typo.
+pub fn select_suites_by_cli(
+    suites: &[Suite],
+    cli_selection: &[String],
+) -> Result<Vec<usize>, Error> {
+    if cli_selection.is_empty() {
+        return Ok((0..suites.len()).collect());
     }
-
-    Ok(Report {
-        results,
-        cleanup_residue,
-        wall_ms,
-    })
+    // Build the set of requested names (de-duplicated) and verify each
+    // matches a known suite. Iteration order is metadata-declared order.
+    let mut requested: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for name in cli_selection {
+        if !suites.iter().any(|s| s.name == *name) {
+            let known: Vec<String> = suites.iter().map(|s| format!("\"{}\"", s.name)).collect();
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "--suite \"{name}\" does not match any suite in [package.metadata.lihaaf]. Known suites: [{}].\nWhy this matters: lihaaf only runs suites that are declared in metadata; --suite cannot create a new one.",
+                    known.join(", ")
+                ),
+            }));
+        }
+        requested.insert(name.as_str());
+    }
+    Ok(suites
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| requested.contains(s.name.as_str()))
+        .map(|(i, _)| i)
+        .collect())
 }
 
 fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: bool) {
@@ -403,6 +563,20 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
     }
 }
 
+/// One-line per-suite aggregate emitted between suites in a multi-suite
+/// run. Skipped on single-suite runs so the legacy output stays
+/// byte-identical for adopters who never declare a named suite.
+///
+/// Format pinned to:
+/// `lihaaf: suite "<name>": <n> ok, <n> failed, <n> timeout, <n> memory_exhausted`
+fn print_per_suite_aggregate(suite: &Suite, results: &[FixtureResult]) {
+    let agg = aggregate_counts(results);
+    eprintln!(
+        "lihaaf: suite \"{}\": {} ok, {} failed, {} timeout, {} memory_exhausted",
+        suite.name, agg.ok, agg.failed, agg.timeout, agg.memory_exhausted
+    );
+}
+
 /// Render any non-fatal warnings attached to a fixture result. Today
 /// this is only `LARGE_SNAPSHOT` (the policy complexity ceiling), but
 /// the emit point is generic so additional warning kinds slot in
@@ -465,13 +639,13 @@ fn aggregate_counts(results: &[FixtureResult]) -> AggregateCounts {
     a
 }
 
-fn compute_parallelism(cli: &Cli, config: &config::Config) -> usize {
+fn compute_parallelism(cli: &Cli, suite: &Suite) -> usize {
     let cpu_cap: usize = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     let ram_cap: usize = match util::total_ram_mb() {
         Some(total) => {
-            let cap = total / config.per_fixture_memory_mb as u64;
+            let cap = total / suite.per_fixture_memory_mb as u64;
             cap.max(1) as usize
         }
         None => cpu_cap, // honest fallback when the platform doesn't expose RAM
@@ -597,11 +771,11 @@ fn _ensure_dir_exists(p: &Path) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::config::DEFAULT_SUITE_NAME;
 
-    fn cfg(per_fixture_mb: u32) -> Config {
-        Config {
-            dylib_crate: "x".into(),
+    fn suite(name: &str, per_fixture_mb: u32) -> Suite {
+        Suite {
+            name: name.into(),
             extern_crates: vec!["x".into()],
             fixture_dirs: vec![],
             features: vec![],
@@ -610,7 +784,6 @@ mod tests {
             compile_fail_marker: "compile_fail".into(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: per_fixture_mb,
-            raw_metadata: toml::Value::Table(toml::map::Map::new()),
         }
     }
 
@@ -620,6 +793,7 @@ mod tests {
             bless: false,
             filter: vec![],
             jobs: Some(2),
+            suite: vec![],
             no_cache: false,
             manifest_path: None,
             list: false,
@@ -628,10 +802,10 @@ mod tests {
             use_symlink: false,
             keep_output: false,
         };
-        let p = compute_parallelism(&cli, &cfg(1024));
+        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
         assert!(p <= 2);
         cli.jobs = Some(1);
-        let p2 = compute_parallelism(&cli, &cfg(1024));
+        let p2 = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
         assert_eq!(p2, 1);
     }
 
@@ -641,6 +815,7 @@ mod tests {
             bless: false,
             filter: vec![],
             jobs: None,
+            suite: vec![],
             no_cache: false,
             manifest_path: None,
             list: false,
@@ -650,7 +825,7 @@ mod tests {
             keep_output: false,
         };
         // Even with an absurd per-fixture cap, the result must not be 0.
-        let p = compute_parallelism(&cli, &cfg(u32::MAX / 2));
+        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, u32::MAX / 2));
         assert!(p >= 1);
     }
 
@@ -826,5 +1001,64 @@ mod tests {
         assert_eq!(j["b"], serde_json::json!("two"));
         assert_eq!(j["c"], serde_json::json!([3, 4]));
         assert_eq!(j["d"]["e"], serde_json::json!(true));
+    }
+
+    // ---- Suite selection ----
+
+    fn suites_named(names: &[&str]) -> Vec<Suite> {
+        names.iter().map(|n| suite(n, 1024)).collect()
+    }
+
+    #[test]
+    fn select_suites_empty_cli_returns_all_in_declared_order() {
+        let suites = suites_named(&["default", "spatial", "extra"]);
+        let idx = select_suites_by_cli(&suites, &[]).unwrap();
+        assert_eq!(idx, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn select_suites_filters_to_named_subset_in_declared_order() {
+        let suites = suites_named(&["default", "spatial", "extra"]);
+        // CLI argument order is "extra" then "spatial" but execution
+        // order is metadata-declared order (spatial before extra).
+        let idx =
+            select_suites_by_cli(&suites, &["extra".to_string(), "spatial".to_string()]).unwrap();
+        assert_eq!(idx, vec![1, 2]);
+    }
+
+    #[test]
+    fn select_suites_dedups_repeated_cli_names() {
+        let suites = suites_named(&["default", "spatial"]);
+        let idx = select_suites_by_cli(
+            &suites,
+            &[
+                "spatial".to_string(),
+                "spatial".to_string(),
+                "default".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(idx, vec![0, 1]);
+    }
+
+    #[test]
+    fn select_suites_unknown_name_rejected_with_known_list() {
+        let suites = suites_named(&["default", "spatial"]);
+        let err = select_suites_by_cli(&suites, &["unknown".to_string()]).unwrap_err();
+        match err {
+            Error::Session(Outcome::ConfigInvalid { message }) => {
+                assert!(message.contains("\"unknown\""));
+                assert!(message.contains("\"default\""));
+                assert!(message.contains("\"spatial\""));
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn select_suites_default_is_addressable_by_cli_name() {
+        let suites = suites_named(&["default", "spatial"]);
+        let idx = select_suites_by_cli(&suites, &["default".to_string()]).unwrap();
+        assert_eq!(idx, vec![0]);
     }
 }

@@ -47,7 +47,19 @@ fn main() -> ProcessExitCode {
 
     match session::run(parsed) {
         Ok(report) => ProcessExitCode::from(report.exit_code() as u8),
-        Err(Error::Session(outcome)) => ProcessExitCode::from(outcome.exit_code() as u8),
+        Err(Error::Session(outcome)) => {
+            // Pre-v0.1.0-alpha.3 this branch was silent — the exit code
+            // told the story but the diagnostic body was dropped on the
+            // floor. The multi-suite work expanded the surface area of
+            // session-level config errors (`--suite NAME` mismatch,
+            // duplicate suite names, fixture_dirs collisions across
+            // suites), so the diagnostic message is now printed before
+            // the exit-code mapping. The Display impl on Outcome
+            // already produces a fully-rendered, byte-deterministic
+            // message — see `src/error.rs`.
+            eprintln!("{outcome}");
+            ProcessExitCode::from(outcome.exit_code() as u8)
+        }
         Err(other) => {
             eprintln!("lihaaf: {other}");
             ProcessExitCode::from(ExitCode::ConfigInvalid as u8)

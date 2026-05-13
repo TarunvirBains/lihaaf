@@ -34,7 +34,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::config::Config;
+use crate::config::Suite;
 use crate::discovery::{Fixture, FixtureKind};
 use crate::error::Error;
 use crate::freshness::{self, FreshnessFailure, FreshnessSnapshot};
@@ -96,14 +96,23 @@ pub struct WorkerContext {
 }
 
 impl WorkerContext {
-    /// Build a context from the validated config + dylib build output +
-    /// session-startup state.
+    /// Build a context from the validated suite + global dylib_crate +
+    /// dylib build output + session-startup state.
+    ///
+    /// `dylib_crate` is owned by the top-level [`Config`] (one per
+    /// session), not the suite — see `config::Config` rustdoc for why
+    /// `dylib_crate` is intentionally NOT a per-suite key. Everything
+    /// else (`features`, `extern_crates`, `edition`, `dev_deps`,
+    /// timeout, memory ceiling) is per-suite and read from `suite`.
+    ///
+    /// [`Config`]: crate::config::Config
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         crate_root: PathBuf,
         managed_dylib: PathBuf,
         deps_dir: PathBuf,
-        config: &Config,
+        dylib_crate: &str,
+        suite: &Suite,
         bless: bool,
         verbose: bool,
         keep_output: bool,
@@ -112,7 +121,7 @@ impl WorkerContext {
         sysroot: &Path,
         freshness_snapshot: FreshnessSnapshot,
     ) -> Self {
-        let extra_extern_crates = config
+        let extra_extern_crates = suite
             .extern_crates
             .iter()
             .skip(1)
@@ -122,13 +131,13 @@ impl WorkerContext {
             crate_root,
             managed_dylib,
             deps_dir: deps_dir.clone(),
-            dylib_crate: config.dylib_crate.clone(),
+            dylib_crate: dylib_crate.to_string(),
             extra_extern_crates,
-            dev_deps: config.dev_deps.clone(),
-            features: config.features.clone(),
-            edition: config.edition.clone(),
-            timeout_secs: config.fixture_timeout_secs,
-            memory_mb_ceiling: config.per_fixture_memory_mb,
+            dev_deps: suite.dev_deps.clone(),
+            features: suite.features.clone(),
+            edition: suite.edition.clone(),
+            timeout_secs: suite.fixture_timeout_secs,
+            memory_mb_ceiling: suite.per_fixture_memory_mb,
             bless,
             verbose,
             keep_output,
@@ -903,6 +912,12 @@ fn apply_rustc_env(cmd: &mut Command, ctx: &WorkerContext) {
     cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
 }
 
+fn apply_feature_cfgs(cmd: &mut Command, features: &[String]) {
+    for feat in features {
+        cmd.arg("--cfg").arg(format!("feature=\"{feat}\""));
+    }
+}
+
 fn spawn_and_monitor(
     fx: &Fixture,
     ctx: &WorkerContext,
@@ -945,10 +960,13 @@ fn spawn_and_monitor(
         }
     }
 
-    // Features as `--cfg feature="<f>"`.
-    for feat in &ctx.features {
-        cmd.arg("--cfg").arg(format!("feature=\"{feat}\""));
-    }
+    // Features as `--cfg feature="<f>"`. Extracted helper so the
+    // multi-suite regression guard (the `suite_demo` fixture and
+    // `tests/lihaaf_fixture_shape.rs`) drives the same code path as
+    // production — removing the loop, dropping the `--cfg` arg shape,
+    // or stripping the quoted-feature-name format trips the
+    // `apply_feature_cfgs_*` unit tests without needing to spawn rustc.
+    apply_feature_cfgs(&mut cmd, &ctx.features);
 
     cmd.arg(&fx.path);
 
@@ -1585,5 +1603,31 @@ plain text line
             .flatten()
             .expect("CARGO_MANIFEST_DIR still present after override");
         assert_eq!(std::path::Path::new(manifest_dir), override_path.as_path());
+    }
+
+    #[test]
+    fn apply_feature_cfgs_emits_quoted_feature_cfgs() {
+        let mut cmd = Command::new("rustc");
+        apply_feature_cfgs(&mut cmd, &["suite_demo".to_string(), "spatial".to_string()]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--cfg",
+                "feature=\"suite_demo\"",
+                "--cfg",
+                "feature=\"spatial\""
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_feature_cfgs_is_noop_for_empty_feature_set() {
+        let mut cmd = Command::new("rustc");
+        apply_feature_cfgs(&mut cmd, &[]);
+        assert_eq!(cmd.get_args().count(), 0);
     }
 }

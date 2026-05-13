@@ -415,6 +415,96 @@ explicitly. Auto-enabling would split the dylib into two cache lines
 (with and without the feature) and double build time the moment a
 lihaaf run interleaves with a normal `cargo test` run.
 
+### 3.6 Suites — fixture subsets with different feature sets
+
+Some adopters need to compile a subset of their fixtures against a
+DIFFERENT Cargo-feature set than the rest of the corpus. The canonical
+case is a feature like `spatial` that gates a few compile-pass
+fixtures: those fixtures contain `#[cfg(feature = "spatial")]`-gated
+bodies that exercise the macro's spatial path, while the other ~233
+fixtures must continue to compile against the default (no-spatial)
+feature set so unrelated diagnostics stay deterministic.
+
+The mechanism is **named suites**. A suite is a self-contained bundle
+of `(features, fixture_dirs, …)` and triggers an independent dylib
+build with that suite's feature set propagated to per-fixture rustc.
+The top-level `[package.metadata.lihaaf]` table is always the implicit
+**default suite**; adopters declare additional suites with the
+`[[package.metadata.lihaaf.suite]]` array-of-tables shape:
+
+```toml
+[package.metadata.lihaaf]
+dylib_crate = "consumer"
+extern_crates = ["consumer", "consumer-macros"]
+fixture_dirs = ["tests/lihaaf/compile_fail", "tests/lihaaf/compile_pass"]
+features = []  # default suite: no Cargo features
+
+[[package.metadata.lihaaf.suite]]
+name = "spatial"
+features = ["spatial"]
+fixture_dirs = ["tests/lihaaf/compile_pass_spatial"]
+# extern_crates, dev_deps, edition, compile_fail_marker,
+# fixture_timeout_secs, per_fixture_memory_mb all inherit from the
+# top-level table when omitted on a named suite.
+```
+
+**Per-suite resources.** The default suite uses the legacy paths
+`target/lihaaf/manifest.json` and `target/lihaaf-build/`; named suites
+get suite-namespaced paths `target/lihaaf/manifest-<name>.json` and
+`target/lihaaf-build-<name>/`. Different feature sets therefore have
+their own cargo target dirs (no incremental-cache thrashing) and their
+own freshness-tracked manifest snapshots.
+
+**CLI selection.** `cargo lihaaf` (no `--suite`) runs every defined
+suite in declared metadata order — the implicit default suite first,
+then each `[[suite]]` entry in source order. `cargo lihaaf --suite NAME`
+(repeatable) limits the run to the named subset. `--suite default`
+selects the implicit default suite by name. Unknown names are rejected
+at session startup with the list of valid names.
+
+**Inheritance rules.**
+
+- `name` and `fixture_dirs` are required on every named suite.
+- `dylib_crate` is NOT a per-suite key. lihaaf builds one consumer
+  crate per session; suites vary the FEATURE SET passed to that crate,
+  not the crate identity. Setting `dylib_crate` on a `[[suite]]` entry
+  is rejected at parse time.
+- `features` does NOT inherit. A named suite that omits `features`
+  gets `[]`, not the default suite's features. The explicit-replacement
+  rule keeps a "spatial only" suite from accidentally pulling in a
+  sibling `testing` feature.
+- `extern_crates`, `dev_deps`, `edition`, `compile_fail_marker`,
+  `fixture_timeout_secs`, and `per_fixture_memory_mb` DO inherit from
+  the default suite when omitted.
+- The reserved name `default` cannot be claimed by a `[[suite]]` entry.
+- Suite names must contain only `[A-Za-z0-9_-]` (used in filesystem
+  paths and on the CLI).
+
+**Cross-suite invariants.** Fixture directories must be **disjoint**
+across suites — validated at config parse time. Two suites sharing a
+fixture directory would write conflicting `.stderr` snapshots from
+different feature sets, breaking determinism. Adopters who want to run
+the same fixture under two different feature sets must use two
+distinct directories.
+
+**Reporter shape.** Single-suite runs (adopters who never declare a
+`[[suite]]` entry) keep their legacy output byte-identical: no header,
+no per-suite line, just the existing `lihaaf: <n> ok, <n> failed, <n>
+timeout, <n> memory_exhausted` final aggregate. Multi-suite runs add a
+`lihaaf: === suite "<name>" ===` header before each suite's verdict
+block and a `lihaaf: suite "<name>": <n> ok, …` aggregate after each
+suite's block; the cross-suite final aggregate retains the same shape
+as the single-suite case so CI greps keep working.
+
+**Self-test.** lihaaf consumes itself as a multi-suite adopter — see
+the `[[package.metadata.lihaaf.suite]] name = "suite_demo"` entry in
+this crate's own `Cargo.toml` plus the `tests/lihaaf/compile_pass_suite_demo/`
+fixture, which references a const exposed only when lihaaf is built
+with `--features suite_demo`. CI runs `cargo lihaaf` against the full
+two-suite corpus on every push; any regression that drops feature
+propagation between the dylib build and the per-fixture rustc fails
+to link.
+
 ---
 
 ## 4. Session lifecycle

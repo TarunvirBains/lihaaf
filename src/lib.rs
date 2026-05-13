@@ -74,3 +74,19 @@ pub mod worker;
 /// pin the value so a forgotten bump fails CI rather than shipping a
 /// stale stamp.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Self-test marker for the multi-suite end-to-end corpus. Exposed
+/// only when the `suite_demo` Cargo feature is enabled — the named
+/// `[[package.metadata.lihaaf.suite]]` entry in this crate's own
+/// `Cargo.toml` enables that feature for its dedicated fixture
+/// directory, and the `tests/lihaaf/compile_pass_suite_demo/`
+/// fixture references this const. If feature propagation regresses
+/// (the dylib build skips the feature, or the per-fixture rustc
+/// invocation drops `--cfg feature="suite_demo"`), the fixture
+/// fails to link with `unresolved import lihaaf::SUITE_DEMO_MARKER`
+/// and lihaaf's own CI run fails — the test case bites without
+/// needing a downstream adopter.
+///
+/// Not part of any public API contract.
+#[cfg(feature = "suite_demo")]
+pub const SUITE_DEMO_MARKER: &str = "lihaaf::SUITE_DEMO_MARKER";

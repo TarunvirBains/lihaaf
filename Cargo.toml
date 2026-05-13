@@ -1,6 +1,6 @@
 [package]
 name = "lihaaf"
-version = "0.1.0-alpha.2"
+version = "0.1.0-alpha.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Tarunvir Bains"]
@@ -68,13 +68,37 @@ libc = "0.2"
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
 # `/proc/<pid>/statm` directly via stdlib file I/O.
 
+[features]
+# Self-test marker for the multi-suite end-to-end corpus
+# (`tests/lihaaf/compile_pass_suite_demo/`). Activates a single public
+# const (`SUITE_DEMO_MARKER`) that the demo fixture references; the
+# fixture only links when the dylib is built with `--features
+# suite_demo` AND the per-fixture rustc receives `--cfg
+# feature="suite_demo"`. Used by the `[[package.metadata.lihaaf.suite]]`
+# named suite below to prove that feature-subset propagation works
+# end-to-end. Not part of any public API contract.
+suite_demo = []
+
 # Self-test corpus. lihaaf consumes itself as the dylib_crate so the
 # end-to-end dispatch pipeline exercises against a real fixture set in
 # CI without depending on any downstream consumer crate. The fixture
 # corpus lives under `tests/lihaaf/` (compile_pass + compile_fail
 # subdirectories per spec §3.2). The CI workflow builds `cargo-lihaaf`
 # and runs it against this corpus from the crate root.
+#
+# The default suite (top-level table) compiles the corpus with no
+# Cargo features. The `suite_demo` named suite compiles a separate
+# fixture directory with `--features suite_demo` enabled — proving the
+# v0.1.0-alpha.3 multi-suite capability propagates the feature set to
+# both the dylib build AND the per-fixture rustc dispatch. CI runs
+# `cargo run --bin cargo-lihaaf -- lihaaf` (no `--suite`), which
+# exercises every defined suite in declared metadata order.
 [package.metadata.lihaaf]
 dylib_crate = "lihaaf"
 extern_crates = ["lihaaf"]
 edition = "2024"
+
+[[package.metadata.lihaaf.suite]]
+name = "suite_demo"
+features = ["suite_demo"]
+fixture_dirs = ["tests/lihaaf/compile_pass_suite_demo"]
