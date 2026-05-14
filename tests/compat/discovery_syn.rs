@@ -351,6 +351,37 @@ fn macro_wrapper_invocation_not_recognized() {
     );
 }
 
+/// **`macro_rules!` definitions are NOT unrecognized.** syn 2.0 models
+/// both `macro_rules! name { ... }` definitions AND module-level
+/// macro invocations as `syn::ItemMacro`; the discriminator is
+/// `node.ident` (Some for definitions, None for invocations). The
+/// visitor must skip definitions silently — they are local helpers,
+/// not unrecognized trybuild shapes — and the expression-position
+/// invocation `helper_macro!()` inside a `#[test]` body never reaches
+/// `visit_item_macro` because it is an `ExprMacro`, not an
+/// `ItemMacro`. Regression for round-2 review FIX_BEFORE_BETA: the
+/// earlier code flagged every `ItemMacro` indiscriminately, including
+/// `macro_rules!` definitions.
+#[test]
+fn macro_rules_definition_not_flagged_as_unrecognized() {
+    let crate_root = corpus("macro_rules_definition");
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "no trybuild calls in this corpus; expected zero fixtures, got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.unrecognized.is_empty(),
+        "`macro_rules!` definitions and expression-position invocations \
+         must NOT surface as unrecognized; got {:?}",
+        out.unrecognized
+    );
+}
+
 /// **Parse failure produces a single `discovery_unrecognized` entry.**
 /// `parse_error/tests/bad.rs` contains a syntax error; the visitor
 /// must surface one entry of `detail = "parse_failed: ..."` and not
@@ -873,6 +904,7 @@ fn corpus_scenarios_exist_on_disk() {
         "empty_tests",
         "alias_use_not_recognized",
         "macro_wrapper_unrecognized",
+        "macro_rules_definition",
         "parse_error",
         "subdir_ignored",
     ] {

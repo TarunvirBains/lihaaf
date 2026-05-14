@@ -641,6 +641,18 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        // syn 2.0: `ItemMacro` covers BOTH `macro_rules! name { ... }`
+        // definitions AND module-level invocations like `make_tests!();`.
+        // The two are distinguished by `node.ident`: a definition carries
+        // `Some(name)` (the `example` in `macro_rules! example { ... }`),
+        // an invocation carries `None`. Only invocations are unrecognized
+        // for §3.2.1 purposes — a `macro_rules!` definition is a local
+        // helper and naming it would generate spurious operator noise.
+        if node.ident.is_some() {
+            syn::visit::visit_item_macro(self, node);
+            return;
+        }
+
         // §3.2.1: macro-generated invocations like `make_tests!();` at
         // module level surface as a single `discovery_unrecognized`
         // entry naming the macro's file + line; the visitor cannot
