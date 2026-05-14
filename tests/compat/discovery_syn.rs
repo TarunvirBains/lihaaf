@@ -1619,6 +1619,104 @@ fn ui() {\n\
     );
 }
 
+/// **Round-6 regression: `#[cfg(...)]`-gated `use` declarations are
+/// skipped.** A `#[cfg(feature = "x")] use trybuild::TestCases;` is
+/// NOT in scope at adopter build time when the feature is disabled.
+/// Populating `imported_testcases` from a cfg-gated use would falsely
+/// recognize a downstream `TestCases::new()` call as a fixture even
+/// when the corresponding `use` is gated out.
+///
+/// The fix: skip processing cfg-gated `use` items entirely. The
+/// downstream `TestCases::new()` call, lacking the no-cfg path entry,
+/// matches no known shape (not in `imported_testcases`, not canonical
+/// 3-segment, not in `aliased_testcases`) and is silently dropped —
+/// the safe under-discovery outcome.
+///
+/// The test exercises exactly that shape: a cfg-gated
+/// `use trybuild::TestCases;` followed by a `#[test]` function that
+/// calls `TestCases::new().compile_fail(...)`. Asserts zero fixtures
+/// (the call must not match) and zero unrecognized (the cfg-gated `use`
+/// is silently skipped, not flagged).
+#[test]
+fn cfg_gated_use_is_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+#[cfg(feature = \"x\")]\n\
+use trybuild::TestCases;\n\
+#[test]\n\
+fn ui() {\n\
+    let t = TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    assert!(
+        out.fixtures.is_empty(),
+        "no fixtures — the cfg-gated `use` must NOT populate \
+         `imported_testcases`, so `TestCases::new()` is an unknown \
+         shape that drops silently. got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.unrecognized.is_empty(),
+        "no unrecognized entries — the cfg-gated `use` is silently \
+         skipped (not flagged), and the downstream call is an unknown \
+         shape that drops silently. got {:?}",
+        out.unrecognized
+    );
+}
+
+/// **Round-6 regression: `#[cfg(...)]`-gated `type Foo = TestCases;`
+/// aliases are skipped.** A cfg-gated type alias is NOT materially
+/// present when the cfg is disabled at adopter build time. Emitting
+/// `discovery_unrecognized` for an item that does not exist in the
+/// compiled crate is noise — the operator cannot act on it.
+///
+/// The fix: skip processing cfg-gated `type` items entirely. The
+/// existing un-gated `type Foo = TestCases;` warning continues to fire
+/// as round-3 specified — the fix is the cfg-conditional skip, not a
+/// behavior change for un-gated aliases.
+#[test]
+fn cfg_gated_type_alias_is_skipped() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(&tests).unwrap();
+
+    let source = "\
+#[cfg(feature = \"x\")]\n\
+type Foo = trybuild::TestCases;\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    assert!(
+        out.fixtures.is_empty(),
+        "no fixtures expected; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.unrecognized.is_empty(),
+        "no unrecognized entries — the cfg-gated type alias is silently \
+         skipped because the item does not exist at adopter build time. \
+         got {:?}",
+        out.unrecognized
+    );
+}
+
 /// **Round-6 BLOCK regression: `use trybuild::TestCases;` inside a
 /// function body does NOT leak to sibling functions.** In Rust, `use`
 /// declarations inside a function body are LOCAL to that function — they

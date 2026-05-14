@@ -1018,6 +1018,19 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        // Round-6 fix (Gemini BLOCK-B extension): a `#[cfg(...)]`-gated
+        // type alias is NOT materially present when the cfg is disabled
+        // at adopter build time. Surfacing `discovery_unrecognized` for
+        // an item that does not exist in the compiled crate is
+        // noise — the operator cannot act on it. Skip processing
+        // entirely; downstream `<alias>::new()` calls inside the same
+        // (gated) context will also be silently dropped by the visitor's
+        // unknown-shape policy, and a non-gated call to a gated alias
+        // would have failed to compile in the first place.
+        if find_cfg_attribute(&node.attrs).is_some() {
+            return;
+        }
+
         // `type Foo = trybuild::TestCases;` — a type alias is a v0.1
         // scope-out: type resolution is non-syntactic and the visitor
         // operates on the source AST. If the adopter writes a type
@@ -1056,6 +1069,29 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        // Round-6 fix (Gemini BLOCK-B extension): a `#[cfg(...)]`-gated
+        // `use` declaration is NOT in scope at adopter build time when
+        // the cfg is disabled. Adding the local name to
+        // `imported_testcases` / `aliased_testcases` would cause a
+        // downstream `TestCases::new()` call (gated under the SAME cfg
+        // and disabled together — or gated under a DIFFERENT cfg and
+        // potentially enabled in the wrong half) to be incorrectly
+        // recognized or incorrectly flagged.
+        //
+        // The conservative choice: skip processing the `use` entirely.
+        // If the call is gated under the same cfg, it shares the use's
+        // disabled-at-build-time fate and is correctly ignored. If the
+        // call is in a different cfg arm, the visitor cannot know
+        // either way — letting the call through as an unknown-shape
+        // silent-drop is the safe under-discovery outcome (operator
+        // visibility for the unrecognized cfg-gated CALL still happens
+        // via `visit_item_fn`'s cfg check). Adopters with cfg-gated
+        // imports who want recognition register the canonical path via
+        // `--compat-trybuild-macro` (which side-steps the use entirely).
+        if find_cfg_attribute(&node.attrs).is_some() {
+            return;
+        }
+
         // Two flavors of `use` are interesting here:
         //
         // 1. `use trybuild::TestCases as <name>;` (or any path ending
