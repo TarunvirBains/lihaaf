@@ -336,6 +336,49 @@ fn mismatch_entries_sorted_for_determinism() {
     assert_eq!(result.mismatch_entries[2].fixture, "tests/zzz_last.rs");
 }
 
+/// **Round-3 BLOCK regression.** The `mismatch_entries[*].fixture`
+/// field must be byte-equal to the original `repo_relative_path`
+/// (forward-slash projected), NOT to a `canonical_test_name + ".rs"`
+/// reconstruction. The earlier code reconstructed via
+/// `normalized[idx].0.clone() + ".rs"`, which:
+///
+/// 1. Lost any `::` separator in the original path (the canonical
+///    form folds `::` to `/`), and
+/// 2. Hardcoded a `.rs` suffix, breaking any future non-`.rs` fixture.
+///
+/// This test exercises (1) by choosing a recognized fixture whose
+/// canonical stem is `tests/ui/foo` (same as a more conventional
+/// `tests/ui/foo.rs`) but whose original `repo_relative_path` uses
+/// the `::` module-path-style separator. Old code emitted
+/// `tests/ui/foo.rs` (the canonical-form reconstruction); the fix
+/// emits the original `tests::ui::foo.rs` byte-for-byte.
+#[test]
+fn mismatch_fixture_preserves_original_repo_relative_path() {
+    // Two fixtures whose canonical forms collide on `tests/ui/foo`
+    // would defeat parser correlation entirely, so we pick one with
+    // a recognizable canonical-vs-original divergence.
+    let recognized = vec![CompatFixtureId {
+        repo_relative_path: PathBuf::from("tests::ui::foo.rs"),
+    }];
+    // Libtest emits the `::`-separator shape — the parser canonicalizes
+    // and correlates back to the recognized fixture.
+    let stdout = "test tests::ui::foo ... ok\n";
+    let result = parse(stdout, &recognized);
+    assert_eq!(result.pass, Some(1));
+    assert_eq!(result.fail, Some(0));
+    assert_eq!(result.unknown_count, 0);
+    assert_eq!(result.mismatch_entries.len(), 1);
+    // The fixture field must be the ORIGINAL `repo_relative_path`
+    // (forward-slash projected). The old reconstruction would have
+    // produced `tests/ui/foo.rs`; the fix preserves `tests::ui::foo.rs`.
+    assert_eq!(
+        result.mismatch_entries[0].fixture, "tests::ui::foo.rs",
+        "mismatch entries must carry the original repo-relative path byte-for-byte, \
+         not a reconstruction from the canonical form; got {}",
+        result.mismatch_entries[0].fixture
+    );
+}
+
 /// **Garbled output safety.** A truncated line, a verdict word the
 /// parser doesn't recognize, and an embedded ANSI escape inside an
 /// otherwise-valid line all must not panic. Every parse failure

@@ -546,8 +546,16 @@ pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> 
             BaselineVerdict::Pass => pass_count = pass_count.saturating_add(1),
             BaselineVerdict::Fail => fail_count = fail_count.saturating_add(1),
         }
+        // Use the ORIGINAL `repo_relative_path` (forward-slash projected)
+        // rather than reconstructing from the canonical form + `.rs`.
+        // The canonical form folds `::` to `/` and strips `.rs`, so
+        // reconstruction is lossy for any fixture whose original path
+        // diverges from its canonical stem (and the hard-coded `.rs`
+        // suffix is fragile for any future non-`.rs` fixture).
+        let original =
+            util::to_forward_slash(&normalized[idx].1.repo_relative_path.to_string_lossy());
         mismatch_entries.push(BaselineMismatch {
-            fixture: normalized[idx].0.clone() + ".rs",
+            fixture: original,
             baseline_verdict: verdict,
         });
     }
