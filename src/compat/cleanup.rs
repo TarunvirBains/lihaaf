@@ -288,16 +288,10 @@ impl CleanupGuard {
 
         let mut classified: Vec<GeneratedPath> = Vec::with_capacity(pending.len());
         for entry in pending {
-            let class = classify(&entry.target_root, &entry.path);
-            let final_class = match (class, self.keep_output) {
-                (GeneratedPathClass::Cleaned, true) => GeneratedPathClass::Kept,
-                (other, _) => other,
-            };
-
+            let final_class = classify_entry(&entry, self.keep_output);
             if final_class == GeneratedPathClass::Cleaned {
                 remove_path_best_effort(&entry.path)?;
             }
-
             classified.push(GeneratedPath {
                 path: entry.path,
                 class: final_class,
@@ -308,6 +302,19 @@ impl CleanupGuard {
         // produce byte-identical envelopes (the §3.3 contract).
         classified.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(classified)
+    }
+}
+
+/// Classify `entry` and apply the `--keep-output` promotion. Returns
+/// the final class so the caller can decide whether to remove the
+/// path (only [`GeneratedPathClass::Cleaned`] requires removal). The
+/// removal itself is the caller's responsibility — `finalize` uses `?`
+/// propagation; Drop swallows errors mid-unwind.
+fn classify_entry(entry: &PendingPath, keep_output: bool) -> GeneratedPathClass {
+    let class = classify(&entry.target_root, &entry.path);
+    match (class, keep_output) {
+        (GeneratedPathClass::Cleaned, true) => GeneratedPathClass::Kept,
+        (other, _) => other,
     }
 }
 
@@ -347,11 +354,7 @@ impl Drop for CleanupGuard {
         };
 
         for entry in pending {
-            let class = classify(&entry.target_root, &entry.path);
-            let final_class = match (class, self.keep_output) {
-                (GeneratedPathClass::Cleaned, true) => GeneratedPathClass::Kept,
-                (other, _) => other,
-            };
+            let final_class = classify_entry(&entry, self.keep_output);
             if final_class == GeneratedPathClass::Cleaned {
                 // Best-effort: discard the error so Drop does not
                 // double-panic on a filesystem failure mid-unwind.
