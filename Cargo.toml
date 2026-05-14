@@ -56,6 +56,10 @@ path = "tests/compat/argv_baseline_no_shell.rs"
 name = "baseline_conservative"
 path = "tests/compat/baseline_conservative.rs"
 
+[[test]]
+name = "cleanup_dirty_worktree"
+path = "tests/compat/cleanup_dirty_worktree.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }

@@ -148,6 +148,28 @@ pub use compat::baseline::parse_libtest_output as compat_parse_libtest_output;
 #[doc(hidden)]
 pub use compat::baseline::run_baseline_with_recognized_fixtures as compat_baseline_run_with_recognized_fixtures;
 
+// Compat-mode dirty-worktree cleanup (Phase 5 of compat mode, GH #10).
+// Re-exported for the same reason as the overlay above —
+// `tests/compat/cleanup_dirty_worktree.rs` lives in a separate test
+// crate and reaches the cleanup types through these `#[doc(hidden)]`
+// re-exports. The stability contract is the same: NOT part of any
+// v0.1 surface; the supported entry to compat mode is `cargo lihaaf
+// --compat`.
+//
+// `install_panic_hook` is re-exported alongside the guard types
+// because Phase 9 wires it into `compat::run` and integration tests
+// will eventually call it directly (in a child process so the
+// process-wide hook does not perturb libtest's panic capture in the
+// outer test runner).
+#[doc(hidden)]
+pub use compat::cleanup::CleanupGuard as CompatCleanupGuard;
+#[doc(hidden)]
+pub use compat::cleanup::GeneratedPath as CompatGeneratedPath;
+#[doc(hidden)]
+pub use compat::cleanup::GeneratedPathClass as CompatGeneratedPathClass;
+#[doc(hidden)]
+pub use compat::cleanup::install_panic_hook as compat_install_panic_hook;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`

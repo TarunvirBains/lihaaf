@@ -13,6 +13,7 @@
 //! stability contract; treat `pub(crate) fn run` as private.
 
 pub(crate) mod baseline;
+pub(crate) mod cleanup;
 pub(crate) mod cli;
 pub(crate) mod overlay;
 
