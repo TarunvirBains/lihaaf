@@ -20,19 +20,15 @@ readme = "README.md"
 # `cargo publish` for lihaaf itself would try to interpret the nested
 # manifests as part of the package and the corpus would ship to
 # crates.io.
-exclude = [
-    "tests/integration_corpus/",
-    # Phase 6 (§3.2.1) discovery-corpus fixtures. Each
-    # `discovery_corpus/<scenario>/tests/*.rs` file contains hand-crafted
-    # source — some intentionally malformed (`parse_error/`) — that the
-    # `discovery_syn` integration test feeds to the syn AST walker. These
-    # files are NOT part of lihaaf's compiled surface and must not be
-    # interpreted by cargo's `tests/` auto-discovery; the nested `tests/`
-    # directories sit two levels below the top-level `tests/` cargo
-    # scans, so the auto-discovery already skips them, but the exclude
-    # block keeps them out of the published package too.
-    "tests/compat/discovery_corpus/",
-]
+#
+# The Phase 6 (§3.2.1) `tests/compat/discovery_corpus/` fixtures are
+# DELIBERATELY NOT excluded — the `discovery_syn` integration test
+# registered below asserts that the corpus exists on disk and feeds
+# each scenario to the syn AST walker. Excluding them would ship a
+# .crate artifact whose `cargo test` invocation fails on a missing
+# corpus, defeating the purpose of `cargo publish --dry-run` as a
+# release-gate signal.
+exclude = ["tests/integration_corpus/"]
 
 # Pre-release alpha — adopters must pin the exact version
 # (`cargo install lihaaf` without a version selector will not pick up
