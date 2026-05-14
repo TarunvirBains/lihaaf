@@ -37,6 +37,7 @@
 //! | `dylib` | `cargo rustc --crate-type=dylib` invocation, copy mechanic. (pub(crate)) |
 //! | `manifest` | `target/lihaaf/manifest.json` schema + atomic write. (pub(crate)) |
 //! | `freshness` | Per-dispatch the policy invariant re-check (mtime / SHA-256 / rustc). (pub(crate)) |
+//! | `lock` | Session-wide advisory file lock on `target/lihaaf/.session.lock`. (pub(crate)) |
 //! | `discovery` | Walk `fixture_dirs`, classify pass/fail, sort. (pub(crate)) |
 //! | `worker` | Per-fixture `rustc` spawn, RSS sampling, OOM, timeout. (pub(crate)) |
 //! | `normalize` | Stderr normalization (fixed-string, byte-level). (pub(crate)) |
@@ -62,6 +63,7 @@ pub(crate) mod dylib;
 pub(crate) mod error;
 pub mod exit;
 pub(crate) mod freshness;
+pub(crate) mod lock;
 pub(crate) mod manifest;
 pub(crate) mod normalize;
 pub(crate) mod session;

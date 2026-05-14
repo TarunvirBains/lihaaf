@@ -50,6 +50,7 @@ use crate::dylib;
 use crate::error::{Error, Outcome};
 use crate::exit::ExitCode;
 use crate::freshness::FreshnessSnapshot;
+use crate::lock;
 use crate::manifest::{self, Manifest};
 use crate::normalize::NormalizationContext;
 use crate::toolchain::{self, Toolchain};
@@ -138,6 +139,17 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     }
 
     let workspace_target = dylib::workspace_target_dir(&manifest_path);
+
+    // Session lock (FIX_BEFORE_BETA Spec B, issue #1). Held for the
+    // remainder of `run` to serialize concurrent `cargo lihaaf`
+    // sessions that share a `CARGO_TARGET_DIR`. Acquired AFTER the
+    // `--list` short-circuit above so read-only `--list` invocations
+    // do not block on a busy target dir. Acquired BEFORE the
+    // `--no-cache` deletion block below so a second session cannot
+    // observe `target/lihaaf/` mid-delete. The underscore prefix
+    // keeps clippy happy about the unused-binding ("used only for
+    // its `Drop`") — releasing on session-end is the entire point.
+    let _session_lock = lock::SessionLock::acquire(&workspace_target)?;
 
     // `--no-cache` (the policy): force a fresh dylib build by removing
     // every per-suite manifest AND every per-suite lihaaf-build target
