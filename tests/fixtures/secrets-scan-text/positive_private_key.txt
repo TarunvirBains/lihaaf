@@ -1,0 +1,5 @@
+Here's the private key:
+
+-----BEGIN RSA PRIVATE KEY-----
+(redacted body)
+-----END RSA PRIVATE KEY-----
