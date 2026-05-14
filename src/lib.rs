@@ -239,6 +239,20 @@ pub use compat::report::generated_path_from_cleanup as compat_envelope_generated
 #[doc(hidden)]
 pub use compat::report::write_envelope as compat_write_envelope;
 
+// Compat-mode §3.4 active-toolchain capture (Phase 9 of compat mode).
+// Re-exported for the same reason as the other compat surfaces above —
+// `tests/compat/toolchain_resolution.rs` lives in a separate test crate
+// and reaches the capture entry point + its internal "swap the program
+// name" variant through these `#[doc(hidden)]` re-exports. The
+// stability contract is the same: NOT part of any v0.1 surface; the
+// supported entry to compat mode is `cargo lihaaf --compat`. Phase 10
+// (driver wire-up) calls `capture_active_toolchain` directly through
+// `crate::compat::rustup::*`, not through this re-export.
+#[doc(hidden)]
+pub use compat::rustup::capture_active_toolchain as compat_capture_active_toolchain;
+#[doc(hidden)]
+pub use compat::rustup::capture_with_program as compat_capture_with_program;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`
