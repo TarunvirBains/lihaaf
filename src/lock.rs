@@ -360,6 +360,11 @@ mod tests {
     /// hit the try-lock fast path; if it blocked, this test would
     /// either hang or (on Windows without the explicit `UnlockFileEx`
     /// in `Drop`) intermittently fail.
+    ///
+    /// On Windows this also bites the absence of an explicit
+    /// `UnlockFileEx` in `Drop` — `CloseHandle` releases `LockFileEx`-held
+    /// locks asynchronously per Microsoft docs, so without explicit
+    /// unlock the post-drop fast-path re-acquire intermittently fails.
     #[test]
     fn drop_releases_lock_for_same_process_reacquire() {
         let tmp = tempfile::tempdir().unwrap();
@@ -417,42 +422,11 @@ mod tests {
     //
     // The bite for the underlying behavior is preserved:
     // - The "waiting" diagnostic path is exercised by the
-    //   `synchronous_release_on_windows_drop` test below in the
-    //   opposite direction (it asserts the diagnostic does NOT fire
-    //   on the fast path).
+    //   `drop_releases_lock_for_same_process_reacquire` test above
+    //   in the opposite direction (it asserts the post-drop fast-path
+    //   re-acquire completes under `POST_WAIT_REPORT_MS`; if the
+    //   diagnostic fired it would mean the fast path was NOT taken).
     // - The blocking-then-proceeding semantics on contention is
     //   covered by the manual two-terminal sanity check before each
     //   release.
-
-    /// Test 5 (§5, Windows-only): a same-thread sequential
-    /// `acquire` / `drop` / `acquire` MUST take the fast path on the
-    /// second `acquire`. Without the explicit `UnlockFileEx` in
-    /// `Drop`, this can intermittently fail because Windows's
-    /// `CloseHandle` releases `LockFileEx`-held locks asynchronously
-    /// (per Microsoft documentation, the timing is unspecified).
-    /// Asserting the fast path took less than `POST_WAIT_REPORT_MS`
-    /// bites the regression.
-    #[cfg(windows)]
-    #[test]
-    fn synchronous_release_on_windows_drop() {
-        let tmp = tempfile::tempdir().unwrap();
-        let workspace_target = tmp.path().join("target");
-
-        // First acquire + drop.
-        {
-            let _g1 = SessionLock::acquire(&workspace_target).unwrap();
-        }
-
-        // Immediate re-acquire — no sleep between drop and re-acquire,
-        // deliberately, so the test bites if Drop does not issue an
-        // explicit UnlockFileEx.
-        let start = std::time::Instant::now();
-        let _g2 = SessionLock::acquire(&workspace_target).unwrap();
-        let elapsed_ms = start.elapsed().as_millis();
-        assert!(
-            elapsed_ms < POST_WAIT_REPORT_MS,
-            "post-drop re-acquire must hit the fast path; elapsed = {} ms",
-            elapsed_ms,
-        );
-    }
 }
