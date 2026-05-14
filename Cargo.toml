@@ -72,6 +72,10 @@ path = "tests/compat/cleanup_dirty_worktree.rs"
 name = "discovery_syn"
 path = "tests/compat/discovery_syn.rs"
 
+[[test]]
+name = "normalizer_compat_cargo"
+path = "tests/compat/normalizer_compat_cargo.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }

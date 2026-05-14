@@ -38,6 +38,12 @@ pub struct NormalizationContext {
     pub sysroot: PathBuf,
     /// `<CARGO_HOME>/registry/`. Rewritten to `$CARGO/registry/`.
     pub cargo_registry: Option<PathBuf>,
+    /// Compat-mode flag (§3.2.2). When `true`, the normalizer emits
+    /// trybuild's shorter `$CARGO/<crate>-<ver>/<rest>` form instead of
+    /// the literal-prefix `$CARGO/registry/src/index.crates.io-<hash>/...`
+    /// form. Default `false`; non-compat callers leave it `false` and
+    /// observe byte-identical v0.1 output.
+    pub compat_short_cargo: bool,
 }
 
 impl NormalizationContext {
@@ -52,6 +58,7 @@ impl NormalizationContext {
             workspace_root,
             sysroot,
             cargo_registry,
+            compat_short_cargo: false,
         }
     }
 }
@@ -79,7 +86,14 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     push_path(&mut substitutions, fixture_dir, "$DIR");
     push_path(&mut substitutions, &ctx.workspace_root, "$WORKSPACE");
     push_path(&mut substitutions, &ctx.sysroot, "$RUST");
-    if let Some(reg) = &ctx.cargo_registry {
+    // The `$CARGO/registry` literal substitution is only pushed in v0.1
+    // stable mode. In compat mode (§3.2.2) the registry rewrite runs as
+    // a structural post-pass — see `rewrite_cargo_short` below — because
+    // the trybuild short form `$CARGO/<crate>-<ver>/<rest>` requires
+    // hash-shape recognition that does not fit the literal-prefix loop.
+    if let Some(reg) = &ctx.cargo_registry
+        && !ctx.compat_short_cargo
+    {
         push_path(&mut substitutions, reg, "$CARGO/registry");
     }
     // Sort by descending source-string length so the longest prefix
@@ -121,6 +135,19 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             // right, advancing past each replacement so no accidental
             // match occurs inside the placeholder.
             s = replace_advancing(&s, needle, repl);
+        }
+        // Compat-mode post-pass (§3.2.2): rewrite
+        // `<cargo_registry>/src/<host>-<16hex>/` to `$CARGO/` so the
+        // output matches trybuild's short form
+        // `$CARGO/<crate>-<ver>/<rest>`. Runs AFTER the literal $DIR /
+        // $WORKSPACE / $RUST substitutions so the longest-prefix-wins
+        // invariant on those three placeholders is intact, and only
+        // when the compat flag is set with a known registry root —
+        // non-compat callers see byte-identical v0.1 output.
+        if ctx.compat_short_cargo
+            && let Some(reg) = &ctx.cargo_registry
+        {
+            s = rewrite_cargo_short(&s, reg);
         }
         s = rewrite_type_ids(&s);
         // Trailing whitespace.
@@ -177,6 +204,102 @@ fn replace_advancing(s: &str, needle: &str, repl: &str) -> String {
         rest = &rest[idx + needle.len()..];
     }
     out.push_str(rest);
+    out
+}
+
+/// Compat-mode rewrite (§3.2.2): replace
+/// `<cargo_registry>/src/<host>-<16 lowercase hex>/` with `$CARGO/`,
+/// emitting trybuild's short form `$CARGO/<crate>-<ver>/<rest>`.
+///
+/// Recognized hosts (mirrors `trybuild/src/normalize.rs:305-306`):
+///   - `github.com-<16 lowercase hex>` (cargo ≤ 1.69, `[source]` overrides)
+///   - `index.crates.io-<16 lowercase hex>` (cargo ≥ 1.70 sparse registry)
+///
+/// All three structural conditions must hold for a match:
+///   1. The byte sequence `<cargo_registry>/src/<host>-` appears.
+///   2. The 16 bytes after the dash are ASCII lowercase hex (matches
+///      `b'0'..=b'9' | b'a'..=b'f'`).
+///   3. The byte after the 16-hex sequence is `/`.
+///
+/// On match, `<cargo_registry>/src/<host>-<hash>` is replaced with
+/// `$CARGO`, leaving `/<crate>-<ver>/<rest>` intact. The line is
+/// scanned left to right, advancing past each replacement so
+/// already-rewritten bytes don't re-match. Non-matching content
+/// passes through unchanged.
+///
+/// No regex (§6.1). Pure byte-walk.
+fn rewrite_cargo_short(s: &str, cargo_registry: &Path) -> String {
+    // Build the two full prefix forms once per call:
+    //   `<cargo_registry>/src/github.com-`
+    //   `<cargo_registry>/src/index.crates.io-`
+    // Slash-normalize so the match works on either OS (the registry
+    // path may have been captured as a native Windows path; rustc's
+    // emitted diagnostics typically use forward slashes, and the
+    // surrounding pipeline already normalizes `--> ` / `::: ` lines —
+    // applying the same normalization here keeps the prefix shape
+    // aligned with the line's shape).
+    let registry = util::to_forward_slash(&cargo_registry.to_string_lossy());
+    if registry.is_empty() {
+        return s.to_string();
+    }
+    let middles: [String; 2] = [
+        format!("{registry}/src/github.com-"),
+        format!("{registry}/src/index.crates.io-"),
+    ];
+    const HEX_LEN: usize = 16;
+
+    // Fast path — no candidate prefix anywhere in the line. Avoids
+    // an allocation on the common case (most diagnostic lines never
+    // mention a registry path at all).
+    if !middles.iter().any(|m| s.contains(m)) {
+        return s.to_string();
+    }
+
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        // Try every recognized middle at this position. Match shape:
+        //   `<middle><16 lowercase hex>/`
+        let mut consumed = 0usize;
+        for middle in &middles {
+            let m = middle.as_bytes();
+            if i + m.len() + HEX_LEN + 1 > bytes.len() {
+                continue;
+            }
+            if &bytes[i..i + m.len()] != m {
+                continue;
+            }
+            let hex_start = i + m.len();
+            let hex_end = hex_start + HEX_LEN;
+            let hex = &bytes[hex_start..hex_end];
+            if !hex.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                continue;
+            }
+            if bytes[hex_end] != b'/' {
+                continue;
+            }
+            // Full structural match: `<registry>/src/<host>-<16hex>`
+            // is replaced with `$CARGO`. The trailing `/` is left for
+            // the copy loop so the output reads `$CARGO/<crate>-<ver>/...`.
+            out.push_str("$CARGO");
+            consumed = m.len() + HEX_LEN;
+            break;
+        }
+        if consumed > 0 {
+            i += consumed;
+            continue;
+        }
+        // No match at this offset — copy one char (UTF-8 boundary safe;
+        // the byte at `i` starts a UTF-8 sequence so the continuation
+        // bytes `(b & 0xC0) == 0x80` follow).
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
+            j += 1;
+        }
+        out.push_str(&s[i..j]);
+        i = j;
+    }
     out
 }
 
@@ -333,6 +456,7 @@ mod tests {
             workspace_root: PathBuf::from(workspace),
             sysroot: PathBuf::from(sysroot),
             cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
+            compat_short_cargo: false,
         }
     }
 
@@ -615,6 +739,84 @@ error: aborting due to 1 previous error
         assert_normalizes(
             "   = note: consider using `--verbose` to print the full type name to the console\n",
             "   = note: consider using `--verbose` to print the full type name to the console",
+        );
+    }
+
+    // ---- §3.2.2 compat-mode short-$CARGO rewrite (cases a-d) ----
+    //
+    // The cases below mirror the spec's named test list at the bottom
+    // of §3.2.2. They use the public `NormalizationContext` directly so
+    // the assertions sit against the byte-for-byte normalizer output.
+    // The cross-module integration variants live in
+    // `tests/compat/normalizer_compat_cargo.rs`.
+
+    /// Build a compat-mode context (flag on). The sysroot is set to a
+    /// path that cannot substring-collide with the input lines (the
+    /// shared `ctx()` helper uses `/r` which happens to live inside the
+    /// substring `/registry`; that's harmless for the existing tests
+    /// but would corrupt our $CARGO assertions here).
+    fn ctx_compat(workspace: &str, sysroot: &str) -> NormalizationContext {
+        NormalizationContext {
+            workspace_root: PathBuf::from(workspace),
+            sysroot: PathBuf::from(sysroot),
+            cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
+            compat_short_cargo: true,
+        }
+    }
+
+    fn ctx_non_compat_no_collision(workspace: &str, sysroot: &str) -> NormalizationContext {
+        NormalizationContext {
+            workspace_root: PathBuf::from(workspace),
+            sysroot: PathBuf::from(sysroot),
+            cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
+            compat_short_cargo: false,
+        }
+    }
+
+    #[test]
+    fn compat_a_index_crates_io_rewrites_to_short_form() {
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+    }
+
+    #[test]
+    fn compat_b_github_com_handled_identically() {
+        let input = "  --> /home/u/.cargo/registry/src/github.com-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+    }
+
+    #[test]
+    fn compat_c_line_without_registry_segment_unchanged() {
+        // No `/registry/src/...` anywhere — line passes through the
+        // post-pass untouched. The other three placeholders ($DIR /
+        // $WORKSPACE / $RUST) still apply.
+        let input = "  --> /p/tests/foo.rs:3:1\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/tests");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  --> $DIR/foo.rs:3:1");
+    }
+
+    #[test]
+    fn compat_d_flag_off_byte_identical_to_v0_1() {
+        // With `compat_short_cargo = false`, the literal-prefix path
+        // (`$CARGO/registry`) substitution fires exactly as in v0.1.
+        // Regression bite for the v0.1 stable contract: identical
+        // input must produce byte-identical output before and after
+        // Phase 7 lands.
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1"
         );
     }
 }

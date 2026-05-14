@@ -192,6 +192,17 @@ pub use compat::cleanup::GeneratedPathClass as CompatGeneratedPathClass;
 #[doc(hidden)]
 pub use compat::cleanup::install_panic_hook as compat_install_panic_hook;
 
+// Compat-mode normalizer flag plumbing (Phase 7 of compat mode,
+// §3.2.2 of the compatibility plan). Re-exported for the same reason
+// as the other compat surfaces above — `tests/compat/
+// normalizer_compat_cargo.rs` lives in a separate test crate and
+// reaches the public `NormalizationContext` / `normalize` entry
+// points through these `#[doc(hidden)]` re-exports. The stability
+// contract is the same: NOT part of any v0.1 surface; the supported
+// entry to compat mode is `cargo lihaaf --compat`.
+#[doc(hidden)]
+pub use normalize::{NormalizationContext, normalize};
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`
