@@ -308,10 +308,13 @@ fn ui() {\n\
     );
 }
 
-/// **Macro-expanded invocations are NOT recognized.** A `make_tests!()`
-/// macro call that would expand to a `TestCases::new()` chain at
-/// compile time produces no fixtures. The discovery walk operates on
-/// the source AST and cannot expand macros.
+/// **Macro-expanded invocations are NOT recognized AND surface as
+/// `discovery_unrecognized`.** A `make_tests!()` macro call that would
+/// expand to a `TestCases::new()` chain at compile time produces zero
+/// fixtures plus exactly one `discovery_unrecognized` entry naming the
+/// macro invocation's file + line. The visitor cannot expand macros
+/// at AST time, so the operator-visible signal is the unrecognized
+/// entry (spec §3.2.1).
 #[test]
 fn macro_wrapper_invocation_not_recognized() {
     let crate_root = corpus("macro_wrapper_unrecognized");
@@ -323,6 +326,28 @@ fn macro_wrapper_invocation_not_recognized() {
             .iter()
             .map(|f| f.relative_path.as_str())
             .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "the macro invocation must surface exactly one unrecognized entry; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("make_tests"),
+        "detail must name the macro path; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the corpus tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+    assert!(
+        entry.line > 0,
+        "line must be 1-indexed and non-zero; got {}",
+        entry.line
     );
 }
 

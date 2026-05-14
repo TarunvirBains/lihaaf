@@ -45,10 +45,15 @@
 //! Calls produced by an unexpanded macro (`make_tests!()` that expands
 //! to a `TestCases::new().pass(...)` chain at compile time) are NOT
 //! recognized — the discovery pass operates on the source AST, not on
-//! the post-expansion token tree. Such shapes surface as a single
-//! `discovery_unrecognized` entry naming the macro invocation's
-//! file + line; discovery does not abort and continues with the rest
-//! of the file.
+//! the post-expansion token tree. Module-level macro invocations
+//! (`Item::Macro`, e.g. `make_tests!();` at file scope in a
+//! `tests/*.rs`) surface as one `discovery_unrecognized` entry naming
+//! the macro path + file + line; discovery does not abort and
+//! continues with the rest of the file. Macros at expression positions
+//! inside function bodies are NOT flagged — `assert_eq!`, `println!`,
+//! and similar are pervasive and would produce noise; adopters with
+//! macro-wrapped trybuild constructors at expression position register
+//! the wrapper via `--compat-trybuild-macro` instead.
 //!
 //! ## Determinism
 //!
@@ -611,6 +616,32 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // `t.pass("a").compile_fail("b")`) still surface every
         // terminal.
         syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
+        // §3.2.1: macro-generated invocations like `make_tests!();` at
+        // module level surface as a single `discovery_unrecognized`
+        // entry naming the macro's file + line; the visitor cannot
+        // expand macros at AST time and so cannot tell whether the
+        // macro wraps a trybuild call or does something unrelated.
+        // Adopters with macro-wrapped trybuild invocations register
+        // the wrapper's expanded constructor path via
+        // `--compat-trybuild-macro`.
+        let path_str = path_segments_string(&node.mac.path);
+        // The bang token (`!`) is the most precise span for the macro
+        // invocation; `node.mac.path` would need the `Spanned` trait
+        // imported, and the bang sits right next to the macro name.
+        let line = node.mac.bang_token.span.start().line.max(1);
+        self.unrecognized.push(DiscoveryUnrecognized {
+            file: self.current_file.to_path_buf(),
+            line,
+            detail: format!(
+                "macro invocation `{path_str}!` at module level is not a recognized v0.1 \
+                 trybuild shape (discovery operates on the source AST, not on \
+                 post-expansion tokens)"
+            ),
+        });
+        syn::visit::visit_item_macro(self, node);
     }
 }
 
