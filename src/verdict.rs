@@ -47,6 +47,36 @@ pub enum Verdict {
         /// Path of the rewritten file, relative to crate root.
         snapshot_path: PathBuf,
     },
+    /// `--bless` was set, a Snapshot{Diff,Missing} verdict would
+    /// otherwise have triggered an overwrite, but the per-fixture
+    /// unchanged-`.rs` guard refused. The classical case: a real
+    /// regression broke the snapshot, the user (or AI) ran `--bless`
+    /// to "fix" it, but the fixture's `.rs` file is byte-identical to
+    /// `HEAD` — so the snapshot drift is unjustified by any fixture
+    /// change.
+    ///
+    /// Exit code is delegated to the carried [`underlying`] verdict so
+    /// the run still surfaces the unfixed snapshot drift to CI. The
+    /// aggregate count line splits this into its own `bless_skipped`
+    /// bucket so adopters can distinguish "guard fired" from "test
+    /// failed".
+    ///
+    /// [`underlying`]: Self::BlessSkipped::underlying
+    BlessSkipped {
+        /// Human-readable explanation of why the guard fired
+        /// (typically `<fixture>.rs is unchanged from HEAD`).
+        reason: String,
+        /// The verdict that would have been emitted without `--bless`.
+        /// Drives [`Verdict::exit_code`] so the run still fails for the
+        /// real reason rather than collapsing to OK.
+        ///
+        /// Invariant: this is one of `SnapshotDiff { .. }` or
+        /// `SnapshotMissing { .. }` (the two verdicts that would have
+        /// triggered a bless overwrite). It is boxed because the
+        /// underlying variants carry potentially large payloads
+        /// (a full unified diff or the entire normalized stderr).
+        underlying: Box<Verdict>,
+    },
     /// Worker exceeded `fixture_timeout_secs`.
     Timeout,
     /// Worker exceeded `per_fixture_memory_mb` on both initial and serial
@@ -93,7 +123,10 @@ pub enum MalformedSource {
 impl Verdict {
     /// Map this verdict to its exit code severity bucket.
     ///
-    /// `Ok` and `Blessed` both map to `ExitCode::Ok`.
+    /// `Ok` and `Blessed` both map to `ExitCode::Ok`. `BlessSkipped`
+    /// delegates to its carried [`Verdict::BlessSkipped::underlying`]
+    /// so a guard-blocked bless still surfaces the unfixed snapshot
+    /// drift in the run's exit code.
     pub fn exit_code(&self) -> ExitCode {
         match self {
             Self::Ok | Self::Blessed { .. } => ExitCode::Ok,
@@ -106,6 +139,10 @@ impl Verdict {
             Self::WorkerCrashed { .. } => ExitCode::WorkerCrashed,
             Self::SnapshotDiffTooLarge { .. } => ExitCode::SnapshotDiffTooLarge,
             Self::MalformedDiagnostic { .. } => ExitCode::MalformedDiagnostic,
+            // Delegate to the underlying SnapshotDiff / SnapshotMissing
+            // so the exit code still reflects "this fixture is broken"
+            // — the guard refused to silently paper over it.
+            Self::BlessSkipped { underlying, .. } => underlying.exit_code(),
         }
     }
 
@@ -118,6 +155,7 @@ impl Verdict {
             Self::SnapshotDiff { .. } => "SNAPSHOT_DIFF",
             Self::SnapshotMissing { .. } => "SNAPSHOT_MISSING",
             Self::Blessed { .. } => "BLESSED",
+            Self::BlessSkipped { .. } => "BLESS_SKIPPED",
             Self::Timeout => "TIMEOUT",
             Self::MemoryExhausted => "MEMORY_EXHAUSTED",
             Self::WorkerCrashed { .. } => "WORKER_CRASHED",
@@ -128,6 +166,11 @@ impl Verdict {
 
     /// True when this verdict counts as a passing outcome (`Ok` or
     /// `Blessed`).
+    ///
+    /// `BlessSkipped` is NOT a pass: by construction the underlying
+    /// verdict is `SnapshotDiff` or `SnapshotMissing`, both of which
+    /// indicate real snapshot drift that the guard refused to silently
+    /// erase.
     pub fn is_pass(&self) -> bool {
         matches!(self, Self::Ok | Self::Blessed { .. })
     }

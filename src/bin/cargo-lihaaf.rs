@@ -36,9 +36,18 @@ fn main() -> ProcessExitCode {
 
     let parsed = match cli::parse_from(argv) {
         Ok(p) => p,
-        Err(e) => {
+        Err(Error::Cli { clap_exit_code, .. }) => {
             // clap prints its own diagnostic on `--help` / `--version`
-            // and on parse errors; the exit code is propagated directly.
+            // and on parse errors; the exit code is propagated
+            // directly. `clap_exit_code` carries clap's recommended
+            // code (typically `0` for graceful `--help`/`--version`
+            // and `2` for usage errors). The `ExitCode` enum has no
+            // "clap usage" variant by design — clap's `2` is a CLI
+            // exit code, not a session outcome — so we bypass the
+            // enum and cast directly to `ProcessExitCode`.
+            return ProcessExitCode::from(clap_exit_code.clamp(0, 255) as u8);
+        }
+        Err(e) => {
             return ProcessExitCode::from(e.exit_code() as u8);
         }
     };
@@ -57,6 +66,16 @@ fn main() -> ProcessExitCode {
             // message — see `src/error.rs`.
             eprintln!("{outcome}");
             ProcessExitCode::from(outcome.exit_code() as u8)
+        }
+        // CLI errors raised AFTER parse (e.g., the post-dispatch
+        // `--bless` guard failure surfaced from `session::run`) must
+        // honor their carried `clap_exit_code` (typically `2` for
+        // usage errors) rather than collapsing onto
+        // `ExitCode::ConfigInvalid` (64). Without this branch, the
+        // bless-guard exit code would be 64, masking the
+        // CLI-classification of the failure.
+        Err(Error::Cli { clap_exit_code, .. }) => {
+            ProcessExitCode::from(clap_exit_code.clamp(0, 255) as u8)
         }
         Err(other) => {
             eprintln!("lihaaf: {other}");

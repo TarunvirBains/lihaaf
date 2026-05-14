@@ -153,19 +153,48 @@ impl WorkerContext {
 
 /// Result of a worker-pool dispatch.
 ///
-/// Carries the per-fixture results PLUS an optional freshness failure
-/// — if any fixture's per-dispatch the policy check fails, the pool stops
-/// dispatching new work, drains the in-flight fixtures, and bubbles
-/// the failure back to [`crate::session::run`] for conversion to a
-/// session-level `Outcome::FreshnessDrift` exit.
+/// Carries the per-fixture results PLUS optional failure signals:
+///
+/// - `freshness_failure`: a per-dispatch policy invariant drifted; the
+///   pool stops dispatching new work, drains the in-flight fixtures,
+///   and bubbles the failure back to [`crate::session::run`] for
+///   conversion to a session-level `Outcome::FreshnessDrift` exit.
+/// - `bless_guard_failure`: the `--bless` per-fixture unchanged-`.rs`
+///   guard could not run (not a git working tree, or `git diff`
+///   returned an unexpected exit). The pool aborts the same way as
+///   freshness drift and the session converts to a clap-style usage
+///   error (`Error::Cli` with `clap_exit_code: 2`).
 #[derive(Debug)]
 pub struct DispatchOutcome {
     /// Per-fixture results in deterministic (lexicographic) order.
-    /// Will be a partial set if `freshness_failure` is Some.
+    /// Will be a partial set if either failure field is Some.
     pub results: Vec<FixtureResult>,
-    /// `Some` if a per-dispatch the policy invariant drifted; `None` on a
+    /// `Some` if a per-dispatch policy invariant drifted; `None` on a
     /// clean run.
     pub freshness_failure: Option<FreshnessFailure>,
+    /// `Some` if the `--bless` guard failed to run. Carries a
+    /// pre-rendered diagnostic body for `session::run` to wrap in
+    /// `Error::Cli`. `None` on a clean run.
+    pub bless_guard_failure: Option<BlessGuardFailure>,
+}
+
+/// Why the `--bless` per-fixture unchanged-`.rs` guard could not run.
+///
+/// This is a session-level failure, not a per-fixture verdict — it
+/// means the harness cannot enforce the guard at all, so refusing to
+/// proceed is the safe default. The session converts this to a clap
+/// usage error (exit 2) so adopters get a clear "fix your environment
+/// and re-run" diagnostic rather than a silently-skipped guard.
+#[derive(Debug, Clone)]
+pub struct BlessGuardFailure {
+    /// Path of the fixture whose guard call surfaced the failure.
+    /// Carried for diagnostic and test purposes; the session
+    /// converter currently only echoes `message`, but a future log
+    /// renderer can attribute the failure to a specific fixture.
+    #[allow(dead_code)]
+    pub fixture_path: PathBuf,
+    /// Pre-rendered diagnostic body. Free-form; surfaced verbatim.
+    pub message: String,
 }
 
 /// Permit pool for the policy dynamic-parallelism rule.
@@ -385,15 +414,27 @@ pub fn dispatch_serial(
             return DispatchOutcome {
                 results,
                 freshness_failure: Some(failure),
+                bless_guard_failure: None,
             };
         }
         let outcome = run_one(fx, ctx);
         progress(&outcome.result);
         results.push(outcome.result);
+        // Bless-guard failure is session-fatal: stop dispatching new
+        // work and bubble back. Mirrors `freshness_failure` semantics:
+        // already-completed verdicts are reported normally.
+        if let Some(failure) = outcome.bless_guard_failure {
+            return DispatchOutcome {
+                results,
+                freshness_failure: None,
+                bless_guard_failure: Some(failure),
+            };
+        }
     }
     DispatchOutcome {
         results,
         freshness_failure: None,
+        bless_guard_failure: None,
     }
 }
 
@@ -435,6 +476,7 @@ pub fn dispatch_pool(
     let queue: Arc<Mutex<std::collections::VecDeque<Fixture>>> =
         Arc::new(Mutex::new(fixtures.iter().cloned().collect()));
     let freshness_failure: Arc<Mutex<Option<FreshnessFailure>>> = Arc::new(Mutex::new(None));
+    let bless_guard_failure: Arc<Mutex<Option<BlessGuardFailure>>> = Arc::new(Mutex::new(None));
     let gate = Arc::new(ParallelismGate::new(parallelism));
     let ctx = Arc::new(ctx.clone());
     let mut handles = Vec::with_capacity(parallelism);
@@ -443,6 +485,7 @@ pub fn dispatch_pool(
         let c = Arc::clone(&ctx);
         let t = tx.clone();
         let ff = Arc::clone(&freshness_failure);
+        let bf = Arc::clone(&bless_guard_failure);
         let g = Arc::clone(&gate);
         let h = thread::spawn(move || {
             loop {
@@ -456,8 +499,11 @@ pub fn dispatch_pool(
                 }
                 // the policy: re-check before pulling. If a peer worker
                 // already recorded a failure, exit promptly without
-                // pulling more work.
-                if ff.lock().unwrap().is_some() {
+                // pulling more work. Same fast-exit pattern applies to
+                // the bless-guard failure path so the pool unwinds
+                // promptly once any worker has flagged an environment
+                // problem (e.g., not a git working tree).
+                if ff.lock().unwrap().is_some() || bf.lock().unwrap().is_some() {
                     g.release();
                     break;
                 }
@@ -484,6 +530,19 @@ pub fn dispatch_pool(
                         // subsequent dispatch across all workers.
                         if outcome.harness_oom_observed {
                             g.reduce();
+                        }
+                        // Bless-guard failure is session-fatal. Record
+                        // (first-write-wins) and drain the queue so
+                        // peers exit on their next loop pass. The
+                        // already-completed result still ships down
+                        // the channel so the partial verdict set is
+                        // available to the reporter.
+                        if let Some(failure) = outcome.bless_guard_failure {
+                            let mut slot = bf.lock().unwrap();
+                            if slot.is_none() {
+                                *slot = Some(failure);
+                            }
+                            q.lock().unwrap().clear();
                         }
                         if t.send(outcome.result).is_err() {
                             g.release();
@@ -515,16 +574,18 @@ pub fn dispatch_pool(
         let _ = h.join();
     }
     results.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    let failure = freshness_failure.lock().unwrap().take();
+    let freshness_failure = freshness_failure.lock().unwrap().take();
+    let bless_guard_failure = bless_guard_failure.lock().unwrap().take();
     DispatchOutcome {
         results,
-        freshness_failure: failure,
+        freshness_failure,
+        bless_guard_failure,
     }
 }
 
-/// Per-fixture run outcome — the published `FixtureResult` plus an
-/// internal `harness_oom_observed` flag the dispatch loop consumes to
-/// drive the policy dynamic-parallelism reduction.
+/// Per-fixture run outcome — the published `FixtureResult` plus
+/// internal signals the dispatch loop consumes (dynamic-parallelism
+/// OOM reduction, session-fatal bless-guard failures).
 struct RunOneOutcome {
     result: FixtureResult,
     /// True iff the harness initiated an OOM kill on this fixture (on
@@ -535,6 +596,12 @@ struct RunOneOutcome {
     /// etc.) do NOT set this flag — they surface as `WORKER_CRASHED`
     /// per the OOM-attribution heuristic in the policy.
     harness_oom_observed: bool,
+    /// `Some` iff the `--bless` per-fixture unchanged-`.rs` guard
+    /// could not run. Carries a pre-rendered diagnostic body. When
+    /// set, the dispatch loop aborts the pool and surfaces the
+    /// failure to `session::run`, the same control-flow pattern used
+    /// by `FreshnessFailure`.
+    bless_guard_failure: Option<BlessGuardFailure>,
 }
 
 /// Run one fixture: spawn rustc, monitor RSS + timeout, capture
@@ -555,6 +622,7 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
                 warning: None,
             },
             harness_oom_observed: false,
+            bless_guard_failure: None,
         };
     }
 
@@ -588,25 +656,75 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
         MonitorKind::ExternalKill { cause } => (Verdict::WorkerCrashed { cause }, None),
     };
 
-    // Bless path: a SnapshotDiff verdict with bless on causes
-    // overwrite and Blessed emission. The bless transition does not affect
-    // any LARGE_SNAPSHOT warning that may already be attached — the
+    // Bless path: a SnapshotDiff or SnapshotMissing verdict with
+    // `--bless` on triggers an overwrite — gated by the per-fixture
+    // unchanged-`.rs` guard. The bless transition does not affect any
+    // LARGE_SNAPSHOT warning that may already be attached — the
     // warning is about the input shape, not the verdict.
+    //
+    // Guard semantics (see [`fixture_rs_is_modified`]):
+    //   - `Ok(true)`  → fixture `.rs` is modified vs HEAD; overwrite
+    //                    proceeds and the verdict transitions to
+    //                    `Blessed`.
+    //   - `Ok(false)` → fixture `.rs` is unmodified vs HEAD (or
+    //                    untracked); the overwrite is refused and the
+    //                    verdict transitions to `BlessSkipped` carrying
+    //                    the underlying SnapshotDiff/SnapshotMissing.
+    //                    Other fixtures in the run are unaffected.
+    //   - `Err(_)`    → the guard could not run (not a git working
+    //                    tree, or git itself failed). The dispatch
+    //                    loop aborts the pool and surfaces the failure
+    //                    to `session::run`, which converts it to an
+    //                    `Error::Cli` (exit 2). No bless overwrite
+    //                    happens for any fixture in the run.
+    let mut bless_guard_failure: Option<BlessGuardFailure> = None;
     if ctx.bless {
-        if let Verdict::SnapshotDiff { .. } = &verdict
-            && let Some(actual) = compute_actual_normalized(fx, ctx)
-            && let Ok(p) = snapshot::write(&fx.path, &actual)
-        {
-            verdict = Verdict::Blessed { snapshot_path: p };
-        }
-        if let Verdict::SnapshotMissing { actual } = &verdict
-            && let Ok(p) = snapshot::write(&fx.path, actual)
-        {
-            verdict = Verdict::Blessed { snapshot_path: p };
-            // SnapshotMissing carries no LARGE_SNAPSHOT signal — drop
-            // any incidental warning the prior path may have produced
-            // (in practice none is set on the SnapshotMissing branch).
-            warning = None;
+        let should_bless = matches!(
+            &verdict,
+            Verdict::SnapshotDiff { .. } | Verdict::SnapshotMissing { .. }
+        );
+        if should_bless {
+            match fixture_rs_is_modified(&fx.path) {
+                Ok(true) => {
+                    if let Verdict::SnapshotDiff { .. } = &verdict
+                        && let Some(actual) = compute_actual_normalized(fx, ctx)
+                        && let Ok(p) = snapshot::write(&fx.path, &actual)
+                    {
+                        verdict = Verdict::Blessed { snapshot_path: p };
+                    } else if let Verdict::SnapshotMissing { actual } = &verdict
+                        && let Ok(p) = snapshot::write(&fx.path, actual)
+                    {
+                        verdict = Verdict::Blessed { snapshot_path: p };
+                        // SnapshotMissing carries no LARGE_SNAPSHOT
+                        // signal — drop any incidental warning the
+                        // prior path may have produced (in practice
+                        // none is set on the SnapshotMissing branch).
+                        warning = None;
+                    }
+                }
+                Ok(false) => {
+                    let reason = format!(
+                        "fixture `{}` is unchanged from HEAD; refusing to bless. \
+                         Commit the fixture's .rs change first, then re-run --bless.",
+                        fx.relative_path
+                    );
+                    let underlying = std::mem::replace(&mut verdict, Verdict::Ok);
+                    verdict = Verdict::BlessSkipped {
+                        reason,
+                        underlying: Box::new(underlying),
+                    };
+                    // BlessSkipped is not a pass — but the LARGE_SNAPSHOT
+                    // warning that may already be attached is about the
+                    // SnapshotDiff shape and remains meaningful, so we
+                    // leave `warning` intact here.
+                }
+                Err(message) => {
+                    bless_guard_failure = Some(BlessGuardFailure {
+                        fixture_path: fx.path.clone(),
+                        message,
+                    });
+                }
+            }
         }
     }
 
@@ -632,6 +750,7 @@ fn run_one(fx: &Fixture, ctx: &WorkerContext) -> RunOneOutcome {
             warning,
         },
         harness_oom_observed,
+        bless_guard_failure,
     }
 }
 
@@ -665,6 +784,118 @@ fn fixture_workdir_name(fx: &Fixture) -> String {
         }
     }
     s
+}
+
+/// Check whether the fixture's `.rs` source file shows a diff against
+/// the surrounding git repository's `HEAD` revision. Used as the
+/// per-fixture guard before applying a `--bless` overwrite: if the
+/// fixture is byte-identical to `HEAD`, the snapshot drift is
+/// suspicious (the fixture didn't change but its output did — probably
+/// a real bug, not a deliberate fixture update).
+///
+/// `git diff --quiet HEAD -- <path>` returns:
+///
+/// - exit `0` → no diff (file is unmodified, or untracked and
+///   therefore not differing FROM `HEAD`'s view of it). Treated as
+///   "do not bless" — committing a brand-new fixture before blessing
+///   is required by design.
+/// - exit `1` → file has diffs (modified vs HEAD, including
+///   staged-but-not-committed content). "Bless allowed".
+/// - exit `128` → not a git repo, no `HEAD` commit yet, git not on
+///   `PATH`, or another fatal git error. Surfaces as a session-level
+///   failure via [`BlessGuardFailure`].
+/// - any other → unexpected; also surfaces as a session-level
+///   failure to avoid silently doing the wrong thing.
+///
+/// Returns `Ok(true)` to allow the overwrite, `Ok(false)` to skip
+/// (emit `BlessSkipped`), and `Err(message)` to abort the run with a
+/// directed diagnostic.
+fn fixture_rs_is_modified(fixture_rs_path: &Path) -> Result<bool, String> {
+    // Run git from the fixture's parent directory so the surrounding
+    // git repo (the one containing the fixture, not the caller's CWD)
+    // is the one consulted. Without `-C <dir>`, `git diff HEAD --
+    // /tmp/...` inherits the caller's CWD and reports "path outside
+    // repository" when the fixture lives somewhere other than the
+    // workspace the harness was launched from. Real adopters may
+    // have fixtures outside their workspace root; tests reliably do.
+    let workdir = fixture_rs_path.parent().unwrap_or(Path::new("."));
+
+    // Preflight: confirm we're actually in a git repo with a
+    // resolvable HEAD. `git rev-parse --verify HEAD` is the standard
+    // probe — it exits 0 when HEAD resolves to a commit, and
+    // non-zero (with a diagnostic on stderr) otherwise. Doing this
+    // BEFORE running `git diff` is required because `git diff
+    // --quiet HEAD` outside a repo returns exit code 1 with
+    // "Could not access 'HEAD'" on stderr, which is indistinguishable
+    // from the legitimate "file modified" exit-1 case. The preflight
+    // disambiguates the two.
+    let preflight = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .args(["rev-parse", "--verify", "--quiet", "HEAD"])
+        .output();
+    let preflight = match preflight {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(format!(
+                "--bless requires lihaaf to be run inside a git working tree, \
+                 to verify the fixture's .rs file has been intentionally modified. \
+                 `git` could not be spawned ({e}). Path: {}",
+                fixture_rs_path.display()
+            ));
+        }
+    };
+    if !preflight.status.success() {
+        return Err(format!(
+            "--bless requires lihaaf to be run inside a git working tree with a \
+             valid HEAD commit. `git rev-parse --verify HEAD` failed (exit {:?}) — \
+             typically because the fixture's directory is not inside a git repo, \
+             or because the repo has no commits yet. Path: {}\n\
+             git stderr: {}",
+            preflight.status.code(),
+            fixture_rs_path.display(),
+            String::from_utf8_lossy(&preflight.stderr).trim_end(),
+        ));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workdir)
+        .arg("diff")
+        .arg("--quiet")
+        .arg("HEAD")
+        .arg("--")
+        .arg(fixture_rs_path)
+        .output();
+    let output = match output {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(format!(
+                "--bless guard: `git diff` could not be spawned ({e}). Path: {}",
+                fixture_rs_path.display()
+            ));
+        }
+    };
+
+    match output.status.code() {
+        Some(0) => Ok(false), // unmodified or untracked
+        Some(1) => Ok(true),  // modified
+        Some(128) => Err(format!(
+            "--bless guard: `git diff` exited 128 (typically: fixture path is \
+             outside the surrounding git repo, despite the preflight passing). \
+             Path: {}\n\
+             git stderr: {}",
+            fixture_rs_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        )),
+        other => Err(format!(
+            "--bless guard: `git diff --quiet HEAD -- {}` returned unexpected \
+             exit code {:?}. git stderr: {}",
+            fixture_rs_path.display(),
+            other,
+            String::from_utf8_lossy(&output.stderr).trim_end(),
+        )),
+    }
 }
 
 /// Classify a worker's exit into a verdict plus an optional warning.
@@ -1745,5 +1976,262 @@ plain text line
         let mut cmd = Command::new("rustc");
         apply_feature_cfgs(&mut cmd, &[]);
         assert_eq!(cmd.get_args().count(), 0);
+    }
+
+    // -- `fixture_rs_is_modified` unit tests ---------------------------
+    //
+    // These tests cover the four edge cases the spec calls out:
+    //   1. fixture in a non-git tempdir → guard returns Err
+    //   2. untracked .rs fixture        → guard returns Ok(false)
+    //   3. staged-but-not-committed     → guard returns Ok(true)
+    //   4. unchanged .rs vs HEAD        → guard returns Ok(false)
+    // plus a "modified after commit" case as the canonical positive
+    // signal.
+    //
+    // The tests shell out to a real `git` binary. If git is not on
+    // PATH, the assertion bodies become "guard must surface Err with
+    // a directed diagnostic", which is itself a useful contract test.
+
+    /// Initialize a fresh git repo inside `dir` with deterministic
+    /// identity so commit creation does not need a global git config.
+    /// Returns `true` on success, `false` if git is unavailable or
+    /// rejected `init` (treated as a skip signal by callers).
+    fn init_git_repo_in(dir: &Path) -> bool {
+        let out = Command::new("git").arg("init").arg("-q").arg(dir).output();
+        let Ok(out) = out else {
+            return false;
+        };
+        if !out.status.success() {
+            return false;
+        }
+        // Set a local identity so commits succeed even when the host
+        // has no global git user configured (CI sandboxes frequently
+        // lack one).
+        for kv in &[
+            ("user.email", "lihaaf-test@example.invalid"),
+            ("user.name", "lihaaf test"),
+        ] {
+            let _ = Command::new("git")
+                .args(["-C"])
+                .arg(dir)
+                .args(["config", "--local", kv.0, kv.1])
+                .output();
+        }
+        true
+    }
+
+    fn git_in(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn bless_guard_unmodified_fixture_returns_false() {
+        // Fixture committed to HEAD with content X; no edits. Guard
+        // must return Ok(false) → bless will be skipped.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !init_git_repo_in(tmp.path()) {
+            // git unavailable — skip rather than failing the test
+            // (CI configurations without git are out of scope for
+            // this unit test; the integration test covers the
+            // git-required end-to-end path).
+            return;
+        }
+        let fx = tmp.path().join("fixture.rs");
+        std::fs::write(&fx, b"fn main() {}\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "fixture.rs"]));
+        assert!(git_in(
+            tmp.path(),
+            &["commit", "-q", "-m", "initial fixture"]
+        ));
+
+        let modified = fixture_rs_is_modified(&fx).expect("guard must succeed inside a git repo");
+        assert!(
+            !modified,
+            "unchanged fixture must report unmodified (Ok(false))"
+        );
+    }
+
+    #[test]
+    fn bless_guard_modified_fixture_returns_true() {
+        // Fixture committed, then locally modified. Guard must return
+        // Ok(true) → bless overwrite proceeds.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !init_git_repo_in(tmp.path()) {
+            return;
+        }
+        let fx = tmp.path().join("fixture.rs");
+        std::fs::write(&fx, b"fn main() {}\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "fixture.rs"]));
+        assert!(git_in(
+            tmp.path(),
+            &["commit", "-q", "-m", "initial fixture"]
+        ));
+
+        // Local edit (no `git add`, no commit). git diff HEAD must
+        // see this and return exit 1.
+        std::fs::write(&fx, b"fn main() { /* updated */ }\n").unwrap();
+
+        let modified = fixture_rs_is_modified(&fx).expect("guard must succeed inside a git repo");
+        assert!(
+            modified,
+            "modified-vs-HEAD fixture must report modified (Ok(true))"
+        );
+    }
+
+    #[test]
+    fn bless_guard_staged_but_not_committed_returns_true() {
+        // Fixture committed to HEAD, then edited and `git add`ed (but
+        // not committed). git diff HEAD shows staged changes as a
+        // diff, so the guard must allow bless. The user's intent is
+        // clear: they have queued a change to this fixture.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !init_git_repo_in(tmp.path()) {
+            return;
+        }
+        let fx = tmp.path().join("fixture.rs");
+        std::fs::write(&fx, b"fn main() {}\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "fixture.rs"]));
+        assert!(git_in(
+            tmp.path(),
+            &["commit", "-q", "-m", "initial fixture"]
+        ));
+
+        std::fs::write(&fx, b"fn main() { let _ = 1; }\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "fixture.rs"]));
+
+        let modified = fixture_rs_is_modified(&fx).expect("guard must succeed inside a git repo");
+        assert!(
+            modified,
+            "staged-but-not-committed fixture must report modified (Ok(true)) \
+             — the user has signaled intent by `git add`"
+        );
+    }
+
+    #[test]
+    fn bless_guard_untracked_fixture_returns_false() {
+        // Fixture exists on disk but was never `git add`ed. git diff
+        // HEAD does not see untracked files, so it returns exit 0 (no
+        // diff) — the guard reports Ok(false) and refuses to bless.
+        // Required behavior per the spec: commit the new fixture
+        // first.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !init_git_repo_in(tmp.path()) {
+            return;
+        }
+        // Create an initial commit so HEAD exists. Without HEAD, git
+        // diff returns 128 (no HEAD yet), which is the "non-git"
+        // failure path tested separately.
+        std::fs::write(tmp.path().join("README"), b"seed\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "README"]));
+        assert!(git_in(tmp.path(), &["commit", "-q", "-m", "seed"]));
+
+        // Now create a brand-new fixture, do NOT add it to the index.
+        let fx = tmp.path().join("new_fixture.rs");
+        std::fs::write(&fx, b"fn main() {}\n").unwrap();
+
+        let modified = fixture_rs_is_modified(&fx).expect("guard must succeed inside a git repo");
+        assert!(
+            !modified,
+            "untracked fixture must report unmodified (Ok(false)) — \
+             user must commit the new fixture before blessing"
+        );
+    }
+
+    #[test]
+    fn bless_guard_outside_git_repo_returns_err() {
+        // Non-git tempdir: git diff cannot find a HEAD and exits 128.
+        // The guard must surface this as Err with a directed
+        // diagnostic so the session aborts cleanly.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let fx = tmp.path().join("orphan_fixture.rs");
+        std::fs::write(&fx, b"fn main() {}\n").unwrap();
+
+        let result = fixture_rs_is_modified(&fx);
+        // Two acceptable outcomes:
+        //   - git is on PATH and returned 128 → Err with a directed
+        //     diagnostic (the expected case in normal CI).
+        //   - git is not on PATH → Err with the spawn-failure
+        //     diagnostic (still Err; still surfaces to the user).
+        // Either way, the guard MUST refuse to claim Ok(_).
+        let err = result.expect_err(
+            "outside a git repo, the guard must surface Err — \
+             never silently degrade to Ok(true) or Ok(false)",
+        );
+        assert!(
+            err.contains("git") || err.contains("working tree"),
+            "diagnostic must mention git or working tree: {err}"
+        );
+    }
+
+    #[test]
+    fn bless_guard_renamed_fixture_returns_false() {
+        // Spec edge case 4: a fixture whose `.rs` was renamed (i.e.,
+        // a new path that doesn't exist at HEAD). git treats the new
+        // path as untracked from HEAD's view, so the guard returns
+        // Ok(false). The user must `git add` the rename and commit
+        // it before blessing — same UX as the brand-new-fixture case.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        if !init_git_repo_in(tmp.path()) {
+            return;
+        }
+        let old_path = tmp.path().join("old_name.rs");
+        std::fs::write(&old_path, b"fn main() {}\n").unwrap();
+        assert!(git_in(tmp.path(), &["add", "old_name.rs"]));
+        assert!(git_in(
+            tmp.path(),
+            &["commit", "-q", "-m", "initial fixture"]
+        ));
+
+        // Move the fixture on disk. From git's `git diff HEAD --
+        // new_name.rs` perspective, `new_name.rs` is untracked
+        // (no entry in the index, no entry at HEAD for that path).
+        let new_path = tmp.path().join("new_name.rs");
+        std::fs::rename(&old_path, &new_path).unwrap();
+
+        let modified = fixture_rs_is_modified(&new_path)
+            .expect("guard must succeed inside a git repo (preflight HEAD verified)");
+        assert!(
+            !modified,
+            "renamed-but-not-committed fixture must report unmodified (Ok(false)). \
+             The user must `git add` the rename and commit before blessing."
+        );
+    }
+
+    #[test]
+    fn bless_skipped_verdict_inherits_underlying_exit_code() {
+        // BlessSkipped's exit_code must delegate to the underlying
+        // verdict so the run still surfaces the unfixed snapshot
+        // drift. Pinned via a unit test so a future refactor does
+        // not accidentally collapse this to Ok.
+        use crate::verdict::Verdict;
+        let v = Verdict::BlessSkipped {
+            reason: "test reason".into(),
+            underlying: Box::new(Verdict::SnapshotDiff {
+                diff: "diff body".into(),
+            }),
+        };
+        assert_eq!(
+            v.exit_code(),
+            crate::exit::ExitCode::SnapshotDiffOrUnexpected
+        );
+
+        let v = Verdict::BlessSkipped {
+            reason: "test reason".into(),
+            underlying: Box::new(Verdict::SnapshotMissing {
+                actual: "stderr body".into(),
+            }),
+        };
+        assert_eq!(v.exit_code(), crate::exit::ExitCode::SnapshotMissing);
+
+        // BlessSkipped is not a pass — the whole point is to surface
+        // the unfixed snapshot drift.
+        assert!(!v.is_pass());
+        assert_eq!(v.label(), "BLESS_SKIPPED");
     }
 }

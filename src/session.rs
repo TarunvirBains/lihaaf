@@ -475,6 +475,28 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         }));
     }
 
+    // The `--bless` per-fixture unchanged-`.rs` guard could not run
+    // (no git working tree, no HEAD, git not on PATH, etc.). The
+    // pool already aborted on first failure; convert to a clap-style
+    // usage error (exit 2) with the directed diagnostic body. We
+    // route this through `Error::Cli` rather than `Error::Session`
+    // because the underlying failure is "your invocation environment
+    // is wrong" — fixable by the caller, not by the harness.
+    if let Some(failure) = dispatch_outcome.bless_guard_failure {
+        let message = format!(
+            "error: --bless guard could not verify fixture state.\n\
+             {}\n\
+             note: fix: either run `cargo lihaaf --bless` inside a git working tree \
+             with a HEAD commit, or commit the fixture(s) first, or drop --bless.",
+            failure.message,
+        );
+        eprintln!("{message}");
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message,
+        });
+    }
+
     Ok(dispatch_outcome.results)
 }
 
@@ -536,18 +558,24 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
     }
     eprintln!("lihaaf: {summary}");
 
-    // The aggregate line is kept to four buckets (`ok`, `failed`,
-    // `summary` above carry every verdict label; this line re-projects
-    // the four buckets reported as `ok`, `failed`, `timeout`,
-    // adopter-friendly shape `<n> ok, <n> failed, <n> timeout, <n>
-    // memory_exhausted` so CI greps and dashboards have a single fixed
-    // line to anchor on regardless of which exotic verdicts a run
-    // produced. `failed` aggregates everything that is neither pass
-    // nor the named timeout/memory_exhausted buckets.
+    // The aggregate line carries five buckets in a fixed, CI-grep-able
+    // shape: `<n> ok, <n> failed, <n> timeout, <n> memory_exhausted,
+    // <n> bless_skipped`. `failed` aggregates everything that is
+    // neither pass nor one of the three named buckets
+    // (timeout/memory_exhausted/bless_skipped). The `bless_skipped`
+    // bucket is split out from `failed` so adopters can distinguish
+    // "guard fired" from "test failed for a non-bless reason".
+    //
+    // The line is appended to (not reordered): existing CI scripts
+    // that anchor on the first four buckets keep working.
     let aggregate = aggregate_counts(results);
     eprintln!(
-        "lihaaf: {} ok, {} failed, {} timeout, {} memory_exhausted",
-        aggregate.ok, aggregate.failed, aggregate.timeout, aggregate.memory_exhausted
+        "lihaaf: {} ok, {} failed, {} timeout, {} memory_exhausted, {} bless_skipped",
+        aggregate.ok,
+        aggregate.failed,
+        aggregate.timeout,
+        aggregate.memory_exhausted,
+        aggregate.bless_skipped,
     );
 
     eprintln!("lihaaf: total wall-clock: {:.1}s", wall_ms as f64 / 1000.0);
@@ -602,6 +630,32 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
                 eprintln!("--- actual head ---\n{actual_head}");
                 eprintln!("--- expected head ---\n{expected_head}");
             }
+            // Render the unchanged-fixture guard's diagnostic in full
+            // so the adopter sees the reason next to the verdict line.
+            // The underlying SnapshotDiff/SnapshotMissing is rendered
+            // alongside so the same run still shows the actual drift
+            // the guard refused to paper over.
+            Verdict::BlessSkipped { reason, underlying } => {
+                eprintln!("\n=== {} (BLESS_SKIPPED) ===\n{reason}", r.relative_path);
+                match underlying.as_ref() {
+                    Verdict::SnapshotDiff { diff } => {
+                        eprintln!("--- underlying SNAPSHOT_DIFF ---\n{diff}");
+                    }
+                    Verdict::SnapshotMissing { actual } => {
+                        eprintln!(
+                            "--- underlying SNAPSHOT_MISSING (actual normalized stderr) ---\n{actual}"
+                        );
+                    }
+                    other => {
+                        // BlessSkipped is constructed with a
+                        // SnapshotDiff or SnapshotMissing underlying;
+                        // any other shape is a programming error and
+                        // gets rendered minimally rather than going
+                        // silent.
+                        eprintln!("--- underlying {} ---", other.label());
+                    }
+                }
+            }
             _ => {}
         }
     }
@@ -612,12 +666,12 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
 /// byte-identical for adopters who never declare a named suite.
 ///
 /// Format pinned to:
-/// `lihaaf: suite "<name>": <n> ok, <n> failed, <n> timeout, <n> memory_exhausted`
+/// `lihaaf: suite "<name>": <n> ok, <n> failed, <n> timeout, <n> memory_exhausted, <n> bless_skipped`
 fn print_per_suite_aggregate(suite: &Suite, results: &[FixtureResult]) {
     let agg = aggregate_counts(results);
     eprintln!(
-        "lihaaf: suite \"{}\": {} ok, {} failed, {} timeout, {} memory_exhausted",
-        suite.name, agg.ok, agg.failed, agg.timeout, agg.memory_exhausted
+        "lihaaf: suite \"{}\": {} ok, {} failed, {} timeout, {} memory_exhausted, {} bless_skipped",
+        suite.name, agg.ok, agg.failed, agg.timeout, agg.memory_exhausted, agg.bless_skipped,
     );
 }
 
@@ -647,28 +701,38 @@ fn emit_fixture_warnings(r: &FixtureResult) {
     }
 }
 
-/// Bucketed counts for the policy aggregate line. Captures the four
-/// names the worked example calls out (`ok`, `failed`, `timeout`,
-/// `memory_exhausted`); every other verdict folds into `failed` so the
-/// line stays at four buckets regardless of how exotic a run got.
+/// Bucketed counts for the aggregate line. Captures the five named
+/// buckets (`ok`, `failed`, `timeout`, `memory_exhausted`,
+/// `bless_skipped`); every other verdict folds into `failed` so the
+/// line stays at five buckets regardless of how exotic a run got.
+///
+/// `bless_skipped` is split out (not folded into `failed`) so adopters
+/// can distinguish guard-blocked bless attempts from genuine test
+/// failures while scanning the line.
 #[derive(Debug, Default, Clone, Copy)]
 struct AggregateCounts {
     ok: usize,
     failed: usize,
     timeout: usize,
     memory_exhausted: usize,
+    bless_skipped: usize,
 }
 
-/// Bucket per-fixture verdicts into the four the policy aggregate names.
+/// Bucket per-fixture verdicts into the five aggregate names.
 ///
-/// `Ok` and `Blessed` count as `ok` (verdict-table footnote: "Treated as
-/// OK for exit-code purposes"). `Timeout` and `MemoryExhausted` are
-/// dedicated buckets per the policy. Everything else (`SnapshotDiff`,
-/// `SnapshotMissing`, `WorkerCrashed`, `MalformedDiagnostic`,
-/// `SnapshotDiffTooLarge`, `ExpectedFailButPassed`,
-/// `ExpectedPassButFailed`) folds into `failed` — the policy worked
-/// example's "failed" bucket is the catch-all for "fixture did not pass
-/// for a reason other than timeout or memory_exhausted."
+/// - `Ok` and `Blessed` count as `ok` (verdict-table footnote:
+///   "Treated as OK for exit-code purposes").
+/// - `Timeout` and `MemoryExhausted` are dedicated buckets per the
+///   policy.
+/// - `BlessSkipped` gets its own bucket. The underlying SnapshotDiff /
+///   SnapshotMissing it carries is NOT also counted as `failed` — the
+///   `bless_skipped` count is the only place this verdict appears, so
+///   the total of all buckets matches the total number of fixtures.
+/// - Everything else (`SnapshotDiff`, `SnapshotMissing`,
+///   `WorkerCrashed`, `MalformedDiagnostic`, `SnapshotDiffTooLarge`,
+///   `ExpectedFailButPassed`, `ExpectedPassButFailed`) folds into
+///   `failed` — the catch-all for "fixture did not pass for a reason
+///   other than timeout, memory_exhausted, or bless_skipped".
 fn aggregate_counts(results: &[FixtureResult]) -> AggregateCounts {
     use crate::verdict::Verdict;
     let mut a = AggregateCounts::default();
@@ -677,6 +741,7 @@ fn aggregate_counts(results: &[FixtureResult]) -> AggregateCounts {
             Verdict::Ok | Verdict::Blessed { .. } => a.ok += 1,
             Verdict::Timeout => a.timeout += 1,
             Verdict::MemoryExhausted => a.memory_exhausted += 1,
+            Verdict::BlessSkipped { .. } => a.bless_skipped += 1,
             _ => a.failed += 1,
         }
     }
@@ -919,14 +984,32 @@ mod tests {
                     cause: "signal: 11".into(),
                 },
             ),
+            // BlessSkipped is its own bucket — not folded into `failed`.
+            r(
+                "i",
+                Verdict::BlessSkipped {
+                    reason: "fixture `i.rs` is unchanged from HEAD".into(),
+                    underlying: Box::new(Verdict::SnapshotDiff {
+                        diff: "diff".into(),
+                    }),
+                },
+            ),
         ];
         let agg = aggregate_counts(&results);
         // Ok + Blessed → 2 ok. SnapshotDiff + ExpectedFailButPassed +
-        // WorkerCrashed → 3 failed. Two Timeout, one MemoryExhausted.
+        // WorkerCrashed → 3 failed. Two Timeout, one MemoryExhausted,
+        // one BlessSkipped. The total of all buckets matches the input
+        // length (every fixture is counted in exactly one bucket).
         assert_eq!(agg.ok, 2);
         assert_eq!(agg.failed, 3);
         assert_eq!(agg.timeout, 2);
         assert_eq!(agg.memory_exhausted, 1);
+        assert_eq!(agg.bless_skipped, 1);
+        assert_eq!(
+            agg.ok + agg.failed + agg.timeout + agg.memory_exhausted + agg.bless_skipped,
+            results.len(),
+            "every fixture must be counted in exactly one aggregate bucket"
+        );
     }
 
     /// Run `derive_crate_root` against `input` and assert:

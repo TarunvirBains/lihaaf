@@ -10,6 +10,28 @@
 //!
 //! Bless overwrites checked-in `.stderr` files. The harness expects
 //! snapshot edits to flow through normal code review.
+//!
+//! Two defensive guards constrain when `--bless` can fire:
+//!
+//! 1. **CLI-level blast-radius guard.** `--bless` (or
+//!    `LIHAAF_OVERWRITE=1`) without `--filter` is rejected at parse
+//!    time via [`crate::cli::Cli::validate_bless_requires_filter`].
+//!    Pass `--filter ""` to opt into bulk blessing; the awkward form
+//!    is intentional. See the `cli` module rustdoc for the rationale.
+//!
+//! 2. **Per-fixture unchanged-`.rs` guard.** Even with `--filter` and
+//!    a matching SnapshotDiff or SnapshotMissing verdict, lihaaf
+//!    refuses to overwrite the snapshot of a fixture whose `.rs`
+//!    source file is byte-identical to its `HEAD` revision in the
+//!    surrounding git repository. The guard implementation is in
+//!    `worker.rs` (`fixture_rs_is_modified`); skipped fixtures emit a
+//!    [`crate::verdict::Verdict::BlessSkipped`] verdict carrying the
+//!    underlying SnapshotDiff / SnapshotMissing so the exit code still
+//!    reflects the unfixed snapshot drift.
+//!
+//! The combined intent is to make the classical lazy-bless failure
+//! mode (real regression breaks snapshot → run `--bless` → bug ships)
+//! hard to hit by accident.
 
 use std::path::{Path, PathBuf};
 
