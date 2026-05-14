@@ -198,6 +198,89 @@ fn target_directory_path_classified_as_ignored() {
     assert_eq!(class_of(&results, &path), GeneratedPathClass::Ignored);
 }
 
+/// **Round-3 BLOCK regression: relative paths resolve against
+/// `target_root` at `track` time.** The `CleanupGuard::track` API
+/// accepts relative-to-`target_root` paths for caller convenience,
+/// but the classifier's `is_under_cargo_target` compares against
+/// the joined `<target_root>/target` prefix via `starts_with`. A
+/// relative path like `target/foo` would silently miss the prefix
+/// and fall through to the git-classifier, then to the `Cleaned`
+/// default — at which point the file would be REMOVED even though
+/// it lives under cargo's owned `target/` directory.
+///
+/// The fix resolves relative paths against `target_root` eagerly
+/// in `track`, storing the absolute form internally. After the
+/// fix:
+///
+/// 1. The result `GeneratedPath.path` is `target_root.join(...)` —
+///    the absolute form, byte-equal to what a directly-absolute
+///    `track` call would produce.
+/// 2. The classification matches the absolute-form invocation
+///    (`Ignored` for a `target/`-rooted path).
+#[test]
+fn relative_track_input_resolves_against_target_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git_init(root); // No .gitignore — `target/` is short-circuited.
+
+    // Use a path under `target/` so the `is_under_cargo_target`
+    // short-circuit decides the classification; that branch is the
+    // one a relative input regressed.
+    let relative = PathBuf::from("target/lihaaf-compat-converted/fixture.rs");
+    let absolute = root.join(&relative);
+    write_artifact(&absolute, b"// converted fixture\n");
+
+    // Reference run: track the absolute form directly. This is the
+    // "what should happen" baseline.
+    let absolute_guard = CleanupGuard::new(/*keep_output=*/ false);
+    absolute_guard.track(absolute.clone(), root);
+    let absolute_results = absolute_guard.finalize().expect("finalize must succeed");
+    assert_eq!(
+        class_of(&absolute_results, &absolute),
+        GeneratedPathClass::Ignored,
+        "baseline: absolute `target/`-rooted path must classify as Ignored"
+    );
+
+    // Restore the file (the reference run did not remove it because
+    // it classified as Ignored, so this is a no-op; we keep it
+    // defensive against future refactors).
+    write_artifact(&absolute, b"// converted fixture\n");
+
+    // Test run: track the RELATIVE form. The fix resolves it against
+    // `target_root` at track time, so the result entry's `path` field
+    // is byte-equal to the absolute form, AND the classification
+    // matches the baseline.
+    let relative_guard = CleanupGuard::new(/*keep_output=*/ false);
+    relative_guard.track(relative.clone(), root);
+    let relative_results = relative_guard.finalize().expect("finalize must succeed");
+
+    // Stored path is the absolute form, not the relative input.
+    assert_eq!(
+        relative_results.len(),
+        1,
+        "exactly one tracked entry expected; got {:?}",
+        relative_results
+    );
+    assert_eq!(
+        relative_results[0].path,
+        absolute,
+        "track must store the absolute resolution of a relative input; \
+         got `{}` expected `{}`",
+        relative_results[0].path.display(),
+        absolute.display()
+    );
+    // Classification matches the absolute-form baseline.
+    assert_eq!(
+        class_of(&relative_results, &absolute),
+        GeneratedPathClass::Ignored,
+        "relative-input classification must match absolute-form baseline"
+    );
+    assert!(
+        absolute.exists(),
+        "Ignored path must survive cleanup regardless of track-input shape"
+    );
+}
+
 /// **`.gitignore`d path is classified `Ignored` and not cleaned.**
 ///
 /// Explicitly tests the `git check-ignore` path: the file is not

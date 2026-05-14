@@ -225,11 +225,16 @@ impl CleanupGuard {
 
     /// Register a generated path for classification + cleanup.
     ///
-    /// `path` is the artifact the driver produced (absolute, or
-    /// relative to `target_root`; the classifier resolves it against
-    /// `target_root` before invoking `git`). `target_root` is the
-    /// adopter's `--compat-root` — the working directory for the
-    /// `git` invocations in [`CleanupGuard::finalize`].
+    /// `path` may be absolute OR relative to `target_root`; the
+    /// API boundary accepts both for caller convenience, but the
+    /// tracker stores the path in absolute form internally. This
+    /// matters because the classifier (`is_under_cargo_target`)
+    /// does a `starts_with` check against `<target_root>/target` —
+    /// a relative path would silently miss the prefix and be
+    /// misclassified as `Cleaned` (then removed) when it actually
+    /// lives under `target/`. `target_root` is the adopter's
+    /// `--compat-root` — the working directory for the `git`
+    /// invocations in [`CleanupGuard::finalize`].
     ///
     /// Registration is cheap: the entry is appended to a pending
     /// vector; classification + filesystem work is deferred to
@@ -239,6 +244,18 @@ impl CleanupGuard {
     /// `pub` to allow the test crate's `#[doc(hidden)]` re-export to
     /// reach this method.
     pub fn track(&self, path: PathBuf, target_root: &Path) {
+        // Resolve relative inputs against `target_root` eagerly. The
+        // classifier's `starts_with` check and the `git` subprocess
+        // both behave correctly on absolute paths; storing the
+        // absolute form here means the rest of the cleanup pipeline
+        // is invariant w.r.t. how the caller chose to express the
+        // path. `PathBuf::join` is a no-op when `path` is already
+        // absolute, so absolute inputs pass through unchanged.
+        let absolute = if path.is_absolute() {
+            path
+        } else {
+            target_root.join(&path)
+        };
         // Acquire-only — if a previous panic poisoned the mutex, we
         // still want to record the new entry. The `into_inner` /
         // `get_mut` path used by Drop handles the poisoning
@@ -248,7 +265,7 @@ impl CleanupGuard {
             Err(poisoned) => poisoned.into_inner(),
         };
         guard.pending.push(PendingPath {
-            path,
+            path: absolute,
             target_root: target_root.to_path_buf(),
         });
     }
