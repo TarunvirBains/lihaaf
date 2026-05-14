@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.1] — 2026-05-13
+
+First public beta. Adopters who pinned `0.1.0-alpha.4` should upgrade
+straight to `0.1.0-beta.1`. The Rust library surface has narrowed (see
+`### Changed`); adopters who imported internal module paths
+(`lihaaf::dylib::*`, `lihaaf::worker::*`, etc.) must switch to the new
+crate-root re-exports or to subprocess-spawning `cargo lihaaf`. The
+CLI surface, exit codes, verdict catalog, snapshot byte format, and
+`[package.metadata.lihaaf]` schema are unchanged from `0.1.0-alpha.4`.
+
 ### Added
 - Local pre-commit guard (`scripts/scan-secrets.sh`) that scans staged diffs
   for credential-like patterns: database URLs with embedded credentials,
@@ -258,6 +268,5 @@ should subprocess-spawn `cargo lihaaf` rather than depend on
   `src/freshness.rs` rustdoc. (Codex delta-review A3.)
 
 ### Pending before v0.1.0 release
-- macOS / Windows RSS sampling APIs are not yet wired (KR-5); on
-  those platforms v0.1 falls back to the OS OOMkiller and surfaces
-  runaway workers as `WORKER_CRASHED` rather than `MEMORY_EXHAUSTED`.
+- (Resolved in `0.1.0-beta.1`) macOS / Windows RSS sampling APIs are
+  not yet wired (KR-5).
