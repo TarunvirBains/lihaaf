@@ -1039,6 +1039,60 @@ fn second() {\n\
     );
 }
 
+/// **Round-4 FIX regression: a `let` shadow of a trybuild binding
+/// invalidates the binding.** Inside one `#[test]` body, an early
+/// `let t = TestCases::new();` records `t` as a trybuild receiver; a
+/// subsequent `let t = some_other_function();` REBINDS `t` to a
+/// non-receiver. After the shadow, `t.compile_fail(...)` must NOT be
+/// treated as a trybuild call — the binding tracker must remove the
+/// stale entry on every non-TestCases `let` against the same ident.
+///
+/// Before the fix the visitor only INSERTED into `local_bindings`,
+/// never REMOVED. The shadow above would leave the original `t` entry
+/// in place; `t.compile_fail("path")` after the shadow would be
+/// silently surfaced as a fixture even though it points at a
+/// different runtime value. False positives like this survive every
+/// snapshot check until a human notices the discovered fixture has
+/// no business being there.
+#[test]
+fn let_shadow_invalidates_trybuild_binding() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    // Inside one `#[test]` body: the first `t` is a real trybuild
+    // receiver; the second `let t = ...;` rebinds `t` to a String,
+    // after which `t.compile_fail("path")` is NOT a trybuild call.
+    // Note: we deliberately do not call `.compile_fail` on the FIRST
+    // binding either — the test isolates the SHADOW semantics by
+    // asserting zero fixtures, not "exactly one for the first
+    // binding and zero for the shadow". The shadow's terminal call
+    // is the only `.compile_fail(...)` in the body.
+    let source = "\
+fn make_string() -> String { String::from(\"unused\") }\n\
+\n\
+#[test]\n\
+fn ui() {\n\
+    let t = trybuild::TestCases::new();\n\
+    let _ = &t;\n\
+    let t = make_string();\n\
+    let _ = t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "the shadowed `t` is NOT a trybuild receiver; expected zero fixtures, got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **Smoke check on the corpus root.** All five scenarios point at
 /// `tests/compat/discovery_corpus/<name>/`; verify each exists so a
 /// missing checked-in fixture fails fast with a clear message.

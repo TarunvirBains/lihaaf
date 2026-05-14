@@ -634,19 +634,42 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // `let <ident> = <TestCases::new()-or-alias>;`. Anything else
         // (typed pattern, destructured tuple, ref binding) is left
         // alone — the binding tracker is strictly opt-in.
+        //
+        // Shadow-invalidation: a later `let t = something_else();` in
+        // the same scope must REMOVE any previous `t` from
+        // `local_bindings` / `aliased_bindings` so a downstream
+        // `t.compile_fail(...)` is not treated as a trybuild receiver.
+        // Without the removal the visitor would silently surface a
+        // fixture from the shadowed identifier — a false positive that
+        // would survive every snapshot check until a human noticed.
         if let (syn::Pat::Ident(pat_ident), Some(init)) = (&node.pat, &node.init)
             && pat_ident.attrs.is_empty()
             && pat_ident.by_ref.is_none()
             && pat_ident.subpat.is_none()
         {
+            let ident = pat_ident.ident.to_string();
             if self.is_testcases_constructor_expr(&init.expr) {
-                self.local_bindings.insert(pat_ident.ident.to_string());
+                self.local_bindings.insert(ident.clone());
+                // A `let t = TestCases::new();` shadows a previous
+                // `let t = Foo::new();` (where `Foo` is an unregistered
+                // alias) just as much as the converse — drop the
+                // aliased-binding entry so the receiver classifier does
+                // not flag a now-recognized binding as unrecognized.
+                self.aliased_bindings.remove(&ident);
             } else if self.is_aliased_testcases_constructor_expr(&init.expr) {
                 // Pattern 3 for an unregistered `use ... as Foo;` alias:
                 // record the binding so a subsequent
                 // `t.compile_fail(...)` call can be flagged as
                 // unrecognized rather than silently dropped.
-                self.aliased_bindings.insert(pat_ident.ident.to_string());
+                self.aliased_bindings.insert(ident.clone());
+                self.local_bindings.remove(&ident);
+            } else {
+                // A `let t = <non-trybuild>;` rebinds the name to a
+                // non-receiver. Drop both possible entries so the
+                // subsequent terminal-call dispatcher does not pick
+                // up the stale binding.
+                self.local_bindings.remove(&ident);
+                self.aliased_bindings.remove(&ident);
             }
         }
         syn::visit::visit_local(self, node);
