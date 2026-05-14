@@ -101,6 +101,15 @@ pub enum FixtureKind {
     CompileFail,
 }
 
+impl From<crate::discovery::FixtureKind> for FixtureKind {
+    fn from(k: crate::discovery::FixtureKind) -> Self {
+        match k {
+            crate::discovery::FixtureKind::CompilePass => Self::Pass,
+            crate::discovery::FixtureKind::CompileFail => Self::CompileFail,
+        }
+    }
+}
+
 /// One discovered Trybuild fixture call. `pub` for the same reason as
 /// [`FixtureKind`] — the `#[doc(hidden)]` re-export at the crate root.
 #[derive(Debug, Clone, PartialEq, Eq)]
