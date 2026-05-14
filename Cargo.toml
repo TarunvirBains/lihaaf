@@ -20,7 +20,19 @@ readme = "README.md"
 # `cargo publish` for lihaaf itself would try to interpret the nested
 # manifests as part of the package and the corpus would ship to
 # crates.io.
-exclude = ["tests/integration_corpus/"]
+exclude = [
+    "tests/integration_corpus/",
+    # Phase 6 (§3.2.1) discovery-corpus fixtures. Each
+    # `discovery_corpus/<scenario>/tests/*.rs` file contains hand-crafted
+    # source — some intentionally malformed (`parse_error/`) — that the
+    # `discovery_syn` integration test feeds to the syn AST walker. These
+    # files are NOT part of lihaaf's compiled surface and must not be
+    # interpreted by cargo's `tests/` auto-discovery; the nested `tests/`
+    # directories sit two levels below the top-level `tests/` cargo
+    # scans, so the auto-discovery already skips them, but the exclude
+    # block keeps them out of the published package too.
+    "tests/compat/discovery_corpus/",
+]
 
 # Pre-release alpha — adopters must pin the exact version
 # (`cargo install lihaaf` without a version selector will not pick up
@@ -60,6 +72,10 @@ path = "tests/compat/baseline_conservative.rs"
 name = "cleanup_dirty_worktree"
 path = "tests/compat/cleanup_dirty_worktree.rs"
 
+[[test]]
+name = "discovery_syn"
+path = "tests/compat/discovery_syn.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }
@@ -88,6 +104,40 @@ sha2 = "0.11"
 # it wrong on macOS where the system can rotate temp roots.
 tempfile = "3"
 
+# Static AST analysis for compat-mode fixture-invocation discovery
+# (Spec §3.2.1, Phase 6). A string-scan over `tests/*.rs` would
+# produce non-deterministic matches across crate styles; `syn`'s typed
+# visitor (`syn::visit::Visit<'_>`) bounds the recognized set to the
+# three patterns the spec names (direct `TestCases` calls, glob
+# arguments, `#[test]`-wrapped invocations) and produces the same
+# result on every clean-state run.
+#
+# Features:
+#   - `full`     — needed for `#[test] fn ...` item parsing (`syn::ItemFn`).
+#   - `visit`    — exposes the `syn::visit::Visit<'ast>` trait.
+#   - `parsing`  — `syn::parse_file(&str)` entry point.
+#
+# Pin to the major: `2` is current stable; `2.0.x` is already in the
+# build tree transitively via `clap_derive` and `serde_derive`, so
+# adding it as a direct dependency adds no new graph node — the
+# additional compile cost is only the lihaaf code that calls into the
+# visitor.
+#
+# The §6.1 "no regex" rule is preserved — `syn = "2"` does NOT pull a
+# `regex` / `regex-syntax` / `regex-automata` crate (verified by
+# `cargo tree | grep -E "regex(-syntax|-automata)?"` returning zero
+# lines after this dep is added).
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+
+# `Span::start()` is gated on proc-macro2's `span-locations` feature
+# (see proc-macro2's `#[cfg(span_locations)]` in `lib.rs`). The compat
+# discovery walk needs line numbers to emit `discovery_unrecognized`
+# entries with file + line citations and to stamp `CallSite.line` on
+# every recognized fixture, so the feature must be activated. The
+# dependency is already in the graph transitively via `syn` and
+# `clap_derive`; declaring it explicitly here only toggles the feature.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
 # Unix syscalls — `kill(2)` for spec §5.4 worker termination and
 # `sysconf(_SC_PAGESIZE)` for spec §5.4 RSS conversion. The `libc`
 # crate is the canonical curated source for POSIX FFI signatures and
@@ -114,7 +164,10 @@ windows-sys = { version = "0.59", features = [
 # No regex engine, ever. Spec §6.1. Every string match in this crate
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
-# `/proc/<pid>/statm` directly via stdlib file I/O.
+# `/proc/<pid>/statm` directly via stdlib file I/O. The §3.2.1 fixture
+# discovery walk uses `syn` (declared above) for AST analysis — `syn`
+# does NOT pull a regex crate (verified by `cargo tree | grep regex`
+# returning zero lines).
 
 [features]
 # Self-test marker for the multi-suite end-to-end corpus

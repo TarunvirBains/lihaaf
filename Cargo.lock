@@ -279,9 +279,11 @@ version = "0.1.0-beta.3"
 dependencies = [
  "clap",
  "libc",
+ "proc-macro2",
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "tempfile",
  "toml",
  "windows-sys 0.59.0",

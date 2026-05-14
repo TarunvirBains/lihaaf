@@ -15,6 +15,7 @@
 pub(crate) mod baseline;
 pub(crate) mod cleanup;
 pub(crate) mod cli;
+pub(crate) mod discovery;
 pub(crate) mod overlay;
 
 /// Top-level compat-mode entry. Called from `cargo-lihaaf.rs` when

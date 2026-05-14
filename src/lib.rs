@@ -148,6 +148,28 @@ pub use compat::baseline::parse_libtest_output as compat_parse_libtest_output;
 #[doc(hidden)]
 pub use compat::baseline::run_baseline_with_recognized_fixtures as compat_baseline_run_with_recognized_fixtures;
 
+// Compat-mode fixture-invocation discovery (Phase 6 of compat mode,
+// §3.2.1 of the compatibility plan). Re-exported for the same reason
+// as the overlay above — `tests/compat/discovery_syn.rs` lives in a
+// separate test crate and reaches the discovery types through these
+// `#[doc(hidden)]` re-exports. The stability contract is the same:
+// NOT part of any v0.1 surface; the supported entry to compat mode is
+// `cargo lihaaf --compat`. Phase 9 (issue #13 — driver body) wires
+// `discover` into `compat::run`; until then the re-exports exist
+// solely to let the §3.2.1 integration tests reach the visitor.
+#[doc(hidden)]
+pub use compat::discovery::CallSite as CompatDiscoveryCallSite;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveredFixture as CompatDiscoveredFixture;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveryOutput as CompatDiscoveryOutput;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveryUnrecognized as CompatDiscoveryUnrecognized;
+#[doc(hidden)]
+pub use compat::discovery::FixtureKind as CompatFixtureKind;
+#[doc(hidden)]
+pub use compat::discovery::discover as compat_discover;
+
 // Compat-mode dirty-worktree cleanup (Phase 5 of compat mode, GH #10).
 // Re-exported for the same reason as the overlay above —
 // `tests/compat/cleanup_dirty_worktree.rs` lives in a separate test
