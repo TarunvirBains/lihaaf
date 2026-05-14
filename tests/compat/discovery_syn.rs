@@ -1055,6 +1055,97 @@ fn second() {\n\
     );
 }
 
+/// **Round-4 FIX regression: `use trybuild::TestCases;` (no rename)
+/// IS recognized at the call site.** The most common trybuild import
+/// idiom — a plain `use trybuild::TestCases;` followed by
+/// `TestCases::new()` — was previously silently dropped because the
+/// `ItemUse` walker only handled `UseTree::Rename` (the `use X as Y`
+/// case). The fix extends the walker to also handle `UseTree::Name`
+/// when the prefix is exactly `["trybuild"]`; the local name (always
+/// `TestCases` in the canonical form) is then recorded into a per-file
+/// `imported_testcases` set and `is_testcases_constructor_path`
+/// accepts the 2-segment `TestCases::new` form.
+///
+/// Strict prefix match: a `use somelib::TestCases;` (different
+/// upstream crate) is NOT recognized — the visitor cannot prove the
+/// re-export points at trybuild's `TestCases`.
+#[test]
+fn use_testcases_without_rename_is_recognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+use trybuild::TestCases;\n\
+#[test]\n\
+fn ui() {\n\
+    let t = TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "the canonical `use trybuild::TestCases;` import must produce exactly one fixture; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(out.fixtures[0].kind, CompatFixtureKind::CompileFail);
+    assert!(
+        out.fixtures[0].relative_path.ends_with("tests/ui/foo.rs"),
+        "relative_path must point at the literal arg; got {}",
+        out.fixtures[0].relative_path
+    );
+    assert!(
+        out.unrecognized.is_empty(),
+        "a recognized no-rename import must not produce any unrecognized entries; got {:?}",
+        out.unrecognized
+    );
+}
+
+/// **Strict prefix: `use somelib::TestCases;` is NOT recognized as
+/// trybuild.** The no-rename auto-recognition demands a prefix of
+/// exactly `["trybuild"]`; a third-party `TestCases` re-export must
+/// not silently impersonate the canonical type. The call site
+/// `TestCases::new()` resolves to neither a registered alias nor a
+/// canonical import, so the visitor produces no fixtures and emits
+/// nothing (the path doesn't match any of the recognized shapes; it's
+/// silently dropped, which is the correct behavior for code that
+/// targets a non-trybuild library).
+#[test]
+fn use_testcases_from_non_trybuild_prefix_is_not_recognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+use somelib::TestCases;\n\
+#[test]\n\
+fn ui() {\n\
+    let t = TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "a non-trybuild `use ::TestCases;` must NOT be recognized; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **Round-4 FIX regression: a `let` shadow of a trybuild binding
 /// invalidates the binding.** Inside one `#[test]` body, an early
 /// `let t = TestCases::new();` records `t` as a trybuild receiver; a

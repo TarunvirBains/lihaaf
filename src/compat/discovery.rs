@@ -77,6 +77,14 @@
 //! recognizes:
 //!
 //! - `trybuild::TestCases::new()` (canonical form).
+//! - `TestCases::new()` at the call site WHEN paired with a
+//!   `use trybuild::TestCases;` (no-rename) import in the same file.
+//!   The `ItemUse` walker records the local name into a per-file
+//!   `imported_testcases` set, then `is_testcases_constructor_path`
+//!   accepts the 2-segment `<local>::new` form. Strict prefix match
+//!   (`["trybuild"]` only): a `use somelib::TestCases;` is NOT
+//!   recognized because the visitor cannot prove the re-export
+//!   points at trybuild's `TestCases`.
 //! - `<alias>::new()` for any `alias` registered via
 //!   `--compat-trybuild-macro`. The alias must be the literal path
 //!   string passed on the flag; segment-by-segment equality is required.
@@ -423,6 +431,21 @@ struct DiscoveryVisitor<'a> {
     /// binding" from "unregistered alias binding".
     aliased_bindings: BTreeSet<String>,
 
+    /// File-scope: local names introduced by `use trybuild::TestCases;`
+    /// (the no-rename form). The local name equals `TestCases` in the
+    /// canonical case — `use trybuild::{TestCases};` and
+    /// `use trybuild::TestCases;` both produce `"TestCases"` here. The
+    /// `<local_name>::new()` call at the use site is then RECOGNIZED
+    /// (not flagged as unrecognized) — this is the most common
+    /// trybuild import idiom and silently dropping it would be a
+    /// pervasive false negative.
+    ///
+    /// Only the strict `prefix == ["trybuild"]` shape feeds this set —
+    /// a hypothetical `use somelib::TestCases;` is intentionally NOT
+    /// recognized because the visitor cannot prove the re-export points
+    /// at trybuild's `TestCases`.
+    imported_testcases: BTreeSet<String>,
+
     /// Recognized hits, awaiting glob expansion.
     hits: Vec<VisitorHit>,
     /// Unrecognized AST nodes (e.g. `t.pass(format!(...))`).
@@ -457,6 +480,7 @@ impl<'a> DiscoveryVisitor<'a> {
             local_bindings: BTreeSet::new(),
             aliased_testcases: BTreeSet::new(),
             aliased_bindings: BTreeSet::new(),
+            imported_testcases: BTreeSet::new(),
             hits: Vec::new(),
             unrecognized: Vec::new(),
         }
@@ -502,7 +526,8 @@ impl<'a> DiscoveryVisitor<'a> {
 
     /// Returns `true` when `expr` is a path call to
     /// `trybuild::TestCases::new` or `<alias>::new` (custom-macro
-    /// alias's `::new` form).
+    /// alias's `::new` form), or to a no-rename-imported
+    /// `<local>::new` recorded by [`Self::imported_testcases`].
     fn is_testcases_constructor_path(&self, expr: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = expr else {
             return false;
@@ -516,6 +541,16 @@ impl<'a> DiscoveryVisitor<'a> {
         // enforces `leading_colon.is_none()` to mirror the v0.1 spec.
         if path_matches_segments(&p.path, &["trybuild", "TestCases", "new"]) {
             return true;
+        }
+        // No-rename import form: `use trybuild::TestCases;` makes the
+        // local name `TestCases` (or whatever the segment was if the
+        // adopter used a group-import) refer to the canonical trybuild
+        // type. `<local>::new()` at the call site is a 2-segment path.
+        if p.path.leading_colon.is_none() && p.path.segments.len() == 2 {
+            let first = p.path.segments[0].ident.to_string();
+            if self.imported_testcases.contains(&first) && p.path.segments[1].ident == "new" {
+                return true;
+            }
         }
         // Alias form: an entry in `custom_macros` is matched against
         // its `::new` suffix. The flag accepts the constructor's
@@ -756,20 +791,31 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        // Record `use trybuild::TestCases as <name>;` and
-        // `use <registered-alias-path> as <name>;` aliases so the
-        // visitor can flag `<name>::new(); <binding>.compile_fail(...)`
-        // shapes that would otherwise be silently lost. The set is
-        // populated regardless of whether the local `<name>` is also
-        // registered via `--compat-trybuild-macro`; the registration
-        // check is deferred to the terminal-call site so the
-        // unrecognized emission only fires when the alias was not
-        // explicitly opted-in.
-        collect_use_renames_for_testcases(
+        // Two flavors of `use` are interesting here:
+        //
+        // 1. `use trybuild::TestCases as <name>;` (or any path ending
+        //    in `TestCases as <name>;`). The rename's source ident is
+        //    `TestCases`; the local name `<name>` is NOT registered
+        //    via `--compat-trybuild-macro` (the registration check is
+        //    deferred to the call site). Recorded in
+        //    `aliased_testcases`; the terminal-call dispatcher emits
+        //    `discovery_unrecognized` so the adopter knows to register
+        //    the alias.
+        // 2. `use trybuild::TestCases;` (no rename). The strict
+        //    `prefix == ["trybuild"]` shape feeds `imported_testcases`,
+        //    making `TestCases::new()` at the use site a recognized
+        //    canonical constructor (treated identically to a literal
+        //    `trybuild::TestCases::new()`). This is the most common
+        //    trybuild import idiom.
+        let mut sink = UseTreeSink {
+            renamed: &mut self.aliased_testcases,
+            imported: &mut self.imported_testcases,
+        };
+        collect_use_for_testcases(
             &node.tree,
             /* prefix */ Vec::new(),
             /* leading_colon */ node.leading_colon.is_some(),
-            &mut self.aliased_testcases,
+            &mut sink,
         );
         syn::visit::visit_item_use(self, node);
     }
@@ -916,25 +962,50 @@ fn path_matches_string_segments(path: &syn::Path, expected: &[String]) -> bool {
         .all(|(seg, exp)| seg.ident == *exp.as_str())
 }
 
-/// Walk a `syn::UseTree` and record any `<path-ending-in-TestCases> as <local>`
-/// renames into `out`. `prefix` accumulates the parent `UsePath` segments
-/// as the walk descends so a `use trybuild::TestCases as Foo;` produces
-/// `prefix = ["trybuild"]` at the `UseRename { ident: "TestCases", rename: "Foo" }`
-/// node. `_leading_colon` is reserved for future absolute-path variants
-/// (`use ::trybuild::TestCases as Foo;`); v0.1 records either shape
-/// indiscriminately because the spec's alias-detection signal is the
-/// trailing `TestCases` segment, not the path prefix.
-fn collect_use_renames_for_testcases(
+/// Mutable sinks for [`collect_use_for_testcases`].
+///
+/// Keeping the two sets behind one borrow rather than two parallel
+/// `&mut` borrows lets the walker stay recursive on a single helper
+/// without aliasing the visitor's `&mut self` across separate fields.
+struct UseTreeSink<'a> {
+    /// Receives renamed locals (`use ... TestCases as <name>;`).
+    /// Populated regardless of the prefix shape — the adopter may
+    /// have a re-export chain; the spec's alias-detection signal is
+    /// the trailing `TestCases` ident.
+    renamed: &'a mut BTreeSet<String>,
+    /// Receives no-rename canonical imports (`use trybuild::TestCases;`).
+    /// ONLY populated when the prefix is exactly `["trybuild"]` so a
+    /// `use somelib::TestCases;` is NOT silently treated as canonical.
+    imported: &'a mut BTreeSet<String>,
+}
+
+/// Walk a `syn::UseTree` and record:
+///
+/// - `<path-ending-in-TestCases> as <local>` renames into
+///   `sink.renamed` (Q6's alias-detection path; later flagged as
+///   `discovery_unrecognized` at the terminal-call site).
+/// - `trybuild::TestCases` no-rename imports into `sink.imported`
+///   (the canonical idiom; the local `<name>::new()` call site is
+///   then RECOGNIZED as a fixture).
+///
+/// `prefix` accumulates the parent `UsePath` segments as the walk
+/// descends so `use trybuild::TestCases;` produces `prefix =
+/// ["trybuild"]` at the `UseTree::Name { ident: "TestCases" }` leaf.
+/// `_leading_colon` is reserved for future absolute-path variants
+/// (`use ::trybuild::TestCases;`); v0.1 records either shape
+/// indiscriminately because the spec's signal is the trailing
+/// `TestCases` segment.
+fn collect_use_for_testcases(
     tree: &syn::UseTree,
     prefix: Vec<String>,
     _leading_colon: bool,
-    out: &mut BTreeSet<String>,
+    sink: &mut UseTreeSink<'_>,
 ) {
     match tree {
         syn::UseTree::Path(path) => {
             let mut next = prefix;
             next.push(path.ident.to_string());
-            collect_use_renames_for_testcases(&path.tree, next, _leading_colon, out);
+            collect_use_for_testcases(&path.tree, next, _leading_colon, sink);
         }
         syn::UseTree::Rename(rename) => {
             // `use <prefix>::<rename.ident> as <rename.rename>;`
@@ -946,17 +1017,30 @@ fn collect_use_renames_for_testcases(
             // ident must be `TestCases` for the discovery surface to
             // flag the alias.
             if rename.ident == "TestCases" && !prefix.is_empty() {
-                out.insert(rename.rename.to_string());
+                sink.renamed.insert(rename.rename.to_string());
             }
         }
         syn::UseTree::Group(group) => {
             for item in &group.items {
-                collect_use_renames_for_testcases(item, prefix.clone(), _leading_colon, out);
+                collect_use_for_testcases(item, prefix.clone(), _leading_colon, sink);
             }
         }
-        // `Name` (no rename), `Glob` (`use foo::*;`): nothing to
-        // record — the local name isn't an alias.
-        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+        syn::UseTree::Name(name) => {
+            // `use <prefix>::<name>;` — the local name equals
+            // `<name>`. Recognize the canonical-form import strictly:
+            // the trailing ident must be `TestCases` AND the prefix
+            // must be exactly `["trybuild"]`. A re-exported
+            // `use crate::TestCases;` or a third-party `use somelib::TestCases;`
+            // is NOT recognized; the visitor cannot prove the
+            // re-export points at trybuild's `TestCases` so we err on
+            // the side of false negatives over false positives.
+            if name.ident == "TestCases" && prefix.as_slice() == ["trybuild"] {
+                sink.imported.insert(name.ident.to_string());
+            }
+        }
+        // `Glob` (`use foo::*;`): nothing to record — `TestCases` is
+        // not named explicitly so we cannot identify the local.
+        syn::UseTree::Glob(_) => {}
     }
 }
 
