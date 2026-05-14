@@ -19,6 +19,21 @@ pub fn corpus_noop(_input: TokenStream) -> TokenStream {
     TokenStream::new()
 }
 
+/// Build `compile_error!(<body>);` as a 4-token sequence. The body is
+/// inserted verbatim into a parenthesized group; callers control what
+/// goes inside (e.g. a string literal, an arbitrary input TokenStream).
+fn emit_compile_error(body: TokenStream) -> TokenStream {
+    let mut out: Vec<TokenTree> = Vec::with_capacity(4);
+    out.push(TokenTree::Ident(Ident::new(
+        "compile_error",
+        Span::call_site(),
+    )));
+    out.push(TokenTree::Punct(Punct::new('!', Spacing::Alone)));
+    out.push(TokenTree::Group(Group::new(Delimiter::Parenthesis, body)));
+    out.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
+    TokenStream::from_iter(out)
+}
+
 /// Wrap the input in `compile_error!(<input>);`. The input is expected
 /// to be a single string literal; we don't re-parse it, we pass it
 /// through into the macro group verbatim. Used by
@@ -27,15 +42,7 @@ pub fn corpus_noop(_input: TokenStream) -> TokenStream {
 /// SNAPSHOT_MISSING verdict paths.
 #[proc_macro]
 pub fn corpus_error(input: TokenStream) -> TokenStream {
-    let mut out: Vec<TokenTree> = Vec::new();
-    out.push(TokenTree::Ident(Ident::new(
-        "compile_error",
-        Span::call_site(),
-    )));
-    out.push(TokenTree::Punct(Punct::new('!', Spacing::Alone)));
-    out.push(TokenTree::Group(Group::new(Delimiter::Parenthesis, input)));
-    out.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
-    TokenStream::from_iter(out)
+    emit_compile_error(input)
 }
 
 /// Emit `compile_error!("line 0\nline 1\n...line N-1");` where N is a
@@ -58,17 +65,9 @@ pub fn corpus_error_with_n_lines(input: TokenStream) -> TokenStream {
         .collect::<Vec<_>>()
         .join("\n");
     let lit = Literal::string(&body);
-    let mut out: Vec<TokenTree> = Vec::new();
-    out.push(TokenTree::Ident(Ident::new(
-        "compile_error",
-        Span::call_site(),
-    )));
-    out.push(TokenTree::Punct(Punct::new('!', Spacing::Alone)));
     let mut grp_inner = TokenStream::new();
     grp_inner.extend(std::iter::once(TokenTree::Literal(lit)));
-    out.push(TokenTree::Group(Group::new(Delimiter::Parenthesis, grp_inner)));
-    out.push(TokenTree::Punct(Punct::new(';', Spacing::Alone)));
-    TokenStream::from_iter(out)
+    emit_compile_error(grp_inner)
 }
 
 /// Sleep the macro-expansion thread forever. lihaaf's per-fixture
@@ -119,12 +118,11 @@ pub fn corpus_oom_allocate(_input: TokenStream) -> TokenStream {
     let mut keep_alive: Vec<Vec<u8>> = Vec::new();
     loop {
         let mut buf = vec![0u8; 64 * 1024 * 1024];
-        let mut i = 0;
-        while i < buf.len() {
-            // Write a non-zero byte to force the kernel to commit a
-            // real page rather than returning the shared zero page.
-            buf[i] = 1;
-            i += 4096;
+        // Write a non-zero byte to the first byte of every 4 KiB chunk to
+        // force the kernel to commit a real page rather than returning the
+        // shared zero page.
+        for chunk in buf.chunks_mut(4096) {
+            chunk[0] = 1;
         }
         keep_alive.push(buf);
         std::thread::sleep(std::time::Duration::from_millis(50));
