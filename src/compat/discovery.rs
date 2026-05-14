@@ -790,6 +790,44 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         syn::visit::visit_item_macro(self, node);
     }
 
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        // `type Foo = trybuild::TestCases;` — a type alias is a v0.1
+        // scope-out: type resolution is non-syntactic and the visitor
+        // operates on the source AST. If the adopter writes a type
+        // alias whose RHS ends in `TestCases`, surface a
+        // `discovery_unrecognized` entry so the operator knows the
+        // 'Foo::new()' call site will be silently dropped. We do NOT
+        // auto-recognize the alias (the spec scope is conservative);
+        // adopters silence the warning by registering the originating
+        // path via `--compat-trybuild-macro` or by avoiding the alias
+        // and writing the canonical `trybuild::TestCases::new()` form
+        // at the call site.
+        //
+        // Match shape: the RHS must be a `Type::Path` whose trailing
+        // segment is `TestCases`. The prefix is not constrained — the
+        // user explicitly wrote `TestCases` so the emission is
+        // actionable regardless of the upstream path.
+        if let syn::Type::Path(p) = &*node.ty
+            && p.qself.is_none()
+            && let Some(last) = p.path.segments.last()
+            && last.ident == "TestCases"
+        {
+            let alias_ident = node.ident.to_string();
+            let rhs = path_segments_string(&p.path);
+            let line = node.ident.span().start().line.max(1);
+            self.unrecognized.push(DiscoveryUnrecognized {
+                file: self.current_file.to_path_buf(),
+                line,
+                detail: format!(
+                    "type alias `{alias_ident} = {rhs}` is not recognized; trybuild detection \
+                     requires the canonical `trybuild::TestCases::new()` form OR a registered \
+                     `--compat-trybuild-macro` alias for the alias's `::new` path"
+                ),
+            });
+        }
+        syn::visit::visit_item_type(self, node);
+    }
+
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
         // Two flavors of `use` are interesting here:
         //

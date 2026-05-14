@@ -1200,7 +1200,53 @@ fn ui() {\n\
     );
 }
 
-/// **Smoke check on the corpus root.** All five scenarios point at
+/// **Round-4 FIX regression: `type Foo = trybuild::TestCases;` emits
+/// `discovery_unrecognized`.** Type aliases of `trybuild::TestCases`
+/// previously went silent — no `visit_item_type` override existed —
+/// so an adopter writing the alias plus `Foo::new()` would see zero
+/// fixtures from their tests with no diagnostic. The fix adds a
+/// `visit_item_type` override that flags any `type <ident> = <Path>;`
+/// where the trailing path segment is `TestCases`. The visitor does
+/// NOT auto-recognize the alias (the spec scope is conservative); the
+/// emission directs the operator at `--compat-trybuild-macro` or the
+/// canonical-form rewrite.
+#[test]
+fn type_alias_of_testcases_emits_discovery_unrecognized() {
+    let crate_root = corpus("type_alias_unrecognized");
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "type alias is NOT auto-recognized; expected zero fixtures, got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry expected for the type alias; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("type alias"),
+        "detail must mention the type alias scenario; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("Foo"),
+        "detail must name the alias ident; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the corpus tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+}
+
+/// **Smoke check on the corpus root.** All scenarios point at
 /// `tests/compat/discovery_corpus/<name>/`; verify each exists so a
 /// missing checked-in fixture fails fast with a clear message.
 #[test]
@@ -1216,6 +1262,7 @@ fn corpus_scenarios_exist_on_disk() {
         "macro_rules_definition",
         "parse_error",
         "subdir_ignored",
+        "type_alias_unrecognized",
     ] {
         let path: &Path = &corpus(scenario);
         assert!(
