@@ -112,6 +112,69 @@
 //! phantom fixture whenever the feature is disabled. Under-discovery
 //! (with operator visibility through the `discovery_unrecognized`
 //! emission) is the safe failure mode.
+//!
+//! ## Known limitations (v0.1)
+//!
+//! ### Block-scoped shadowing inside a `#[test]` body
+//!
+//! `local_bindings` and `aliased_bindings` are FLAT `BTreeSet`s
+//! per-function — they do NOT model lexical block scope. So:
+//!
+//! - A nested `{ let t = 1; }` (where `t` was previously a trybuild
+//!   receiver in the enclosing scope) permanently REMOVES `t` from
+//!   `local_bindings` for the rest of the function. Subsequent
+//!   `t.compile_fail(...)` calls on the original outer `t` are no
+//!   longer recognized.
+//! - Conversely, a binding inserted in a nested block leaks back to
+//!   the outer scope after the block ends. The visitor cannot tell
+//!   the block boundary from a same-scope statement sequence, so the
+//!   inner `let` is treated as a same-scope rebind.
+//!
+//! **Workaround:** keep trybuild bindings at the function's top-level
+//! scope and avoid shadowing the binding ident inside nested blocks.
+//! Use distinct identifiers (e.g. `let t = TestCases::new();` at the
+//! top and `let unrelated = 1;` inside any nested block) so the
+//! visitor's flat set tracks the right shape.
+//!
+//! ### Pattern-3 binders: only `let`
+//!
+//! The pattern-3 visitor tracks `let <ident> = <constructor>;`
+//! exclusively. Other binders are NOT modeled:
+//!
+//! - `for t in ... { /* t.compile_fail(...) */ }` (loop binder) —
+//!   the iteration variable is not recognized as a trybuild receiver.
+//! - `match value { Some(t) => ... }` (pattern binder) — pattern-
+//!   destructured idents are not tracked.
+//! - `if let Some(t) = ...` (irrefutable-pattern binder) — same as
+//!   `match`.
+//! - `|t| { t.compile_fail(...) }` (closure parameter) — closure
+//!   params are not tracked.
+//!
+//! Trybuild calls in any of these contexts may produce false negatives
+//! (silently dropped) when the binder is the trybuild receiver, or
+//! false positives if the ident collides with an outer-scope binding
+//! that the flat set is tracking.
+//!
+//! **Workaround:** keep trybuild calls at the function's top-level
+//! scope; do not bind a `TestCases::new()` constructor through a
+//! `for` / `match` / `if let` / closure parameter. The canonical
+//! shapes (top-level `let t = TestCases::new(); t.compile_fail(...)`
+//! and direct-chain `TestCases::new().compile_fail(...)`) are what
+//! trybuild-style adopters use in practice and are what v0.1 covers.
+//!
+//! ### Why this isn't fixed in v0.1
+//!
+//! The proper fix is a per-function scope-stack data structure
+//! (`Vec<BTreeSet<String>>` with push/pop on every `Block`,
+//! `ExprBlock`, `ExprClosure`, `ExprMatch` arm, `ExprForLoop`,
+//! `ExprIfLet`, etc.). That is a substantial Phase 6 architectural
+//! expansion — non-trivial both to implement and to test
+//! exhaustively across every binder variant — and the trybuild-style
+//! call patterns the v0.1 spec scopes against do not exercise these
+//! shapes. The flat set is a deliberately conservative v0.1 contract;
+//! the limitation is documented here and revisited in a v0.2 spec
+//! discussion if real-world adopter code surfaces the false-negative
+//! case.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
