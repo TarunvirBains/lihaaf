@@ -542,6 +542,92 @@ fn finalize_consumes_guard_drop_is_noop() {
     );
 }
 
+/// **Round-4 FIX regression: a removal failure on one path does not
+/// leak the remaining pending paths.**
+///
+/// Three tracked paths, where the middle one's removal fails (parent
+/// directory has write permission stripped on Unix). Before the fix,
+/// `run_cleanup_once` set the `cleaned` AtomicBool eagerly, drained the
+/// pending vector into a local, then short-circuited on the first
+/// `remove_path_best_effort` error via `?`. Drop saw `cleaned=true` and
+/// no-op'd; the local's tail entries were lost. After the fix, every
+/// pending entry is attempted, failures are aggregated into the
+/// returned `Error::Io`'s context, and the un-failing entries are
+/// actually removed from disk.
+///
+/// Unix-only: the fixture relies on `chmod 0o500` to make a child's
+/// removal fail. Windows ACL manipulation is in a different namespace
+/// and not worth pulling in for the regression bite; the underlying
+/// loop semantics are platform-independent so the Unix test catches
+/// the regression on every CI lane that has Linux/macOS runners.
+#[cfg(unix)]
+#[test]
+fn cleanup_continues_after_individual_path_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let root = tmp.path();
+    git_init(root); // No .gitignore — every path classifies as Cleaned.
+
+    // Three tracked paths. The middle one lives inside a directory
+    // whose perms we strip so `remove_dir_all` fails on the child;
+    // the first and third paths are top-level files that remove
+    // cleanly.
+    let first = root.join("a-overlay.toml");
+    let blocked_parent = root.join("blocked");
+    let blocked_child = blocked_parent.join("child.toml");
+    let third = root.join("z-overlay.toml");
+
+    write_artifact(&first, b"# a\n");
+    write_artifact(&blocked_child, b"# blocked\n");
+    write_artifact(&third, b"# z\n");
+
+    // Strip write permission on `blocked/` so the child cannot be
+    // unlinked. We track the child path directly so the classifier
+    // sees an absolute file; `remove_file` then fails because the
+    // parent forbids the entry-modification syscall.
+    let original_perms = std::fs::metadata(&blocked_parent)
+        .expect("stat blocked dir")
+        .permissions();
+    std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o500))
+        .expect("strip write on blocked dir");
+
+    let guard = CleanupGuard::new(/*keep_output=*/ false);
+    guard.track(first.clone(), root);
+    guard.track(blocked_child.clone(), root);
+    guard.track(third.clone(), root);
+
+    let result = guard.finalize();
+
+    // Restore perms BEFORE the asserts so a panicking test still
+    // leaves the tempdir cleanable.
+    std::fs::set_permissions(&blocked_parent, original_perms).expect("restore perms on blocked");
+
+    let err = result.expect_err("cleanup must surface the failed-removal error");
+    match err {
+        lihaaf::Error::Io { context, .. } => {
+            // The diagnostic must name the failed removal context.
+            assert!(
+                context.contains("removing compat-generated path"),
+                "Io context must name the removal stage; got `{context}`"
+            );
+        }
+        other => panic!("expected Error::Io, got {other:?}"),
+    }
+
+    // The acid test: the un-blocked entries WERE removed despite the
+    // middle entry's failure. Before the fix, `?` short-circuited and
+    // `third` survived.
+    assert!(
+        !first.exists(),
+        "first un-blocked entry must have been removed despite the middle failure"
+    );
+    assert!(
+        !third.exists(),
+        "third un-blocked entry must have been removed despite the middle failure"
+    );
+}
+
 /// **Multiple paths in one guard sort deterministically.**
 ///
 /// The §3.3 envelope writer (Phase 8) reads `finalize`'s returned

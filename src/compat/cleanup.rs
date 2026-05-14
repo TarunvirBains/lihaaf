@@ -290,6 +290,19 @@ impl CleanupGuard {
     /// [`AtomicBool`] gate makes the second call a no-op so a
     /// finalize-then-Drop sequence does not classify or touch the
     /// filesystem twice.
+    ///
+    /// **Error policy:** every pending entry is processed even if a
+    /// previous entry's removal failed. Failures are accumulated; the
+    /// first failure's `Error::Io` is returned with a path-list suffix
+    /// when more than one removal failed. This matters because the
+    /// atomic-gate marks the guard cleaned at function entry — short-
+    /// circuiting on the first error would silently leak every later
+    /// entry (Drop sees the gate already tripped and no-ops). The
+    /// classifications for every entry, whether removal succeeded or
+    /// failed, are returned in the success case; on aggregate error the
+    /// returned `Vec` is empty so the caller does not consume a stale
+    /// list (the §3.3 envelope writer treats a failed cleanup as a
+    /// session-level failure and does not emit residue records for it).
     fn run_cleanup_once(&self) -> Result<Vec<GeneratedPath>, Error> {
         // `swap` returns the previous value. If `true`, cleanup
         // already ran; bail with an empty list (the caller's first
@@ -307,10 +320,18 @@ impl CleanupGuard {
         };
 
         let mut classified: Vec<GeneratedPath> = Vec::with_capacity(pending.len());
+        let mut first_error: Option<Error> = None;
+        let mut additional_failed_paths: Vec<PathBuf> = Vec::new();
         for entry in pending {
             let final_class = classify_entry(&entry, self.keep_output);
-            if final_class == GeneratedPathClass::Cleaned {
-                remove_path_best_effort(&entry.path)?;
+            if final_class == GeneratedPathClass::Cleaned
+                && let Err(err) = remove_path_best_effort(&entry.path)
+            {
+                if first_error.is_none() {
+                    first_error = Some(err);
+                } else {
+                    additional_failed_paths.push(entry.path.clone());
+                }
             }
             classified.push(GeneratedPath {
                 path: entry.path,
@@ -318,10 +339,53 @@ impl CleanupGuard {
             });
         }
 
+        if let Some(err) = first_error {
+            return Err(aggregate_cleanup_error(err, additional_failed_paths));
+        }
+
         // Determinism: sort by path so two runs from the same input
         // produce byte-identical envelopes (the §3.3 contract).
         classified.sort_by(|a, b| a.path.cmp(&b.path));
         Ok(classified)
+    }
+}
+
+/// Build the aggregate-failure `Error` returned by [`CleanupGuard::run_cleanup_once`].
+///
+/// `first_error` is preserved verbatim — the original `Error::Io`'s
+/// `source`, `context`, and `path` fields all carry forward so callers
+/// can still pattern-match on the underlying `io::ErrorKind`. When more
+/// than one entry failed, the additional paths are appended to the
+/// context line so the operator sees the full failure surface in one
+/// message rather than chasing a series of suppressed errors.
+fn aggregate_cleanup_error(first_error: Error, additional: Vec<PathBuf>) -> Error {
+    if additional.is_empty() {
+        return first_error;
+    }
+    match first_error {
+        Error::Io {
+            source,
+            context,
+            path,
+        } => {
+            let suffix = additional
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            Error::Io {
+                source,
+                context: format!(
+                    "{context} (and {} other compat-generated path(s) also failed to remove: {suffix})",
+                    additional.len(),
+                ),
+                path,
+            }
+        }
+        // `remove_path_best_effort` only returns `Error::Io`; any other
+        // variant is a bug, but we surface it verbatim rather than
+        // panic so the original diagnostic survives.
+        other => other,
     }
 }
 
