@@ -361,6 +361,32 @@ pub(crate) fn strip_ansi(s: &str) -> String {
     String::from_utf8(out).unwrap_or_default()
 }
 
+/// Canonicalize a libtest test-name or a fixture path into a single
+/// comparable form. The transformations are:
+///
+/// 1. Forward-slash normalize (`\` → `/`) so Windows-built test
+///    binaries that emit `tests\ui\foo` match the same fixture as
+///    `tests/ui/foo`.
+/// 2. Replace `::` with `/` so the libtest module-path shape
+///    `tests::ui::foo` correlates to `tests/ui/foo`.
+/// 3. Strip a trailing `.rs` extension so fixture paths
+///    (`tests/ui/foo.rs`) and libtest names that preserve the
+///    extension (`tests/ui/foo.rs`) collapse to the same canonical
+///    form as the extension-less libtest shape (`tests/ui/foo`).
+///
+/// Applied to BOTH the recognized-fixture path and the libtest
+/// test-name before exact-match comparison. Order matters: `::` → `/`
+/// must precede `.rs`-stripping so a name like `tests::foo.rs` (rare
+/// but possible) folds to `tests/foo` rather than `tests::foo`.
+fn canonical_test_name(s: &str) -> String {
+    let forward = util::to_forward_slash(s);
+    let no_colons = forward.replace("::", "/");
+    no_colons
+        .strip_suffix(".rs")
+        .map(str::to_string)
+        .unwrap_or(no_colons)
+}
+
 /// Conservative parser for libtest stdout. See module-level docs for
 /// the conservatism rule (§1).
 ///
@@ -400,35 +426,25 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 /// Libtest reports the **test function name** (e.g. `tests::trybuild`),
 /// not the individual fixture path. Phase 6's discovery output maps
 /// `(call_site, fixture_path)` pairs; the parser here uses an
-/// **exact match** against the forward-slash form of
-/// `repo_relative_path` minus the `.rs` extension. Miss ⇒
-/// `unknown_count++`. Exact equality (rather than substring) is the
-/// load-bearing rule that closes a prefix-collision class — a
+/// **exact match** against the canonical form of `repo_relative_path`.
+/// Both sides are run through [`canonical_test_name`] before
+/// comparison: `::` is folded to `/`, trailing `.rs` is stripped, and
+/// path separators are forward-slashed. This accepts every libtest
+/// test-name shape (`tests/ui/foo`, `tests/ui/foo.rs`,
+/// `tests::ui::foo`) while preserving the prefix-collision guard — a
 /// recognized fixture `tests/ui/foo.rs` must not also match a
 /// libtest line `test tests/ui/foo_extra ... ok`.
 pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> ParsedBaseline {
-    // Pre-compute the forward-slash + stem-stripped form of every
-    // recognized fixture. Sorted lookup table for stable matching
-    // semantics — `iter().find` is O(n) per verdict line, but n is
-    // bounded by the recognized-fixture count which is the syn AST
-    // walk's output (typically tens to hundreds of fixtures per
-    // crate; constant-time lookup adds complexity that buys little).
+    // Pre-compute the canonical form of every recognized fixture.
+    // `iter().find` is O(n) per verdict line, but n is bounded by the
+    // recognized-fixture count which is the syn AST walk's output
+    // (typically tens to hundreds of fixtures per crate; constant-time
+    // lookup adds complexity that buys little).
     let normalized: Vec<(String, &FixtureId)> = recognized_fixtures
         .iter()
         .map(|fid| {
             let raw = fid.repo_relative_path.to_string_lossy().into_owned();
-            // Forward-slash normalize. `util::to_forward_slash`
-            // already handles the `\` → `/` case and is the spec's
-            // single canonicalizer.
-            let forward = util::to_forward_slash(&raw);
-            // Strip the `.rs` extension so a libtest test name
-            // doesn't have to include `.rs` (libtest test names
-            // never do).
-            let stem = forward
-                .strip_suffix(".rs")
-                .map(str::to_string)
-                .unwrap_or(forward);
-            (stem, fid)
+            (canonical_test_name(&raw), fid)
         })
         .collect();
 
@@ -507,20 +523,16 @@ pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> 
             continue;
         }
 
-        // Exact match against the fixture stem. Forward-slash
-        // normalize the test name first so `tests\foo` (unlikely
-        // but possible on Windows-built test binaries) matches the
-        // same fixture as `tests/foo`. The earlier substring shape
-        // had a prefix-collision class: a recognized fixture
-        // `tests/ui/foo.rs` would also match a libtest verdict line
-        // `test tests/ui/foo_extra ... ok` because `foo_extra`
-        // contains the substring `foo`. Exact equality closes that
-        // class and is sufficient for every Phase 4 test corpus
-        // (their libtest test names match the stem byte-for-byte).
-        let test_name_norm = util::to_forward_slash(test_name);
+        // Exact match against the fixture's canonical form. Both
+        // sides go through `canonical_test_name` so `tests/ui/foo`,
+        // `tests/ui/foo.rs`, and `tests::ui::foo` all correlate to a
+        // recognized `tests/ui/foo.rs` fixture, while preserving the
+        // prefix-collision guard — `tests/ui/foo_extra` canonicalizes
+        // distinctly from `tests/ui/foo`.
+        let test_name_canon = canonical_test_name(test_name);
         let matched: Option<usize> = normalized
             .iter()
-            .position(|(stem, _)| test_name_norm == stem.as_str());
+            .position(|(stem, _)| test_name_canon == stem.as_str());
 
         let Some(idx) = matched else {
             // Libtest named a test the parser couldn't correlate
@@ -1020,16 +1032,16 @@ mod tests {
         assert!(result.mismatch_entries.is_empty());
     }
 
-    /// `parse_libtest_output` correlates a libtest line that
-    /// substring-matches a recognized fixture and bumps the right
-    /// counter.
+    /// `parse_libtest_output` correlates a libtest line whose
+    /// test-name canonicalizes to the same form as a recognized
+    /// fixture and bumps the right counter.
     #[test]
     fn parse_recognized_pass_correlates() {
         let recognized = vec![FixtureId {
             repo_relative_path: PathBuf::from("tests/foo.rs"),
         }];
-        // The libtest test name contains the fixture's stem
-        // (`tests/foo`).
+        // The libtest test name `tests/foo` canonicalizes to the
+        // same form as the recognized fixture `tests/foo.rs`.
         let stdout = "test tests/foo ... ok\n";
         let result = parse_libtest_output(stdout, &recognized);
         assert_eq!(result.pass, Some(1));

@@ -139,7 +139,8 @@ fn single_recognized_fail_counts_in_fail() {
 /// `tests/ui/foo.rs` must NOT correlate to a libtest verdict line
 /// for `tests/ui/foo_extra`. The earlier substring-match shape would
 /// have happily attributed the `foo_extra` verdict to `foo`; the
-/// exact-match rule closes that class.
+/// canonical-form exact-match rule closes that class — both sides
+/// canonicalize distinctly (`tests/ui/foo` vs `tests/ui/foo_extra`).
 ///
 /// The fixture `tests/ui/foo_extra.rs` IS recognized in this corpus,
 /// so the test also asserts the verdict lands on `foo_extra` (where
@@ -173,6 +174,52 @@ fn recognized_fixture_prefix_does_not_match_longer_libtest_name() {
         result.mismatch_entries[0].baseline_verdict,
         CompatBaselineVerdict::Pass
     );
+}
+
+/// **Test-name shape acceptance.** Libtest can emit the test name in
+/// several shapes depending on how the trybuild macro expands and
+/// what naming convention the host crate uses. The parser must
+/// canonicalize both sides before exact-match comparison so all
+/// three correlate to the same recognized fixture:
+///
+/// - `tests/ui/foo` — path stem (the historic shape)
+/// - `tests/ui/foo.rs` — extension preserved
+/// - `tests::ui::foo` — `::` module-path separator
+///
+/// Regression for round-2 review BLOCK: earlier code stripped `.rs`
+/// only from the recognized side and only forward-slashed the libtest
+/// side, so the `.rs`-preserved and `::`-separator shapes failed to
+/// correlate and silently became `unknown_count`.
+#[test]
+fn libtest_name_with_rs_extension_correlates() {
+    let recognized = vec![fid("tests/ui/foo.rs")];
+    let stdout = "test tests/ui/foo.rs ... ok\n";
+    let result = parse(stdout, &recognized);
+    assert_eq!(
+        result.pass,
+        Some(1),
+        "extension-preserved libtest name must correlate"
+    );
+    assert_eq!(result.fail, Some(0));
+    assert_eq!(result.unknown_count, 0);
+    assert_eq!(result.mismatch_entries.len(), 1);
+    assert_eq!(result.mismatch_entries[0].fixture, "tests/ui/foo.rs");
+}
+
+#[test]
+fn libtest_name_with_colon_separator_correlates() {
+    let recognized = vec![fid("tests/ui/foo.rs")];
+    let stdout = "test tests::ui::foo ... ok\n";
+    let result = parse(stdout, &recognized);
+    assert_eq!(
+        result.pass,
+        Some(1),
+        "`::`-separator libtest name must correlate"
+    );
+    assert_eq!(result.fail, Some(0));
+    assert_eq!(result.unknown_count, 0);
+    assert_eq!(result.mismatch_entries.len(), 1);
+    assert_eq!(result.mismatch_entries[0].fixture, "tests/ui/foo.rs");
 }
 
 /// **Conservatism rule, absence of evidence form.**
