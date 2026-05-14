@@ -708,15 +708,17 @@ path mid-session — significant new state machine in
 operator who hits drift re-runs the session and gets a clean rebuild
 through the normal stage 3 path.
 
-**v0.2 deferred: in-session rebuild.** A future revision will reclaim
+**Post-v0.1.0-beta.1 deferred: in-session rebuild.** A future revision
+(target: v0.1.0-beta.2 or v0.1.0 stable; design TBD) will reclaim
 partial-session progress on benign drift (e.g., an editor saved the
 consumer crate mid-session and cargo replaced the dylib) by rebuilding
 from stage 3 in-place, re-validating the four invariants, and
 resuming dispatch with the new manifest. The rebuild path requires
-worker coordination work that is out of the v0.1 budget. The exit code
-will remain 67 — adopters' CI scripts that key on `TOOLCHAIN_DRIFT` to
-"blow the cache and re-run" continue to behave correctly under both
-v0.1 hard-fail and the eventual v0.2 in-session rebuild.
+worker coordination work that is out of the v0.1.0-beta.1 budget. The
+exit code will remain 67 — adopters' CI scripts that key on
+`TOOLCHAIN_DRIFT` to "blow the cache and re-run" continue to behave
+correctly under both v0.1.0-beta.1's hard-fail and the eventual
+in-session rebuild. Tracked as issue #7.
 
 ### 4.6 Hard-fail on rustc drift
 
