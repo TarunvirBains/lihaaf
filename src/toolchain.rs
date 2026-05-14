@@ -1,8 +1,9 @@
 //! Toolchain capture (the policy stage 2).
 //!
 //! `rustc --version --verbose` produces a multi-line text block, parsed
-//! into a [`Toolchain`] struct; the release line is persisted as the
-//! drift-detection key for the policy.
+//! into a [`Toolchain`] struct; the parsed scalars
+//! `(release_line, host, commit_hash, sysroot)` form the drift-detection
+//! key for the policy. Any single dimension changing trips the hard-fail.
 //!
 //! ## Sample output
 //!
@@ -18,13 +19,23 @@
 //!
 //! The release line is the first line; the rest are `key: value` pairs.
 //! Missing or reordered keys are tolerated — only `release` and `host` are
-//! load-bearing.
+//! load-bearing for parser success. `commit-hash` is optional (custom
+//! rustc builds omit it). `LLVM version:` is intentionally NOT captured
+//! into the drift key — LLVM is fingerprinted into rustc's commit-hash,
+//! so an LLVM swap implies a commit-hash swap on any stable-channel
+//! rustc; see `matches` for the documented caveat.
 //!
 //! ## Why parse, not just stash the raw output
 //!
-//! The drift check (the policy) compares release strings, not the full block.
-//! Parsing once at startup and re-running rustc per dispatch allows
-//! comparing scalars instead of normalizing whole blocks repeatedly.
+//! The drift check (the policy) compares each of the four key scalars
+//! independently, not the full raw block. Parsing once at startup and
+//! re-running rustc per dispatch lets `matches` compare four `String`
+//! / `PathBuf` equalities rather than normalizing whole multi-line
+//! blocks every dispatch. The release line stays in the key (it's the
+//! canonical user-visible identifier), but it is no longer the sole
+//! comparator — `host`, `commit_hash`, and `sysroot` close the
+//! same-release-line / different-toolchain gap that a release-only key
+//! left open (issue #4).
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -136,10 +147,59 @@ pub fn capture() -> Result<Toolchain, Error> {
     })
 }
 
-/// True if `current` matches `original`'s drift-detection key (the
-/// release line). the policy compares release line equality.
+/// True if `current` matches `original` on every field of the
+/// drift-detection key: `release_line`, `host`, `commit_hash`, and
+/// `sysroot`. The hard-fail policy treats any inequality as drift.
+///
+/// The `release` field is not separately checked — `release_line`
+/// already embeds it (e.g. `rustc 1.95.0 (59807616e 2026-04-14)`
+/// includes `1.95.0`), so `release_line` equality implies `release`
+/// equality for any toolchain rustc could plausibly emit.
+///
+/// **Known weakness (custom rustc builds):** When `rustc` is a custom
+/// local build, `commit-hash:` is absent and [`Toolchain::commit_hash`]
+/// is the empty string. Two different custom builds with the same
+/// release line and host both have `commit_hash == ""` and will compare
+/// equal on that field; the `sysroot` comparison usually catches this
+/// in practice because two custom-build installs typically have
+/// different sysroots, but the gap is real. Users running custom rustc
+/// builds operate outside the stable-channel safety net by design.
+///
+/// LLVM-version drift is not part of the key: LLVM is fingerprinted
+/// into rustc's commit_hash, so LLVM drift between two
+/// same-`(release_line, host, commit_hash, sysroot)` toolchains is
+/// implausible. If a real regression surfaces, a follow-up issue
+/// should add LLVM-version capture to [`capture`].
 pub fn matches(original: &Toolchain, current: &Toolchain) -> bool {
     original.release_line == current.release_line
+        && original.host == current.host
+        && original.commit_hash == current.commit_hash
+        && original.sysroot == current.sysroot
+}
+
+/// Render the four-field drift key as a stable multi-line string for
+/// diagnostics. Used by [`crate::error::Outcome::ToolchainDrift`]'s
+/// Display impl so the boundary message names every captured dimension
+/// — without this, a host/commit_hash/sysroot drift with an identical
+/// release line would print indistinguishable "original" and "current"
+/// lines, defeating the purpose of widening the comparator.
+///
+/// Format is byte-deterministic so adopter CI scripts can grep on it:
+///
+/// ```text
+/// release_line: rustc X.Y.Z (...)
+/// host: x86_64-unknown-linux-gnu
+/// commit_hash: <40-hex or empty>
+/// sysroot: /path/to/toolchain
+/// ```
+pub(crate) fn format_drift_key(t: &Toolchain) -> String {
+    format!(
+        "release_line: {rl}\nhost: {host}\ncommit_hash: {ch}\nsysroot: {sr}",
+        rl = t.release_line,
+        host = t.host,
+        ch = t.commit_hash,
+        sr = t.sysroot.display(),
+    )
 }
 
 #[cfg(test)]
@@ -187,21 +247,72 @@ LLVM version: 22.1.2";
         assert_eq!(commit_hash, "59807616e2031c7c44a76b1b0c1bbd0fed9a07cf");
     }
 
-    #[test]
-    fn matches_compares_release_line_only() {
-        let a = Toolchain {
-            release_line: "rustc 1.95.0 (abc 2026-01-01)".into(),
+    /// Build a canonical [`Toolchain`] for the comparator tests. Each
+    /// test below mutates one field on a clone to isolate the field's
+    /// effect on `matches`.
+    fn baseline_toolchain() -> Toolchain {
+        Toolchain {
+            release_line: "rustc 1.95.0 (59807616e 2026-04-14)".into(),
             release: "1.95.0".into(),
             host: "x86_64-unknown-linux-gnu".into(),
-            commit_hash: "abc".into(),
-            sysroot: PathBuf::from("/a"),
-        };
+            commit_hash: "59807616e2031c7c44a76b1b0c1bbd0fed9a07cf".into(),
+            sysroot: PathBuf::from("/usr/local/rustup/toolchains/stable-x86_64"),
+        }
+    }
+
+    #[test]
+    fn matches_identical_toolchains() {
+        let a = baseline_toolchain();
+        let b = a.clone();
+        assert!(matches(&a, &b));
+    }
+
+    #[test]
+    fn matches_compares_full_key_release_line_differs() {
+        let a = baseline_toolchain();
         let mut b = a.clone();
-        assert!(matches(&a, &b));
-        b.sysroot = PathBuf::from("/b");
-        // Sysroot drift is not part of the policy key.
-        assert!(matches(&a, &b));
-        b.release_line = "rustc 1.96.0 (def 2026-04-14)".into();
+        b.release_line = "rustc 1.96.0 (deadbeef 2026-07-01)".into();
         assert!(!matches(&a, &b));
+    }
+
+    #[test]
+    fn matches_compares_full_key_host_differs() {
+        // Same release line, different host (cross-compile or
+        // architecture migration). This is the case Codex slice B
+        // called out: two materially different toolchains with the
+        // same release_line previously compared equal.
+        let a = baseline_toolchain();
+        let mut b = a.clone();
+        b.host = "aarch64-apple-darwin".into();
+        assert!(!matches(&a, &b));
+    }
+
+    #[test]
+    fn matches_compares_full_key_commit_hash_differs() {
+        let a = baseline_toolchain();
+        let mut b = a.clone();
+        b.commit_hash = "0000000000000000000000000000000000000000".into();
+        assert!(!matches(&a, &b));
+    }
+
+    #[test]
+    fn matches_compares_full_key_sysroot_differs() {
+        // Channel-switch case: same rustc identity strings but
+        // installed under a different rustup prefix.
+        let a = baseline_toolchain();
+        let mut b = a.clone();
+        b.sysroot = PathBuf::from("/home/user/.rustup/toolchains/nightly-x86_64");
+        assert!(!matches(&a, &b));
+    }
+
+    #[test]
+    fn matches_custom_build_both_empty_commit_hash() {
+        // Custom rustc builds omit `commit-hash:`; `capture()` stores
+        // `String::new()`. Two such toolchains with the same other
+        // fields compare equal under the documented caveat.
+        let mut a = baseline_toolchain();
+        a.commit_hash = String::new();
+        let b = a.clone();
+        assert!(matches(&a, &b));
     }
 }

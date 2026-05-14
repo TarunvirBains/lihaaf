@@ -363,7 +363,7 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         managed_dylib_path: managed_path.clone(),
         original_mtime_unix_secs: dylib_mtime,
         original_sha256: dylib_sha.clone(),
-        original_rustc_release_line: toolchain.release_line.clone(),
+        original_toolchain: toolchain.clone(),
     };
 
     // Stage 4d — fixture discovery for this suite.
@@ -417,13 +417,17 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     worker_ctx.extern_paths = worker::resolve_extern_paths(&build_out.deps_dir, &extra_names)?;
 
     // Mid-suite toolchain drift check (the policy): the captured
-    // rustc release is compared against a fresh capture. Cheap; cost
-    // is dwarfed by the per-fixture rustc.
+    // rustc identity is compared against a fresh capture across the
+    // four-field key (release_line, host, commit_hash, sysroot). Cheap;
+    // cost is dwarfed by the per-fixture rustc. The rendered Outcome
+    // carries the full key string for both sides so an adopter seeing
+    // a host/commit_hash/sysroot drift gets a diagnostic that names the
+    // dimension, not two identical release lines.
     let post_capture = toolchain::capture()?;
     if !toolchain::matches(toolchain, &post_capture) {
         return Err(Error::Session(Outcome::ToolchainDrift {
-            original: toolchain.release_line.clone(),
-            current: post_capture.release_line.clone(),
+            original: toolchain::format_drift_key(toolchain),
+            current: toolchain::format_drift_key(&post_capture),
         }));
     }
 

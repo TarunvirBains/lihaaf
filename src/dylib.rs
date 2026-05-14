@@ -51,6 +51,7 @@ pub struct BuildOutput {
     pub deps_dir: PathBuf,
     /// The cargo invocation as a single line, for diagnostics if a
     /// later step trips.
+    #[allow(dead_code)] // populated for diagnostic plumbing; not currently read by any caller.
     pub invocation: String,
 }
 

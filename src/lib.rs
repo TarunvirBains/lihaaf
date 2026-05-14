@@ -17,11 +17,15 @@
 //!   (see [`config::Config`]).
 //! - Verdict catalog (see [`verdict::Verdict`]) and exit codes
 //!   (see [`exit::ExitCode`]).
+//! - A small set of crate-root re-exports for adopters who do want to
+//!   drive lihaaf from Rust: [`Cli`], [`Config`], [`Verdict`],
+//!   [`ExitCode`], [`Error`], [`Outcome`], [`run`], [`Report`].
 //!
-//! Library callers exist (the binary itself, and v0.x integration tests),
-//! but this is pre-1.0: module paths and helper signatures may
-//! evolve before v1.0. Adopters who want to drive lihaaf from Rust today
-//! should subprocess-spawn `cargo lihaaf`.
+//! All other modules are `pub(crate)` and may evolve freely across
+//! v0.1.x point releases. Adopters who want to drive lihaaf from Rust
+//! today should prefer the crate-root re-exports above (or
+//! subprocess-spawn `cargo lihaaf`); the internal module paths are not
+//! part of any v0.1 stability contract.
 //!
 //! ## What lives where
 //!
@@ -29,20 +33,20 @@
 //! |---|---|
 //! | [`cli`] | `clap` argument parsing, flag-to-action mapping. |
 //! | [`config`] | Parse + validate `[package.metadata.lihaaf]`. |
-//! | [`toolchain`] | Capture `rustc --version --verbose` for drift checks. |
-//! | [`dylib`] | `cargo rustc --crate-type=dylib` invocation, copy mechanic. |
-//! | [`manifest`] | `target/lihaaf/manifest.json` schema + atomic write. |
-//! | [`freshness`] | Per-dispatch the policy invariant re-check (mtime / SHA-256 / rustc). |
-//! | [`discovery`] | Walk `fixture_dirs`, classify pass/fail, sort. |
-//! | [`worker`] | Per-fixture `rustc` spawn, RSS sampling, OOM, timeout. |
-//! | [`normalize`] | Stderr normalization (fixed-string, byte-level). |
-//! | [`diff`] | Hand-rolled Myers diff with line granularity. |
-//! | [`snapshot`] | `.stderr` file I/O + `--bless` semantics. |
+//! | `toolchain` | Capture `rustc --version --verbose` for drift checks. (pub(crate)) |
+//! | `dylib` | `cargo rustc --crate-type=dylib` invocation, copy mechanic. (pub(crate)) |
+//! | `manifest` | `target/lihaaf/manifest.json` schema + atomic write. (pub(crate)) |
+//! | `freshness` | Per-dispatch the policy invariant re-check (mtime / SHA-256 / rustc). (pub(crate)) |
+//! | `discovery` | Walk `fixture_dirs`, classify pass/fail, sort. (pub(crate)) |
+//! | `worker` | Per-fixture `rustc` spawn, RSS sampling, OOM, timeout. (pub(crate)) |
+//! | `normalize` | Stderr normalization (fixed-string, byte-level). (pub(crate)) |
+//! | `diff` | Hand-rolled Myers diff with line granularity. (pub(crate)) |
+//! | `snapshot` | `.stderr` file I/O + `--bless` semantics. (pub(crate)) |
 //! | [`verdict`] | Per-fixture verdict + session reporter. |
 //! | [`exit`] | Exit-code mapping per the policy. |
-//! | [`session`] | Lifecycle orchestration (stages 1–9 of the policy). |
-//! | [`error`] | Crate-wide error type. |
-//! | [`util`] | Atomic file write + sha256 helpers. |
+//! | `session` | Lifecycle orchestration (stages 1–9 of the policy). (pub(crate)) |
+//! | `error` | Crate-wide error type. (pub(crate)) |
+//! | `util` | Atomic file write + sha256 helpers. (pub(crate)) |
 
 #![deny(missing_docs)]
 #![deny(rustdoc::broken_intra_doc_links)]
@@ -52,20 +56,33 @@
 
 pub mod cli;
 pub mod config;
-pub mod diff;
-pub mod discovery;
-pub mod dylib;
-pub mod error;
+pub(crate) mod diff;
+pub(crate) mod discovery;
+pub(crate) mod dylib;
+pub(crate) mod error;
 pub mod exit;
-pub mod freshness;
-pub mod manifest;
-pub mod normalize;
-pub mod session;
-pub mod snapshot;
-pub mod toolchain;
-pub mod util;
+pub(crate) mod freshness;
+pub(crate) mod manifest;
+pub(crate) mod normalize;
+pub(crate) mod session;
+pub(crate) mod snapshot;
+pub(crate) mod toolchain;
+pub(crate) mod util;
 pub mod verdict;
-pub mod worker;
+pub(crate) mod worker;
+
+// Crate-root re-exports — the v0.1 stable Rust callable surface.
+//
+// `Outcome` is re-exported alongside `Error` because `Error::Session(Outcome)`
+// is a public variant of `Error`; Rust requires every type appearing in a
+// public enum's variants to be at least as visible as the enum itself
+// (E0446). Re-exporting `Outcome` ratifies that surface explicitly.
+pub use cli::Cli;
+pub use config::Config;
+pub use error::{Error, Outcome};
+pub use exit::ExitCode;
+pub use session::{Report, run};
+pub use verdict::Verdict;
 
 /// The semver-stable lihaaf release the binary identifies as.
 ///

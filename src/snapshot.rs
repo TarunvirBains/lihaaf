@@ -37,6 +37,8 @@ pub enum ReadOutcome {
         /// began with an invalid sequence.
         byte_offset: usize,
         /// Total byte length of the file (for the diagnostic line).
+        #[allow(dead_code)]
+        // diagnostic-only field; callers currently quote only `byte_offset`.
         total_bytes: usize,
     },
 }

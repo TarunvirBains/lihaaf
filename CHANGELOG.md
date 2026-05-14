@@ -38,6 +38,25 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multi-suite invariant without needing a downstream adopter.
 
 ### Changed
+- Narrowed the public Rust library surface to a documented CLI-shape.
+  The following modules — previously `pub mod` — are now `pub(crate)`:
+  `diff`, `discovery`, `dylib`, `error`, `freshness`, `manifest`,
+  `normalize`, `session`, `snapshot`, `toolchain`, `util`, `worker`.
+  The `cli`, `config`, `exit`, and `verdict` modules remain `pub` (they
+  define the v0.1 stable schema/catalog/argument-parsing contracts).
+  Adopters who want a Rust-callable surface should use the new
+  crate-root re-exports: `Cli`, `Config`, `Verdict`, `ExitCode`,
+  `Error`, `Outcome`, `run`, `Report`. `Outcome` is part of the v0.1
+  stable Rust surface because `Error::Session(Outcome)` is a public
+  variant of the re-exported `Error` enum; Rust's E0446 rule (private
+  type in public interface) makes `Outcome`'s public visibility
+  load-bearing, so the re-export ratifies the de-facto contract.
+  Pre-1.0 alpha precedent: v0.1.0-alpha.4 is the only published
+  version and the CHANGELOG header already states the library API is
+  non-stable across v0.1.x; adopters who imported internal module
+  paths (`lihaaf::dylib::*`, `lihaaf::worker::*`, etc.) should switch
+  to subprocess-spawning `cargo lihaaf` or to the crate-root
+  re-exports above. Issue #3.
 - The session reporter prints `lihaaf: === suite "<name>" ===` headers
   and per-suite aggregate lines (`lihaaf: suite "<name>": …`) when
   more than one suite runs in a session. Single-suite runs (adopters
@@ -59,6 +78,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-suite identity is what the worker now closes over.
 
 ### Fixed
+- Toolchain drift comparator now widens its key to
+  `(release_line, host, commit_hash, sysroot)`. The previous
+  comparator compared only `release_line`, so two materially different
+  toolchains — e.g. rustup stable rustc 1.95.0 vs. a custom local
+  build with the same release line, or the same release line on a
+  different host triple — compared equal and bypassed the policy
+  §4.5 hard-fail. The widening only catches MORE drift, never less,
+  so existing pass cases stay passing. Known caveat: when `rustc` is
+  a custom local build, `commit-hash:` is absent and `commit_hash`
+  is the empty string; two such builds with the same other fields
+  still compare equal on that field. Users running custom rustc
+  builds operate outside the stable-channel safety net by design;
+  the `sysroot` comparison usually catches this in practice. Issue
+  #4.
 - Session temp directory creation now creates the workspace target
   parent directory first. Clean CI checkouts that run lihaaf before any
   other crate-local Cargo command no longer fail with

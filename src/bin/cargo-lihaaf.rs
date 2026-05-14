@@ -14,17 +14,15 @@
 //! ## Exit codes
 //!
 //! Exit-code mapping lives in [`lihaaf::exit::ExitCode`]. This binary turns an
-//! [`lihaaf::error::Error`] into the matching session exit code.
-//! Per-fixture verdict aggregation runs inside [`lihaaf::session::run`]
+//! [`lihaaf::Error`] into the matching session exit code.
+//! Per-fixture verdict aggregation runs inside [`lihaaf::run`]
 //! and is returned as part of the success path’s report.
-//! [`lihaaf::session::Report`].
+//! [`lihaaf::Report`].
 
 use std::process::ExitCode as ProcessExitCode;
 
 use lihaaf::cli;
-use lihaaf::error::Error;
-use lihaaf::exit::ExitCode;
-use lihaaf::session;
+use lihaaf::{Error, ExitCode, run};
 
 fn main() -> ProcessExitCode {
     // Cargo passes `lihaaf` as the first positional. Strip it if present.
@@ -45,7 +43,7 @@ fn main() -> ProcessExitCode {
         }
     };
 
-    match session::run(parsed) {
+    match run(parsed) {
         Ok(report) => ProcessExitCode::from(report.exit_code() as u8),
         Err(Error::Session(outcome)) => {
             // Pre-v0.1.0-alpha.3 this branch was silent — the exit code

@@ -114,12 +114,18 @@ pub enum Outcome {
         crate_name: String,
     },
 
-    /// rustc release at fixture-dispatch time differs from the version
-    /// captured at dylib build time.
+    /// Captured rustc identity at fixture-dispatch time differs from the
+    /// identity captured at dylib build time, on any field of the
+    /// four-field drift key (release_line, host, commit_hash, sysroot).
+    /// The `original` and `current` strings are pre-rendered multi-line
+    /// keys (see `toolchain::format_drift_key`), so a host /
+    /// commit_hash / sysroot drift produces a diagnostic that names
+    /// the differing dimension rather than echoing identical release
+    /// lines.
     ToolchainDrift {
-        /// The version captured at startup.
+        /// Rendered four-field key captured at startup.
         original: String,
-        /// The version observed at dispatch.
+        /// Rendered four-field key observed at dispatch.
         current: String,
     },
 
@@ -136,7 +142,7 @@ pub enum Outcome {
         /// Stable identifier for the invariant that drifted.
         invariant: String,
         /// Pre-rendered diagnostic body — see
-        /// [`crate::freshness::FreshnessFailure::detail`].
+        /// `freshness::FreshnessFailure::detail` for the upstream renderer.
         detail: String,
     },
 }
@@ -179,9 +185,22 @@ impl fmt::Display for Outcome {
                 )
             }
             Self::ToolchainDrift { original, current } => {
+                // The `original` / `current` strings are multi-line
+                // four-field keys. Indent every line by four spaces so
+                // the rendered output keeps a clear visual hierarchy
+                // and CI grep patterns can anchor on the labels rather
+                // than the line shape.
+                let indent = |s: &str| {
+                    s.lines()
+                        .map(|l| format!("    {l}"))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
                 write!(
                     f,
-                    "lihaaf: rustc version drifted mid-session.\n  original (at dylib build): {original}\n  current (at dispatch):     {current}\nRe-run `cargo lihaaf` to rebuild against the current toolchain."
+                    "lihaaf: rustc toolchain drifted mid-session.\n  original (at dylib build):\n{}\n  current (at dispatch):\n{}\nRe-run `cargo lihaaf` to rebuild against the current toolchain.",
+                    indent(original),
+                    indent(current),
                 )
             }
             Self::FreshnessDrift { invariant, detail } => {
@@ -259,4 +278,5 @@ impl Error {
 }
 
 /// `Result` alias used throughout the crate.
+#[allow(dead_code)] // exported convenience alias; callers spell `Result<_, Error>` directly.
 pub type Result<T> = std::result::Result<T, Error>;
