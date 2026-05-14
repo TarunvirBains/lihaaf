@@ -19,15 +19,18 @@
 //! > The report must list every generated path and classify it as
 //! > `committed`, `ignored`, or `cleaned`.
 //!
-//! And the "Cleanup" subsection:
+//! And the "Cleanup" subsection (reconciled in round 5):
 //!
-//! > Cleanup runs on **every** exit path, including the hard-fail
-//! > exit-67 case in §3.4 (freshness drift), the
-//! > `discovery_unrecognized` error path in §3.2.1, and SIGINT/SIGTERM
-//! > during stage 3 — the driver registers an exit hook before
-//! > materializing the overlay. The single exception is `--keep-
-//! > output`, which preserves all generated paths for local
-//! > debugging.
+//! > Cleanup runs on the in-process exit paths the driver controls —
+//! > the hard-fail exit-67 case in §3.4 (freshness drift), the
+//! > `discovery_unrecognized` error path in §3.2.1, and the panic /
+//! > Drop unwind path the guard owns. The single exception is
+//! > `--keep-output`, which preserves all generated paths for local
+//! > debugging. SIGINT/SIGTERM cleanup is OUT OF SCOPE for v0.1 —
+//! > installing a signal handler would either pull in a new crate
+//! > (`ctrlc` / `signal-hook`) or hand-roll cross-platform FFI; both
+//! > expand the dependency surface for marginal gain. See
+//! > `src/compat/cleanup.rs:66-71` for the documented gap.
 //!
 //! ## Test taxonomy
 //!
