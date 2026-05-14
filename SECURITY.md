@@ -58,10 +58,10 @@ scanned.
 
 False positives can be cleared by editing the offending text to
 include a `<word>`-style placeholder (the same allow-list marker the
-local guard recognizes — see the convention above). For example,
-rewriting `postgres://admin:hunter2@host/db` as
-`postgres://<user>:<password>@<host>/<db>` removes the line from the
-scanner's attention.
+local guard recognizes — see the convention above). For example, a
+postgres URL pasted with real credentials can be redacted to the
+`postgres://<user>:<password>@<host>:<port>/<database>` shape; the
+line is then treated as documentation and skipped.
 
 The pattern set lives in two places — `scripts/scan-secrets.sh` for
 the local guard and `.github/scripts/scan-text-for-secrets.py` for
