@@ -1,0 +1,14 @@
+[package]
+name = "integration_corpus_macros"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Proc-macro library. lihaaf cannot use this crate as `dylib_crate`
+# (cargo rejects `[lib] proc-macro = true` with `--crate-type=dylib`),
+# so the parent `integration_corpus` crate is the dylib and this crate
+# is wired in as an extra extern (resolved out of the dylib's deps dir
+# by `worker::resolve_extern_paths`).
+[lib]
+name = "integration_corpus_macros"
+proc-macro = true

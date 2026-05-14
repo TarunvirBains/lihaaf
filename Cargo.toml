@@ -12,6 +12,16 @@ keywords = ["proc-macro", "trybuild", "compile-fail", "testing", "snapshot"]
 categories = ["development-tools::testing"]
 readme = "README.md"
 
+# Exclude the FIX_BEFORE_BETA Spec D integration corpus from the
+# published package and from cargo's implicit single-package
+# workspace discovery. The corpus lives under `tests/integration_corpus/`
+# and has its own nested Cargo.toml (a regular library) plus a sibling
+# `macros/` proc-macro crate. Without the exclude, `cargo build` /
+# `cargo publish` for lihaaf itself would try to interpret the nested
+# manifests as part of the package and the corpus would ship to
+# crates.io.
+exclude = ["tests/integration_corpus/"]
+
 # Pre-release alpha — adopters must pin the exact version
 # (`cargo install lihaaf` without a version selector will not pick up
 # pre-release tags by design). The `publish = true` flag activates

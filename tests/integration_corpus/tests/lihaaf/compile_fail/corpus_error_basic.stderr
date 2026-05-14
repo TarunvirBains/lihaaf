@@ -1,0 +1,9 @@
+error: integration_corpus: deliberate basic error
+ --> $DIR/corpus_error_basic.rs:9:1
+  |
+9 | corpus_error!("integration_corpus: deliberate basic error");
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the macro `corpus_error` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error: aborting due to 1 previous error

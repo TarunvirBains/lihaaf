@@ -1,0 +1,32 @@
+[package]
+name = "integration_corpus"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# Regular library — this is the crate lihaaf builds as the dylib_crate.
+# Proc-macros cannot be `--crate-type=dylib`; cargo rejects the
+# combination outright. The proc-macros live in the sibling
+# `integration_corpus_macros` crate, and this crate re-exports them so
+# fixtures use a single `use integration_corpus::*;` shape (the
+# serde + serde_derive layout).
+[lib]
+name = "integration_corpus"
+
+[dependencies]
+integration_corpus_macros = { path = "./macros" }
+
+# Self-test corpus configuration consumed by lihaaf itself when run
+# against this manifest. Mirrors the real-adopter shape: a single
+# dylib_crate, an extern_crates list that includes the macro crate so
+# the per-fixture rustc receives `--extern integration_corpus_macros=…`,
+# fixture_dirs pointing at the in-tree fixture set, and tight
+# timeout/memory ceilings so the negative-path fixtures
+# (intentional_timeout / intentional_oom) trip the harness quickly.
+[package.metadata.lihaaf]
+dylib_crate = "integration_corpus"
+extern_crates = ["integration_corpus", "integration_corpus_macros"]
+fixture_dirs = ["tests/lihaaf/compile_pass", "tests/lihaaf/compile_fail"]
+edition = "2021"
+fixture_timeout_secs = 3
+per_fixture_memory_mb = 1024
