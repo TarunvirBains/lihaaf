@@ -45,7 +45,7 @@ use std::path::{Path, PathBuf};
 
 use crate::cli::Cli;
 use crate::config::{self, Config, Suite};
-use crate::discovery;
+use crate::discovery::{self, Fixture};
 use crate::dylib;
 use crate::error::{Error, Outcome};
 use crate::exit::ExitCode;
@@ -56,7 +56,7 @@ use crate::normalize::NormalizationContext;
 use crate::toolchain::{self, Toolchain};
 use crate::util;
 use crate::verdict::FixtureResult;
-use crate::worker::{self, WorkerContext};
+use crate::worker::{self, DispatchOutcome, WorkerContext};
 
 /// Aggregate result of a session run.
 #[derive(Debug)]
@@ -298,9 +298,139 @@ struct SuiteRunInput<'a> {
     session_temp: &'a Path,
 }
 
+/// State produced by stage 3 (dylib build) + 4b (copy) + 4c (manifest
+/// refresh) for one suite. Captured into a helper so the initial pass
+/// and the freshness-drift rebuild path share the exact same setup logic.
+///
+/// The managed-copy SHA-256 and mtime live INSIDE `freshness_snapshot`
+/// (`original_sha256` / `original_mtime_unix_secs`); they are not
+/// duplicated as standalone fields because no caller needs them outside
+/// the snapshot context.
+struct SuiteDylibState {
+    /// The build output (cargo_dylib_path + deps_dir + invocation string).
+    build_out: dylib::BuildOutput,
+    /// Path of the lihaaf-managed copy.
+    managed_path: PathBuf,
+    /// Snapshot of the four freshness invariants, ready to hand to a
+    /// [`WorkerContext`].
+    freshness_snapshot: FreshnessSnapshot,
+}
+
+/// Stage 3 (cargo rustc --crate-type=dylib) → stage 4b (copy) → stage 4c
+/// (manifest refresh) for one suite. Returns the state needed to build
+/// a [`WorkerContext`] and a fresh per-suite [`FreshnessSnapshot`].
+///
+/// Shared between the initial pass at session startup and the rebuild
+/// pass triggered by a mid-session freshness-drift event (§4.5,
+/// issue #7). The toolchain argument is the one the caller captured —
+/// the initial pass passes the session-startup capture; the rebuild
+/// path passes a fresh capture so the cargo invocation runs under the
+/// CURRENT rustc rather than the captured-at-startup one.
+fn prepare_suite_dylib_state(
+    suite: &Suite,
+    config: &Config,
+    manifest_path: &Path,
+    workspace_target: &Path,
+    lihaaf_build_dir: &Path,
+    toolchain: &Toolchain,
+    use_symlink: bool,
+) -> Result<SuiteDylibState, Error> {
+    let build_out = dylib::build(&dylib::BuildParams {
+        crate_name: &config.dylib_crate,
+        features: &suite.features,
+        manifest_path,
+        target_dir: lihaaf_build_dir,
+        toolchain,
+    })?;
+
+    let managed_path = dylib::managed_dylib_path(workspace_target, &build_out.cargo_dylib_path);
+    if use_symlink {
+        dylib::symlink_dylib(&build_out.cargo_dylib_path, &managed_path)?;
+    } else {
+        dylib::copy_dylib(&build_out.cargo_dylib_path, &managed_path)?;
+    }
+
+    let dylib_sha = util::sha256_file(&managed_path)?;
+    let dylib_mtime = dylib::mtime_unix_secs(&managed_path)?;
+    let metadata_snapshot = toml_value_to_json(&config.raw_metadata);
+    let manifest_obj = Manifest {
+        lihaaf_version: crate::VERSION.to_string(),
+        suite_name: suite.name.clone(),
+        rustc_release: toolchain.release_line.clone(),
+        rustc_commit_hash: toolchain.commit_hash.clone(),
+        host_triple: toolchain.host.clone(),
+        sysroot: toolchain.sysroot.clone(),
+        dylib_crate: config.dylib_crate.clone(),
+        cargo_dylib_path: build_out.cargo_dylib_path.clone(),
+        managed_dylib_path: managed_path.clone(),
+        dylib_sha256: dylib_sha.clone(),
+        dylib_mtime_unix_secs: dylib_mtime,
+        use_symlink,
+        features: suite.features.clone(),
+        extern_crates: suite.extern_crates.clone(),
+        edition: suite.edition.clone(),
+        metadata_snapshot,
+    };
+    let manifest_dest = manifest::manifest_path_for_suite(workspace_target, &suite.name);
+    manifest_obj.write(&manifest_dest)?;
+
+    let freshness_snapshot = FreshnessSnapshot {
+        managed_dylib_path: managed_path.clone(),
+        original_mtime_unix_secs: dylib_mtime,
+        original_sha256: dylib_sha.clone(),
+        original_toolchain: toolchain.clone(),
+    };
+
+    Ok(SuiteDylibState {
+        build_out,
+        managed_path,
+        freshness_snapshot,
+    })
+}
+
+/// Build a fully-populated [`WorkerContext`] for a per-suite dispatch
+/// pass. Used both for the initial pass and (after [`prepare_suite_dylib_state`]
+/// re-runs) for the rebuild pass on a freshness-drift event.
+fn build_worker_context_for_suite(
+    suite: &Suite,
+    dylib_crate: &str,
+    crate_root: &Path,
+    session_temp: &Path,
+    toolchain: &Toolchain,
+    state: &SuiteDylibState,
+    cli: &Cli,
+) -> Result<WorkerContext, Error> {
+    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone());
+    let mut worker_ctx = WorkerContext::new(
+        crate_root.to_path_buf(),
+        state.managed_path.clone(),
+        state.build_out.deps_dir.clone(),
+        dylib_crate,
+        suite,
+        cli.effective_bless(),
+        cli.verbose,
+        cli.keep_output,
+        session_temp.to_path_buf(),
+        norm_ctx,
+        &toolchain.sysroot,
+        state.freshness_snapshot.clone(),
+    );
+
+    let mut extra_names = worker_ctx.extra_extern_crates.clone();
+    extra_names.extend(worker_ctx.dev_deps.iter().cloned());
+    worker_ctx.extern_paths =
+        worker::resolve_extern_paths(&state.build_out.deps_dir, &extra_names)?;
+
+    Ok(worker_ctx)
+}
+
 /// Stages 4a–4f for one suite. Returns the per-suite fixture results.
-/// Session-level failures (dylib build, freshness drift, etc.) bubble
-/// up via `Result::Err` and short-circuit the outer suite loop.
+/// Session-level failures (dylib build, etc.) bubble up via `Result::Err`
+/// and short-circuit the outer suite loop. A per-dispatch freshness
+/// drift triggers an in-session stage-3 rebuild + retry on the
+/// unfinished subset of fixtures (issue #7, §4.5); a SECOND drift on
+/// the retry pass falls through to the `Outcome::FreshnessDrift`
+/// hard-fail (exit 67) so adopters never see an unbounded rebuild loop.
 fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> {
     let SuiteRunInput {
         suite,
@@ -319,64 +449,22 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     // thrash each other's incremental cache.
     let lihaaf_build_dir = dylib::build_dir_for_suite(workspace_target, &suite.name);
 
-    // Stage 4a — dylib build with this suite's features.
+    // Stages 4a–4c: build dylib, copy/symlink, write manifest, build
+    // freshness snapshot. Shared with the rebuild path below.
     let build_started = std::time::Instant::now();
-    let build_out = dylib::build(&dylib::BuildParams {
-        crate_name: &config.dylib_crate,
-        features: &suite.features,
+    let mut state = prepare_suite_dylib_state(
+        suite,
+        config,
         manifest_path,
-        target_dir: &lihaaf_build_dir,
+        workspace_target,
+        &lihaaf_build_dir,
         toolchain,
-    })?;
+        cli.use_symlink,
+    )?;
     if !cli.quiet {
         let secs = build_started.elapsed().as_secs_f64();
         eprintln!("lihaaf: built {} dylib in {:.1}s", config.dylib_crate, secs);
     }
-
-    // Stage 4b — dylib copy (or symlink).
-    let managed_path = dylib::managed_dylib_path(workspace_target, &build_out.cargo_dylib_path);
-    if cli.use_symlink {
-        dylib::symlink_dylib(&build_out.cargo_dylib_path, &managed_path)?;
-    } else {
-        dylib::copy_dylib(&build_out.cargo_dylib_path, &managed_path)?;
-    }
-
-    // Stage 4c — manifest refresh. Per-suite path so different suite
-    // builds do not stomp on each other's cached state.
-    let dylib_sha = util::sha256_file(&managed_path)?;
-    let dylib_mtime = dylib::mtime_unix_secs(&managed_path)?;
-    let metadata_snapshot = toml_value_to_json(&config.raw_metadata);
-    let manifest_obj = Manifest {
-        lihaaf_version: crate::VERSION.to_string(),
-        suite_name: suite.name.clone(),
-        rustc_release: toolchain.release_line.clone(),
-        rustc_commit_hash: toolchain.commit_hash.clone(),
-        host_triple: toolchain.host.clone(),
-        sysroot: toolchain.sysroot.clone(),
-        dylib_crate: config.dylib_crate.clone(),
-        cargo_dylib_path: build_out.cargo_dylib_path.clone(),
-        managed_dylib_path: managed_path.clone(),
-        dylib_sha256: dylib_sha.clone(),
-        dylib_mtime_unix_secs: dylib_mtime,
-        use_symlink: cli.use_symlink,
-        features: suite.features.clone(),
-        extern_crates: suite.extern_crates.clone(),
-        edition: suite.edition.clone(),
-        metadata_snapshot,
-    };
-    let manifest_dest = manifest::manifest_path_for_suite(workspace_target, &suite.name);
-    manifest_obj.write(&manifest_dest)?;
-
-    // Capture the four policy invariants from per-suite startup state.
-    // Re-checked per-fixture inside the worker pool dispatch loop. The
-    // snapshot is per-suite because each suite has its own managed dylib
-    // (different feature sets produce different SHA-256s).
-    let freshness_snapshot = FreshnessSnapshot {
-        managed_dylib_path: managed_path.clone(),
-        original_mtime_unix_secs: dylib_mtime,
-        original_sha256: dylib_sha.clone(),
-        original_toolchain: toolchain.clone(),
-    };
 
     // Stage 4d — fixture discovery for this suite.
     let fixtures = discovery::collect(suite, crate_root, &cli.filter)?;
@@ -406,27 +494,15 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         eprintln!("lihaaf: parallelism = {parallelism}");
     }
 
-    // Build the worker context for this suite.
-    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone());
-    let mut worker_ctx = WorkerContext::new(
-        crate_root.to_path_buf(),
-        managed_path.clone(),
-        build_out.deps_dir.clone(),
-        &config.dylib_crate,
+    let mut worker_ctx = build_worker_context_for_suite(
         suite,
-        cli.effective_bless(),
-        cli.verbose,
-        cli.keep_output,
-        session_temp.to_path_buf(),
-        norm_ctx,
-        &toolchain.sysroot,
-        freshness_snapshot,
-    );
-
-    // Resolve `--extern` paths for the non-dylib crates.
-    let mut extra_names = worker_ctx.extra_extern_crates.clone();
-    extra_names.extend(worker_ctx.dev_deps.iter().cloned());
-    worker_ctx.extern_paths = worker::resolve_extern_paths(&build_out.deps_dir, &extra_names)?;
+        &config.dylib_crate,
+        crate_root,
+        session_temp,
+        toolchain,
+        &state,
+        cli,
+    )?;
 
     // Mid-suite toolchain drift check (the policy): the captured
     // rustc identity is compared against a fresh capture across the
@@ -444,8 +520,106 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     }
 
     // Stage 4e — worker pool dispatch.
+    let dispatch_outcome = dispatch_with_progress(&fixtures, &worker_ctx, parallelism, cli);
+
+    // §4.5 (issue #7, restored from the original spec): a per-dispatch
+    // freshness failure triggers an in-session stage-3 rebuild +
+    // resume-on-unfinished-fixtures pass. A second drift on the retry
+    // pass falls through to the `Outcome::FreshnessDrift` hard-fail
+    // (exit 67) so adopters never see an unbounded rebuild loop.
+    let Some(first_failure) = dispatch_outcome.freshness_failure.clone() else {
+        return Ok(dispatch_outcome.results);
+    };
+
+    if !cli.quiet {
+        eprintln!(
+            "lihaaf: rebuilding {} dylib (suite \"{}\") after freshness drift on `{}`",
+            config.dylib_crate,
+            suite.name,
+            first_failure.invariant_label()
+        );
+    }
+
+    // Re-capture the toolchain so the rebuild runs under the CURRENT
+    // rustc. A failure here (e.g., rustc disappeared from PATH between
+    // the drift detection and the rebuild) is itself a drift; surface
+    // it through the existing FreshnessDrift outcome with the captured
+    // failure so the adopter sees the original drift detail.
+    let rebuild_toolchain = match toolchain::capture() {
+        Ok(t) => t,
+        Err(_) => {
+            return Err(Error::Session(Outcome::FreshnessDrift {
+                invariant: first_failure.invariant_label().to_string(),
+                detail: first_failure.detail(),
+            }));
+        }
+    };
+
+    // Stage 3 rebuild + re-copy + manifest re-write + fresh snapshot.
+    state = prepare_suite_dylib_state(
+        suite,
+        config,
+        manifest_path,
+        workspace_target,
+        &lihaaf_build_dir,
+        &rebuild_toolchain,
+        cli.use_symlink,
+    )?;
+
+    // Build a fresh `WorkerContext` carrying the refreshed snapshot.
+    // The retry pass uses the same parallelism cap, the same suite
+    // config, and the same session-temp dir; only the snapshot +
+    // managed dylib + deps_dir change.
+    worker_ctx = build_worker_context_for_suite(
+        suite,
+        &config.dylib_crate,
+        crate_root,
+        session_temp,
+        &rebuild_toolchain,
+        &state,
+        cli,
+    )?;
+
+    // Resume dispatch on the fixtures NOT already processed in the
+    // first pass. `dispatch_outcome.results` contains the partial set
+    // collected before the worker pool drained on the freshness
+    // failure; the rest is what the retry pass should run.
+    let remaining = remaining_fixtures(&fixtures, &dispatch_outcome.results);
+    let retry_outcome = dispatch_with_progress(&remaining, &worker_ctx, parallelism, cli);
+
+    // Loop guard (D3 in the issue-7 brief): if the retry pass ALSO
+    // observes a freshness drift, that's the pathological case where
+    // the toolchain or dylib is swapping faster than we can rebuild.
+    // Bail with the original §4.6 hard-fail (exit 67) so adopters
+    // see a stable terminal state rather than a silent rebuild loop.
+    if let Some(second_failure) = retry_outcome.freshness_failure {
+        return Err(Error::Session(Outcome::FreshnessDrift {
+            invariant: second_failure.invariant_label().to_string(),
+            detail: second_failure.detail(),
+        }));
+    }
+
+    // Merge the partial first-pass results with the retry-pass results
+    // and sort lexicographically (the policy: final-report order is
+    // deterministic lex by relative_path, mirroring `dispatch_pool`).
+    let mut merged = dispatch_outcome.results;
+    merged.extend(retry_outcome.results);
+    merged.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    Ok(merged)
+}
+
+/// Dispatch the worker pool with the canonical progress-line formatting.
+/// Extracted so the initial pass and the freshness-rebuild retry pass
+/// share the same `progress` closure (identical adopter-facing output;
+/// the LARGE_SNAPSHOT warning emission stays uniform).
+fn dispatch_with_progress(
+    fixtures: &[Fixture],
+    worker_ctx: &WorkerContext,
+    parallelism: usize,
+    cli: &Cli,
+) -> DispatchOutcome {
     let progress_quiet = cli.quiet;
-    let dispatch_outcome = worker::dispatch_pool(&fixtures, &worker_ctx, parallelism, move |r| {
+    worker::dispatch_pool(fixtures, worker_ctx, parallelism, move |r| {
         if progress_quiet {
             if !r.verdict.is_pass() {
                 eprintln!("lihaaf: {} {}", r.verdict.label(), r.relative_path);
@@ -463,19 +637,22 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         // for visibility into shouldn't be hidden by a verdict-only
         // quiet mode). the policy mandates the LARGE_SNAPSHOT line.
         emit_fixture_warnings(r);
-    });
+    })
+}
 
-    // the policy: a per-dispatch freshness failure is a session-level
-    // hard fail. Convert to the typed outcome and let main() map it
-    // onto exit code 67 (same as the policy TOOLCHAIN_DRIFT).
-    if let Some(failure) = dispatch_outcome.freshness_failure {
-        return Err(Error::Session(Outcome::FreshnessDrift {
-            invariant: failure.invariant_label().to_string(),
-            detail: failure.detail(),
-        }));
-    }
-
-    Ok(dispatch_outcome.results)
+/// Compute the subset of `fixtures` whose `relative_path` does NOT
+/// appear in `completed`. Used by the freshness-rebuild path to resume
+/// dispatch on the in-flight remainder after a mid-dispatch drift
+/// drained the worker queue. Preserves the input order of `fixtures`
+/// so the retry pass mirrors the original discovery order.
+fn remaining_fixtures(fixtures: &[Fixture], completed: &[FixtureResult]) -> Vec<Fixture> {
+    let done: std::collections::BTreeSet<&str> =
+        completed.iter().map(|r| r.relative_path.as_str()).collect();
+    fixtures
+        .iter()
+        .filter(|fx| !done.contains(fx.relative_path.as_str()))
+        .cloned()
+        .collect()
 }
 
 /// Resolve the user's `--suite` selection against the parsed
@@ -1103,5 +1280,179 @@ mod tests {
         let suites = suites_named(&["default", "spatial"]);
         let idx = select_suites_by_cli(&suites, &["default".to_string()]).unwrap();
         assert_eq!(idx, vec![0]);
+    }
+
+    // ---- In-session freshness-drift rebuild (issue #7) ----
+
+    use crate::discovery::{Fixture, FixtureKind};
+    use crate::verdict::{FixtureResult, Verdict};
+
+    /// Build a synthetic `Fixture` with the given relative path. The
+    /// `path` / `stem` fields are populated so the value type-checks but
+    /// the on-disk file is NOT required to exist: the freshness-rebuild
+    /// orchestration tests below exercise the pure `remaining_fixtures`
+    /// helper, not the rustc spawn path.
+    fn synthetic_fixture(rel: &str) -> Fixture {
+        Fixture {
+            path: PathBuf::from(rel),
+            relative_path: rel.to_string(),
+            stem: rel.rsplit('/').next().unwrap_or(rel).to_string(),
+            kind: FixtureKind::CompilePass,
+        }
+    }
+
+    /// Build a synthetic `FixtureResult` carrying an `Ok` verdict — used
+    /// to populate the "already completed" subset in `remaining_fixtures`
+    /// tests. The verdict body is irrelevant; only `relative_path` drives
+    /// the set-difference computation.
+    fn synthetic_result(rel: &str) -> FixtureResult {
+        FixtureResult {
+            relative_path: rel.to_string(),
+            verdict: Verdict::Ok,
+            cleanup_failure: None,
+            wall_ms: 0,
+            warning: None,
+        }
+    }
+
+    /// `remaining_fixtures` is the core seam for the freshness-rebuild
+    /// resume path: the worker pool returns a PARTIAL `results` vec
+    /// when it short-circuits on drift, and this helper computes the
+    /// "still to run" subset by removing completed `relative_path`
+    /// entries. If this function returned a fixture that was already
+    /// run, the retry pass would double-dispatch and the final merge
+    /// would contain duplicate verdicts.
+    #[test]
+    fn remaining_fixtures_excludes_completed_relative_paths() {
+        let fixtures = vec![
+            synthetic_fixture("a.rs"),
+            synthetic_fixture("b.rs"),
+            synthetic_fixture("c.rs"),
+        ];
+        let completed = vec![synthetic_result("a.rs"), synthetic_result("c.rs")];
+        let remaining = remaining_fixtures(&fixtures, &completed);
+        assert_eq!(remaining.len(), 1, "exactly one fixture remained");
+        assert_eq!(remaining[0].relative_path, "b.rs");
+    }
+
+    /// When the first pass collected zero results (drift fired BEFORE
+    /// any worker pulled a fixture off the queue), the retry pass must
+    /// run every fixture from the original list. Catches a regression
+    /// where an empty `completed` set was treated as "everything is
+    /// done" — which would silently skip the entire suite after drift.
+    #[test]
+    fn remaining_fixtures_returns_all_when_completed_is_empty() {
+        let fixtures = vec![
+            synthetic_fixture("a.rs"),
+            synthetic_fixture("b.rs"),
+            synthetic_fixture("c.rs"),
+        ];
+        let remaining = remaining_fixtures(&fixtures, &[]);
+        assert_eq!(remaining.len(), 3);
+        let rels: Vec<&str> = remaining.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(rels, vec!["a.rs", "b.rs", "c.rs"]);
+    }
+
+    /// `remaining_fixtures` must preserve the input order of the
+    /// fixtures list. The final-results merge sorts lexicographically
+    /// after combining the first-pass + retry-pass vecs, but the
+    /// retry-pass dispatch itself should walk fixtures in the same
+    /// order the discovery layer produced them (so per-fixture progress
+    /// lines, which emit in completion order, match what an adopter
+    /// would see in a no-drift run).
+    #[test]
+    fn remaining_fixtures_preserves_input_order() {
+        let fixtures = vec![
+            synthetic_fixture("z.rs"),
+            synthetic_fixture("a.rs"),
+            synthetic_fixture("m.rs"),
+            synthetic_fixture("b.rs"),
+        ];
+        let completed = vec![synthetic_result("a.rs")];
+        let remaining = remaining_fixtures(&fixtures, &completed);
+        let rels: Vec<&str> = remaining.iter().map(|f| f.relative_path.as_str()).collect();
+        assert_eq!(rels, vec!["z.rs", "m.rs", "b.rs"]);
+    }
+
+    /// Pins the issue-#7 fallback (D3 in the design brief): if the
+    /// retry pass ALSO observes a freshness drift, the session must
+    /// surface `Outcome::FreshnessDrift`, which maps to the
+    /// `TOOLCHAIN_DRIFT` exit code (67). Adopters' CI scripts that key
+    /// on exit-67 to "blow the cache and re-run" continue to behave
+    /// correctly when the pathological double-drift case fires.
+    ///
+    /// This test does not exercise the orchestration loop (which
+    /// requires a live cargo build); it pins the contract that the
+    /// final hard-fail outcome still routes to exit 67. The
+    /// `Outcome::FreshnessDrift` -> `ExitCode::ToolchainDrift` mapping
+    /// is the only piece of the fallback that the session orchestrator
+    /// relies on; the orchestration itself is exercised by the
+    /// `cargo run --release --bin cargo-lihaaf -- lihaaf` integration
+    /// gate.
+    #[test]
+    fn rebuild_failure_falls_back_to_toolchain_drift_exit() {
+        let outcome = Outcome::FreshnessDrift {
+            invariant: "dylib_sha256".to_string(),
+            detail: "synthetic detail for test".to_string(),
+        };
+        assert_eq!(outcome.exit_code(), ExitCode::ToolchainDrift);
+        // The rendered diagnostic must carry the invariant label
+        // verbatim so adopter CI scripts can grep on the stable token.
+        let rendered = format!("{outcome}");
+        assert!(
+            rendered.contains("dylib_sha256"),
+            "rendered diagnostic must name the drifted invariant: {rendered}"
+        );
+    }
+
+    /// The freshness-rebuild orchestrator branches on a
+    /// `FreshnessFailure` that BUBBLED UP from the worker pool's
+    /// partial-results return. This test pins the contract by
+    /// constructing a synthetic `DylibShaMismatch` failure (the most
+    /// common drift cause — an external process mutated the managed
+    /// dylib mid-session) and confirming `freshness::check` produces
+    /// the expected variant when invariant 3 is violated. The session
+    /// rebuild path then keys on the variant via
+    /// `invariant_label()` and `detail()` and re-runs stage 3.
+    #[test]
+    fn freshness_drift_triggers_rebuild_path_via_sha_mismatch() {
+        use crate::freshness::{self, FreshnessFailure, FreshnessSnapshot};
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dylib_stub = tmp.path().join("libstub.so");
+        {
+            let mut f = std::fs::File::create(&dylib_stub).unwrap();
+            f.write_all(b"new contents that don't match the captured sha")
+                .unwrap();
+            f.sync_all().unwrap();
+        }
+        // A snapshot whose `original_sha256` mismatches the file on
+        // disk: this is what `worker::dispatch_pool` would observe on
+        // a mid-session dylib swap. The session orchestrator catches
+        // the failure and dispatches the rebuild path.
+        let snap = FreshnessSnapshot {
+            managed_dylib_path: dylib_stub.clone(),
+            original_mtime_unix_secs: 0,
+            original_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+                .into(),
+            original_toolchain: crate::toolchain::Toolchain {
+                release_line: "rustc 1.95.0 (synthetic)".into(),
+                release: "1.95.0".into(),
+                host: "x86_64-unknown-linux-gnu".into(),
+                commit_hash: "0".repeat(40),
+                sysroot: PathBuf::from("/r"),
+            },
+        };
+        let failure = freshness::check(&snap).expect_err("synthetic snapshot must fail");
+        match &failure {
+            FreshnessFailure::DylibShaMismatch { .. } => {}
+            other => panic!("expected DylibShaMismatch, got {other:?}"),
+        }
+        // The session orchestrator keys on `invariant_label()` for the
+        // diagnostic line and `detail()` for the rendered body. Both
+        // must be stable so adopter CI greps don't break.
+        assert_eq!(failure.invariant_label(), "dylib_sha256");
+        assert!(failure.detail().contains("SHA-256 changed"));
     }
 }

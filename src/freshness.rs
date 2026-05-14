@@ -19,13 +19,17 @@
 //! (dylib build), re-copy, re-validate, then proceed. No 'try anyway'
 //! fallback."
 //!
-//! In practice — and per the dispatch-orchestrator brief — v0.1 hard-
-//! fails with a diagnostic similar in shape to the policy `TOOLCHAIN_DRIFT`
-//! rather than attempting a mid-session rebuild. The mid-session
-//! rebuild is anchored deferral: it requires re-issuing the dylib
-//! build under whatever rustc is currently active, re-copying, and
-//! re-validating every in-flight worker; safer to refuse and let the
-//! adopter re-run the session against the now-current toolchain.
+//! Implementation split (issue #7): the per-dispatch [`check`] function
+//! stays a pure invariant comparator — it returns `Err(FreshnessFailure)`
+//! on drift and never tries to recover. Recovery lives at the session
+//! orchestration layer in `crate::session::run_one_suite`: on the first
+//! freshness failure observed by [`crate::worker::dispatch_pool`], the
+//! session re-captures the toolchain, re-runs stage 3 (dylib build),
+//! re-copies the managed dylib, rebuilds a fresh `FreshnessSnapshot`,
+//! and resumes dispatch on the unfinished fixtures. A SECOND drift on
+//! the retry pass is the pathological case (toolchain swapping faster
+//! than the rebuild) and falls through to the original `TOOLCHAIN_DRIFT`
+//! exit-67 hard-fail so adopters never see a silent rebuild loop.
 //!
 //! ## Why per-dispatch and not per-session
 //!

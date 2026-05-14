@@ -685,40 +685,52 @@ Note: the freshness check covers the MANAGED copy, not the
 cargo-managed original. Cargo may freely replace its own artifact
 between fixture dispatches — that is the whole point of the copy.
 
-**v0.1 behavior on divergence: hard-fail.** Any of the four invariants
-failing terminates the session with `TOOLCHAIN_DRIFT` (exit code 67,
-Section 10.3). The dispatch loop drains in-flight workers, refuses new
-work, and the diagnostic names which invariant fired and what the
-observed-vs-expected values were. This unifies all four §4.5
-invariants under the same hard-fail policy that §4.6 already applies
-to rustc-version drift specifically.
+**v0.1 behavior on divergence: in-session rebuild, then hard-fail as
+fallback.** When any of the four invariants drifts mid-session,
+`worker::dispatch_pool` short-circuits its dispatch queue and returns
+a partial result vec plus the first observed `FreshnessFailure`. The
+session orchestrator (`session::run_one_suite`) catches the failure
+and:
 
-The hard-fail policy is the right v0.1 default for two reasons. First,
-the four invariants cover the same blast radius as the rustc-drift
-case in §4.6: a stale or replaced dylib means the linked fixture
-binaries no longer reflect the consumer code under test, and "try
-anyway" is the failure mode that produces silently wrong test
-results. Second, a rebuild path is non-trivial: in-flight workers
-already hold path references to the OLD managed dylib, and recovering
-without orphaning their child rustc processes requires either a
-coordinated drain-and-restart (suspends progress without telling the
-operator why) or a per-worker re-bind step (re-resolves the dylib
-path mid-session — significant new state machine in
-`worker::dispatch_pool`). v0.1 takes the conservative answer; an
-operator who hits drift re-runs the session and gets a clean rebuild
-through the normal stage 3 path.
+1. Emits a single-line stderr diagnostic naming the drifted invariant
+   (`lihaaf: rebuilding <crate> dylib (suite "<name>") after freshness
+   drift on <invariant>`). Suppressed under `--quiet`.
+2. Re-captures `rustc --version --verbose` so the rebuild runs under
+   the CURRENT toolchain (the one the drift observed).
+3. Re-runs stage 3 (cargo `--crate-type=dylib`), re-copies (or
+   re-symlinks) the managed dylib, re-writes the per-suite manifest
+   atomically, and rebuilds a fresh `FreshnessSnapshot`.
+4. Builds a fresh `WorkerContext` carrying the refreshed snapshot and
+   resumes dispatch on the unfinished subset of fixtures (the ones
+   not present in the partial result vec).
+5. Merges the partial first-pass results with the retry-pass results
+   and sort-lexes the union for deterministic final ordering.
 
-**Post-v0.1.0-beta.1 deferred: in-session rebuild.** A future revision
-(target: v0.1.0-beta.2 or v0.1.0 stable; design TBD) will reclaim
-partial-session progress on benign drift (e.g., an editor saved the
-consumer crate mid-session and cargo replaced the dylib) by rebuilding
-from stage 3 in-place, re-validating the four invariants, and
-resuming dispatch with the new manifest. The rebuild path requires
-worker coordination work that is out of the v0.1.0-beta.1 budget. The
-exit code will remain 67 — adopters' CI scripts that key on
-`TOOLCHAIN_DRIFT` to "blow the cache and re-run" continue to behave
-correctly under both v0.1.0-beta.1's hard-fail and the eventual
-in-session rebuild. Tracked as issue #7.
+**Loop guard.** If the retry pass ALSO observes a freshness drift,
+the session falls back to the original §4.6 hard-fail and exits with
+`TOOLCHAIN_DRIFT` (code 67, Section 10.3). A double-drift inside one
+session means the toolchain or managed dylib is being swapped faster
+than the rebuild can keep up — the safest terminal state is a stable
+hard-fail rather than an unbounded rebuild loop.
+
+**Toolchain re-capture failure.** If `rustc --version --verbose`
+fails between drift detection and the rebuild (e.g., rustc was just
+removed from PATH), the session falls back to the original
+`TOOLCHAIN_DRIFT` hard-fail with the first-pass failure's invariant
+and detail body, so adopters see the original drift rather than a
+synthetic "rustc capture failed" diagnostic.
+
+**Why an in-session rebuild rather than a hard fail.** Benign
+mid-session drift is common: an editor saved the consumer crate and
+cargo replaced the dylib; a CI step rsync'd new artifacts into
+`target/`; a `rustup update` ran in parallel. The original spec
+required the rebuild path; v0.1.0-alpha.1 through v0.1.0-beta.3
+shipped a deferral that hard-failed instead (tracked as issue #7).
+v0.1.0-beta.4 restores the spec-mandated rebuild path. The `TOOLCHAIN_DRIFT`
+exit code stays the terminal state for the pathological double-drift
+case and the rustc-disappeared case, so adopter CI scripts that key
+on exit-67 to "blow the cache and re-run" continue to behave
+correctly.
 
 ### 4.6 Hard-fail on rustc drift
 
