@@ -1246,6 +1246,157 @@ fn type_alias_of_testcases_emits_discovery_unrecognized() {
     );
 }
 
+/// **Round-5 BLOCK regression: `use trybuild::TestCases;` inside an
+/// inline `mod a { ... }` does NOT leak into sibling `mod b { ... }`.**
+/// `imported_testcases` and `aliased_testcases` were previously
+/// file-scope BTreeSets — a `use trybuild::TestCases;` inside one
+/// module would silently populate the set for the rest of the file,
+/// causing a `TestCases::new()` inside a sibling module to be treated
+/// as recognized even though `TestCases` is not in scope there. This
+/// false positive would surface a phantom fixture from the sibling
+/// module's call.
+///
+/// The fix adds a `visit_item_mod` override that mirrors the
+/// save/restore pattern used by `visit_item_fn` for `local_bindings`:
+/// `imported_testcases` and `aliased_testcases` are taken into local
+/// variables on entry, the inline module is walked with the cleared
+/// (empty) sets, and the saved sets are restored on exit. File-level
+/// `use` statements (those outside any `mod` block) continue to work
+/// because they execute on the file's outer scope before any
+/// `visit_item_mod` runs.
+#[test]
+fn imported_testcases_does_not_leak_across_modules() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(tests.join("ui").join("bar.rs"), "fn main() {}\n").unwrap();
+
+    // `mod a` uses `trybuild::TestCases`; its `ui_inside_a` should be
+    // recognized. `mod b` does NOT import `TestCases`; its
+    // `ui_inside_b` call (which also writes `TestCases::new()`) must
+    // NOT be recognized. Previously the file-scope set leaked from
+    // `mod a` into `mod b`, falsely recognizing the sibling call.
+    let source = "\
+mod a {\n\
+    use trybuild::TestCases;\n\
+    #[test]\n\
+    fn ui_inside_a() {\n\
+        let t = TestCases::new();\n\
+        t.compile_fail(\"tests/ui/foo.rs\");\n\
+    }\n\
+}\n\
+mod b {\n\
+    // `TestCases` is NOT in scope here — the leak fix must keep the\n\
+    // call below unrecognized.\n\
+    #[test]\n\
+    fn ui_inside_b() {\n\
+        let t = TestCases::new();\n\
+        t.compile_fail(\"tests/ui/bar.rs\");\n\
+    }\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    // Only `mod a`'s recognized call must surface as a fixture.
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture from `mod a`'s `ui_inside_a`; the sibling \
+         `mod b` import-leak case must NOT surface a phantom fixture. got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.fixtures[0].relative_path.ends_with("tests/ui/foo.rs"),
+        "the recognized fixture must be `mod a`'s foo.rs; got {}",
+        out.fixtures[0].relative_path
+    );
+    assert_eq!(
+        out.fixtures[0].call_site.enclosing_test_fn.as_deref(),
+        Some("ui_inside_a"),
+    );
+}
+
+/// **`use trybuild::TestCases as Foo;` inside a `mod a` does NOT leak
+/// the alias into `mod b`.** The companion to
+/// `imported_testcases_does_not_leak_across_modules` — `aliased_testcases`
+/// is also a per-file set that the round-5 fix scopes to the inline
+/// module. Before the fix, a `use trybuild::TestCases as Foo;` in `mod a`
+/// would populate the file-scope `aliased_testcases`, causing a
+/// `Foo::new(); t.compile_fail(...)` chain in `mod b` to emit a
+/// spurious `discovery_unrecognized` entry (since `Foo` is not actually
+/// in scope in `mod b`).
+///
+/// The test asserts: zero fixtures (no rename is registered via flag),
+/// and zero unrecognized entries for the sibling module's
+/// `Foo::new()` chain — `mod b`'s `Foo` is just an unknown identifier
+/// from the visitor's POV, not an aliased TestCases receiver.
+#[test]
+fn aliased_testcases_does_not_leak_across_modules() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+mod a {\n\
+    use trybuild::TestCases as Foo;\n\
+    #[test]\n\
+    fn ui_inside_a() {\n\
+        let t = Foo::new();\n\
+        t.compile_fail(\"tests/ui/foo.rs\");\n\
+    }\n\
+}\n\
+mod b {\n\
+    // `Foo` is NOT in scope here; a Foo::new() chain must NOT be\n\
+    // classified as an aliased-TestCases receiver. The visitor\n\
+    // would have falsely emitted an unrecognized entry for this\n\
+    // sibling call before the per-module scoping fix.\n\
+    #[test]\n\
+    fn ui_inside_b() {\n\
+        let t = Foo::new();\n\
+        t.compile_fail(\"tests/ui/bar.rs\");\n\
+    }\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    // `mod a` produces exactly one unrecognized entry (alias not
+    // registered via flag — the round-3 behavior). `mod b`'s sibling
+    // call must NOT add a second one — if the alias set leaked, the
+    // sibling would also emit `unrecognized`.
+    assert!(
+        out.fixtures.is_empty(),
+        "no aliases are registered; expected zero fixtures. got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry from `mod a`'s aliased call. \
+         A second entry from `mod b` would indicate the alias set leaked. got {:?}",
+        out.unrecognized
+    );
+    // The surviving entry must reside inside `mod a` (the call site is
+    // in tests/trybuild.rs; line resides in the `mod a` body). The
+    // crucial assertion is the COUNT — a leak would double the count.
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("alias"),
+        "the entry should reference the alias scenario; got `{}`",
+        entry.detail
+    );
+}
+
 /// **Round-5 BLOCK regression: `#[cfg(...)]`-gated `#[test]` functions
 /// emit `discovery_unrecognized` and do NOT contribute fixtures.** A
 /// `#[cfg(feature = "foo")] #[test] fn ui() { ... trybuild call ... }`

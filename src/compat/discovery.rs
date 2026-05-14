@@ -819,6 +819,35 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         self.aliased_bindings = saved_aliased_bindings;
     }
 
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // Round-5 BLOCK fix: `imported_testcases` and `aliased_testcases`
+        // are FILE-scope sets — populated by `visit_item_use` from
+        // `use` statements at file top-level. But inline modules
+        // (`mod a { ... }`) can ALSO carry `use` statements; those uses
+        // must NOT leak into:
+        //   - the enclosing file's scope (siblings of `mod a` should
+        //     not see `mod a`'s imports), or
+        //   - sibling modules (`mod b { ... }` after `mod a { ... }`).
+        //
+        // The save/restore pattern mirrors `visit_item_fn`'s scoping
+        // of `local_bindings` / `aliased_bindings`. File-level `use`s
+        // observed before any `mod` block are preserved across the
+        // walk because the saved sets carry them in.
+        //
+        // syn's default `visit_item_mod` recurses into `node.content`
+        // (the inline body, if any) — we let it do the descent after
+        // we've cleared the use-import sets to the empty set so the
+        // inner `visit_item_use` calls populate this scope only. After
+        // the recursion the saved sets are restored.
+        let saved_imported = std::mem::take(&mut self.imported_testcases);
+        let saved_aliased = std::mem::take(&mut self.aliased_testcases);
+
+        syn::visit::visit_item_mod(self, node);
+
+        self.imported_testcases = saved_imported;
+        self.aliased_testcases = saved_aliased;
+    }
+
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
         // syn 2.0: `ItemMacro` covers BOTH `macro_rules! name { ... }`
         // definitions AND module-level invocations like `make_tests!();`.
