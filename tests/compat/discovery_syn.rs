@@ -1619,6 +1619,83 @@ fn ui() {\n\
     );
 }
 
+/// **Round-6 BLOCK regression: file-level `#![cfg(...)]` inner
+/// attribute gates the entire file.** A `tests/trybuild.rs` whose
+/// first non-comment line is `#![cfg(unix)]` is excluded from the build
+/// on non-Unix platforms — every item inside is invisible to the
+/// compiler. The visitor must NOT descend into a file gated this way;
+/// doing so would surface phantom fixtures on the disabled cfg arm.
+///
+/// The fix: in `discover()`, after parsing the `syn::File`, check
+/// `ast.attrs` for `#[cfg]` / `#[cfg_attr]` (inner attributes parse
+/// into `File.attrs` via `Attribute::parse_inner`). If gated, emit one
+/// `discovery_unrecognized` entry for the file and skip the visitor
+/// walk entirely.
+///
+/// The test asserts: zero fixtures (the entire file is skipped) and
+/// exactly one unrecognized entry whose detail mentions "file" and
+/// "cfg".
+#[test]
+fn file_level_inner_cfg_attribute_emits_discovery_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    // `#![cfg(unix)]` is an INNER attribute — it gates the entire
+    // file. The `#[test] fn ui() { ... }` inside would normally
+    // contribute a fixture, but the inner-attr cfg makes the whole
+    // file unevaluable at AST time.
+    let source = "\
+#![cfg(unix)]\n\
+#[test]\n\
+fn ui() {\n\
+    let t = trybuild::TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    assert!(
+        out.fixtures.is_empty(),
+        "no fixtures — the file-level cfg gate skips the visitor walk; \
+         got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry for the cfg-gated file; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("file"),
+        "detail must mention `file`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("cfg"),
+        "detail must mention `cfg`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the gated tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+    assert!(
+        entry.line > 0,
+        "line must be 1-indexed and non-zero; got {}",
+        entry.line
+    );
+}
+
 /// **Round-6 regression: `#[cfg(...)]`-gated `use` declarations are
 /// skipped.** A `#[cfg(feature = "x")] use trybuild::TestCases;` is
 /// NOT in scope at adopter build time when the feature is disabled.

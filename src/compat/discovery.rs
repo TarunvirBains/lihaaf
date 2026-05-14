@@ -325,6 +325,40 @@ pub fn discover(crate_root: &Path, custom_macros: &[String]) -> Result<Discovery
             }
         };
 
+        // Round-6 fix (Gemini BLOCK-B File): a file-level inner cfg
+        // attribute (`#![cfg(unix)]` at the top of the file) gates the
+        // ENTIRE file's contents — every item, every test, every
+        // module. `syn::parse_file` parses inner attributes into
+        // `File.attrs` (via `Attribute::parse_inner`), so the same
+        // `find_cfg_attribute` helper applies. Without this check the
+        // visitor would descend through the file as if it were
+        // compiled on every platform, surfacing phantom fixtures on
+        // the disabled cfg arm.
+        //
+        // Emission shape: one `discovery_unrecognized` entry at line 1
+        // (inner-attr `#![...]` spans typically start at the file's
+        // first content line; using `min 1` keeps the line valid even
+        // for empty-attr edge cases). Detail mentions both "file" and
+        // "cfg" so the operator can grep.
+        if let Some(cfg_attr) = find_cfg_attribute(&ast.attrs) {
+            let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
+                "cfg_attr"
+            } else {
+                "cfg"
+            };
+            let line = cfg_attr.pound_token.span.start().line.max(1);
+            unrecognized.push(DiscoveryUnrecognized {
+                file: test_file.clone(),
+                line,
+                detail: format!(
+                    "file is cfg-gated at the inner attribute level (`#![{attr_kind}(...)]`); \
+                     trybuild discovery cannot evaluate the cfg without resolution. \
+                     Treat as unrecognized."
+                ),
+            });
+            continue;
+        }
+
         let mut visitor = DiscoveryVisitor::new(&test_file, &alias_set);
         visitor.visit_file(&ast);
 
