@@ -720,13 +720,7 @@ fn expand_glob(crate_root: &Path, test_file: &Path, pattern: &str) -> Result<Vec
     let pattern_path = Path::new(pattern);
     let is_absolute = pattern_path.is_absolute();
 
-    let segments: Vec<&str> = if is_absolute {
-        // Strip the leading `/` for segment walking; we re-anchor at
-        // the filesystem root by starting from `Path::new("/")`.
-        pattern.split('/').filter(|s| !s.is_empty()).collect()
-    } else {
-        pattern.split('/').filter(|s| !s.is_empty()).collect()
-    };
+    let segments: Vec<&str> = pattern.split('/').filter(|s| !s.is_empty()).collect();
 
     if segments.is_empty() {
         return Ok(Vec::new());
