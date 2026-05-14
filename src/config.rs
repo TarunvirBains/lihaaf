@@ -618,46 +618,55 @@ mod tests {
         }
     }
 
+    /// Parse `toml`, assert it produces a `ConfigInvalid` outcome, and
+    /// assert the rendered error message contains every entry in
+    /// `expected_substrings`. Used by the cluster of negative-path tests
+    /// below that all assert "this invalid TOML produces an error message
+    /// naming these specific identifiers".
+    fn assert_parse_rejects_with(toml: &str, expected_substrings: &[&str]) {
+        let err = parse_str(toml).unwrap_err();
+        let msg = unwrap_invalid(err);
+        for expected in expected_substrings {
+            assert!(
+                msg.contains(expected),
+                "error message `{msg}` did not contain expected substring `{expected}`",
+            );
+        }
+    }
+
     #[test]
     fn missing_table_is_session_outcome_with_exact_message() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package]
             name = "x"
             version = "0.1.0"
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("`[package.metadata.lihaaf]`"));
-        assert!(msg.contains("minimum required keys"));
+            &["`[package.metadata.lihaaf]`", "minimum required keys"],
+        );
     }
 
     #[test]
     fn missing_dylib_crate_is_invalid() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             extern_crates = ["foo"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("dylib_crate"));
+            &["dylib_crate"],
+        );
     }
 
     #[test]
     fn extern_crates_first_must_equal_dylib() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
             extern_crates = ["other"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("extern_crates[0]"));
+            &["extern_crates[0]"],
+        );
     }
 
     #[test]
@@ -686,48 +695,41 @@ mod tests {
 
     #[test]
     fn edition_must_be_in_allowed_set() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
             extern_crates = ["consumer"]
             edition = "2026"
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("edition"));
-        assert!(msg.contains("2024"));
+            &["edition", "2024"],
+        );
     }
 
     #[test]
     fn zero_timeout_is_invalid() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
             extern_crates = ["consumer"]
             fixture_timeout_secs = 0
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("fixture_timeout_secs"));
+            &["fixture_timeout_secs"],
+        );
     }
 
     #[test]
     fn zero_memory_ceiling_is_invalid() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
             extern_crates = ["consumer"]
             per_fixture_memory_mb = 0
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("per_fixture_memory_mb"));
+            &["per_fixture_memory_mb"],
+        );
     }
 
     #[test]
@@ -832,7 +834,7 @@ mod tests {
 
     #[test]
     fn named_suite_dylib_crate_is_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -843,16 +845,13 @@ mod tests {
             dylib_crate = "other"
             fixture_dirs = ["tests/lihaaf/spatial"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("dylib_crate"));
-        assert!(msg.contains("not a per-suite key"));
+            &["dylib_crate", "not a per-suite key"],
+        );
     }
 
     #[test]
     fn named_suite_default_is_reserved() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -862,16 +861,13 @@ mod tests {
             name = "default"
             fixture_dirs = ["tests/lihaaf/default_extra"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("\"default\""));
-        assert!(msg.contains("reserved"));
+            &["\"default\"", "reserved"],
+        );
     }
 
     #[test]
     fn named_suite_missing_name_is_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -880,16 +876,13 @@ mod tests {
             [[package.metadata.lihaaf.suite]]
             fixture_dirs = ["tests/lihaaf/x"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("entry #0"));
-        assert!(msg.contains("name"));
+            &["entry #0", "name"],
+        );
     }
 
     #[test]
     fn named_suite_invalid_chars_in_name_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -899,15 +892,13 @@ mod tests {
             name = "with space"
             fixture_dirs = ["tests/lihaaf/space"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("ASCII alphanumeric"));
+            &["ASCII alphanumeric"],
+        );
     }
 
     #[test]
     fn named_suite_missing_fixture_dirs_is_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -917,16 +908,13 @@ mod tests {
             name = "spatial"
             features = ["spatial"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("fixture_dirs"));
-        assert!(msg.contains("required"));
+            &["fixture_dirs", "required"],
+        );
     }
 
     #[test]
     fn named_suite_empty_fixture_dirs_is_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -936,15 +924,13 @@ mod tests {
             name = "spatial"
             fixture_dirs = []
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("empty array"));
+            &["empty array"],
+        );
     }
 
     #[test]
     fn duplicate_suite_names_rejected() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -958,16 +944,13 @@ mod tests {
             name = "spatial"
             fixture_dirs = ["tests/lihaaf/b"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("duplicate suite name"));
-        assert!(msg.contains("\"spatial\""));
+            &["duplicate suite name", "\"spatial\""],
+        );
     }
 
     #[test]
     fn fixture_dirs_must_be_disjoint_across_suites() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -978,17 +961,13 @@ mod tests {
             name = "spatial"
             fixture_dirs = ["tests/lihaaf/shared"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("shared"));
-        assert!(msg.contains("default"));
-        assert!(msg.contains("spatial"));
+            &["shared", "default", "spatial"],
+        );
     }
 
     #[test]
     fn fixture_dirs_must_be_disjoint_after_dot_normalization() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -999,12 +978,8 @@ mod tests {
             name = "spatial"
             fixture_dirs = ["./tests/lihaaf/shared"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("resolves to the same directory"));
-        assert!(msg.contains("default"));
-        assert!(msg.contains("spatial"));
+            &["resolves to the same directory", "default", "spatial"],
+        );
     }
 
     #[test]
@@ -1033,7 +1008,7 @@ mod tests {
 
     #[test]
     fn fixture_dirs_must_be_disjoint_between_two_named_suites() {
-        let err = parse_str(
+        assert_parse_rejects_with(
             r#"
             [package.metadata.lihaaf]
             dylib_crate = "consumer"
@@ -1047,11 +1022,8 @@ mod tests {
             name = "beta"
             fixture_dirs = ["tests/lihaaf/x"]
         "#,
-        )
-        .unwrap_err();
-        let msg = unwrap_invalid(err);
-        assert!(msg.contains("alpha"));
-        assert!(msg.contains("beta"));
+            &["alpha", "beta"],
+        );
     }
 
     #[test]
