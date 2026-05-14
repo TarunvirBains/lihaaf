@@ -216,6 +216,54 @@ version = "0.1.0"
 }
 
 #[test]
+fn workspace_root_manifest_is_rejected_with_directed_diagnostic() {
+    // `[workspace]` without `[package]` is a workspace root — cargo
+    // cannot build it as a library and the lihaaf stage-3 dylib pass
+    // would fail with an opaque error. Phase 2 overlay rejects this
+    // upfront with a directed diagnostic pointing the adopter at a
+    // member crate's Cargo.toml.
+    let input = r#"[workspace]
+members = ["crate-a", "crate-b"]
+"#;
+    let (_tmp, upstream) = write_upstream(input);
+    let err = materialize_overlay(&upstream).expect_err("workspace root must be rejected");
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(clap_exit_code, 2, "exit code must be the clap usage code");
+            assert!(
+                message.contains("workspace"),
+                "diagnostic must name `workspace`; got: {message}"
+            );
+            assert!(
+                message.contains("--compat-root"),
+                "diagnostic must point at the flag; got: {message}"
+            );
+            assert!(
+                message.contains("member crate"),
+                "diagnostic must direct adopter to a member crate; got: {message}"
+            );
+        }
+        other => panic!("expected Error::Cli, got {other:?}"),
+    }
+}
+
+#[test]
+fn manifest_without_package_or_workspace_still_tolerated() {
+    // An empty / odd manifest (no `[package]`, no `[workspace]`) is
+    // not the workspace-root shape — the rejection is targeted. The
+    // overlay still produces a sibling without complaint, treating
+    // the shape as "no library to build" (uniform §3.3 envelope
+    // classification, no lib rewrite).
+    let input = "# empty manifest\n";
+    let (_tmp, upstream) = write_upstream(input);
+    let plan = materialize_overlay(&upstream).expect("non-workspace empty manifest must succeed");
+    assert!(plan.sibling_manifest.exists());
+}
+
+#[test]
 fn multiline_string_hash_is_not_a_comment() {
     // Regression bite for the §3.3 envelope's `overlay.dropped_comments`
     // inventory. A `#` byte that lives inside a TOML triple-quoted

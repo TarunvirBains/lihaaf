@@ -137,14 +137,26 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
             message: e.to_string(),
         })?;
 
-    // Spec invariant: `--compat-root` is single-crate (workspaces are
-    // rejected upstream with a directed diagnostic — see open question
-    // Q4 in the implementation plan). The unwrap below is guarded by
-    // Phase 4's `[package]` precondition; for safety in tests that
-    // exercise the overlay in isolation, we still tolerate the absence
-    // of `[package]` (no crate-type rewrite needed when no library will
-    // be built) by treating it as an `upstream_already_has_dylib =
-    // false` no-op.
+    // Spec invariant: `--compat-root` is single-crate. A workspace-root
+    // manifest (`[workspace]` table, no `[package]` and no
+    // `[workspace.package]`) cannot host a `[lib] crate-type` rewrite;
+    // the lihaaf stage-3 dylib build would have nothing to compile.
+    // Reject with a directed diagnostic pointing the adopter at a
+    // member crate's Cargo.toml. The empty / unusual case (neither
+    // `[package]` nor `[workspace]`) stays tolerant — that may be a
+    // test fixture or a partial manifest the operator is constructing.
+    if is_workspace_root_manifest(&value) {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--compat-root` must point to a single-crate Cargo.toml; \
+                 `{}` is a workspace root (declares `[workspace]` without `[package]`). \
+                 Pass a member crate's Cargo.toml as `--compat-root` instead.",
+                upstream_manifest_path.display()
+            ),
+        });
+    }
+
     let upstream_already_has_dylib = inspect_existing_crate_type(&value);
 
     if let toml::Value::Table(top) = &mut value {
@@ -191,6 +203,30 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
         upstream_already_has_dylib,
         dropped_comments,
     })
+}
+
+/// Return `true` when `value` is a workspace-root manifest: declares a
+/// `[workspace]` table, and declares neither `[package]` nor
+/// `[workspace.package]`. The two negative conditions are required
+/// because a virtual-manifest workspace can host a `[workspace.package]`
+/// (cargo "inherited package metadata"), but the actual crate the
+/// adopter wants overlayed lives in a member directory either way.
+fn is_workspace_root_manifest(value: &toml::Value) -> bool {
+    let Some(top) = value.as_table() else {
+        return false;
+    };
+    let has_workspace = top.get("workspace").is_some_and(|v| v.is_table());
+    if !has_workspace {
+        return false;
+    }
+    if top.get("package").is_some_and(|v| v.is_table()) {
+        return false;
+    }
+    let has_workspace_package = top
+        .get("workspace")
+        .and_then(|w| w.get("package"))
+        .is_some_and(|p| p.is_table());
+    !has_workspace_package
 }
 
 /// Return `true` when the upstream `[lib] crate-type` already contains
