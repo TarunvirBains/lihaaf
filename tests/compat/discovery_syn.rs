@@ -177,6 +177,52 @@ fn pattern_3_test_wrapped_let_binding() {
     );
 }
 
+/// **Round-3 BLOCK regression: `#[std::test]` attribute recognized.**
+/// `is_test_attribute` must accept `std::test` / `::std::test` in
+/// addition to the bare `test`, `core::test`, and `::core::test`
+/// variants — a `#[std::test]` function body must have
+/// `enclosing_test_fn` set on call sites discovered inside it. Custom
+/// test framework setups occasionally use the qualified form.
+#[test]
+fn pattern_3_std_test_attribute_recognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests_dir = crate_root.join("tests");
+    std::fs::create_dir_all(tests_dir.join("ui")).unwrap();
+    std::fs::write(tests_dir.join("ui").join("x.rs"), "fn main() {}\n").unwrap();
+
+    // `#[std::test]` (the qualified form) annotates the function;
+    // discovery must still set `enclosing_test_fn` on the inner call.
+    let source = "\
+#[std::test]\n\
+fn ui() {\n\
+    let t = trybuild::TestCases::new();\n\
+    t.compile_fail(\"tests/ui/x.rs\");\n\
+}\n";
+    std::fs::write(tests_dir.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture expected inside the `#[std::test]` body; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(out.unrecognized.is_empty(), "{:?}", out.unrecognized);
+    let f = &out.fixtures[0];
+    assert!(f.relative_path.ends_with("tests/ui/x.rs"));
+    assert_eq!(f.kind, CompatFixtureKind::CompileFail);
+    assert_eq!(
+        f.call_site.enclosing_test_fn.as_deref(),
+        Some("ui"),
+        "the call lived inside `#[std::test] fn ui()` — \
+         `is_test_attribute` must accept the `std::test` path shape"
+    );
+}
+
 /// **Multiple top-level test files.** A crate with `tests/a.rs` and
 /// `tests/b.rs`, each carrying one invocation, must surface both
 /// fixtures in deterministic order. The sort key is the fixture

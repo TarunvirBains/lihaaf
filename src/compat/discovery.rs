@@ -707,7 +707,7 @@ fn is_test_attribute(attrs: &[syn::Attribute]) -> bool {
         let segments = path_segments_string(attr.meta.path());
         matches!(
             segments.as_str(),
-            "test" | "::test" | "core::test" | "::core::test"
+            "test" | "::test" | "core::test" | "::core::test" | "std::test" | "::std::test"
         )
     })
 }
