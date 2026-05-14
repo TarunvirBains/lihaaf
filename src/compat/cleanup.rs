@@ -455,9 +455,11 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
 /// treated as already-cleaned (no error) so the cleanup is idempotent
 /// across reruns.
 ///
-/// Symlinks under `path` are removed without following — the standard
-/// [`std::fs::remove_dir_all`] handles this correctly on every
-/// supported platform.
+/// Symlinks route through [`remove_symlink_dispatch`], which uses
+/// `unlink` on Unix (works on any symlink target) and a target-
+/// inspecting dispatch on Windows (dir symlinks need `remove_dir`;
+/// `remove_file`/`DeleteFileW` refuses them). In either case the
+/// target tree under the link is preserved.
 fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(m) => m,
@@ -474,11 +476,9 @@ fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
     let file_type = metadata.file_type();
     let result = if file_type.is_dir() {
         std::fs::remove_dir_all(path)
+    } else if file_type.is_symlink() {
+        remove_symlink_dispatch(path)
     } else {
-        // Regular files, symlinks, and (on unix) other special types
-        // are all removed via `remove_file`. `remove_dir_all` would
-        // fail on a non-directory; conversely `remove_file` succeeds
-        // on a symlink-to-dir without following it.
         std::fs::remove_file(path)
     };
 
@@ -490,6 +490,33 @@ fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
             "removing compat-generated path",
             Some(path.to_path_buf()),
         )),
+    }
+}
+
+/// Platform-aware symlink removal: removes the link entry itself
+/// without recursing into the target tree.
+///
+/// On Unix, `unlink(2)` (the syscall behind `std::fs::remove_file`)
+/// removes the link regardless of what it points to, so the
+/// dispatch is unconditional.
+///
+/// On Windows, `DeleteFileW` refuses to operate on a directory
+/// symlink or junction — the entry must be removed via
+/// `RemoveDirectoryW` (`std::fs::remove_dir`). We follow the link
+/// once to inspect the target: target-is-directory uses
+/// `remove_dir`, target-is-file (or a broken link) falls back to
+/// `remove_file`. `remove_dir` does not recurse, so the target
+/// tree is preserved either way.
+#[cfg(unix)]
+fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
+    std::fs::remove_file(path)
+}
+
+#[cfg(windows)]
+fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
+    match std::fs::metadata(path) {
+        Ok(target_md) if target_md.is_dir() => std::fs::remove_dir(path),
+        _ => std::fs::remove_file(path),
     }
 }
 
@@ -593,6 +620,47 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("never-existed.txt");
         remove_path_best_effort(&path).expect("removing non-existent path must succeed");
+    }
+
+    /// **`remove_path_best_effort` removes a symlink-to-directory
+    /// without following.** On Unix, `std::fs::remove_file` works on
+    /// dir symlinks; the targeted fix is for Windows, where dir
+    /// symlinks/junctions need `remove_dir`. This Unix-side test
+    /// proves the new dispatch (`metadata` → `remove_dir` when target
+    /// is a directory) still leaves the target tree untouched on
+    /// platforms where the older `remove_file` path also worked.
+    #[cfg(unix)]
+    #[test]
+    fn remove_symlink_to_directory_unix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let target = tmp.path().join("real_dir");
+        std::fs::create_dir_all(&target).expect("create target dir");
+        std::fs::write(target.join("inside.txt"), b"keep me").expect("write into target");
+
+        let link = tmp.path().join("link_to_dir");
+        std::os::unix::fs::symlink(&target, &link).expect("create symlink-to-dir");
+
+        // Sanity: the link exists and resolves to a directory.
+        assert!(link.exists(), "symlink must exist before removal");
+        assert!(
+            link.symlink_metadata().unwrap().file_type().is_symlink(),
+            "link_to_dir must be a symlink, not a real dir"
+        );
+
+        remove_path_best_effort(&link).expect("removing the symlink must succeed");
+
+        // The link is gone.
+        assert!(
+            !link.exists() && link.symlink_metadata().is_err(),
+            "symlink must be removed"
+        );
+        // The target tree is untouched (we removed the link, not its
+        // contents).
+        assert!(target.exists(), "target directory must NOT be removed");
+        assert!(
+            target.join("inside.txt").exists(),
+            "target's contents must NOT be removed"
+        );
     }
 
     /// `remove_path_best_effort` deletes a directory tree
