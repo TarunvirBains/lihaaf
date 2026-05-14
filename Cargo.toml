@@ -69,7 +69,13 @@ libc = "0.2"
 # Unix `libc` block above (canonical FFI source, audited externally,
 # small compile cost, no transitive deps).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Storage_FileSystem",     # Spec B
+    "Win32_System_IO",              # Spec B
+    "Win32_Foundation",             # Spec B
+    "Win32_System_Threading",       # Spec C — OpenProcess
+    "Win32_System_ProcessStatus",   # Spec C — GetProcessMemoryInfo
+] }
 
 # No regex engine, ever. Spec §6.1. Every string match in this crate
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte

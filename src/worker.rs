@@ -2,13 +2,14 @@
 //!
 //! ## Dispatch choices worth calling out
 //!
-//! - **RSS sampling (Linux for now):** on Linux, `/proc/<pid>/statm`
-//!   (2nd field × page-size) is read. This is the live per-process RSS
-//!   for a running child — verified by hand on `rustc 1.95` on Linux
-//!   6.x x86_64. macOS and Windows are documented stubs (return `None`);
-//!   without correct sampling those platforms would silently miss the same
-//!   guardrail, so they currently fall back to OS-level OOM attribution
-//!   (`WORKER_CRASHED`).
+//! - **RSS sampling (Linux / macOS / Windows):** per-platform live RSS
+//!   is sampled for running worker children via the platform's native API.
+//!   Linux reads `/proc/<pid>/statm` (2nd field × page-size); macOS calls
+//!   `libc::proc_pidinfo(PROC_PIDTASKINFO)` and reads `pti_resident_size`;
+//!   Windows calls `OpenProcess` + `GetProcessMemoryInfo` and reads
+//!   `WorkingSetSize`. On other Unixes (FreeBSD, NetBSD, etc.) the
+//!   sampler returns `None` and the OS OOMkiller backstops, with runaway
+//!   workers surfacing as `WORKER_CRASHED` rather than `MEMORY_EXHAUSTED`.
 //!
 //! - **Sampling interval:** 100 ms on Linux. This is short enough to catch
 //!   runaway work before the OS OOMkiller usually triggers, while staying
@@ -1150,31 +1151,44 @@ unsafe fn libc_kill(pid: i32, sig: i32) {
     unsafe { libc::kill(pid, sig) };
 }
 
-/// Sample per-process RSS in KiB. Linux-only in v0.1; returns `None`
-/// on other platforms (see KR-5 documentation at module top).
+/// Sample per-process RSS in KiB. Dispatches to the platform-native
+/// implementation. Returns `None` on unsupported platforms (FreeBSD,
+/// NetBSD, etc.) — the OS OOMkiller backstops and the worker surfaces
+/// as `WORKER_CRASHED` rather than `MEMORY_EXHAUSTED` on those targets.
 fn sample_rss_kib(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let path = format!("/proc/{pid}/statm");
-        let text = std::fs::read_to_string(&path).ok()?;
-        // statm: size resident shared text lib data dt — all in pages.
-        let mut tokens = text.split_whitespace();
-        tokens.next()?; // size
-        let resident_pages: u64 = tokens.next()?.parse().ok()?;
-        // Page size: assume 4096 unless overridden via env (testing).
-        let page_kib = page_size_kib();
-        Some(resident_pages * page_kib)
+        sample_rss_kib_linux(pid)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        // KR-5: per-platform sampling is implementer's responsibility.
-        // The ceiling check is disabled on platforms without a verified
-        // live-RSS API. The OS OOMkiller still backstops; a runaway
-        // worker surfaces as WORKER_CRASHED rather than MEMORY_EXHAUSTED.
-        // Documented in the worker module's preamble.
+        sample_rss_kib_macos(pid)
+    }
+    #[cfg(windows)]
+    {
+        sample_rss_kib_windows(pid)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        // Other Unixes (FreeBSD, NetBSD, OpenBSD, Solaris, etc.) —
+        // still unsupported. The OS OOMkiller backstops; runaway worker
+        // surfaces as WORKER_CRASHED, not MEMORY_EXHAUSTED.
         let _ = pid;
         None
     }
+}
+
+#[cfg(target_os = "linux")]
+fn sample_rss_kib_linux(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{pid}/statm");
+    let text = std::fs::read_to_string(&path).ok()?;
+    // statm: size resident shared text lib data dt — all in pages.
+    let mut tokens = text.split_whitespace();
+    tokens.next()?; // size
+    let resident_pages: u64 = tokens.next()?.parse().ok()?;
+    // Page size: assume 4096 unless overridden via env (testing).
+    let page_kib = page_size_kib();
+    Some(resident_pages * page_kib)
 }
 
 #[cfg(target_os = "linux")]
@@ -1184,6 +1198,85 @@ fn page_size_kib() -> u64 {
     // falling back to 4 if anything goes wrong.
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     if raw <= 0 { 4 } else { (raw as u64) / 1024 }
+}
+
+#[cfg(target_os = "macos")]
+fn sample_rss_kib_macos(pid: u32) -> Option<u64> {
+    use std::mem::{MaybeUninit, size_of};
+    let mut info: MaybeUninit<libc::proc_taskinfo> = MaybeUninit::zeroed();
+    let size = size_of::<libc::proc_taskinfo>() as i32;
+    // SAFETY: libc::proc_pidinfo writes into info; size matches the buffer.
+    // On success returns the number of bytes written (== size); on failure
+    // returns -1 with errno set. We treat anything other than `size` as
+    // unsamplable and return None.
+    let rc = unsafe {
+        libc::proc_pidinfo(
+            pid as i32,
+            libc::PROC_PIDTASKINFO,
+            0,
+            info.as_mut_ptr().cast(),
+            size,
+        )
+    };
+    if rc != size {
+        return None;
+    }
+    // SAFETY: rc == size implies proc_pidinfo fully populated the buffer.
+    let info = unsafe { info.assume_init() };
+    Some(info.pti_resident_size / 1024)
+}
+
+#[cfg(windows)]
+fn sample_rss_kib_windows(pid: u32) -> Option<u64> {
+    use std::mem::{MaybeUninit, size_of};
+    use windows_sys::Win32::Foundation::{CloseHandle, FALSE};
+    use windows_sys::Win32::System::ProcessStatus::{
+        GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+    // SAFETY: pid is u32 (PID type on Windows is DWORD); OpenProcess
+    // returns a null handle on failure for this access mask, which we
+    // check below. `windows-sys` 0.59 types `HANDLE` as a raw pointer
+    // (`*mut c_void`), not an integer, so we must use `.is_null()`
+    // rather than integer comparisons; same pattern as Spec B's
+    // `src/lock.rs` (which uses `as _` casts for the FFI).
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) };
+    if handle.is_null() {
+        return None;
+    }
+
+    // `cb` MUST be set to the struct size BEFORE GetProcessMemoryInfo
+    // per the Microsoft documented contract. Zero-initializing the
+    // buffer leaves `cb = 0`, which the kernel uses as a version /
+    // size discriminator and rejects with FALSE — silently disabling
+    // RSS sampling on Windows if we forget. Initialize the field
+    // explicitly.
+    let mut counters: MaybeUninit<PROCESS_MEMORY_COUNTERS> = MaybeUninit::zeroed();
+    let size = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: `counters.as_mut_ptr()` is a valid pointer to a
+    // zero-initialized buffer of exactly `PROCESS_MEMORY_COUNTERS` size;
+    // writing the primitive `u32` `cb` field is sound.
+    unsafe {
+        std::ptr::addr_of_mut!((*counters.as_mut_ptr()).cb).write(size);
+    }
+
+    // SAFETY: handle is non-null and obtained from OpenProcess above;
+    // counters is sized correctly and has its `cb` field set; size
+    // matches the struct.
+    let rc = unsafe { GetProcessMemoryInfo(handle, counters.as_mut_ptr(), size) };
+    // SAFETY: handle is non-null and owned by us; CloseHandle returns
+    // non-zero on success. Return value intentionally ignored — the
+    // sample succeeded or failed already, and this is a cleanup path
+    // with no error-propagation lane.
+    let _ = unsafe { CloseHandle(handle) };
+
+    if rc == 0 {
+        return None;
+    }
+    // SAFETY: rc != 0 implies GetProcessMemoryInfo fully populated the buffer.
+    let counters = unsafe { counters.assume_init() };
+    Some((counters.WorkingSetSize as u64) / 1024)
 }
 
 #[cfg(test)]
@@ -1489,13 +1582,30 @@ plain text line
         assert_eq!(n, "tests_lihaaf_compile_fail_foo.rs");
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn sample_rss_returns_some_for_self() {
+        // Every supported platform — Linux, macOS, Windows — must return
+        // Some(kib) for our own PID. Previously this test was Linux-only
+        // (returning None on other platforms tripped the implicit
+        // "harness ceiling check disabled" path); KR-5 / FIX_BEFORE_BETA
+        // Spec C closes the gap.
         let pid = std::process::id();
         let kib = sample_rss_kib(pid);
-        assert!(kib.is_some(), "self RSS must be readable on Linux");
-        assert!(kib.unwrap() > 0);
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        {
+            let rss = kib.expect("expected Some(rss) on supported platforms (Linux/macOS/Windows)");
+            assert!(rss > 0, "self RSS must be > 0; got {rss}");
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        assert!(kib.is_none(), "unsupported platforms still return None");
+    }
+
+    #[test]
+    fn sample_rss_returns_none_for_invalid_pid() {
+        // u32::MAX is virtually guaranteed to be a non-existent PID on
+        // every supported platform. The sampler must return None rather
+        // than panicking, returning 0, or surfacing an error.
+        assert_eq!(sample_rss_kib(u32::MAX), None);
     }
 
     /// Regression test for issue #14.
