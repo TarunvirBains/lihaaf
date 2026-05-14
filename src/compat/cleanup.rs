@@ -167,12 +167,15 @@ struct CleanupTracker {
 ///
 /// ## Once-only semantics
 ///
-/// Cleanup runs at most once per guard. `finalize` and Drop both go
-/// through a private `run_cleanup_once` helper, which checks an
-/// [`AtomicBool`] before doing any filesystem work. A double-cleanup
-/// is harmless (it is a no-op), but the atomic also lets the Drop
-/// path skip the [`Mutex`] lock entirely when `finalize` has already
-/// consumed the guard.
+/// Cleanup runs at most once per guard. Both [`Self::finalize`] and
+/// the Drop impl swap a shared [`AtomicBool`] before touching the
+/// tracker state, so the second call is a no-op. `finalize` is the
+/// explicit, well-known path and reports filesystem errors via
+/// `Result`; Drop is the panic / early-return safety net and
+/// best-effort-swallows filesystem errors so an unwinding panic is
+/// never masked by a secondary cleanup error. The two paths share the
+/// private `classify_entry` helper but otherwise differ in mutex
+/// acquisition (Drop uses `try_lock`) and error handling.
 ///
 /// ## Thread safety
 ///
