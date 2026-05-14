@@ -974,15 +974,9 @@ mod tests {
     #[test]
     fn derive_crate_root_returns_parent_of_absolute_manifest() {
         #[cfg(unix)]
-        {
-            let root = derive_crate_root(&PathBuf::from("/abs/pkg/Cargo.toml"));
-            assert_eq!(root, PathBuf::from("/abs/pkg"));
-        }
+        assert_derive_crate_root_equals("/abs/pkg/Cargo.toml", "/abs/pkg");
         #[cfg(windows)]
-        {
-            let root = derive_crate_root(&PathBuf::from(r"C:\abs\pkg\Cargo.toml"));
-            assert_eq!(root, PathBuf::from(r"C:\abs\pkg"));
-        }
+        assert_derive_crate_root_equals(r"C:\abs\pkg\Cargo.toml", r"C:\abs\pkg");
     }
 
     /// Multi-component relative paths already had a non-empty
