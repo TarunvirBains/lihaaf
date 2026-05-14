@@ -427,7 +427,7 @@ fn canonical_test_name(s: &str) -> String {
 /// not the individual fixture path. Phase 6's discovery output maps
 /// `(call_site, fixture_path)` pairs; the parser here uses an
 /// **exact match** against the canonical form of `repo_relative_path`.
-/// Both sides are run through [`canonical_test_name`] before
+/// Both sides are run through `canonical_test_name` before
 /// comparison: `::` is folded to `/`, trailing `.rs` is stripped, and
 /// path separators are forward-slashed. This accepts every libtest
 /// test-name shape (`tests/ui/foo`, `tests/ui/foo.rs`,
