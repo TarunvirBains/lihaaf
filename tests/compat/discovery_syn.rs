@@ -724,6 +724,103 @@ fn ui() {\n\
     assert_eq!(out.fixtures[0].kind, CompatFixtureKind::Pass);
 }
 
+/// **Local bindings inside `impl` methods are recognized AND scoped.**
+/// The visitor must descend into `impl Foo { fn t() { ... } }` bodies
+/// (otherwise pattern 3 inside an impl method would be invisible) AND
+/// must save/restore `local_bindings` across the impl method boundary
+/// so a `let t = TestCases::new()` inside the method does not leak
+/// into the enclosing scope or vice-versa.
+///
+/// The corpus exercises a `Foo` struct with a `#[test]` impl method
+/// containing the pattern-3 shape; the fixture must be recognized.
+#[test]
+fn impl_method_local_bindings_are_scoped_and_recognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+struct Harness;\n\
+\n\
+impl Harness {\n\
+    #[test]\n\
+    fn ui() {\n\
+        let t = trybuild::TestCases::new();\n\
+        t.pass(\"tests/ui/foo.rs\");\n\
+    }\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture from the impl-method pattern-3 shape; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    let f = &out.fixtures[0];
+    assert_eq!(f.kind, CompatFixtureKind::Pass);
+    assert!(f.relative_path.ends_with("tests/ui/foo.rs"));
+    assert_eq!(
+        f.call_site.enclosing_test_fn.as_deref(),
+        Some("ui"),
+        "the call lived inside the impl method `#[test] fn ui()`"
+    );
+}
+
+/// **`impl` method bindings do not leak into sibling impl methods.**
+/// A `let t = TestCases::new()` in one impl method must not be in
+/// scope for `t.compile_fail(...)` in a sibling method (the second
+/// method binds `t` to a different value — a plain integer here —
+/// and the visitor must not attribute the call to a trybuild
+/// fixture). Mirrors `cross_function_binding_does_not_leak` for the
+/// impl-method scope.
+#[test]
+fn impl_method_bindings_do_not_leak_across_methods() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("first.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+struct Harness;\n\
+\n\
+impl Harness {\n\
+    #[test]\n\
+    fn first() {\n\
+        let t = trybuild::TestCases::new();\n\
+        t.compile_fail(\"tests/ui/first.rs\");\n\
+    }\n\
+\n\
+    #[test]\n\
+    fn second() {\n\
+        // Different `t` — must NOT inherit the trybuild binding\n\
+        // from `first()`.\n\
+        let t = 42;\n\
+        let _ = t;\n\
+    }\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture from `first`; the `second`'s `let t = 42` must not match. got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(out.fixtures[0].relative_path.ends_with("tests/ui/first.rs"));
+}
+
 /// **Cross-function bindings do NOT leak.** A `let t = TestCases::new();`
 /// in one `#[test]` function must NOT be in scope for a subsequent
 /// `t.compile_fail(...)` in a different function body.

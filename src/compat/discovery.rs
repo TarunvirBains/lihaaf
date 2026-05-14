@@ -618,6 +618,28 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         syn::visit::visit_expr_method_call(self, node);
     }
 
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        // Methods inside `impl Foo { fn bar() { ... } }` get walked
+        // via syn's default visitor when this override is absent — and
+        // the default visitor does NOT scope `local_bindings`, so a
+        // `let t = TestCases::new();` inside an impl method would leak
+        // into the enclosing scope's bindings table (or vice-versa).
+        // Mirror the save/restore pattern from `visit_item_fn` so each
+        // impl method gets its own fresh bindings scope; `#[test]` on
+        // impl methods is exceedingly rare but supported uniformly
+        // (the same `is_test_attribute` filter applies).
+        let saved_enclosing = self.enclosing_test_fn.take();
+        let saved_bindings = std::mem::take(&mut self.local_bindings);
+
+        if is_test_attribute(&node.attrs) {
+            self.enclosing_test_fn = Some(node.sig.ident.to_string());
+        }
+        syn::visit::visit_impl_item_fn(self, node);
+
+        self.enclosing_test_fn = saved_enclosing;
+        self.local_bindings = saved_bindings;
+    }
+
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
         // §3.2.1: macro-generated invocations like `make_tests!();` at
         // module level surface as a single `discovery_unrecognized`
