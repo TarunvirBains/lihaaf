@@ -216,6 +216,43 @@ version = "0.1.0"
 }
 
 #[test]
+fn multiline_string_hash_is_not_a_comment() {
+    // Regression bite for the §3.3 envelope's `overlay.dropped_comments`
+    // inventory. A `#` byte that lives inside a TOML triple-quoted
+    // string is content, not a comment marker — the scanner must walk
+    // string state across line boundaries to honor that.
+    let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+description = """
+line with #notacomment
+and another #alsonot
+"""
+
+[dependencies]
+# real comment
+serde = "1"
+"#;
+    let (_tmp, upstream) = write_upstream(input);
+    let plan = materialize_overlay(&upstream).expect("overlay must succeed");
+    // The only dropped comment from this input is the line that reads
+    // `# real comment`. The `#notacomment` and `#alsonot` lines live
+    // inside a multi-line basic string and must NOT be in the inventory.
+    assert!(
+        plan.dropped_comments
+            .iter()
+            .all(|c| !c.contains("notacomment") && !c.contains("alsonot")),
+        "multi-line string bodies must not surface as comments; got {:?}",
+        plan.dropped_comments
+    );
+    assert!(
+        plan.dropped_comments.iter().any(|c| c == "real comment"),
+        "the genuine comment line must still be captured; got {:?}",
+        plan.dropped_comments
+    );
+}
+
+#[test]
 fn comments_stripped_and_recorded() {
     let input = r#"# header comment
 [package]

@@ -83,9 +83,12 @@ pub struct OverlayPlan {
     pub upstream_already_has_dylib: bool,
     /// Comment text dropped during canonicalization. The `toml` crate's
     /// `Value` model drops comments on parse, so the overlay code
-    /// recovers them from the raw upstream bytes with a tiny
-    /// line-by-line scanner (no regex per spec §6.1) and stashes them
-    /// here for the §3.3 envelope's `overlay.dropped_comments` field.
+    /// recovers them from the raw upstream bytes with a small
+    /// state-machine scanner (no regex per spec §6.1) that tracks all
+    /// four TOML string forms — basic, literal, multi-line basic, and
+    /// multi-line literal — so a `#` inside any string is not surfaced
+    /// here. Entries are stashed for the §3.3 envelope's
+    /// `overlay.dropped_comments` field.
     ///
     /// Each entry is the raw comment text WITHOUT the leading `#` and
     /// WITHOUT surrounding whitespace, so the envelope can render the
@@ -418,50 +421,150 @@ fn post_process_output(input: &str) -> String {
 /// out, both line-leading (`# foo`) and trailing (`name = "x" # foo`).
 ///
 /// **Why this is fixed-string, not regex:** spec §6.1 forbids a regex
-/// engine in this crate. The scan is line-by-line, splitting on the
-/// first unquoted `#` per line. Single and double quotes both protect
-/// `#` chars from being treated as comment markers.
+/// engine in this crate. The scanner is a single byte-stream walk that
+/// tracks four kinds of string state — basic (`"..."`), literal
+/// (`'...'`), multi-line basic (`"""..."""`), and multi-line literal
+/// (`'''...'''`) — so a `#` inside any TOML string form is never
+/// recorded as a comment. The multi-line forms are line-spanning, so
+/// the walker explicitly cannot be a line-by-line split: a `#` inside
+/// `"""..."""` on a continuation line must still be treated as content.
 fn scan_dropped_comments(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    for line in text.lines() {
-        if let Some(comment) = extract_unquoted_comment(line) {
-            out.push(comment);
+    let bytes = text.as_bytes();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    // Mutually exclusive: at most one of these is `true` at any time.
+    let mut in_basic = false;
+    let mut in_literal = false;
+    let mut in_multi_basic = false;
+    let mut in_multi_literal = false;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+
+        // Inside a multi-line basic string (`"""..."""`). Honors `\`
+        // escapes per TOML basic-string rules; the close is the first
+        // un-escaped `"""`.
+        if in_multi_basic {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' && i + 2 < bytes.len() && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_multi_basic = false;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
         }
+
+        // Inside a multi-line literal string (`'''...'''`). No escapes;
+        // the close is the first `'''`.
+        if in_multi_literal {
+            if b == b'\'' && i + 2 < bytes.len() && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_multi_literal = false;
+                i += 3;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Inside a single-line basic string. Honors `\` escapes; newline
+        // closes the scope defensively (TOML forbids unescaped newlines
+        // in basic strings, but a malformed input must not strand the
+        // scanner in the wrong mode).
+        if in_basic {
+            if b == b'\\' && i + 1 < bytes.len() {
+                i += 2;
+                continue;
+            }
+            if b == b'"' {
+                in_basic = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\n' {
+                in_basic = false;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Inside a single-line literal string. No escapes; newline
+        // closes defensively (same reasoning as basic strings).
+        if in_literal {
+            if b == b'\'' {
+                in_literal = false;
+                i += 1;
+                continue;
+            }
+            if b == b'\n' {
+                in_literal = false;
+                i += 1;
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Out of any string. Three openers and one comment marker to
+        // recognize, plus newline as the boundary that lets `extract`
+        // capture per-line comment bodies.
+        if b == b'#' {
+            let start = i + 1;
+            let mut end = start;
+            while end < bytes.len() && bytes[end] != b'\n' {
+                end += 1;
+            }
+            // `start..end` is ASCII-safe inside the slice because we
+            // only consumed `#` (a single ASCII byte) and stopped at
+            // either end-of-input or `\n` (another single ASCII byte);
+            // we never split a multibyte UTF-8 codepoint. `text` is
+            // valid UTF-8, so the slice is too.
+            let body = &text[start..end];
+            out.push(body.trim().to_string());
+            i = end;
+            continue;
+        }
+
+        if b == b'"' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'"' && bytes[i + 2] == b'"' {
+                in_multi_basic = true;
+                i += 3;
+                continue;
+            }
+            in_basic = true;
+            i += 1;
+            continue;
+        }
+
+        if b == b'\'' {
+            if i + 2 < bytes.len() && bytes[i + 1] == b'\'' && bytes[i + 2] == b'\'' {
+                in_multi_literal = true;
+                i += 3;
+                continue;
+            }
+            in_literal = true;
+            i += 1;
+            continue;
+        }
+
+        i += 1;
     }
+
     out
 }
 
-/// Return the trimmed comment body (without the leading `#`) when the
-/// line contains an unquoted `#`. Returns `None` when the `#` lives
-/// inside a TOML string literal.
+/// Single-line variant kept for the unit tests that exercise the
+/// per-line classification logic. Real scanning goes through
+/// [`scan_dropped_comments`] which handles multi-line strings.
+#[cfg(test)]
 fn extract_unquoted_comment(line: &str) -> Option<String> {
-    let bytes = line.as_bytes();
-    let mut i = 0;
-    let mut in_single = false;
-    let mut in_double = false;
-    while i < bytes.len() {
-        let b = bytes[i];
-        if !in_single && !in_double && b == b'#' {
-            // Found the comment start. Strip leading `#` and whitespace,
-            // then return the body. Empty bodies are still recorded so
-            // the envelope sees a faithful count of dropped lines.
-            let body = &line[i + 1..];
-            let trimmed = body.trim();
-            return Some(trimmed.to_string());
-        }
-        match b {
-            b'"' if !in_single => in_double = !in_double,
-            b'\'' if !in_double => in_single = !in_single,
-            b'\\' if in_double => {
-                // Skip escaped char inside a double-quoted string so
-                // `"foo\""` does not toggle the quote state spuriously.
-                i = i.saturating_add(1);
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    None
+    let comments = scan_dropped_comments(line);
+    comments.into_iter().next()
 }
 
 /// Human-readable name for a [`toml::Value`] variant. Used in error
@@ -596,6 +699,59 @@ mod tests {
     #[test]
     fn extract_unquoted_comment_ignores_hash_inside_single_quote() {
         assert_eq!(extract_unquoted_comment(r#"name = 'foo#bar'"#), None);
+    }
+
+    #[test]
+    fn scan_ignores_hash_inside_multiline_basic_string() {
+        let text = "description = \"\"\"\nline with #notacomment\n\"\"\"\n";
+        let comments = scan_dropped_comments(text);
+        assert!(
+            comments.iter().all(|c| !c.contains("notacomment")),
+            "multi-line basic string body must not be classified as a comment; got {comments:?}",
+        );
+    }
+
+    #[test]
+    fn scan_ignores_hash_inside_multiline_literal_string() {
+        let text = "description = '''\nline with #stillnotacomment\n'''\n";
+        let comments = scan_dropped_comments(text);
+        assert!(
+            comments.iter().all(|c| !c.contains("stillnotacomment")),
+            "multi-line literal string body must not be classified as a comment; got {comments:?}",
+        );
+    }
+
+    #[test]
+    fn scan_recognizes_comment_after_multiline_string_closes() {
+        // A trailing `#real comment` after the closing `"""` must still
+        // surface — the close pop is load-bearing.
+        let text = "description = \"\"\"\nblock\n\"\"\" # real comment\n";
+        let comments = scan_dropped_comments(text);
+        assert!(
+            comments.iter().any(|c| c == "real comment"),
+            "comment AFTER the multi-line string close must be captured; got {comments:?}",
+        );
+        assert!(
+            comments.iter().all(|c| !c.contains("block")),
+            "multi-line body must never appear as a comment; got {comments:?}",
+        );
+    }
+
+    #[test]
+    fn scan_basic_string_escape_does_not_strand_state() {
+        // `"foo \" bar"` is a single basic string; the escaped `"` must
+        // not flip the in-string flag off and let a subsequent `#` leak
+        // as a comment.
+        let text = "name = \"foo \\\" #notacomment\"\n# real\n";
+        let comments = scan_dropped_comments(text);
+        assert!(
+            !comments.iter().any(|c| c.contains("notacomment")),
+            "escaped quote inside basic string must keep scanner in-string; got {comments:?}",
+        );
+        assert!(
+            comments.iter().any(|c| c == "real"),
+            "comment on the following line must still be captured; got {comments:?}",
+        );
     }
 
     #[test]
