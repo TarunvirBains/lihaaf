@@ -48,6 +48,24 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   multi-suite invariant without needing a downstream adopter.
 
 ### Changed
+- New CI gate: `tests/integration_corpus/`, a real-adopter-shaped
+  integration corpus that exercises each lihaaf verdict class
+  (`OK`, `SNAPSHOT_DIFF` with `LARGE_SNAPSHOT` warning,
+  `SNAPSHOT_MISSING`, `TIMEOUT`, `MEMORY_EXHAUSTED`) end-to-end against
+  a real proc-macro crate (FIX_BEFORE_BETA Spec D). The corpus uses a
+  two-crate `serde + serde_derive` layout — a regular library
+  (`integration_corpus`, which lihaaf builds as the `dylib_crate`)
+  plus a sibling proc-macro crate (`integration_corpus_macros`,
+  resolved out of the dylib's deps dir as an extra `--extern`). The
+  proc-macro crate cannot itself be `dylib_crate` because cargo
+  rejects `[lib] proc-macro = true` with `--crate-type=dylib`. The
+  corpus is `publish = false` and is excluded from lihaaf's own
+  package via the new root `[package].exclude` entry. CI runs the
+  corpus after the existing self-test step and asserts each verdict
+  label fires via four `grep -q` gates against the captured lihaaf
+  output — any regression that renames or drops one of those labels
+  (or the `LARGE_SNAPSHOT` warning) flips CI red here even if the
+  rest of lihaaf still builds clean.
 - Narrowed the public Rust library surface to a documented CLI-shape.
   The following modules — previously `pub mod` — are now `pub(crate)`:
   `diff`, `discovery`, `dylib`, `error`, `freshness`, `manifest`,

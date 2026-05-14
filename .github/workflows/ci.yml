@@ -75,6 +75,60 @@ jobs:
         # independent suites.
         run: cargo run --release --bin cargo-lihaaf -- lihaaf
 
+      - name: Self-test corpus (integration_corpus)
+        # FIX_BEFORE_BETA Spec D: a real-adopter-shaped integration
+        # corpus that exercises lihaaf's negative-path verdict classes
+        # in CI. The corpus lives under `tests/integration_corpus/`
+        # (excluded from lihaaf's own package via `[package].exclude`
+        # in the root Cargo.toml) and uses a two-crate layout — a
+        # regular library `integration_corpus` (which lihaaf builds as
+        # the dylib_crate) plus a sibling `integration_corpus_macros`
+        # proc-macro crate (which lihaaf cannot build as a dylib;
+        # cargo rejects `[lib] proc-macro = true` with
+        # `--crate-type=dylib`). The macros are re-exported through
+        # the parent crate so fixtures use a single
+        # `use integration_corpus::*;` shape (the serde/serde_derive
+        # layout).
+        #
+        # The six fixtures cover one verdict class each:
+        # - uses_corpus_noop.rs       → OK (no-op macro + const)
+        # - corpus_error_basic.rs     → OK (snapshot match)
+        # - large_snapshot.rs         → SNAPSHOT_DIFF + LARGE_SNAPSHOT
+        #                                warning (>10K-line diagnostic
+        #                                with one mutated snapshot line)
+        # - missing_snapshot.rs       → SNAPSHOT_MISSING (no .stderr)
+        # - intentional_timeout.rs    → TIMEOUT (macro sleeps forever)
+        # - intentional_oom.rs        → MEMORY_EXHAUSTED (paced 16 MiB
+        #                                writes against a 128 MiB cap)
+        #
+        # The grep gates anchor on the verdict labels in
+        # `src/verdict.rs::Verdict::label` and on the warning line
+        # emitted in `src/session.rs::emit_fixture_warnings`. Any
+        # regression that drops one of those labels — e.g. renaming
+        # `MEMORY_EXHAUSTED` to `OOM`, dropping the LARGE_SNAPSHOT
+        # warning emit, or short-circuiting the snapshot-missing path
+        # — flips CI red here, even if the rest of lihaaf still builds
+        # and the self-test suite still passes.
+        #
+        # `|| true` after `tee` ensures the verdict-bearing lihaaf
+        # invocation does not fail the step (lihaaf exits non-zero
+        # whenever fixtures don't all pass — by design, this corpus
+        # has four deliberate failures); the six `grep -q` calls are
+        # the real assertion: four negative-verdict labels, the
+        # LARGE_SNAPSHOT warning, and the aggregate summary line.
+        run: |
+          cargo run --release --bin cargo-lihaaf -- lihaaf \
+            --manifest-path tests/integration_corpus/Cargo.toml \
+            --quiet 2>&1 | tee /tmp/corpus.log || true
+          grep -q SNAPSHOT_MISSING /tmp/corpus.log
+          grep -q TIMEOUT /tmp/corpus.log
+          grep -q MEMORY_EXHAUSTED /tmp/corpus.log
+          grep -q LARGE_SNAPSHOT /tmp/corpus.log
+          grep -q SNAPSHOT_DIFF /tmp/corpus.log
+          grep -qE 'lihaaf: 2 ok, 2 failed, 1 timeout, 1 memory_exhausted' /tmp/corpus.log
+        env:
+          CARGO_TERM_COLOR: always
+
   docs:
     name: cargo doc
     runs-on: ubuntu-latest
