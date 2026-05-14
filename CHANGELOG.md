@@ -6,6 +6,39 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.3] — 2026-05-14
+
+Follow-up simplification pass closing the three deferred Codex SIBLING
+findings from the v0.1.0-beta.2 adversarial review. No adopter-visible
+behavior change — diagnostic text, public API surface, exit codes,
+snapshot byte format, and `[package.metadata.lihaaf]` schema are
+unchanged from v0.1.0-beta.2.
+
+### Changed
+- **Test consolidation (config):** Sixteen invalid-TOML tests in
+  `src/config.rs::tests` now share an
+  `assert_parse_rejects_with(toml, &[expected_substrings])` helper.
+- **Test consolidation (normalize):** Eleven text-handling tests in
+  `src/normalize.rs::tests` now share an
+  `assert_normalizes(input, expected)` helper that uses the standard
+  `/p` workspace + `/r` sysroot + `/p/x` fixture-directory triplet.
+  Path-rewriting tests with custom context and long-type-note tests
+  with multi-`contains` assertions retain their original setup.
+- **Test consolidation (session):** All four `derive_crate_root_*`
+  tests in `src/session.rs::tests` now share an
+  `assert_derive_crate_root_equals(input, expected)` helper that
+  also asserts the issue-14 empty-path invariant. Previously only
+  two of the four tests carried the explicit guard; the helper
+  uniformizes the family.
+
+### Internal
+- Codex's beta-2 round-2 adversarial review surfaced three
+  informational SIBLING findings (config / normalize / session test
+  parameterization opportunities). All three are now addressed
+  across four atomic commits.
+- Adversarial review for beta-3: Codex + Gemini 3.1-pro-preview +
+  Sonnet-tier strict reviewer, all ALLOW on round 1.
+
 ## [0.1.0-beta.2] — 2026-05-13
 
 Retro simplification pass against the v0.1.0-beta.1 surface. No

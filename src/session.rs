@@ -929,6 +929,24 @@ mod tests {
         assert_eq!(agg.memory_exhausted, 1);
     }
 
+    /// Run `derive_crate_root` against `input` and assert:
+    /// 1. The returned path equals `PathBuf::from(expected)`.
+    /// 2. The returned path is NEVER the empty path — this pins the
+    ///    issue #14 / xhigh PR-15 invariant: a bare `Cargo.toml` (single
+    ///    segment) has `parent() == Some("")`, so the original
+    ///    `.unwrap_or_else(|| ".".into())` fallback was bypassed and
+    ///    `CARGO_MANIFEST_DIR=""` propagated to the per-fixture rustc.
+    ///    `derive_crate_root` keeps the invariant intact even when callers
+    ///    skip the absolutize step.
+    fn assert_derive_crate_root_equals(input: &str, expected: &str) {
+        let root = derive_crate_root(&PathBuf::from(input));
+        assert_eq!(root, PathBuf::from(expected));
+        assert!(
+            !root.as_os_str().is_empty(),
+            "crate root must never be the empty path (issue #14 / xhigh PR-15 review)"
+        );
+    }
+
     /// Regression for the issue-14 follow-up (gpt-5.5 xhigh PR-15 review):
     /// the single-component-relative manifest path
     /// `PathBuf::from("Cargo.toml")` must not yield an empty
@@ -940,12 +958,7 @@ mod tests {
     /// skip the absolutize step.
     #[test]
     fn derive_crate_root_handles_bare_cargo_toml() {
-        let root = derive_crate_root(&PathBuf::from("Cargo.toml"));
-        assert_eq!(root, PathBuf::from("."));
-        assert!(
-            !root.as_os_str().is_empty(),
-            "crate root must never be the empty path (issue #14 / xhigh PR-15 review)"
-        );
+        assert_derive_crate_root_equals("Cargo.toml", ".");
     }
 
     /// A `parent()` of `None` (the original assumed case) must also
@@ -953,9 +966,7 @@ mod tests {
     /// produces this shape.
     #[test]
     fn derive_crate_root_falls_back_for_parentless_input() {
-        let root = derive_crate_root(&PathBuf::new());
-        assert_eq!(root, PathBuf::from("."));
-        assert!(!root.as_os_str().is_empty());
+        assert_derive_crate_root_equals("", ".");
     }
 
     /// Absolute manifest paths produce absolute crate roots — the
@@ -963,15 +974,9 @@ mod tests {
     #[test]
     fn derive_crate_root_returns_parent_of_absolute_manifest() {
         #[cfg(unix)]
-        {
-            let root = derive_crate_root(&PathBuf::from("/abs/pkg/Cargo.toml"));
-            assert_eq!(root, PathBuf::from("/abs/pkg"));
-        }
+        assert_derive_crate_root_equals("/abs/pkg/Cargo.toml", "/abs/pkg");
         #[cfg(windows)]
-        {
-            let root = derive_crate_root(&PathBuf::from(r"C:\abs\pkg\Cargo.toml"));
-            assert_eq!(root, PathBuf::from(r"C:\abs\pkg"));
-        }
+        assert_derive_crate_root_equals(r"C:\abs\pkg\Cargo.toml", r"C:\abs\pkg");
     }
 
     /// Multi-component relative paths already had a non-empty
@@ -979,8 +984,7 @@ mod tests {
     /// refactor cannot regress them either.
     #[test]
     fn derive_crate_root_returns_parent_of_relative_workspace_member() {
-        let root = derive_crate_root(&PathBuf::from("member/Cargo.toml"));
-        assert_eq!(root, PathBuf::from("member"));
+        assert_derive_crate_root_equals("member/Cargo.toml", "member");
     }
 
     /// `resolve_manifest_path` must absolutize a relative
