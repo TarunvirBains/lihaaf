@@ -696,7 +696,7 @@ fn compute_parallelism(cli: &Cli, suite: &Suite) -> usize {
     };
     // `cli.jobs` is guaranteed positive: the clap value parser rejects
     // `-j 0` per the policy. The platform-derived `cpu_cap` and `ram_cap`
-    // both clamp to >= 1 above. No defensive `max(1)` here — the
+    // both clamp to >= 1 above. No defensive `max(1)` here — policy
     // forbids the silent-zero coercion.
     let cli_cap: usize = cli.jobs.map(|n| n as usize).unwrap_or(cpu_cap);
     cli_cap.min(ram_cap)
@@ -805,11 +805,6 @@ fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
             serde_json::Value::Object(map)
         }
     }
-}
-
-#[allow(dead_code)]
-fn _ensure_dir_exists(p: &Path) -> Result<(), Error> {
-    std::fs::create_dir_all(p).map_err(|e| Error::io(e, "creating dir", Some(p.to_path_buf())))
 }
 
 #[cfg(test)]

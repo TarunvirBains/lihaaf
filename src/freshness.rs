@@ -112,6 +112,11 @@ pub enum FreshnessFailure {
     /// than the one-shot pre-dispatch check. Any of `release_line`,
     /// `host`, `commit_hash`, or `sysroot` may differ — the rendered
     /// detail names which dimension(s) drifted.
+    ///
+    /// `original` and `observed` are boxed to keep the `FreshnessFailure`
+    /// enum (and the `Result<(), FreshnessFailure>` consumed across the
+    /// per-dispatch hot path) small per clippy's `result_large_err` lint.
+    /// Unboxing here re-trips the lint.
     RustcDrift {
         /// Full toolchain captured at session startup.
         original: Box<toolchain::Toolchain>,
