@@ -757,29 +757,24 @@ pub fn run_baseline_with_recognized_fixtures(
     })
 }
 
-/// Serialize the v1 sidecar JSON and write it atomically. Used by
-/// the Phase 3 entry point [`run_baseline`]; the Phase 4 entry point
-/// calls [`write_sidecar_v2`] instead.
+/// Build the v1-shaped envelope keys: `schema_version`, `argv`,
+/// `exit_code`, `stdout`, `stderr`, in that insertion order. The v2
+/// writer appends additional keys on top of this base.
 ///
-/// Split out from [`run_baseline`] for testability — the inline unit
-/// test in this module exercises the serializer shape without
-/// spawning a child.
-fn write_sidecar(
-    sidecar_path: &Path,
+/// Insertion order is preserved by the `preserve_order` feature on
+/// `serde_json` (enabled at the crate level), so adopters reading the
+/// file with `jq` see a stable shape across runs.
+fn build_v1_envelope(
+    schema_version: u32,
     argv: &[String],
     exit_code: i32,
     stdout: &str,
     stderr: &str,
-) -> Result<(), Error> {
-    // Use `serde_json::Map` with `preserve_order` (enabled at the
-    // crate level via the `preserve_order` feature on `serde_json`) so
-    // the emitted JSON keeps the order this code inserts them in.
-    // Adopters reading the file with `jq` see a stable shape across
-    // runs.
+) -> serde_json::Map<String, serde_json::Value> {
     let mut envelope = serde_json::Map::new();
     envelope.insert(
         "schema_version".to_string(),
-        serde_json::Value::from(SIDECAR_SCHEMA_VERSION_V1),
+        serde_json::Value::from(schema_version),
     );
     envelope.insert(
         "argv".to_string(),
@@ -798,6 +793,24 @@ fn write_sidecar(
         "stderr".to_string(),
         serde_json::Value::String(stderr.to_string()),
     );
+    envelope
+}
+
+/// Serialize the v1 sidecar JSON and write it atomically. Used by
+/// the Phase 3 entry point [`run_baseline`]; the Phase 4 entry point
+/// calls [`write_sidecar_v2`] instead.
+///
+/// Split out from [`run_baseline`] for testability — the inline unit
+/// test in this module exercises the serializer shape without
+/// spawning a child.
+fn write_sidecar(
+    sidecar_path: &Path,
+    argv: &[String],
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+) -> Result<(), Error> {
+    let envelope = build_v1_envelope(SIDECAR_SCHEMA_VERSION_V1, argv, exit_code, stdout, stderr);
 
     let mut bytes =
         serde_json::to_vec_pretty(&serde_json::Value::Object(envelope)).map_err(|e| {
@@ -829,28 +842,8 @@ fn write_sidecar_v2(
     stderr: &str,
     parsed: &ParsedBaseline,
 ) -> Result<(), Error> {
-    let mut envelope = serde_json::Map::new();
-    envelope.insert(
-        "schema_version".to_string(),
-        serde_json::Value::from(SIDECAR_SCHEMA_VERSION_V2),
-    );
-    envelope.insert(
-        "argv".to_string(),
-        serde_json::Value::Array(
-            argv.iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        ),
-    );
-    envelope.insert("exit_code".to_string(), serde_json::Value::from(exit_code));
-    envelope.insert(
-        "stdout".to_string(),
-        serde_json::Value::String(stdout.to_string()),
-    );
-    envelope.insert(
-        "stderr".to_string(),
-        serde_json::Value::String(stderr.to_string()),
-    );
+    let mut envelope =
+        build_v1_envelope(SIDECAR_SCHEMA_VERSION_V2, argv, exit_code, stdout, stderr);
     envelope.insert(
         "pass".to_string(),
         match parsed.pass {
