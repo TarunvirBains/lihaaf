@@ -6,6 +6,57 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.2] — 2026-05-13
+
+Retro simplification pass against the v0.1.0-beta.1 surface. No
+behavior change visible to adopters. Internal cleanup only — diagnostic
+text, public API surface, exit codes, snapshot byte format, and
+`[package.metadata.lihaaf]` schema are unchanged from v0.1.0-beta.1.
+
+### Changed
+- **Test consolidation:** Four freshness drift tests (`release_line`,
+  `host`, `commit_hash`, `sysroot`) now share an
+  `assert_only_field_drifts(field, mutate)` helper that anchors to
+  live `rustc` and asserts both the named field appears in the
+  changed-fields diagnostic prefix AND the other three do not. The
+  `release_line` test previously used a placeholder toolchain and
+  skipped the absence-assertion; the new shape strengthens its
+  regression bite.
+- **Test consolidation:** Four `toolchain::matches` comparator tests
+  (`release_line`, `host`, `commit_hash`, `sysroot`) now share an
+  `assert_field_mutation_differs(mutate)` helper, mirroring the
+  freshness helper above so the same parameterization pattern applies
+  to both layers of the four-field comparator.
+- **Platform-duplicate test removed:** Windows-only
+  `synchronous_release_on_windows_drop` deleted from `lock.rs`. The
+  cross-platform `drop_releases_lock_for_same_process_reacquire`
+  already bites the same regression on Windows CI; the survivor's
+  rustdoc now explicitly documents the Windows-specific behavior.
+- **Corpus macro dedup:** The `corpus_error` and
+  `corpus_error_with_n_lines` procedural macros in the integration
+  corpus now share an `emit_compile_error(body)` helper for the
+  shared 4-token `compile_error!(<body>);` emission sequence.
+- **Corpus loop clarity:** `corpus_oom_allocate` now uses
+  `buf.chunks_mut(4096)` instead of a manual stride index for
+  page-touching. LLVM-equivalent codegen; reads as the documented
+  intent.
+
+### Internal
+- Dead `_ensure_dir_exists` helper deleted from `session.rs` (was
+  `#[allow(dead_code)]` + `_`-prefixed double signal; zero callers).
+- Broken comment fragment in `compute_parallelism` fixed.
+- `FreshnessFailure::RustcDrift` now documents the `Box<Toolchain>`
+  × 2 rationale (clippy `result_large_err` mitigation; unboxing
+  re-trips the lint).
+- 43 simplify-pass findings reviewed (Reuse 4 / Quality 27 /
+  Efficiency 12). 8 high-certainty items applied across 4 atomic
+  commits; 11 lower-certainty items deferred; 1 (`EFFICIENCY-1`)
+  retained per the existing module-level rationale (defense-in-depth
+  against in-session toolchain swap).
+- Triple-reviewer adversarial panel: Codex + Gemini 3.1-pro-preview +
+  Sonnet-tier strict reviewer. Family-completeness sweeps confirmed
+  no remaining sibling sites in the crate.
+
 ## [0.1.0-beta.1] — 2026-05-13
 
 First public beta. Adopters who pinned `0.1.0-alpha.4` should upgrade
