@@ -112,6 +112,11 @@ pub enum FreshnessFailure {
     /// than the one-shot pre-dispatch check. Any of `release_line`,
     /// `host`, `commit_hash`, or `sysroot` may differ — the rendered
     /// detail names which dimension(s) drifted.
+    ///
+    /// `original` and `observed` are boxed to keep the `FreshnessFailure`
+    /// enum (and the `Result<(), FreshnessFailure>` consumed across the
+    /// per-dispatch hot path) small per clippy's `result_large_err` lint.
+    /// Unboxing here re-trips the lint.
     RustcDrift {
         /// Full toolchain captured at session startup.
         original: Box<toolchain::Toolchain>,
@@ -399,168 +404,78 @@ mod tests {
         assert!(a.contains("def"));
     }
 
-    /// Invariant 4 fires when the captured `release_line` differs from
-    /// the live rustc. Constructed by setting `original_toolchain` to a
-    /// fake `release_line` that no real rustc could emit; the live
-    /// `rustc::capture()` returns the real release line, the comparator
-    /// rejects the pair, `RustcDrift` is returned, and `detail()` names
-    /// `release_line` in its changed-fields list.
+    /// Shared body for the four freshness-drift tests. Anchors to the live
+    /// `rustc` so `release_line`, `host`, `commit_hash`, and `sysroot` all
+    /// genuinely match between the snapshot and the check-time capture;
+    /// the caller's `mutate` closure changes only the named field. The
+    /// assertion that the changed-fields prefix contains `field_name` AND
+    /// NOT the other three field names bites two regressions: a comparator
+    /// regressed to release-line-only (would return `Ok(())` and panic at
+    /// `unwrap_err()`) and a detail renderer that drops the "names only
+    /// the drifted dimensions" property.
+    fn assert_only_field_drifts(
+        field_name: &'static str,
+        mutate: impl FnOnce(&mut toolchain::Toolchain),
+    ) {
+        let tmp = tempdir().unwrap();
+        let live = toolchain::capture().expect("rustc must be on PATH for this test");
+        let mut original = live.clone();
+        mutate(&mut original);
+        let snap = snapshot_with_synthetic_toolchain(tmp.path(), original);
+
+        let err = check(&snap).unwrap_err();
+        assert!(
+            matches!(err, FreshnessFailure::RustcDrift { .. }),
+            "expected RustcDrift, got {err:?}"
+        );
+        assert_eq!(err.invariant_label(), "rustc_release");
+
+        let detail = err.detail();
+        let changed_prefix = detail
+            .split(';')
+            .next()
+            .filter(|s| s.contains("changed fields:"))
+            .expect("changed-fields prefix must be present");
+        assert!(
+            changed_prefix.contains(field_name),
+            "changed-fields list must name {field_name}: {changed_prefix}"
+        );
+        for other in ["release_line", "host", "commit_hash", "sysroot"] {
+            if other != field_name {
+                assert!(
+                    !changed_prefix.contains(other),
+                    "{other} must NOT appear in changed-fields: {changed_prefix}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn freshness_check_detects_release_line_drift() {
-        let tmp = tempdir().unwrap();
-        let mut tc = placeholder_toolchain();
-        tc.release_line = "rustc 0.0.0 (fake 1970-01-01)".into();
-        let snap = snapshot_with_synthetic_toolchain(tmp.path(), tc);
-        let err = check(&snap).unwrap_err();
-        match &err {
-            FreshnessFailure::RustcDrift { .. } => {}
-            other => panic!("expected RustcDrift, got {other:?}"),
-        }
-        assert_eq!(err.invariant_label(), "rustc_release");
-        let detail = err.detail();
-        assert!(
-            detail.contains("release_line"),
-            "detail must name release_line as changed: {detail}"
-        );
+        assert_only_field_drifts("release_line", |tc| {
+            tc.release_line = "rustc 0.0.0 (fake 1970-01-01)".into();
+        });
     }
 
-    /// Invariant 4 fires when only `host` differs (the previously-shadowed
-    /// case): the original branch's release-line-only comparator would
-    /// have silently passed this; the widened comparator must reject it.
-    ///
-    /// Anchored to the live rustc so `release_line`, `commit_hash`, and
-    /// `sysroot` genuinely match between snapshot and check-time capture.
-    /// Only `host` is mutated, so if `check()` regressed to release-line-only
-    /// it would see release_line == release_line and return Ok(()), causing
-    /// `unwrap_err()` to panic — biting the regression.
     #[test]
     fn freshness_check_detects_host_drift() {
-        let tmp = tempdir().unwrap();
-        let live = toolchain::capture().expect("rustc must be on PATH for this test");
-        let mut original = live.clone();
-        original.host = "fake-host-target".into();
-        let snap = snapshot_with_synthetic_toolchain(tmp.path(), original);
-
-        let err = check(&snap).unwrap_err();
-        match &err {
-            FreshnessFailure::RustcDrift { .. } => {}
-            other => panic!("expected RustcDrift, got {other:?}"),
-        }
-        assert_eq!(err.invariant_label(), "rustc_release");
-
-        let detail = err.detail();
-        // Extract only the "changed fields: <names>" prefix before the
-        // first semicolon so that negative assertions are not confused
-        // by field values in the original/observed dump that follows.
-        let changed_prefix = detail
-            .split(';')
-            .next()
-            .filter(|s| s.contains("changed fields:"))
-            .expect("changed-fields prefix must be present");
-        assert!(
-            changed_prefix.contains("host"),
-            "changed-fields list must name host: {changed_prefix}"
-        );
-        // Regression-bite: the other fields genuinely matched, so they
-        // must NOT appear in the changed-fields prefix.
-        assert!(
-            !changed_prefix.contains("release_line"),
-            "release_line must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("commit_hash"),
-            "commit_hash must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("sysroot"),
-            "sysroot must NOT appear in changed-fields: {changed_prefix}"
-        );
+        assert_only_field_drifts("host", |tc| {
+            tc.host = "fake-host-target".into();
+        });
     }
 
-    /// Invariant 4 fires when only `commit_hash` differs. Anchored to the
-    /// live rustc so `release_line`, `host`, and `sysroot` genuinely match;
-    /// only `commit_hash` is mutated. A release-line-only regression would
-    /// return Ok(()), panicking at `unwrap_err()`.
     #[test]
     fn freshness_check_detects_commit_hash_drift() {
-        let tmp = tempdir().unwrap();
-        let live = toolchain::capture().expect("rustc must be on PATH for this test");
-        let mut original = live.clone();
-        original.commit_hash = "00000000000000000000000000000000fakehash".into();
-        let snap = snapshot_with_synthetic_toolchain(tmp.path(), original);
-
-        let err = check(&snap).unwrap_err();
-        match &err {
-            FreshnessFailure::RustcDrift { .. } => {}
-            other => panic!("expected RustcDrift, got {other:?}"),
-        }
-        assert_eq!(err.invariant_label(), "rustc_release");
-
-        let detail = err.detail();
-        let changed_prefix = detail
-            .split(';')
-            .next()
-            .filter(|s| s.contains("changed fields:"))
-            .expect("changed-fields prefix must be present");
-        assert!(
-            changed_prefix.contains("commit_hash"),
-            "changed-fields list must name commit_hash: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("release_line"),
-            "release_line must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("host"),
-            "host must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("sysroot"),
-            "sysroot must NOT appear in changed-fields: {changed_prefix}"
-        );
+        assert_only_field_drifts("commit_hash", |tc| {
+            tc.commit_hash = "00000000000000000000000000000000fakehash".into();
+        });
     }
 
-    /// Invariant 4 fires when only `sysroot` differs. Anchored to the live
-    /// rustc so `release_line`, `host`, and `commit_hash` genuinely match;
-    /// only `sysroot` is mutated. A release-line-only regression would
-    /// return Ok(()), panicking at `unwrap_err()`.
     #[test]
     fn freshness_check_detects_sysroot_drift() {
-        let tmp = tempdir().unwrap();
-        let live = toolchain::capture().expect("rustc must be on PATH for this test");
-        let mut original = live.clone();
-        original.sysroot = PathBuf::from("/nonexistent/fake/toolchains/stable");
-        let snap = snapshot_with_synthetic_toolchain(tmp.path(), original);
-
-        let err = check(&snap).unwrap_err();
-        match &err {
-            FreshnessFailure::RustcDrift { .. } => {}
-            other => panic!("expected RustcDrift, got {other:?}"),
-        }
-        assert_eq!(err.invariant_label(), "rustc_release");
-
-        let detail = err.detail();
-        let changed_prefix = detail
-            .split(';')
-            .next()
-            .filter(|s| s.contains("changed fields:"))
-            .expect("changed-fields prefix must be present");
-        assert!(
-            changed_prefix.contains("sysroot"),
-            "changed-fields list must name sysroot: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("release_line"),
-            "release_line must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("host"),
-            "host must NOT appear in changed-fields: {changed_prefix}"
-        );
-        assert!(
-            !changed_prefix.contains("commit_hash"),
-            "commit_hash must NOT appear in changed-fields: {changed_prefix}"
-        );
+        assert_only_field_drifts("sysroot", |tc| {
+            tc.sysroot = PathBuf::from("/nonexistent/fake/toolchains/stable");
+        });
     }
 
     /// `detail()` rendering is byte-deterministic across the new
