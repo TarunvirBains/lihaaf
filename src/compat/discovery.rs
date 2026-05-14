@@ -101,6 +101,17 @@
 //!   (or open a v0.2 spec discussion).
 //! - `crate::TestCases::new()` (re-exported locally) is NOT recognized;
 //!   register via `--compat-trybuild-macro`.
+//!
+//! ## `#[cfg]` / `#[cfg_attr]` gates
+//!
+//! A function with ANY `#[cfg(...)]` or `#[cfg_attr(...)]` attribute is
+//! conservatively recorded as `discovery_unrecognized` and its body is
+//! NOT descended into. The cfg's truth value depends on the adopter's
+//! `--features` selection at `cargo build` time; the discovery walk
+//! does not resolve cfgs, and silently descending would produce a
+//! phantom fixture whenever the feature is disabled. Under-discovery
+//! (with operator visibility through the `discovery_unrecognized`
+//! emission) is the safe failure mode.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -655,6 +666,39 @@ impl<'a> DiscoveryVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        // Round-5 BLOCK fix: `#[cfg(...)]`-gated functions cannot be
+        // evaluated at AST time — the cfg's truth value depends on the
+        // adopter's `--features` selection at `cargo build`. A function
+        // with ANY `#[cfg]` / `#[cfg_attr]` attribute is therefore
+        // recorded as `discovery_unrecognized` and its body is NOT
+        // descended into. Under-discovery (with operator visibility)
+        // is the safe failure mode: a feature-disabled trybuild call
+        // would otherwise produce a phantom fixture in the discovery
+        // output that the dispatch run could never match.
+        if let Some(cfg_attr) = find_cfg_attribute(&node.attrs) {
+            let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
+                "cfg_attr"
+            } else {
+                "cfg"
+            };
+            let line = node.sig.ident.span().start().line.max(1);
+            let fn_name = node.sig.ident.to_string();
+            self.unrecognized.push(DiscoveryUnrecognized {
+                file: self.current_file.to_path_buf(),
+                line,
+                detail: format!(
+                    "function `{fn_name}` is cfg-gated (`#[{attr_kind}(...)]`); \
+                     trybuild discovery cannot evaluate the cfg without resolution. \
+                     Treat as unrecognized."
+                ),
+            });
+            // Do NOT descend into the body — recording a binding or
+            // hit from a gated function would silently introduce a
+            // phantom fixture when the feature is disabled at build
+            // time.
+            return;
+        }
+
         // Save and reset both the enclosing-test marker and the
         // per-function bindings so cross-function leakage is
         // impossible.
@@ -729,6 +773,29 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        // Round-5 BLOCK fix (mirrored from `visit_item_fn`): a
+        // `#[cfg(...)]`-gated impl method cannot be evaluated at AST
+        // time. Surface as `discovery_unrecognized` and skip the body.
+        if let Some(cfg_attr) = find_cfg_attribute(&node.attrs) {
+            let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
+                "cfg_attr"
+            } else {
+                "cfg"
+            };
+            let line = node.sig.ident.span().start().line.max(1);
+            let fn_name = node.sig.ident.to_string();
+            self.unrecognized.push(DiscoveryUnrecognized {
+                file: self.current_file.to_path_buf(),
+                line,
+                detail: format!(
+                    "function `{fn_name}` is cfg-gated (`#[{attr_kind}(...)]`); \
+                     trybuild discovery cannot evaluate the cfg without resolution. \
+                     Treat as unrecognized."
+                ),
+            });
+            return;
+        }
+
         // Methods inside `impl Foo { fn bar() { ... } }` get walked
         // via syn's default visitor when this override is absent — and
         // the default visitor does NOT scope `local_bindings`, so a
@@ -951,6 +1018,23 @@ fn is_test_attribute(attrs: &[syn::Attribute]) -> bool {
             segments.as_str(),
             "test" | "::test" | "core::test" | "::core::test" | "std::test" | "::std::test"
         )
+    })
+}
+
+/// Returns the cfg-gating attribute (if any) on `attrs`. Recognized
+/// shapes: `#[cfg(...)]` and `#[cfg_attr(...)]` in their unqualified
+/// (single-segment) form. Qualified forms (`::core::cfg`, etc.) are not
+/// expected in user code — `cfg` is a built-in attribute, not a
+/// re-exported item — and would not trigger here, but if a downstream
+/// adopter writes one the under-discovery cost is the same as the
+/// unguarded body walk (the existing v0.1 behavior).
+///
+/// Returned reference points into `attrs` so the caller can render the
+/// attribute's textual form into the `discovery_unrecognized` detail.
+fn find_cfg_attribute(attrs: &[syn::Attribute]) -> Option<&syn::Attribute> {
+    attrs.iter().find(|attr| {
+        let path = attr.meta.path();
+        path.is_ident("cfg") || path.is_ident("cfg_attr")
     })
 }
 

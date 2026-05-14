@@ -1246,6 +1246,130 @@ fn type_alias_of_testcases_emits_discovery_unrecognized() {
     );
 }
 
+/// **Round-5 BLOCK regression: `#[cfg(...)]`-gated `#[test]` functions
+/// emit `discovery_unrecognized` and do NOT contribute fixtures.** A
+/// `#[cfg(feature = "foo")] #[test] fn ui() { ... trybuild call ... }`
+/// is unevaluable at AST time — the cfg's truth value depends on
+/// `--features` at `cargo build` time. The visitor previously descended
+/// into the body and surfaced the trybuild call as an active fixture,
+/// producing a phantom entry whenever the feature was disabled.
+///
+/// The fix: any function carrying `#[cfg]` or `#[cfg_attr]` is recorded
+/// as `discovery_unrecognized` (detail names the function and mentions
+/// `cfg`) and its body is NOT descended. Adjacent un-gated functions
+/// remain unaffected — the corpus fixture below has both
+/// `#[cfg(feature = "foo")] fn ui` (gated) and `#[test] fn ui_always`
+/// (un-gated); the test asserts exactly one fixture (from `ui_always`)
+/// and exactly one unrecognized entry (from `ui`).
+#[test]
+fn cfg_gated_function_emits_discovery_unrecognized() {
+    let crate_root = corpus("cfg_gated_fn_unrecognized");
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    // Only `ui_always`'s `bar.rs` fixture must surface — the cfg-gated
+    // `ui` function's body must NOT contribute.
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture from the un-gated `ui_always`; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.fixtures[0].relative_path.ends_with("tests/ui/bar.rs"),
+        "the surviving fixture must be `ui_always`'s `bar.rs`; got {}",
+        out.fixtures[0].relative_path
+    );
+    assert_eq!(
+        out.fixtures[0].call_site.enclosing_test_fn.as_deref(),
+        Some("ui_always"),
+        "the un-gated call must report its enclosing `#[test] fn ui_always`",
+    );
+
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry from the cfg-gated `ui`; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("cfg"),
+        "detail must mention `cfg`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("ui"),
+        "detail must name the cfg-gated function `ui`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the corpus tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+    assert!(
+        entry.line > 0,
+        "line must be 1-indexed and non-zero; got {}",
+        entry.line
+    );
+}
+
+/// **`#[cfg_attr(...)]` on a function also emits `discovery_unrecognized`.**
+/// The cfg-gating check is on both `#[cfg(...)]` and `#[cfg_attr(...)]` —
+/// the latter can conditionally apply a `#[test]` attribute, so a
+/// trybuild call inside the body is just as unevaluable. The detail
+/// must distinguish `cfg_attr` from `cfg` so the operator can map back
+/// to the source.
+#[test]
+fn cfg_attr_gated_function_emits_discovery_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    // `#[cfg_attr(feature = "X", test)]` conditionally applies `#[test]`.
+    // The cfg's truth value is unevaluable, so the whole function must
+    // be unrecognized.
+    let source = "\
+#[cfg_attr(feature = \"foo\", test)]\n\
+fn ui() {\n\
+    let t = trybuild::TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "the cfg_attr-gated body must NOT contribute fixtures; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry for the cfg_attr-gated function; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("cfg_attr"),
+        "detail must mention `cfg_attr` specifically; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("ui"),
+        "detail must name the gated function `ui`; got `{}`",
+        entry.detail
+    );
+}
+
 /// **Smoke check on the corpus root.** All scenarios point at
 /// `tests/compat/discovery_corpus/<name>/`; verify each exists so a
 /// missing checked-in fixture fails fast with a clear message.
@@ -1263,6 +1387,7 @@ fn corpus_scenarios_exist_on_disk() {
         "parse_error",
         "subdir_ignored",
         "type_alias_unrecognized",
+        "cfg_gated_fn_unrecognized",
     ] {
         let path: &Path = &corpus(scenario);
         assert!(
