@@ -371,9 +371,13 @@ struct DiscoveryVisitor<'a> {
     /// Absolute path of the file being walked. Read-only for the
     /// duration of `visit_file`; stamped onto every recognized hit.
     current_file: &'a Path,
-    /// Caller-supplied custom-macro aliases. Pattern recognition treats
-    /// `<alias>::new()` as equivalent to `trybuild::TestCases::new()`.
-    custom_macros: &'a [&'a str],
+    /// Pre-computed segment vectors for each `--compat-trybuild-macro`
+    /// alias, plus a parallel vector with `::new` appended. Splitting
+    /// once at visitor construction lets the hot path compare against
+    /// borrowed `&str` slices instead of allocating a fresh `String`
+    /// per `Expr::Path` node.
+    alias_segments: Vec<Vec<String>>,
+    alias_with_new_segments: Vec<Vec<String>>,
 
     /// Name of the enclosing `#[test]` function, or `None` for
     /// top-level / non-`#[test]` calls.
@@ -393,9 +397,28 @@ struct DiscoveryVisitor<'a> {
 
 impl<'a> DiscoveryVisitor<'a> {
     fn new(current_file: &'a Path, custom_macros: &'a [&'a str]) -> Self {
+        let alias_segments: Vec<Vec<String>> = custom_macros
+            .iter()
+            .map(|alias| {
+                alias
+                    .split("::")
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .collect();
+        let alias_with_new_segments: Vec<Vec<String>> = alias_segments
+            .iter()
+            .map(|segs| {
+                let mut v = segs.clone();
+                v.push("new".to_string());
+                v
+            })
+            .collect();
         Self {
             current_file,
-            custom_macros,
+            alias_segments,
+            alias_with_new_segments,
             enclosing_test_fn: None,
             local_bindings: BTreeSet::new(),
             hits: Vec::new(),
@@ -453,9 +476,9 @@ impl<'a> DiscoveryVisitor<'a> {
         if p.qself.is_some() || !p.attrs.is_empty() {
             return false;
         }
-        let segments_str = path_segments_string(&p.path);
-        // Canonical form.
-        if segments_str == "trybuild::TestCases::new" {
+        // Canonical form. Leading `::` is rejected — `path_matches_segments`
+        // enforces `leading_colon.is_none()` to mirror the v0.1 spec.
+        if path_matches_segments(&p.path, &["trybuild", "TestCases", "new"]) {
             return true;
         }
         // Alias form: an entry in `custom_macros` is matched against
@@ -463,18 +486,14 @@ impl<'a> DiscoveryVisitor<'a> {
         // owning path (e.g. `mycrate::ui_tests`); the actual call site
         // is `mycrate::ui_tests::new()` or, for adopter convenience,
         // `mycrate::ui_tests()` (no `::new`). Recognize both shapes.
-        for alias in self.custom_macros {
-            // Bare-call shape: `<alias>()` is rewritten to
-            // `<alias>::new` by check_call_alias; this branch is the
-            // explicit-`::new()` form.
-            let with_new = format!("{alias}::new");
-            if segments_str == with_new {
-                return true;
-            }
-            if segments_str == *alias {
-                // Bare alias call: `<alias>()` was used. Pattern 1
-                // says the alias is an alias for `TestCases::new()`,
-                // so the bare-call form is the constructor too.
+        for (alias_segs, with_new_segs) in self
+            .alias_segments
+            .iter()
+            .zip(self.alias_with_new_segments.iter())
+        {
+            if path_matches_string_segments(&p.path, with_new_segs)
+                || path_matches_string_segments(&p.path, alias_segs)
+            {
                 return true;
             }
         }
@@ -638,6 +657,34 @@ fn path_segments_string(path: &syn::Path) -> String {
         s.push_str(&seg.ident.to_string());
     }
     s
+}
+
+/// Returns `true` when `path` has no leading `::` and its segment
+/// idents match `expected` element-wise. Borrowing comparison —
+/// avoids the `String` allocation that `path_segments_string` would
+/// otherwise force on every `Expr::Path` node in the visitor's hot
+/// path.
+fn path_matches_segments(path: &syn::Path, expected: &[&str]) -> bool {
+    if path.leading_colon.is_some() || path.segments.len() != expected.len() {
+        return false;
+    }
+    path.segments
+        .iter()
+        .zip(expected.iter())
+        .all(|(seg, exp)| seg.ident == *exp)
+}
+
+/// `String`-segment variant of [`path_matches_segments`] for the
+/// pre-computed `--compat-trybuild-macro` alias tables on
+/// [`DiscoveryVisitor`].
+fn path_matches_string_segments(path: &syn::Path, expected: &[String]) -> bool {
+    if path.leading_colon.is_some() || path.segments.len() != expected.len() {
+        return false;
+    }
+    path.segments
+        .iter()
+        .zip(expected.iter())
+        .all(|(seg, exp)| seg.ident == *exp.as_str())
 }
 
 // -----------------------------------------------------------------
