@@ -225,8 +225,13 @@ impl Cli {
     /// Reject inconsistent mode combinations between `--compat` and the
     /// v0.1 surface.
     ///
-    /// Called by [`parse_from`] after clap parsing succeeds. The
-    /// validator returns directed diagnostics:
+    /// Called by [`parse_from`] after clap parsing succeeds AND by
+    /// [`crate::session::run`] at the top of its dispatch — both entry
+    /// points must enforce the matrix so a Rust caller that constructs
+    /// `Cli` via direct field initialization cannot bypass it. The
+    /// validator is idempotent (no side effects, pure inspection), so
+    /// a double call from `parse_from` → `run` is safe. The validator
+    /// returns directed diagnostics:
     ///
     /// - In compat mode, `--filter` and `--manifest-path` are mode
     ///   errors and the message names the replacement (`--compat-filter`

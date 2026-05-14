@@ -99,6 +99,16 @@ impl Report {
 /// failure (config invalid, dylib build failed, etc.), returns
 /// [`Error::Session`].
 pub fn run(cli: Cli) -> Result<Report, Error> {
+    // Mode-consistency validation. This is also enforced in
+    // `cli::parse_from`, but a Rust caller that builds `Cli` via
+    // direct field initialization (or via `Cli::try_parse_from`) would
+    // otherwise bypass it — `--compat-root` without `--compat` is a
+    // silent no-op in the non-compat session path, which is exactly
+    // the shape the validator exists to reject. Calling here closes
+    // the gap on both entry points. Idempotent: a second invocation
+    // (after `parse_from` already validated) returns `Ok(())`.
+    cli.validate_mode_consistency()?;
+
     // Stage 1 — configuration load.
     let manifest_path = resolve_manifest_path(&cli)?;
     let crate_root = derive_crate_root(&manifest_path);

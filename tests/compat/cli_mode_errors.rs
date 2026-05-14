@@ -205,6 +205,62 @@ fn compat_run_accepts_pass_through_flags() {
     );
 }
 
+// --- Rust API also enforces mode-consistency. ---
+
+/// A Rust caller that constructs `Cli` via direct field initialization
+/// (or via `Cli::try_parse_from`) bypasses `cli::parse_from`, so the
+/// validator must ALSO run at the top of `lihaaf::run`. Without this,
+/// a Rust adopter could pass `--compat-root` without `--compat` and
+/// the harness would silently ignore the compat-only flag — exactly
+/// the shape the §3.1 mode-error matrix exists to reject.
+///
+/// This test constructs a `Cli` with `compat: false` and
+/// `compat_root: Some(...)`, calls `lihaaf::run(cli)`, and asserts the
+/// returned error is the mode-consistency diagnostic (clap_exit_code
+/// 2, message names the offending flag and `--compat`).
+#[test]
+fn rust_api_run_enforces_mode_consistency() {
+    let cli = lihaaf::Cli {
+        bless: false,
+        compat: false,
+        compat_cargo_test_argv: None,
+        compat_commit: None,
+        compat_filter: vec![],
+        compat_manifest: None,
+        compat_report: None,
+        compat_root: Some(PathBuf::from("/tmp/lihaaf-rust-api-validator-test")),
+        compat_trybuild_macro: vec![],
+        filter: vec![],
+        jobs: None,
+        suite: vec![],
+        no_cache: false,
+        manifest_path: None,
+        list: false,
+        quiet: false,
+        verbose: false,
+        use_symlink: false,
+        keep_output: false,
+    };
+    let err = lihaaf::run(cli).expect_err("validator must fire on the Rust API path");
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(clap_exit_code, 2, "mode-consistency must use exit code 2");
+            assert!(
+                message.contains("--compat-root"),
+                "diagnostic must name the offending flag; got: {message}"
+            );
+            assert!(
+                message.contains("--compat"),
+                "diagnostic must point at --compat; got: {message}"
+            );
+        }
+        other => panic!("expected Error::Cli, got {other:?}"),
+    }
+}
+
 // --- Regression bite: non-compat surface stays byte-identical. ---
 
 #[test]
