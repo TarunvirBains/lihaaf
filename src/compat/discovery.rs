@@ -956,10 +956,17 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
 }
 
 impl<'a> DiscoveryVisitor<'a> {
-    /// Whether `path` is `<aliased>::new()` shape — a two-segment path
-    /// whose first segment is in `aliased_testcases` and second segment
-    /// is `new`. Mirrors [`Self::is_testcases_constructor_path`] for the
-    /// alias case.
+    /// Whether `path` is the unregistered-alias constructor shape.
+    /// Accepts both forms — `<aliased>::new()` (the canonical
+    /// constructor-suffix idiom) AND `<aliased>()` (the
+    /// no-`::new` form a registered alias would also accept via
+    /// [`Self::is_testcases_constructor_path`]'s `alias_segs` arm).
+    /// Round-5 BLOCK fix: previously only the two-segment `::new` form
+    /// was matched here, so `use trybuild::TestCases as Foo; Foo()`
+    /// silently dropped instead of emitting `discovery_unrecognized`
+    /// at the terminal call site. The registered-alias matcher already
+    /// recognized both shapes; mirroring that parity here keeps the
+    /// unregistered-alias diagnostic surface aligned.
     fn is_aliased_testcases_constructor(&self, expr: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = expr else {
             return false;
@@ -967,12 +974,24 @@ impl<'a> DiscoveryVisitor<'a> {
         if p.qself.is_some() || !p.attrs.is_empty() || p.path.leading_colon.is_some() {
             return false;
         }
-        if p.path.segments.len() != 2 {
-            return false;
+        match p.path.segments.len() {
+            // `Foo::new()` — `<alias>::new`.
+            2 => {
+                let first = p.path.segments[0].ident.to_string();
+                let second = p.path.segments[1].ident.to_string();
+                second == "new" && self.aliased_testcases.contains(&first)
+            }
+            // `Foo()` — single-segment alias path; the registered-alias
+            // matcher already accepts this via the `alias_segs` arm in
+            // `is_testcases_constructor_path`, and the unregistered
+            // alias should mirror it so the diagnostic surface stays
+            // consistent.
+            1 => {
+                let first = p.path.segments[0].ident.to_string();
+                self.aliased_testcases.contains(&first)
+            }
+            _ => false,
         }
-        let first = p.path.segments[0].ident.to_string();
-        let second = p.path.segments[1].ident.to_string();
-        second == "new" && self.aliased_testcases.contains(&first)
     }
 
     /// Whether the receiver chain ultimately roots at an

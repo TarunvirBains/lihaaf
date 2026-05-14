@@ -379,6 +379,104 @@ fn use_alias_emits_discovery_unrecognized_for_terminal_call() {
     );
 }
 
+/// **Round-5 BLOCK regression: an unregistered `use trybuild::TestCases
+/// as Foo;` called as `Foo()` (NO `::new`) also surfaces as
+/// `discovery_unrecognized`.** The previous `is_aliased_testcases_constructor`
+/// only matched the two-segment `Foo::new` shape, so `Foo()` paired
+/// with `Foo().compile_fail(...)` (or via a `let t = Foo();` binding)
+/// silently dropped instead of emitting an entry. The registered-alias
+/// matcher already accepts both `<alias>::new` AND `<alias>` forms;
+/// the unregistered-alias diagnostic surface should mirror it so
+/// adopters using either constructor idiom see the same warning.
+///
+/// Two sub-shapes: the direct chain (`Foo().compile_fail(...)`) and
+/// the bound chain (`let t = Foo(); t.compile_fail(...)`). Each must
+/// produce exactly one unrecognized entry and zero fixtures.
+#[test]
+fn use_alias_called_without_new_emits_discovery_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    // Direct chain: `Foo().compile_fail(...)` (no `::new`, no binding).
+    let source = "\
+use trybuild::TestCases as Foo;\n\
+#[test]\n\
+fn ui() {\n\
+    Foo().compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "unregistered `Foo()` alias must produce zero fixtures; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry expected for the `Foo()` form; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("alias"),
+        "detail must mention the alias scenario; got `{}`",
+        entry.detail
+    );
+}
+
+/// **`use ... as Foo;` bound via `let t = Foo();` (no `::new`) is also
+/// flagged.** Companion to the direct-call shape above — exercises the
+/// `is_aliased_testcases_constructor_expr` path that populates
+/// `aliased_bindings`. The terminal call on the binding must emit
+/// exactly one `discovery_unrecognized`.
+#[test]
+fn use_alias_let_bound_without_new_emits_discovery_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("bar.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+use trybuild::TestCases as Foo;\n\
+#[test]\n\
+fn ui() {\n\
+    let t = Foo();\n\
+    t.compile_fail(\"tests/ui/bar.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "unregistered `Foo()` alias + binding must produce zero fixtures; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry expected for the bound `Foo()` form; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("alias"),
+        "detail must mention the alias scenario; got `{}`",
+        entry.detail
+    );
+}
+
 /// **Registered aliases via `--compat-trybuild-macro` are NOT flagged
 /// as unrecognized even when paired with `use ... as Foo;`.** When the
 /// adopter has registered the originating path, the `use` rename
