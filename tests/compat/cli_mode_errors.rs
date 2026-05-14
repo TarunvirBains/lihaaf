@@ -205,6 +205,44 @@ fn compat_run_accepts_pass_through_flags() {
     );
 }
 
+/// **Round-4 FIX regression: `--compat-cargo-test-argv` is optional.**
+///
+/// The doc comment on `Cli::compat_cargo_test_argv` previously said
+/// "Required when `--compat` is set"; the actual behavior in
+/// `CompatArgs::from_cli` defaults to `["cargo", "test"]` when the flag
+/// is absent. The doc is now corrected to "Optional in compat mode"
+/// with the default named explicitly. This integration test locks the
+/// runtime behavior so a future regression that tightens the validator
+/// would also fail here, not just trip the inline unit test in
+/// `src/compat/cli.rs`.
+///
+/// The assertion is the same shape as
+/// `compat_run_accepts_pass_through_flags`: a fully-formed compat
+/// invocation that DOES NOT set `--compat-cargo-test-argv` must exit 0
+/// from the Phase 1 stub.
+#[test]
+fn compat_run_accepts_omitted_cargo_test_argv() {
+    let out = run_binary(&[
+        "--compat",
+        "--compat-root",
+        ".",
+        "--compat-report",
+        "/tmp/lihaaf-compat-report-omitted-argv.json",
+    ]);
+    let stderr = stderr_string(&out);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "compat run without --compat-cargo-test-argv must succeed (default is `cargo test`); \
+         got {:?}; stderr:\n{stderr}",
+        out.status.code(),
+    );
+    assert!(
+        !stderr.contains("--compat-cargo-test-argv"),
+        "stderr must not mention --compat-cargo-test-argv when it is omitted; got:\n{stderr}"
+    );
+}
+
 // --- Rust API also enforces mode-consistency. ---
 
 /// A Rust caller that constructs `Cli` via direct field initialization

@@ -49,8 +49,9 @@ pub struct Cli {
     #[arg(long)]
     pub compat: bool,
 
-    /// Required when `--compat` is set. JSON array passed verbatim as argv to
-    /// the baseline `cargo test` invocation (no shell). Default `["cargo","test"]`.
+    /// Optional in compat mode. JSON array passed verbatim as argv to
+    /// the baseline `cargo test` invocation (no shell). Defaults to
+    /// `["cargo","test"]` when not specified.
     #[arg(long, value_name = "JSON")]
     pub compat_cargo_test_argv: Option<String>,
 
