@@ -732,18 +732,7 @@ fn expand_glob(crate_root: &Path, test_file: &Path, pattern: &str) -> Result<Vec
     // convention; we tolerate either to keep discovery robust.
     let mut anchors: Vec<PathBuf> = Vec::new();
     if is_absolute {
-        #[cfg(windows)]
-        {
-            // On Windows an absolute glob without a drive letter is
-            // unusual; we anchor at the system root. Adopters who
-            // need fancier handling should register a fully-qualified
-            // path.
-            anchors.push(PathBuf::from("/"));
-        }
-        #[cfg(not(windows))]
-        {
-            anchors.push(PathBuf::from("/"));
-        }
+        anchors.push(PathBuf::from("/"));
     } else {
         anchors.push(crate_root.to_path_buf());
         if let Some(test_dir) = test_file.parent()
