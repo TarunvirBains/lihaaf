@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Local pre-commit guard (`scripts/scan-secrets.sh`) that scans staged diffs
+  for credential-like patterns: database URLs with embedded credentials,
+  environment-variable assignments with secret-shaped keys, private key
+  blocks, and AWS access keys. Lines containing `<placeholder>` syntax are
+  treated as documentation examples and skipped. Install per-clone via
+  `scripts/install-pre-commit-hook.sh`; bypass for legitimate false positives
+  with `git commit --no-verify`. `scripts/run-scan-tests.sh` exercises the
+  scanner against 4 positive and 2 negative fixture files and is wired into
+  CI as a step. `SECURITY.md` documents the pattern set, placeholder
+  convention, bypass mechanism, and reporting contact.
 - macOS and Windows RSS sampling for `MEMORY_EXHAUSTED` attribution
   (KR-5, FIX_BEFORE_BETA Spec C, issue #6). `sample_rss_kib` now uses
   `libc::proc_pidinfo(PROC_PIDTASKINFO)` on macOS and

@@ -129,6 +129,9 @@ jobs:
         env:
           CARGO_TERM_COLOR: always
 
+      - name: Secrets-scan self-tests
+        run: bash scripts/run-scan-tests.sh
+
   docs:
     name: cargo doc
     runs-on: ubuntu-latest
