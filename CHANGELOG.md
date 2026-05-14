@@ -7,6 +7,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- macOS and Windows RSS sampling for `MEMORY_EXHAUSTED` attribution
+  (KR-5, FIX_BEFORE_BETA Spec C, issue #6). `sample_rss_kib` now uses
+  `libc::proc_pidinfo(PROC_PIDTASKINFO)` on macOS and
+  `OpenProcess` + `GetProcessMemoryInfo` on Windows, matching the
+  existing Linux `/proc/<pid>/statm` semantics. The §5.4
+  dynamic-parallelism cap reduction now fires on all three platforms
+  after every harness-attributed `MEMORY_EXHAUSTED` kill; on other
+  Unixes the OS OOMkiller backstops as before. Two additional Windows
+  features (`Win32_System_Threading`, `Win32_System_ProcessStatus`)
+  are added to the existing `windows-sys 0.59` dependency.
 - Multi-suite configuration. Adopters can declare additional named
   feature-subset suites with `[[package.metadata.lihaaf.suite]]` array
   entries (each with `name`, `features`, `fixture_dirs`, and optional
