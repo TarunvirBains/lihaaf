@@ -1,0 +1,13 @@
+[package]
+name = "demo"
+version = "0.1.0"
+
+[lib]
+crate-type = ["dylib", "rlib"]
+
+[dependencies]
+serde = "1"
+
+[patch.crates-io.serde]
+branch = "main"
+git = "https://example.com/serde"

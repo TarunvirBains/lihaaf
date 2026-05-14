@@ -44,6 +44,10 @@ path = "src/bin/cargo-lihaaf.rs"
 name = "cli_mode_errors"
 path = "tests/compat/cli_mode_errors.rs"
 
+[[test]]
+name = "overlay_determinism"
+path = "tests/compat/overlay_determinism.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }

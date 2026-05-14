@@ -99,6 +99,20 @@ pub use compat::cli::CompatArgs;
 #[doc(hidden)]
 pub use compat::run as run_compat;
 
+// Compat-mode overlay (Phase 2 of compat mode, GH #11). Re-exported
+// for the same reason as `CompatArgs` above — `tests/compat/
+// overlay_determinism.rs` lives in a separate test crate and reaches
+// the overlay module through this `#[doc(hidden)]` re-export. The
+// stability contract is the same: NOT part of any v0.1 surface.
+//
+// Only `materialize_overlay` is re-exported because that is what the
+// integration tests exercise; the canonicalizer, key-order helper, and
+// serializer are unit-tested inline within `src/compat/overlay.rs`.
+// Phase 4 reaches them through `crate::compat::overlay::*`, not through
+// a crate-root re-export.
+#[doc(hidden)]
+pub use compat::overlay::materialize_overlay as compat_overlay_materialize;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`

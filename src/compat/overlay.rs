@@ -1,0 +1,641 @@
+//! Phase 2 of compat mode (issue #11) — sibling-manifest overlay generator.
+//!
+//! Reads the upstream `Cargo.toml`, canonicalizes `[lib] crate-type` so the
+//! lihaaf stage-3 dylib build can succeed without mutating the upstream
+//! file, and writes the result to `Cargo.lihaaf.toml` next to it.
+//!
+//! Per `docs/compatibility-plan.md` §3.2.3, the overlay is:
+//!
+//! 1. Re-serialized through the existing `toml = "1"` dependency. No
+//!    second TOML crate is introduced (the v0.1 surface forbids
+//!    `toml_edit` — that's a v0.2 conversation).
+//! 2. Written with table keys in cargo's canonical order: `package`,
+//!    `lib`, `bin`, `dependencies`, `dev-dependencies`,
+//!    `build-dependencies`, `features`, `workspace`, then alphabetical
+//!    for the long tail.
+//! 3. Stripped of comments. The `toml` crate's `Value` data model drops
+//!    comments on parse; an upstream-text scan recovers them for the
+//!    §3.3 envelope's `overlay.dropped_comments` field.
+//! 4. Always LF line endings, never CRLF. No trailing whitespace.
+//! 5. Idempotent: a second run from the same input produces a
+//!    byte-identical output, and the write is skipped (preserving mtime)
+//!    when the existing sibling matches.
+//!
+//! The atomic write reuses [`crate::util::write_file_atomic`] so the
+//! sibling is either fully written or absent — a SIGKILL mid-write
+//! cannot leave a half-formed `Cargo.lihaaf.toml` for the stage-3
+//! `cargo rustc` to choke on.
+//!
+//! ## Crate-type canonicalization
+//!
+//! `[lib] crate-type` is the only field the overlay modifies. The
+//! semantics:
+//!
+//! | Input                                       | Output                                       |
+//! |---------------------------------------------|----------------------------------------------|
+//! | absent                                      | `["dylib", "rlib"]`                          |
+//! | `["rlib"]`                                  | `["dylib", "rlib"]`                          |
+//! | `["dylib"]`                                 | `["dylib", "rlib"]` (rlib appended)          |
+//! | `["dylib", "rlib"]`                         | unchanged                                    |
+//! | `["cdylib"]`                                | `["dylib", "rlib", "cdylib"]`                |
+//! | `["rlib", "staticlib"]`                     | `["dylib", "rlib", "staticlib"]`             |
+//!
+//! `rlib` is retained on every output shape so the non-lihaaf
+//! `cargo test` baseline (§3.4) keeps working. Other entries
+//! (`cdylib`, `staticlib`, etc.) are preserved verbatim AFTER the
+//! `dylib`/`rlib` pair, in their original order.
+//!
+//! ## What the overlay does NOT touch
+//!
+//! - `[patch.crates-io]` — must pass through verbatim. The spec
+//!   (§3.2.3 risks section) is explicit that `[patch]` cannot add
+//!   crate-type and the overlay code must not rewrite it.
+//! - Every other top-level table (`dependencies`, `dev-dependencies`,
+//!   `features`, `[[bin]]`, `[workspace]`, …) is preserved as parsed.
+
+use std::path::{Path, PathBuf};
+
+use crate::error::Error;
+use crate::util;
+
+/// One materialized overlay run. Constructed by [`materialize_overlay`]
+/// after the sibling manifest is written (or skipped as idempotent).
+///
+/// The bundle is consumed by Phase 8's §3.3 envelope writer — the
+/// `overlay.generated` classification reads from this struct.
+///
+/// `pub` (with the parent module pinned at `pub(crate)`) so the crate
+/// root can `#[doc(hidden)]` re-export this for the test crate. Not
+/// part of any v0.1 stability contract.
+#[derive(Debug)]
+pub struct OverlayPlan {
+    /// Path to the upstream `Cargo.toml` the overlay was derived from.
+    pub upstream_manifest: PathBuf,
+    /// Path to the generated `Cargo.lihaaf.toml`. Always the
+    /// sibling of `upstream_manifest`; never inside `target/`.
+    pub sibling_manifest: PathBuf,
+    /// `true` when the upstream manifest already declared
+    /// `[lib] crate-type = ["dylib", ...]`. The sibling is still
+    /// written (idempotently) so the §3.3 envelope's
+    /// `overlay.generated` classification is uniform; the flag lets the
+    /// envelope record whether the dylib declaration was a real change
+    /// or a redundant one.
+    pub upstream_already_has_dylib: bool,
+    /// Comment text dropped during canonicalization. The `toml` crate's
+    /// `Value` model drops comments on parse, so the overlay code
+    /// recovers them from the raw upstream bytes with a tiny
+    /// line-by-line scanner (no regex per spec §6.1) and stashes them
+    /// here for the §3.3 envelope's `overlay.dropped_comments` field.
+    ///
+    /// Each entry is the raw comment text WITHOUT the leading `#` and
+    /// WITHOUT surrounding whitespace, so the envelope can render the
+    /// list directly.
+    pub dropped_comments: Vec<String>,
+}
+
+/// Read the upstream `Cargo.toml`, materialize the sibling overlay, and
+/// return the plan.
+///
+/// `upstream_manifest_path` must point at the upstream `Cargo.toml`
+/// itself (not its parent directory). The sibling path is computed via
+/// [`Path::with_file_name`] — the safest cross-platform way to swap
+/// only the filename component.
+///
+/// **Pre-write idempotency check.** If the sibling already exists with
+/// byte-identical contents, no write is performed. This preserves
+/// mtime per the §3.2.3 "dirty-worktree rule" — repeated runs from
+/// clean state must not churn the filesystem.
+///
+/// **Errors.** Returns [`Error::Io`] on read/write failure and
+/// [`Error::TomlParse`] when the upstream manifest cannot be parsed as
+/// TOML. The compat driver maps both into the §3.3 envelope's
+/// `overlay.*` error category.
+pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan, Error> {
+    let raw_bytes = std::fs::read(upstream_manifest_path).map_err(|e| {
+        Error::io(
+            e,
+            "reading upstream Cargo.toml for overlay",
+            Some(upstream_manifest_path.to_path_buf()),
+        )
+    })?;
+    let raw_text = String::from_utf8(raw_bytes).map_err(|e| {
+        Error::io(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            "decoding upstream Cargo.toml as UTF-8",
+            Some(upstream_manifest_path.to_path_buf()),
+        )
+    })?;
+
+    let dropped_comments = scan_dropped_comments(&raw_text);
+
+    let mut value: toml::Value =
+        toml::from_str(&raw_text).map_err(|e: toml::de::Error| Error::TomlParse {
+            path: upstream_manifest_path.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    // Spec invariant: `--compat-root` is single-crate (workspaces are
+    // rejected upstream with a directed diagnostic — see open question
+    // Q4 in the implementation plan). The unwrap below is guarded by
+    // Phase 4's `[package]` precondition; for safety in tests that
+    // exercise the overlay in isolation, we still tolerate the absence
+    // of `[package]` (no crate-type rewrite needed when no library will
+    // be built) by treating it as an `upstream_already_has_dylib =
+    // false` no-op.
+    let upstream_already_has_dylib = inspect_existing_crate_type(&value);
+
+    if let toml::Value::Table(top) = &mut value {
+        // Insert/extend [lib] crate-type. The canonicalization is
+        // idempotent: a second run on the output is a no-op.
+        let lib_table = top
+            .entry("lib".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        if let toml::Value::Table(lib) = lib_table {
+            canonicalize_crate_type(lib)?;
+        } else {
+            return Err(Error::TomlParse {
+                path: upstream_manifest_path.to_path_buf(),
+                message: "`[lib]` must be a table, not an inline value".to_string(),
+            });
+        }
+    }
+
+    let serialized = serialize_canonical(&value)?;
+    let sibling_path = upstream_manifest_path.with_file_name("Cargo.lihaaf.toml");
+
+    // Idempotent rerun guard — skip the write when bytes match. This
+    // preserves mtime so a clean-state second invocation does not
+    // appear as a worktree change to fork-CI greppers.
+    let need_write = match std::fs::read(&sibling_path) {
+        Ok(existing) => existing != serialized,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                "checking existing Cargo.lihaaf.toml for idempotent rerun",
+                Some(sibling_path.clone()),
+            ));
+        }
+    };
+
+    if need_write {
+        util::write_file_atomic(&sibling_path, &serialized)?;
+    }
+
+    Ok(OverlayPlan {
+        upstream_manifest: upstream_manifest_path.to_path_buf(),
+        sibling_manifest: sibling_path,
+        upstream_already_has_dylib,
+        dropped_comments,
+    })
+}
+
+/// Return `true` when the upstream `[lib] crate-type` already contains
+/// `dylib`. Used only for envelope classification — the overlay rewrite
+/// runs unconditionally.
+fn inspect_existing_crate_type(value: &toml::Value) -> bool {
+    let Some(lib) = value.get("lib") else {
+        return false;
+    };
+    let Some(ct) = lib.get("crate-type") else {
+        return false;
+    };
+    let Some(arr) = ct.as_array() else {
+        return false;
+    };
+    arr.iter().filter_map(|v| v.as_str()).any(|s| s == "dylib")
+}
+
+/// Canonicalize the `[lib] crate-type` array on a `[lib]` table.
+///
+/// Per §3.2.3 the output array must:
+/// - Start with `"dylib"`.
+/// - Contain `"rlib"` (so the non-lihaaf `cargo test` baseline still
+///   works).
+/// - Preserve any other entries (`cdylib`, `staticlib`, …) AFTER the
+///   `dylib`/`rlib` pair, in their original order.
+///
+/// Non-string entries in the input array trigger [`Error::TomlParse`]
+/// with a directed diagnostic; downstream code can rely on the output
+/// being a homogeneous string array.
+pub(crate) fn canonicalize_crate_type(
+    table: &mut toml::map::Map<String, toml::Value>,
+) -> Result<(), Error> {
+    let existing: Vec<String> = match table.get("crate-type") {
+        None => Vec::new(),
+        Some(toml::Value::Array(arr)) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for (idx, v) in arr.iter().enumerate() {
+                match v.as_str() {
+                    Some(s) => out.push(s.to_string()),
+                    None => {
+                        return Err(Error::TomlParse {
+                            path: PathBuf::from("<overlay>"),
+                            message: format!(
+                                "`[lib] crate-type` element at index {idx} is not a string; \
+                                 the overlay accepts only string crate-type entries"
+                            ),
+                        });
+                    }
+                }
+            }
+            out
+        }
+        Some(other) => {
+            return Err(Error::TomlParse {
+                path: PathBuf::from("<overlay>"),
+                message: format!(
+                    "`[lib] crate-type` must be an array of strings, got `{}`",
+                    type_name_of(other)
+                ),
+            });
+        }
+    };
+
+    // Strategy: a stable interleave that always puts `dylib`/`rlib`
+    // first (in that order), then everything else in input order with
+    // dups removed. We do NOT alphabetize the long tail — the spec
+    // says "preserved verbatim AFTER the dylib/rlib pair".
+    let mut out: Vec<String> = Vec::with_capacity(existing.len() + 2);
+    out.push("dylib".to_string());
+    out.push("rlib".to_string());
+    for entry in &existing {
+        if entry == "dylib" || entry == "rlib" {
+            continue;
+        }
+        if !out.contains(entry) {
+            out.push(entry.clone());
+        }
+    }
+
+    let array = out.into_iter().map(toml::Value::String).collect::<Vec<_>>();
+    table.insert("crate-type".to_string(), toml::Value::Array(array));
+    Ok(())
+}
+
+/// Cargo's canonical table key order. The long tail (anything not in
+/// this slice) is sorted alphabetically when serialized.
+///
+/// This list is intentionally hardcoded; a configuration option would
+/// expand the v0.1 surface for no adopter benefit (locked decision 4
+/// in the Phase 2 plan).
+pub(crate) fn canonical_key_order() -> &'static [&'static str] {
+    &[
+        "package",
+        "lib",
+        "bin",
+        "example",
+        "test",
+        "bench",
+        "dependencies",
+        "dev-dependencies",
+        "build-dependencies",
+        "target",
+        "features",
+        "patch",
+        "replace",
+        "profile",
+        "workspace",
+    ]
+}
+
+/// Re-serialize a parsed [`toml::Value`] into bytes with the canonical
+/// table order, no comments, no trailing whitespace, LF line endings.
+///
+/// **Why a custom shim:** `toml = "1"`'s default serializer emits
+/// table keys in `BTreeMap` (alphabetical) order, which is NOT the
+/// cargo-canonical order the spec mandates. We work around this by
+/// serializing each top-level key as its own single-key wrapper
+/// (preserving the crate's stable inline-key ordering for inner
+/// tables) and concatenating the segments with the canonical order
+/// applied.
+///
+/// **Why the segments are concatenated with `\n` separators:** each
+/// `toml::ser::to_string` call ends with `\n`, so prepending another
+/// `\n` produces exactly one blank line between sections. Post-
+/// processing collapses any accidental triple-newlines back to a
+/// single blank line for the byte-determinism guarantee.
+pub(crate) fn serialize_canonical(value: &toml::Value) -> Result<Vec<u8>, Error> {
+    let top = match value {
+        toml::Value::Table(t) => t,
+        other => {
+            return Err(Error::TomlParse {
+                path: PathBuf::from("<overlay>"),
+                message: format!(
+                    "overlay serializer expected a TOML document (table) at the top level, got `{}`",
+                    type_name_of(other)
+                ),
+            });
+        }
+    };
+
+    // Build the canonical key sequence: every canonical key that is
+    // present in the input, in canonical order, followed by every
+    // other key in alphabetical order.
+    let mut emitted: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut order: Vec<String> = Vec::with_capacity(top.len());
+    for canonical in canonical_key_order() {
+        if top.contains_key(*canonical) {
+            order.push((*canonical).to_string());
+            emitted.insert(*canonical);
+        }
+    }
+    let mut leftovers: Vec<&String> = top
+        .keys()
+        .filter(|k| !emitted.contains(k.as_str()))
+        .collect();
+    leftovers.sort();
+    for k in leftovers {
+        order.push(k.clone());
+    }
+
+    let mut segments: Vec<String> = Vec::with_capacity(order.len());
+    for key in &order {
+        let v = top.get(key).expect("key came from `top`'s own iteration");
+        let mut wrapper = toml::map::Map::new();
+        wrapper.insert(key.clone(), v.clone());
+        let segment =
+            toml::ser::to_string(&toml::Value::Table(wrapper)).map_err(|e: toml::ser::Error| {
+                Error::TomlParse {
+                    path: PathBuf::from("<overlay>"),
+                    message: format!("overlay serializer failed for `{key}`: {e}"),
+                }
+            })?;
+        segments.push(segment);
+    }
+
+    let joined = segments.join("\n");
+    let normalized = post_process_output(&joined);
+    Ok(normalized.into_bytes())
+}
+
+/// Apply the §3.2.3 byte-shape invariants:
+///
+/// - LF line endings only (strip any `\r`).
+/// - No trailing whitespace on any line.
+/// - Collapse two-or-more consecutive blank lines down to one blank
+///   line, so segment concatenation can't produce churning whitespace
+///   when one segment ends with an internal blank line.
+/// - Exactly one trailing `\n`.
+fn post_process_output(input: &str) -> String {
+    // First pass: normalize line endings and strip trailing whitespace.
+    let mut lines: Vec<&str> = Vec::with_capacity(input.lines().count());
+    for line in input.lines() {
+        // `lines()` already strips both `\n` and `\r\n`, so the only
+        // `\r` we can see is one embedded mid-line (extremely rare in
+        // hand-edited TOML). We re-trim per-line to belt-and-suspenders
+        // against a Windows-checkout `\r\n` upstream.
+        let trimmed = line.trim_end_matches([' ', '\t', '\r']);
+        lines.push(trimmed);
+    }
+
+    // Second pass: collapse runs of blank lines down to one blank.
+    let mut out = String::with_capacity(input.len());
+    let mut prev_blank = false;
+    for line in &lines {
+        let is_blank = line.is_empty();
+        if is_blank && prev_blank {
+            continue;
+        }
+        out.push_str(line);
+        out.push('\n');
+        prev_blank = is_blank;
+    }
+
+    // Strip a trailing blank line (we always end with a single `\n`,
+    // not a `\n\n`), then make sure exactly one trailing `\n` is
+    // present.
+    while out.ends_with("\n\n") {
+        out.pop();
+    }
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
+}
+
+/// Walk the raw TOML bytes once and pull every `#`-prefixed comment
+/// out, both line-leading (`# foo`) and trailing (`name = "x" # foo`).
+///
+/// **Why this is fixed-string, not regex:** spec §6.1 forbids a regex
+/// engine in this crate. The scan is line-by-line, splitting on the
+/// first unquoted `#` per line. Single and double quotes both protect
+/// `#` chars from being treated as comment markers.
+fn scan_dropped_comments(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        if let Some(comment) = extract_unquoted_comment(line) {
+            out.push(comment);
+        }
+    }
+    out
+}
+
+/// Return the trimmed comment body (without the leading `#`) when the
+/// line contains an unquoted `#`. Returns `None` when the `#` lives
+/// inside a TOML string literal.
+fn extract_unquoted_comment(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    let mut in_single = false;
+    let mut in_double = false;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if !in_single && !in_double && b == b'#' {
+            // Found the comment start. Strip leading `#` and whitespace,
+            // then return the body. Empty bodies are still recorded so
+            // the envelope sees a faithful count of dropped lines.
+            let body = &line[i + 1..];
+            let trimmed = body.trim();
+            return Some(trimmed.to_string());
+        }
+        match b {
+            b'"' if !in_single => in_double = !in_double,
+            b'\'' if !in_double => in_single = !in_single,
+            b'\\' if in_double => {
+                // Skip escaped char inside a double-quoted string so
+                // `"foo\""` does not toggle the quote state spuriously.
+                i = i.saturating_add(1);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Human-readable name for a [`toml::Value`] variant. Used in error
+/// messages so the diagnostic names the actual shape encountered rather
+/// than echoing a generic "wrong type".
+fn type_name_of(v: &toml::Value) -> &'static str {
+    match v {
+        toml::Value::String(_) => "string",
+        toml::Value::Integer(_) => "integer",
+        toml::Value::Float(_) => "float",
+        toml::Value::Boolean(_) => "boolean",
+        toml::Value::Datetime(_) => "datetime",
+        toml::Value::Array(_) => "array",
+        toml::Value::Table(_) => "table",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_inserts_dylib_rlib_when_absent() {
+        let mut t = toml::map::Map::new();
+        canonicalize_crate_type(&mut t).unwrap();
+        let ct = t.get("crate-type").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = ct.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["dylib", "rlib"]);
+    }
+
+    #[test]
+    fn canonicalize_prepends_dylib_to_rlib_only() {
+        let mut t = toml::map::Map::new();
+        t.insert(
+            "crate-type".into(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        canonicalize_crate_type(&mut t).unwrap();
+        let ct = t.get("crate-type").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = ct.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["dylib", "rlib"]);
+    }
+
+    #[test]
+    fn canonicalize_appends_rlib_when_only_dylib() {
+        let mut t = toml::map::Map::new();
+        t.insert(
+            "crate-type".into(),
+            toml::Value::Array(vec![toml::Value::String("dylib".into())]),
+        );
+        canonicalize_crate_type(&mut t).unwrap();
+        let ct = t.get("crate-type").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = ct.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["dylib", "rlib"]);
+    }
+
+    #[test]
+    fn canonicalize_preserves_cdylib_after_pair() {
+        let mut t = toml::map::Map::new();
+        t.insert(
+            "crate-type".into(),
+            toml::Value::Array(vec![toml::Value::String("cdylib".into())]),
+        );
+        canonicalize_crate_type(&mut t).unwrap();
+        let ct = t.get("crate-type").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = ct.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["dylib", "rlib", "cdylib"]);
+    }
+
+    #[test]
+    fn canonicalize_dedups_duplicates() {
+        let mut t = toml::map::Map::new();
+        t.insert(
+            "crate-type".into(),
+            toml::Value::Array(vec![
+                toml::Value::String("rlib".into()),
+                toml::Value::String("dylib".into()),
+                toml::Value::String("rlib".into()),
+                toml::Value::String("cdylib".into()),
+            ]),
+        );
+        canonicalize_crate_type(&mut t).unwrap();
+        let ct = t.get("crate-type").unwrap().as_array().unwrap();
+        let strs: Vec<&str> = ct.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(strs, vec!["dylib", "rlib", "cdylib"]);
+    }
+
+    #[test]
+    fn canonicalize_rejects_non_string_element() {
+        let mut t = toml::map::Map::new();
+        t.insert(
+            "crate-type".into(),
+            toml::Value::Array(vec![toml::Value::Integer(1)]),
+        );
+        let err = canonicalize_crate_type(&mut t).unwrap_err();
+        let s = format!("{err:?}");
+        assert!(
+            s.contains("not a string"),
+            "diagnostic must name the failure: {s}"
+        );
+    }
+
+    #[test]
+    fn canonical_key_order_starts_with_package() {
+        assert_eq!(canonical_key_order()[0], "package");
+    }
+
+    #[test]
+    fn extract_unquoted_comment_strips_leading_hash() {
+        assert_eq!(
+            extract_unquoted_comment("# a leading comment"),
+            Some("a leading comment".into())
+        );
+    }
+
+    #[test]
+    fn extract_unquoted_comment_handles_trailing() {
+        assert_eq!(
+            extract_unquoted_comment(r#"name = "demo" # trailing"#),
+            Some("trailing".into())
+        );
+    }
+
+    #[test]
+    fn extract_unquoted_comment_ignores_hash_inside_string() {
+        assert_eq!(
+            extract_unquoted_comment(r#"url = "http://example.com/#anchor""#),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_unquoted_comment_ignores_hash_inside_single_quote() {
+        assert_eq!(extract_unquoted_comment(r#"name = 'foo#bar'"#), None);
+    }
+
+    #[test]
+    fn post_process_strips_trailing_whitespace() {
+        let raw = "foo = 1  \nbar = 2\t\n";
+        let out = post_process_output(raw);
+        assert!(out.lines().all(|l| !l.ends_with(' ') && !l.ends_with('\t')));
+    }
+
+    #[test]
+    fn post_process_strips_cr() {
+        let raw = "foo = 1\r\nbar = 2\r\n";
+        let out = post_process_output(raw);
+        assert!(!out.contains('\r'));
+    }
+
+    #[test]
+    fn post_process_collapses_blank_runs() {
+        let raw = "foo = 1\n\n\n\nbar = 2\n";
+        let out = post_process_output(raw);
+        assert_eq!(out, "foo = 1\n\nbar = 2\n");
+    }
+
+    #[test]
+    fn serialize_canonical_emits_package_first() {
+        let input = r#"
+[features]
+default = []
+
+[dependencies]
+serde = "1"
+
+[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        let val: toml::Value = toml::from_str(input).unwrap();
+        let bytes = serialize_canonical(&val).unwrap();
+        let out = String::from_utf8(bytes).unwrap();
+        let first_header = out.lines().find(|l| l.starts_with('[')).unwrap();
+        assert_eq!(first_header, "[package]", "got:\n{out}");
+    }
+}

@@ -13,6 +13,7 @@
 //! stability contract; treat `pub(crate) fn run` as private.
 
 pub(crate) mod cli;
+pub(crate) mod overlay;
 
 /// Top-level compat-mode entry. Called from `cargo-lihaaf.rs` when
 /// `cli.compat` is true.
