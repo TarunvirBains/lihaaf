@@ -36,9 +36,17 @@
 //! constructor (`::new()` shape); the visitor matches against the path
 //! string verbatim.
 //!
-//! `use trybuild::TestCases as Foo;` aliases are NOT syntactically
-//! recognized (Q6 locked). Adopters with `use ... as ...` re-exports
-//! must register them via `--compat-trybuild-macro`.
+//! `use trybuild::TestCases as Foo;` aliases ARE detected at the
+//! `ItemUse` level: the visitor records every rename whose source
+//! ident is `TestCases` into a per-file `aliased_testcases` set. When
+//! a subsequent `Foo::new()` (or `let t = Foo::new(); t.<method>(...)`)
+//! call site uses the alias, the visitor emits a
+//! `discovery_unrecognized` entry naming the file/line so the operator
+//! sees the misconfiguration. The emission only fires when the local
+//! name is NOT registered via `--compat-trybuild-macro`; adopters
+//! silence the warning either by registering the local name (e.g.
+//! `--compat-trybuild-macro Foo`) or by avoiding the rename and using
+//! the canonical `trybuild::TestCases::new()` form at the call site.
 //!
 //! ## Macro-generated invocations
 //!

@@ -278,13 +278,14 @@ fn empty_tests_directory_yields_empty_output() {
     );
 }
 
-/// **`use trybuild::TestCases as Foo;` is NOT recognized (Q6 locked).**
-/// `Foo::new().compile_fail(...)` must produce no fixtures and one
-/// `discovery_unrecognized` entry naming the file/line.
-///
-/// Adopters with `use ... as ...` re-exports register via
-/// `--compat-trybuild-macro`; the discovery pass does not attempt to
-/// resolve `use` aliases syntactically.
+/// **`use trybuild::TestCases as Foo;` without `--compat-trybuild-macro`
+/// emits `discovery_unrecognized`.** `Foo::new().compile_fail(...)`
+/// must produce no fixtures and exactly one `discovery_unrecognized`
+/// entry naming the file/line — the round-3 fix added `visit_item_use`
+/// detection so the visitor records the rename and flags the terminal
+/// call on the aliased receiver. Adopters silence the warning by
+/// registering the local name via `--compat-trybuild-macro Foo` (see
+/// `use_alias_registered_via_flag_does_not_emit_unrecognized`).
 #[test]
 fn use_alias_not_recognized_without_flag() {
     let crate_root = corpus("alias_use_not_recognized");
@@ -297,16 +298,31 @@ fn use_alias_not_recognized_without_flag() {
             .map(|f| f.relative_path.as_str())
             .collect::<Vec<_>>()
     );
-    // The `Foo::new().compile_fail("tests/ui/foo.rs")` call does NOT
-    // match `trybuild::TestCases::new` syntactically, so the visitor
-    // never reaches the unrecognized-call branch — it simply ignores
-    // the call. The integration contract is "no fixtures", which is
-    // exactly what we assert above; whether `unrecognized` is empty
-    // or not depends on whether the visitor decides to flag the
-    // shape. The spec's recognized-only set requires the assertion
-    // above and is silent on whether to flag the shape, so we accept
-    // any unrecognized count for this scenario.
-    let _ = &out.unrecognized;
+    // The `Foo::new(); t.compile_fail(...)` chain emits exactly one
+    // unrecognized entry — the round-3 `visit_item_use` walker
+    // populates `aliased_testcases` from `use trybuild::TestCases as
+    // Foo;`, and the terminal-call dispatcher (`try_record_terminal_call`)
+    // surfaces the misconfigured alias on the `t.compile_fail(...)`
+    // line. The entry must point at the `tests/trybuild.rs` corpus
+    // file and the detail must mention the alias scenario so the
+    // operator can map back to a `--compat-trybuild-macro` flag.
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry expected for the aliased terminal call; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("alias"),
+        "detail must reference the alias issue; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the corpus tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
 }
 
 /// **Round-3 BLOCK regression: `use trybuild::TestCases as Foo;` must
