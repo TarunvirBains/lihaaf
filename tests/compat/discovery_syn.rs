@@ -309,6 +309,108 @@ fn use_alias_not_recognized_without_flag() {
     let _ = &out.unrecognized;
 }
 
+/// **Round-3 BLOCK regression: `use trybuild::TestCases as Foo;` must
+/// emit `discovery_unrecognized`.** Earlier the visitor silently
+/// dropped the `Foo::new(); t.compile_fail(...)` call chain because
+/// `Foo` didn't match the canonical `trybuild::TestCases` path and
+/// didn't match any registered `--compat-trybuild-macro` alias.
+/// Adopters then lost visibility into the misconfigured-alias case.
+///
+/// The fix walks `ItemUse` trees to populate a per-file
+/// `aliased_testcases` set whenever the rename source is `TestCases`.
+/// A subsequent `Foo::new()` (and any `let t = Foo::new(); t.<...>`)
+/// terminal call surfaces as exactly one `discovery_unrecognized`
+/// entry pointing at the `compile_fail` line, naming the alias issue
+/// in `detail`. Zero fixtures because the call was never resolvable.
+#[test]
+fn use_alias_emits_discovery_unrecognized_for_terminal_call() {
+    let crate_root = corpus("use_alias_unrecognized");
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "unregistered `use ... as` alias must produce zero fixtures; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry expected for the aliased terminal call; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    // The detail must name the alias scenario so operators can map
+    // the entry back to a `--compat-trybuild-macro` registration.
+    assert!(
+        entry.detail.contains("alias"),
+        "detail must reference the alias issue; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at the corpus tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+    // The terminal call (`compile_fail`) is on line 15 of the corpus
+    // file. Line numbering is 1-indexed and the line points at the
+    // method ident, not the receiver.
+    assert!(
+        entry.line > 0,
+        "line must be 1-indexed and non-zero; got {}",
+        entry.line
+    );
+}
+
+/// **Registered aliases via `--compat-trybuild-macro` are NOT flagged
+/// as unrecognized even when paired with `use ... as Foo;`.** When the
+/// adopter has registered the originating path, the `use` rename
+/// silently re-exports a recognized name; we must not double-emit.
+///
+/// This test pairs with the BLOCK regression above to lock the
+/// "register to silence the warning" workflow: the unrecognized
+/// emission is gated on the alias NOT being registered, not on the
+/// `use` rename's presence.
+#[test]
+fn use_alias_registered_via_flag_does_not_emit_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests_dir = crate_root.join("tests");
+    std::fs::create_dir_all(tests_dir.join("ui")).unwrap();
+    std::fs::write(tests_dir.join("ui").join("x.rs"), "fn main() {}\n").unwrap();
+
+    // `use mycrate::ui_tests as Foo;` paired with a `--compat-trybuild-macro`
+    // registration of `Foo` keeps the call site recognized — the
+    // registered alias is `Foo`, which is exactly the local name the
+    // `let t = Foo::new();` binding observes.
+    let source = "\
+use mycrate::ui_tests as Foo;\n\
+#[test]\n\
+fn ui() {\n\
+    let t = Foo::new();\n\
+    t.compile_fail(\"tests/ui/x.rs\");\n\
+}\n";
+    std::fs::write(tests_dir.join("trybuild.rs"), source).unwrap();
+
+    let aliases = vec!["Foo".to_string()];
+    let out = discover(&crate_root, &aliases).expect("discover succeeds");
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "registered alias must resolve the call; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.unrecognized.is_empty(),
+        "registered alias must not produce an unrecognized entry; got {:?}",
+        out.unrecognized
+    );
+}
+
 /// **Leading-`::` form is NOT recognized, even with a flag registration.**
 /// The spec's canonical form omits the leading separator. The matcher
 /// (`path_matches_string_segments` in src/compat/discovery.rs) rejects

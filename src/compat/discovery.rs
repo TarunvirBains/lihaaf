@@ -400,6 +400,21 @@ struct DiscoveryVisitor<'a> {
     /// construction.
     local_bindings: BTreeSet<String>,
 
+    /// File-scope: local names introduced by
+    /// `use trybuild::TestCases as <name>;` (or `use <registered-alias-path> as <name>;`)
+    /// where the local `<name>` is NOT itself registered via
+    /// `--compat-trybuild-macro`. The visitor uses this set to flag
+    /// `<name>::new()` / `let t = <name>::new(); t.compile_fail(...)`
+    /// call shapes as `discovery_unrecognized` so adopters know to
+    /// register the alias.
+    aliased_testcases: BTreeSet<String>,
+    /// Per-function bindings rooted in an `aliased_testcases` entry.
+    /// `let t = Foo::new();` populates this when `Foo` is in
+    /// `aliased_testcases`. Tracked separately from `local_bindings`
+    /// so the terminal-call path can distinguish "recognized alias
+    /// binding" from "unregistered alias binding".
+    aliased_bindings: BTreeSet<String>,
+
     /// Recognized hits, awaiting glob expansion.
     hits: Vec<VisitorHit>,
     /// Unrecognized AST nodes (e.g. `t.pass(format!(...))`).
@@ -432,6 +447,8 @@ impl<'a> DiscoveryVisitor<'a> {
             alias_with_new_segments,
             enclosing_test_fn: None,
             local_bindings: BTreeSet::new(),
+            aliased_testcases: BTreeSet::new(),
+            aliased_bindings: BTreeSet::new(),
             hits: Vec::new(),
             unrecognized: Vec::new(),
         }
@@ -549,6 +566,24 @@ impl<'a> DiscoveryVisitor<'a> {
             _ => return false,
         };
         if !self.receiver_is_testcases(&node.receiver) {
+            // The receiver isn't registered, but it MAY be an
+            // unregistered `use trybuild::TestCases as Foo;` alias.
+            // Surface that case as `discovery_unrecognized` rather than
+            // silently dropping the call — adopters need to know to
+            // register the alias via `--compat-trybuild-macro`.
+            if self.receiver_is_aliased_testcases(&node.receiver) {
+                let call_site = self.make_call_site(&node.method);
+                self.unrecognized.push(DiscoveryUnrecognized {
+                    file: call_site.file,
+                    line: call_site.line,
+                    detail: format!(
+                        ".{method_str}() called via an unregistered `use ... as` alias — \
+                         register the originating constructor path via \
+                         --compat-trybuild-macro so discovery can match the call site"
+                    ),
+                });
+                return true;
+            }
             return false;
         }
         let call_site = self.make_call_site(&node.method);
@@ -582,6 +617,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // impossible.
         let saved_enclosing = self.enclosing_test_fn.take();
         let saved_bindings = std::mem::take(&mut self.local_bindings);
+        let saved_aliased_bindings = std::mem::take(&mut self.aliased_bindings);
 
         if is_test_attribute(&node.attrs) {
             self.enclosing_test_fn = Some(node.sig.ident.to_string());
@@ -590,6 +626,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
 
         self.enclosing_test_fn = saved_enclosing;
         self.local_bindings = saved_bindings;
+        self.aliased_bindings = saved_aliased_bindings;
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
@@ -601,9 +638,16 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
             && pat_ident.attrs.is_empty()
             && pat_ident.by_ref.is_none()
             && pat_ident.subpat.is_none()
-            && self.is_testcases_constructor_expr(&init.expr)
         {
-            self.local_bindings.insert(pat_ident.ident.to_string());
+            if self.is_testcases_constructor_expr(&init.expr) {
+                self.local_bindings.insert(pat_ident.ident.to_string());
+            } else if self.is_aliased_testcases_constructor_expr(&init.expr) {
+                // Pattern 3 for an unregistered `use ... as Foo;` alias:
+                // record the binding so a subsequent
+                // `t.compile_fail(...)` call can be flagged as
+                // unrecognized rather than silently dropped.
+                self.aliased_bindings.insert(pat_ident.ident.to_string());
+            }
         }
         syn::visit::visit_local(self, node);
     }
@@ -630,6 +674,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // (the same `is_test_attribute` filter applies).
         let saved_enclosing = self.enclosing_test_fn.take();
         let saved_bindings = std::mem::take(&mut self.local_bindings);
+        let saved_aliased_bindings = std::mem::take(&mut self.aliased_bindings);
 
         if is_test_attribute(&node.attrs) {
             self.enclosing_test_fn = Some(node.sig.ident.to_string());
@@ -638,6 +683,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
 
         self.enclosing_test_fn = saved_enclosing;
         self.local_bindings = saved_bindings;
+        self.aliased_bindings = saved_aliased_bindings;
     }
 
     fn visit_item_macro(&mut self, node: &'ast syn::ItemMacro) {
@@ -677,9 +723,74 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         });
         syn::visit::visit_item_macro(self, node);
     }
+
+    fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+        // Record `use trybuild::TestCases as <name>;` and
+        // `use <registered-alias-path> as <name>;` aliases so the
+        // visitor can flag `<name>::new(); <binding>.compile_fail(...)`
+        // shapes that would otherwise be silently lost. The set is
+        // populated regardless of whether the local `<name>` is also
+        // registered via `--compat-trybuild-macro`; the registration
+        // check is deferred to the terminal-call site so the
+        // unrecognized emission only fires when the alias was not
+        // explicitly opted-in.
+        collect_use_renames_for_testcases(
+            &node.tree,
+            /* prefix */ Vec::new(),
+            /* leading_colon */ node.leading_colon.is_some(),
+            &mut self.aliased_testcases,
+        );
+        syn::visit::visit_item_use(self, node);
+    }
 }
 
 impl<'a> DiscoveryVisitor<'a> {
+    /// Whether `path` is `<aliased>::new()` shape — a two-segment path
+    /// whose first segment is in `aliased_testcases` and second segment
+    /// is `new`. Mirrors [`Self::is_testcases_constructor_path`] for the
+    /// alias case.
+    fn is_aliased_testcases_constructor(&self, expr: &syn::Expr) -> bool {
+        let syn::Expr::Path(p) = expr else {
+            return false;
+        };
+        if p.qself.is_some() || !p.attrs.is_empty() || p.path.leading_colon.is_some() {
+            return false;
+        }
+        if p.path.segments.len() != 2 {
+            return false;
+        }
+        let first = p.path.segments[0].ident.to_string();
+        let second = p.path.segments[1].ident.to_string();
+        second == "new" && self.aliased_testcases.contains(&first)
+    }
+
+    /// Whether the receiver chain ultimately roots at an
+    /// `aliased_testcases` constructor or an `aliased_bindings`
+    /// binding. Mirrors [`Self::receiver_is_testcases`] for the
+    /// alias case so the terminal-call dispatcher can distinguish
+    /// "recognized" from "unregistered alias" receivers.
+    fn receiver_is_aliased_testcases(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Call(call) => {
+                self.is_aliased_testcases_constructor(&call.func) && call.args.is_empty()
+            }
+            syn::Expr::MethodCall(inner) => self.receiver_is_aliased_testcases(&inner.receiver),
+            syn::Expr::Path(path_expr) => {
+                if path_expr.attrs.is_empty()
+                    && path_expr.qself.is_none()
+                    && let Some(ident) = path_expr.path.get_ident()
+                {
+                    return self.aliased_bindings.contains(&ident.to_string());
+                }
+                false
+            }
+            syn::Expr::Reference(r) => self.receiver_is_aliased_testcases(&r.expr),
+            syn::Expr::Paren(p) => self.receiver_is_aliased_testcases(&p.expr),
+            syn::Expr::Group(g) => self.receiver_is_aliased_testcases(&g.expr),
+            _ => false,
+        }
+    }
+
     /// Whether `expr` is the no-arg constructor expression
     /// `trybuild::TestCases::new()` or an alias's `::new()`. Used by
     /// the pattern-3 `let` tracker.
@@ -690,6 +801,22 @@ impl<'a> DiscoveryVisitor<'a> {
             }
             syn::Expr::Paren(p) => self.is_testcases_constructor_expr(&p.expr),
             syn::Expr::Group(g) => self.is_testcases_constructor_expr(&g.expr),
+            _ => false,
+        }
+    }
+
+    /// Whether `expr` is `<aliased>::new()` (no args) — the alias-case
+    /// counterpart to [`Self::is_testcases_constructor_expr`]. Used by
+    /// the pattern-3 `let` tracker so `let t = Foo::new();` (where
+    /// `Foo` is an unregistered `use trybuild::TestCases as Foo;`
+    /// alias) populates [`Self::aliased_bindings`].
+    fn is_aliased_testcases_constructor_expr(&self, expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Call(call) => {
+                self.is_aliased_testcases_constructor(&call.func) && call.args.is_empty()
+            }
+            syn::Expr::Paren(p) => self.is_aliased_testcases_constructor_expr(&p.expr),
+            syn::Expr::Group(g) => self.is_aliased_testcases_constructor_expr(&g.expr),
             _ => false,
         }
     }
@@ -756,6 +883,50 @@ fn path_matches_string_segments(path: &syn::Path, expected: &[String]) -> bool {
         .iter()
         .zip(expected.iter())
         .all(|(seg, exp)| seg.ident == *exp.as_str())
+}
+
+/// Walk a `syn::UseTree` and record any `<path-ending-in-TestCases> as <local>`
+/// renames into `out`. `prefix` accumulates the parent `UsePath` segments
+/// as the walk descends so a `use trybuild::TestCases as Foo;` produces
+/// `prefix = ["trybuild"]` at the `UseRename { ident: "TestCases", rename: "Foo" }`
+/// node. `_leading_colon` is reserved for future absolute-path variants
+/// (`use ::trybuild::TestCases as Foo;`); v0.1 records either shape
+/// indiscriminately because the spec's alias-detection signal is the
+/// trailing `TestCases` segment, not the path prefix.
+fn collect_use_renames_for_testcases(
+    tree: &syn::UseTree,
+    prefix: Vec<String>,
+    _leading_colon: bool,
+    out: &mut BTreeSet<String>,
+) {
+    match tree {
+        syn::UseTree::Path(path) => {
+            let mut next = prefix;
+            next.push(path.ident.to_string());
+            collect_use_renames_for_testcases(&path.tree, next, _leading_colon, out);
+        }
+        syn::UseTree::Rename(rename) => {
+            // `use <prefix>::<rename.ident> as <rename.rename>;`
+            // We only record renames whose source ident is `TestCases`.
+            // A `use trybuild::TestCases as Foo;` produces `prefix =
+            // ["trybuild"]`, `rename.ident = TestCases`, `rename.rename =
+            // Foo`. The prefix shape is not constrained here — the
+            // adopter may have a re-export chain — but the trailing
+            // ident must be `TestCases` for the discovery surface to
+            // flag the alias.
+            if rename.ident == "TestCases" && !prefix.is_empty() {
+                out.insert(rename.rename.to_string());
+            }
+        }
+        syn::UseTree::Group(group) => {
+            for item in &group.items {
+                collect_use_renames_for_testcases(item, prefix.clone(), _leading_colon, out);
+            }
+        }
+        // `Name` (no rename), `Glob` (`use foo::*;`): nothing to
+        // record — the local name isn't an alias.
+        syn::UseTree::Name(_) | syn::UseTree::Glob(_) => {}
+    }
 }
 
 // -----------------------------------------------------------------
