@@ -113,6 +113,20 @@ pub use compat::run as run_compat;
 #[doc(hidden)]
 pub use compat::overlay::materialize_overlay as compat_overlay_materialize;
 
+// Compat-mode baseline runner (Phase 3 of compat mode, GH #8).
+// Re-exported for the same reason as the overlay above —
+// `tests/compat/argv_baseline_no_shell.rs` lives in a separate test
+// crate and reaches the baseline module through these
+// `#[doc(hidden)]` re-exports. The stability contract is the same:
+// NOT part of any v0.1 surface. Phase 4 (issue #9) layers
+// fixture-level parsing on top of `BaselineResult` and bumps the
+// sidecar `schema_version` from `1` to `2`; that change is additive
+// and the re-export name stays put.
+#[doc(hidden)]
+pub use compat::baseline::BaselineResult as CompatBaselineResult;
+#[doc(hidden)]
+pub use compat::baseline::run_baseline as compat_baseline_run;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`

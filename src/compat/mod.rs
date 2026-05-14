@@ -12,6 +12,7 @@
 //! --compat-report <PATH>`. The Rust API is not part of the v0.1
 //! stability contract; treat `pub(crate) fn run` as private.
 
+pub(crate) mod baseline;
 pub(crate) mod cli;
 pub(crate) mod overlay;
 
