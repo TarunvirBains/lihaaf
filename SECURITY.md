@@ -35,15 +35,49 @@ The bypass is stateless (no session leak) and standard git practice.
 Use it sparingly — in shared repos, a bypassed commit still reaches
 the remote git history where it cannot be cleanly removed.
 
-### Reporting a vulnerability
-
-Email TarunvirBains@kindnudge.app with a clear description. Do not file a
-public GitHub issue with the vulnerability details.
-
-### What this guard does NOT do
+### What the local guard does NOT do
 
 - Does not rewrite git history. Any secret already in the repo's
   history must be considered exposed.
-- Does not scan GitHub issues / PRs / comments. That guard is a
-  separate follow-up; until then, contributors must redact
-  secrets manually before pasting into public GitHub text.
+- Does not scan GitHub issues / PRs / comments — that surface is
+  covered by the GitHub Actions public-text guard below.
+
+## Public-text guard (GitHub Actions)
+
+The `.github/workflows/secrets-scan.yml` workflow scans the text of
+new issues, PR descriptions, comments, and review comments for the
+same sensitive-info patterns as the local pre-commit guard. On a
+match, the workflow posts a single comment naming the pattern
+**category** (never the matched value), asking the author to redact
+and edit.
+
+The workflow uses `pull_request_target` for PR events so it runs with
+the upstream token rather than the read-only fork-PR token. It does
+NOT check out fork-PR head code — only the event payload's text is
+scanned.
+
+False positives can be cleared by editing the offending text to
+include a `<word>`-style placeholder (the same allow-list marker the
+local guard recognizes — see the convention above). For example,
+rewriting `postgres://admin:hunter2@host/db` as
+`postgres://<user>:<password>@<host>/<db>` removes the line from the
+scanner's attention.
+
+The pattern set lives in two places — `scripts/scan-secrets.sh` for
+the local guard and `.github/scripts/scan-text-for-secrets.py` for
+the workflow. When updating one side, update the other in the same
+PR; the parity check in `scripts/run-scan-tests.sh` and the manual
+fixtures under `tests/fixtures/secrets-scan-text/` help confirm both
+sides still agree.
+
+### What the public-text guard does NOT do
+
+- Does not scan attachments, images, or external links — only the
+  inline text of issues, PRs, and comments.
+- Does not block the event. The workflow posts an advisory comment;
+  the author must edit the offending text manually.
+
+## Reporting a vulnerability
+
+Email TarunvirBains@kindnudge.app with a clear description. Do not file a
+public GitHub issue with the vulnerability details.

@@ -1,0 +1,4 @@
+Two problems in this body:
+
+AKIAIOSFODNN7EXAMPLE
+PGPASSWORD=hunter2
