@@ -78,6 +78,32 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   per-suite identity is what the worker now closes over.
 
 ### Fixed
+- Concurrent `cargo lihaaf` invocations sharing a
+  `CARGO_TARGET_DIR` are now serialized via a session-wide advisory
+  file lock at `target/lihaaf/.session.lock`. Previously, two
+  sessions could collide on `target/lihaaf/manifest-<suite>.json`,
+  `target/lihaaf-build-<suite>/`, or the managed-dylib copy —
+  most loudly when one side passed `--no-cache` and unconditionally
+  deleted the other's mid-read state — and the race surfaced as
+  intermittent `DylibBuildFailed`, `DylibNotFound`, spurious
+  `FreshnessDrift` on `managed_dylib_path` / `dylib_sha256`, or
+  `MalformedDiagnostic` on a partially-deleted snapshot. The lock
+  is acquired after the `--list` short-circuit (so `--list` does
+  not block) and before the `--no-cache` deletion sweep, and held
+  for the remainder of the session. On contention, lihaaf emits
+  `lihaaf: waiting for another lihaaf session to release <path>
+  ...` to stderr BEFORE blocking, and (if the wait exceeded 50 ms)
+  follows up with `lihaaf: acquired session lock after N ms` after
+  the lock is granted; single-session runs hit the fast path and
+  emit neither line. Cross-platform via `libc::flock(LOCK_EX)` on
+  Unix (in an `EINTR` retry loop) and `LockFileEx` on Windows
+  (with an explicit `UnlockFileEx` in `Drop` so a fast back-to-back
+  same-process re-acquire does not race the OS's deferred
+  `CloseHandle` release). Crash recovery is automatic: a process
+  that dies holding the lock releases it via OS handle cleanup,
+  no stale-lockfile removal needed. New Windows dependency
+  `windows-sys 0.59` under `cfg(windows)` only; Unix uses the
+  existing `libc` dep. Issue #1.
 - Toolchain drift comparator now widens its key to
   `(release_line, host, commit_hash, sysroot)`. The previous
   comparator compared only `release_line`, so two materially different

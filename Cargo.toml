@@ -63,6 +63,14 @@ tempfile = "3"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Windows FFI — `LockFileEx` / `UnlockFileEx` for the session lock
+# (FIX_BEFORE_BETA Spec B, issue #1). `windows-sys` is the Microsoft-
+# published curated bindings crate; same justification shape as the
+# Unix `libc` block above (canonical FFI source, audited externally,
+# small compile cost, no transitive deps).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Storage_FileSystem", "Win32_System_IO", "Win32_Foundation"] }
+
 # No regex engine, ever. Spec §6.1. Every string match in this crate
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
