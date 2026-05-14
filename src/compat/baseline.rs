@@ -573,39 +573,25 @@ pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> 
     }
 }
 
-/// Run the baseline `cargo test` invocation.
+/// Capture from one argv-only child process spawn. Shared by the
+/// Phase 3 and Phase 4 entry points; the only behavioral divergence
+/// between them is the post-capture parse + sidecar shape.
+struct SpawnCapture {
+    exit_code: i32,
+    dur_ms: u64,
+    stdout: String,
+    stderr: String,
+}
+
+/// Argv-only child spawn + capture. Centralizes the empty-argv guard,
+/// the `Command::new().args().current_dir()` build, the piped I/O
+/// setup, the wall-clock measurement, and the
+/// signal-terminated-exit-code sentinel handling.
 ///
-/// **Argv-only.** No shell, no `sh -c`, no `cmd /c`. The first element
-/// of `argv` is the program; the remaining elements are direct argv
-/// entries the OS hands to the child without interpretation.
-///
-/// **Errors.** Returns:
-///
-/// - [`Error::Cli`] when `argv` is empty. The diagnostic names the
-///   `--compat-cargo-test-argv` flag so the adopter knows which input
-///   was malformed even when this function is called through the
-///   default `["cargo", "test"]` path.
-/// - [`Error::SubprocessSpawn`] when the OS refuses to spawn the
-///   program (binary not found, permission denied, …). Distinct from
-///   a non-zero exit, which is a normal session outcome captured in
-///   [`BaselineResult::exit_code`].
-/// - [`Error::Io`] on failure to wait on the child or to write the
-///   sidecar JSON.
-/// - [`Error::JsonParse`] when the sidecar JSON cannot be serialized.
-///   In practice this is unreachable — the input is `String`s,
-///   integers, and a vector of `String`s, all of which `serde_json`
-///   serializes infallibly — but the error path is wired in defensively
-///   so a future schema bump can fail loudly rather than panicking.
-///
-/// **Side effects.** Writes the sidecar JSON to `sidecar_path` via
-/// `crate::util::write_file_atomic`. Creates the sidecar's parent
-/// directory if it doesn't exist (matching the atomic-write helper's
-/// own semantics).
-pub fn run_baseline(
-    argv: &[String],
-    cwd: &Path,
-    sidecar_path: &Path,
-) -> Result<BaselineResult, Error> {
+/// No shell, no `sh -c`, no `cmd /c` — the first argv element is the
+/// program; the remaining elements are direct argv entries the OS
+/// hands to the child without interpretation.
+fn spawn_and_capture(argv: &[String], cwd: &Path) -> Result<SpawnCapture, Error> {
     if argv.is_empty() {
         return Err(Error::Cli {
             clap_exit_code: 2,
@@ -657,6 +643,54 @@ pub fn run_baseline(
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
 
+    Ok(SpawnCapture {
+        exit_code,
+        dur_ms,
+        stdout,
+        stderr,
+    })
+}
+
+/// Run the baseline `cargo test` invocation.
+///
+/// **Argv-only.** No shell, no `sh -c`, no `cmd /c`. The first element
+/// of `argv` is the program; the remaining elements are direct argv
+/// entries the OS hands to the child without interpretation.
+///
+/// **Errors.** Returns:
+///
+/// - [`Error::Cli`] when `argv` is empty. The diagnostic names the
+///   `--compat-cargo-test-argv` flag so the adopter knows which input
+///   was malformed even when this function is called through the
+///   default `["cargo", "test"]` path.
+/// - [`Error::SubprocessSpawn`] when the OS refuses to spawn the
+///   program (binary not found, permission denied, …). Distinct from
+///   a non-zero exit, which is a normal session outcome captured in
+///   [`BaselineResult::exit_code`].
+/// - [`Error::Io`] on failure to wait on the child or to write the
+///   sidecar JSON.
+/// - [`Error::JsonParse`] when the sidecar JSON cannot be serialized.
+///   In practice this is unreachable — the input is `String`s,
+///   integers, and a vector of `String`s, all of which `serde_json`
+///   serializes infallibly — but the error path is wired in defensively
+///   so a future schema bump can fail loudly rather than panicking.
+///
+/// **Side effects.** Writes the sidecar JSON to `sidecar_path` via
+/// `crate::util::write_file_atomic`. Creates the sidecar's parent
+/// directory if it doesn't exist (matching the atomic-write helper's
+/// own semantics).
+pub fn run_baseline(
+    argv: &[String],
+    cwd: &Path,
+    sidecar_path: &Path,
+) -> Result<BaselineResult, Error> {
+    let SpawnCapture {
+        exit_code,
+        dur_ms,
+        stdout,
+        stderr,
+    } = spawn_and_capture(argv, cwd)?;
+
     write_sidecar(sidecar_path, argv, exit_code, &stdout, &stderr)?;
 
     Ok(BaselineResult {
@@ -699,39 +733,12 @@ pub fn run_baseline_with_recognized_fixtures(
     sidecar_path: &Path,
     recognized_fixtures: &[FixtureId],
 ) -> Result<BaselineResult, Error> {
-    if argv.is_empty() {
-        return Err(Error::Cli {
-            clap_exit_code: 2,
-            message: "error: `--compat-cargo-test-argv` must contain at least one argument \
-                      (the program to spawn, e.g. `\"cargo\"`)"
-                .to_string(),
-        });
-    }
-
-    let program = &argv[0];
-    let args = &argv[1..];
-
-    let started = Instant::now();
-    let output = Command::new(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|e| Error::SubprocessSpawn {
-            program: program.clone(),
-            source: e,
-        })?;
-
-    let dur_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-
-    let exit_code = output
-        .status
-        .code()
-        .unwrap_or(SIGNAL_TERMINATED_EXIT_SENTINEL);
-
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let SpawnCapture {
+        exit_code,
+        dur_ms,
+        stdout,
+        stderr,
+    } = spawn_and_capture(argv, cwd)?;
 
     // Phase 4: parse libtest output conservatively.
     let parsed = parse_libtest_output(&stdout, recognized_fixtures);
