@@ -263,6 +263,51 @@ fn use_alias_not_recognized_without_flag() {
     let _ = &out.unrecognized;
 }
 
+/// **Leading-`::` form is NOT recognized, even with a flag registration.**
+/// The spec's canonical form omits the leading separator. The matcher
+/// (`path_matches_string_segments` in src/compat/discovery.rs) rejects
+/// any `syn::Path` whose `leading_colon` is set, AND the alias parser
+/// strips empty segments — so a `--compat-trybuild-macro ::trybuild::TestCases`
+/// is stored as `["trybuild", "TestCases"]` and even when the caller
+/// types `::trybuild::TestCases::new()` at the call site, the matcher
+/// declines because `leading_colon.is_some()`.
+///
+/// This test documents the v0.1 limitation rather than working around
+/// it; the doc-comment fix removes the "register via flag" advice that
+/// implied a workaround existed.
+#[test]
+fn leading_colon_call_site_not_recognized_even_with_alias_flag() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests_dir = crate_root.join("tests");
+    std::fs::create_dir_all(tests_dir.join("ui")).unwrap();
+    std::fs::write(tests_dir.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    let source = "\
+#[test]\n\
+fn ui() {\n\
+    let t = ::trybuild::TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests_dir.join("trybuild.rs"), source).unwrap();
+
+    // Registering the absolute form via the flag does NOT make the
+    // call site recognizable. The matcher's `leading_colon.is_some()`
+    // check is the v0.1-locked behavior; the doc comment used to
+    // suggest this flag invocation as an escape hatch, but it does
+    // not work.
+    let aliases = vec!["::trybuild::TestCases".to_string()];
+    let out = discover(&crate_root, &aliases).expect("discover succeeds");
+    assert!(
+        out.fixtures.is_empty(),
+        "leading-`::` call sites are NOT recognized in v0.1, even with --compat-trybuild-macro; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// **Macro-expanded invocations are NOT recognized.** A `make_tests!()`
 /// macro call that would expand to a `TestCases::new()` chain at
 /// compile time produces no fixtures. The discovery walk operates on

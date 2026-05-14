@@ -68,12 +68,18 @@
 //!   `--compat-trybuild-macro`. The alias must be the literal path
 //!   string passed on the flag; segment-by-segment equality is required.
 //! - The leading `::` form (`::trybuild::TestCases::new()`) is NOT
-//!   recognized. The spec's canonical form omits the leading separator
-//!   and accepting it would broaden the match surface without
-//!   improving determinism. Adopters using the absolute form can
-//!   register via `--compat-trybuild-macro ::trybuild::TestCases`.
-//! - `crate::TestCases::new()` (re-exported locally) is NOT recognized
-//!   for the same reason; register via `--compat-trybuild-macro`.
+//!   recognized in v0.1. The spec's canonical form omits the leading
+//!   separator and accepting it would broaden the match surface without
+//!   improving determinism. There is no `--compat-trybuild-macro`
+//!   workaround for this in v0.1: alias-flag values are parsed by
+//!   splitting on `::` and dropping empty segments, and the matcher
+//!   itself rejects every path whose `leading_colon` is set — so even
+//!   a `--compat-trybuild-macro ::trybuild::TestCases` registration
+//!   would not match a leading-`::` call site. Adopters writing the
+//!   absolute form must rewrite the call site to the canonical form
+//!   (or open a v0.2 spec discussion).
+//! - `crate::TestCases::new()` (re-exported locally) is NOT recognized;
+//!   register via `--compat-trybuild-macro`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
