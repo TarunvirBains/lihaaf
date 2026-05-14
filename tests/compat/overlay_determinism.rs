@@ -251,6 +251,50 @@ members = ["crate-a", "crate-b"]
 }
 
 #[test]
+fn virtual_workspace_with_inherited_workspace_package_is_rejected() {
+    // Cargo's "inherited package metadata" pattern: a virtual workspace
+    // hosts a `[workspace.package]` table for members to inherit via
+    // `package.version.workspace = true`. The manifest itself is STILL a
+    // virtual workspace (no top-level `[package]`) — cargo cannot build
+    // it as a library, so the overlay must reject it just like the
+    // bare-virtual-workspace case. Regression for round-2 review BLOCK:
+    // earlier logic exempted virtual workspaces that carried
+    // `[workspace.package]`, treating the inherited-metadata table as if
+    // it made the root manifest buildable. It does not.
+    let input = r#"[workspace]
+members = ["crate-a", "crate-b"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+"#;
+    let (_tmp, upstream) = write_upstream(input);
+    let err = materialize_overlay(&upstream)
+        .expect_err("virtual workspace with [workspace.package] must be rejected");
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(clap_exit_code, 2, "exit code must be the clap usage code");
+            assert!(
+                message.contains("workspace"),
+                "diagnostic must name `workspace`; got: {message}"
+            );
+            assert!(
+                message.contains("--compat-root"),
+                "diagnostic must point at the flag; got: {message}"
+            );
+            assert!(
+                message.contains("member crate"),
+                "diagnostic must direct adopter to a member crate; got: {message}"
+            );
+        }
+        other => panic!("expected Error::Cli, got {other:?}"),
+    }
+}
+
+#[test]
 fn manifest_without_package_or_workspace_still_tolerated() {
     // An empty / odd manifest (no `[package]`, no `[workspace]`) is
     // not the workspace-root shape — the rejection is targeted. The

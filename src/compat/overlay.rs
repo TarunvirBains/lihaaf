@@ -138,9 +138,11 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
         })?;
 
     // Spec invariant: `--compat-root` is single-crate. A workspace-root
-    // manifest (`[workspace]` table, no `[package]` and no
-    // `[workspace.package]`) cannot host a `[lib] crate-type` rewrite;
-    // the lihaaf stage-3 dylib build would have nothing to compile.
+    // manifest (`[workspace]` table without a top-level `[package]`)
+    // cannot host a `[lib] crate-type` rewrite; the lihaaf stage-3
+    // dylib build would have nothing to compile. `[workspace.package]`
+    // is inherited-metadata for member crates and does NOT make the
+    // manifest itself buildable, so it is rejected uniformly.
     // Reject with a directed diagnostic pointing the adopter at a
     // member crate's Cargo.toml. The empty / unusual case (neither
     // `[package]` nor `[workspace]`) stays tolerant — that may be a
@@ -206,27 +208,18 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
 }
 
 /// Return `true` when `value` is a workspace-root manifest: declares a
-/// `[workspace]` table, and declares neither `[package]` nor
-/// `[workspace.package]`. The two negative conditions are required
-/// because a virtual-manifest workspace can host a `[workspace.package]`
-/// (cargo "inherited package metadata"), but the actual crate the
-/// adopter wants overlayed lives in a member directory either way.
+/// `[workspace]` table AND lacks a top-level `[package]`. The
+/// `[workspace.package]` table is INHERITED metadata for member crates
+/// (the `package.version.workspace = true` pattern) — its presence does
+/// NOT make the manifest itself a buildable library; the actual crate
+/// the adopter wants overlayed lives in a member directory.
 fn is_workspace_root_manifest(value: &toml::Value) -> bool {
     let Some(top) = value.as_table() else {
         return false;
     };
     let has_workspace = top.get("workspace").is_some_and(|v| v.is_table());
-    if !has_workspace {
-        return false;
-    }
-    if top.get("package").is_some_and(|v| v.is_table()) {
-        return false;
-    }
-    let has_workspace_package = top
-        .get("workspace")
-        .and_then(|w| w.get("package"))
-        .is_some_and(|p| p.is_table());
-    !has_workspace_package
+    let has_package = top.get("package").is_some_and(|v| v.is_table());
+    has_workspace && !has_package
 }
 
 /// Return `true` when the upstream `[lib] crate-type` already contains
