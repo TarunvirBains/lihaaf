@@ -883,6 +883,39 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        // Round-6 BLOCK fix: `#[cfg(...)]` / `#[cfg_attr(...)]` on the
+        // module itself gates the ENTIRE inline body — every `use`,
+        // every `#[test] fn`, every nested module. Without resolving
+        // the cfg (which depends on `--features` at `cargo build` time)
+        // we cannot descend safely: a `#[cfg(unix)] mod tests { ... }`
+        // on Windows must NOT contribute fixtures, and vice-versa.
+        //
+        // Mirror the `visit_item_fn` / `visit_impl_item_fn` round-5
+        // pattern: emit one `discovery_unrecognized` entry naming the
+        // module, then skip the walk (do NOT descend into `node.content`).
+        // Under-discovery with operator visibility is the safe failure
+        // mode — descending silently would produce a phantom fixture
+        // whenever the cfg is disabled at adopter build time.
+        if let Some(cfg_attr) = find_cfg_attribute(&node.attrs) {
+            let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
+                "cfg_attr"
+            } else {
+                "cfg"
+            };
+            let line = node.ident.span().start().line.max(1);
+            let mod_name = node.ident.to_string();
+            self.unrecognized.push(DiscoveryUnrecognized {
+                file: self.current_file.to_path_buf(),
+                line,
+                detail: format!(
+                    "module `{mod_name}` is cfg-gated (`#[{attr_kind}(...)]`); \
+                     trybuild discovery cannot evaluate the cfg without resolution. \
+                     Treat as unrecognized."
+                ),
+            });
+            return;
+        }
+
         // Round-5 BLOCK fix: `imported_testcases` and `aliased_testcases`
         // are FILE-scope sets — populated by `visit_item_use` from
         // `use` statements at file top-level. But inline modules

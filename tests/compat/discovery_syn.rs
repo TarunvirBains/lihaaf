@@ -1619,6 +1619,112 @@ fn ui() {\n\
     );
 }
 
+/// **Round-6 BLOCK regression: `#[cfg(...)]`-gated inline modules emit
+/// `discovery_unrecognized` and do NOT contribute fixtures.** A
+/// `#[cfg(feature = "x")] mod gated { ... trybuild call ... }` is
+/// unevaluable at AST time — the cfg's truth value depends on
+/// `--features` at `cargo build` time. The visitor previously descended
+/// into the body and surfaced the trybuild call as an active fixture,
+/// producing a phantom entry whenever the feature was disabled.
+///
+/// The fix: any inline module carrying `#[cfg]` or `#[cfg_attr]` is
+/// recorded as `discovery_unrecognized` (detail names the module and
+/// mentions `cfg`) and its body is NOT descended — mirroring the round-5
+/// `visit_item_fn` / `visit_impl_item_fn` fix.
+///
+/// The test pairs a `#[cfg(feature = "x")] mod gated { ... }` with a
+/// sibling un-gated module so the assertion validates both halves of
+/// the contract: zero fixtures from `gated`, one fixture from the
+/// sibling. Adjacent un-gated modules remain unaffected — the fix is
+/// per-module.
+#[test]
+fn cfg_gated_module_emits_discovery_unrecognized() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(tests.join("ui").join("bar.rs"), "fn main() {}\n").unwrap();
+
+    // `gated` is `#[cfg(feature = "x")]`; its `ui` test must NOT
+    // contribute a fixture (the feature may be disabled at build time).
+    // `always` is un-gated; its `ui_always` test must contribute one
+    // fixture as usual.
+    let source = "\
+#[cfg(feature = \"x\")]\n\
+mod gated {\n\
+    #[test]\n\
+    fn ui() {\n\
+        let t = trybuild::TestCases::new();\n\
+        t.compile_fail(\"tests/ui/foo.rs\");\n\
+    }\n\
+}\n\
+mod always {\n\
+    #[test]\n\
+    fn ui_always() {\n\
+        let t = trybuild::TestCases::new();\n\
+        t.compile_fail(\"tests/ui/bar.rs\");\n\
+    }\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    // Only the un-gated `always::ui_always` fixture must surface.
+    assert_eq!(
+        out.fixtures.len(),
+        1,
+        "exactly one fixture from the un-gated `always` module; got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        out.fixtures[0].relative_path.ends_with("tests/ui/bar.rs"),
+        "the surviving fixture must be `always::ui_always`'s `bar.rs`; got {}",
+        out.fixtures[0].relative_path
+    );
+    assert_eq!(
+        out.fixtures[0].call_site.enclosing_test_fn.as_deref(),
+        Some("ui_always"),
+        "the un-gated call must report its enclosing `#[test] fn ui_always`",
+    );
+
+    assert_eq!(
+        out.unrecognized.len(),
+        1,
+        "exactly one unrecognized entry from the cfg-gated `gated` module; got {:?}",
+        out.unrecognized
+    );
+    let entry = &out.unrecognized[0];
+    assert!(
+        entry.detail.contains("module"),
+        "detail must mention `module`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("gated"),
+        "detail must name the cfg-gated module `gated`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.detail.contains("cfg"),
+        "detail must mention `cfg`; got `{}`",
+        entry.detail
+    );
+    assert!(
+        entry.file.ends_with("tests/trybuild.rs"),
+        "file must point at tests/trybuild.rs; got {}",
+        entry.file.display()
+    );
+    assert!(
+        entry.line > 0,
+        "line must be 1-indexed and non-zero; got {}",
+        entry.line
+    );
+}
+
 /// **Smoke check on the corpus root.** All scenarios point at
 /// `tests/compat/discovery_corpus/<name>/`; verify each exists so a
 /// missing checked-in fixture fails fast with a clear message.
