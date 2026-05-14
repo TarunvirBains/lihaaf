@@ -135,6 +135,46 @@ fn single_recognized_fail_counts_in_fail() {
     );
 }
 
+/// **Prefix-collision regression.** A recognized fixture
+/// `tests/ui/foo.rs` must NOT correlate to a libtest verdict line
+/// for `tests/ui/foo_extra`. The earlier substring-match shape would
+/// have happily attributed the `foo_extra` verdict to `foo`; the
+/// exact-match rule closes that class.
+///
+/// The fixture `tests/ui/foo_extra.rs` IS recognized in this corpus,
+/// so the test also asserts the verdict lands on `foo_extra` (where
+/// it belongs), not on `foo`.
+#[test]
+fn recognized_fixture_prefix_does_not_match_longer_libtest_name() {
+    let recognized = vec![fid("tests/ui/foo.rs"), fid("tests/ui/foo_extra.rs")];
+    let stdout = "test tests/ui/foo_extra ... ok\n";
+    let result = parse(stdout, &recognized);
+    // The verdict must land on `foo_extra`, not on `foo`.
+    assert_eq!(
+        result.pass,
+        Some(1),
+        "exactly one recognized fixture passed"
+    );
+    assert_eq!(result.fail, Some(0));
+    // `foo.rs` was never named — counts as unknown (absence of
+    // evidence).
+    assert_eq!(
+        result.unknown_count, 1,
+        "the unnamed `tests/ui/foo.rs` fixture counts as one unknown; got {}",
+        result.unknown_count
+    );
+    assert_eq!(result.mismatch_entries.len(), 1);
+    assert_eq!(
+        result.mismatch_entries[0].fixture, "tests/ui/foo_extra.rs",
+        "verdict must correlate to the exact-match fixture, not the prefix; got {}",
+        result.mismatch_entries[0].fixture
+    );
+    assert_eq!(
+        result.mismatch_entries[0].baseline_verdict,
+        CompatBaselineVerdict::Pass
+    );
+}
+
 /// **Conservatism rule, absence of evidence form.**
 ///
 /// A recognized fixture the libtest output never names must count as

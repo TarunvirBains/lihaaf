@@ -298,10 +298,12 @@ pub struct ParsedBaseline {
     /// fixture-level verdict. Always populated. Increments for:
     ///
     /// 1. Every verdict line when the recognized-fixture set is empty.
-    /// 2. Verdict lines whose libtest test name does not contain
-    ///    any recognized fixture's stem (substring match against
-    ///    the forward-slash form of `repo_relative_path` minus its
-    ///    `.rs` extension).
+    /// 2. Verdict lines whose libtest test name does not equal any
+    ///    recognized fixture's stem (forward-slash form of
+    ///    `repo_relative_path` minus its `.rs` extension; exact
+    ///    match — substring matching would let fixture
+    ///    `tests/ui/foo.rs` collide with libtest line
+    ///    `tests/ui/foo_extra`).
     /// 3. Recognized fixtures the parser never saw in output (the
     ///    "absence of evidence is not pass" rule).
     /// 4. Verdict lines with malformed shape after ANSI stripping
@@ -397,22 +399,13 @@ pub(crate) fn strip_ansi(s: &str) -> String {
 ///
 /// Libtest reports the **test function name** (e.g. `tests::trybuild`),
 /// not the individual fixture path. Phase 6's discovery output maps
-/// `(call_site, fixture_path)` pairs; the parser here uses a simpler
-/// **substring match**: if the libtest test name contains the
-/// fixture's stem (the forward-slash form of `repo_relative_path`,
-/// minus the `.rs` extension if present), the verdict is assigned to
-/// that fixture. Miss ⇒ `unknown_count++`. This is intentionally
-/// loose; the full correlation logic lands in Phase 8 when discovery
-/// output is wired end-to-end. Phase 4 ships the conservative
-/// scaffold.
-///
-/// **Why substring, not exact match?** Trybuild's standard test
-/// function name (`trybuild_tests`) does not literally contain the
-/// fixture path, so a strict equality check would always miss for
-/// real trybuild output. Phase 6 will replace this with a typed
-/// call-site map; for Phase 4 testing, the substring shape produces
-/// a clear bite (tests can construct libtest output that names a
-/// specific fixture and assert correlation works).
+/// `(call_site, fixture_path)` pairs; the parser here uses an
+/// **exact match** against the forward-slash form of
+/// `repo_relative_path` minus the `.rs` extension. Miss ⇒
+/// `unknown_count++`. Exact equality (rather than substring) is the
+/// load-bearing rule that closes a prefix-collision class — a
+/// recognized fixture `tests/ui/foo.rs` must not also match a
+/// libtest line `test tests/ui/foo_extra ... ok`.
 pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> ParsedBaseline {
     // Pre-compute the forward-slash + stem-stripped form of every
     // recognized fixture. Sorted lookup table for stable matching
@@ -514,14 +507,20 @@ pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> 
             continue;
         }
 
-        // Substring match against the fixture stem. Forward-slash
+        // Exact match against the fixture stem. Forward-slash
         // normalize the test name first so `tests\foo` (unlikely
         // but possible on Windows-built test binaries) matches the
-        // same fixture as `tests/foo`.
+        // same fixture as `tests/foo`. The earlier substring shape
+        // had a prefix-collision class: a recognized fixture
+        // `tests/ui/foo.rs` would also match a libtest verdict line
+        // `test tests/ui/foo_extra ... ok` because `foo_extra`
+        // contains the substring `foo`. Exact equality closes that
+        // class and is sufficient for every Phase 4 test corpus
+        // (their libtest test names match the stem byte-for-byte).
         let test_name_norm = util::to_forward_slash(test_name);
         let matched: Option<usize> = normalized
             .iter()
-            .position(|(stem, _)| test_name_norm.contains(stem.as_str()));
+            .position(|(stem, _)| test_name_norm == stem.as_str());
 
         let Some(idx) = matched else {
             // Libtest named a test the parser couldn't correlate
