@@ -1619,6 +1619,83 @@ fn ui() {\n\
     );
 }
 
+/// **Round-6 BLOCK regression: `use trybuild::TestCases;` inside a
+/// function body does NOT leak to sibling functions.** In Rust, `use`
+/// declarations inside a function body are LOCAL to that function — they
+/// do NOT leak to sibling functions. The visitor must therefore scope
+/// `imported_testcases` per-function, mirroring what `visit_item_mod`
+/// already does for inline modules.
+///
+/// Before the fix, `visit_item_fn` saved/restored `local_bindings` and
+/// `aliased_bindings` but NOT `imported_testcases` / `aliased_testcases`.
+/// A `fn a() { use trybuild::TestCases; ... }` would populate the
+/// file-scope set, and a sibling `fn b() { let t = TestCases::new(); ... }`
+/// (where `TestCases` is NOT actually in scope) would silently surface
+/// as a phantom fixture.
+///
+/// The test exercises exactly that shape: `fn a` imports `TestCases`
+/// inside its body; `fn b` (the `#[test]` function) constructs a
+/// `TestCases::new()` chain with NO import in scope. The fix requires
+/// `b`'s call to NOT be recognized as a fixture. `a` is intentionally
+/// NOT a `#[test]` (it just exercises the body-scope `use`); the
+/// visitor still enters its body, so the leak case is fully reachable.
+#[test]
+fn imported_testcases_does_not_leak_across_function_bodies() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let crate_root = tmp.path().to_path_buf();
+    let tests = crate_root.join("tests");
+    std::fs::create_dir_all(tests.join("ui")).unwrap();
+    std::fs::write(tests.join("ui").join("foo.rs"), "fn main() {}\n").unwrap();
+
+    // `fn a` has a body-scoped `use trybuild::TestCases;`. The visitor
+    // enters its body and must NOT leak the import into the file-scope
+    // `imported_testcases` set. `fn b` (the `#[test]`) constructs a
+    // `TestCases::new()` chain with NO import in scope at the file or
+    // function level — the `TestCases::new()` call must therefore NOT
+    // be recognized as a fixture (the call is a 2-segment `TestCases::new`
+    // path that does not match the canonical 3-segment shape and is
+    // not in `imported_testcases`).
+    let source = "\
+fn a() {\n\
+    use trybuild::TestCases;\n\
+    let _t = TestCases::new();\n\
+}\n\
+#[test]\n\
+fn b() {\n\
+    let t = TestCases::new();\n\
+    t.compile_fail(\"tests/ui/foo.rs\");\n\
+}\n";
+    std::fs::write(tests.join("trybuild.rs"), source).unwrap();
+
+    let out = discover(&crate_root, &[]).expect("discover succeeds");
+
+    // The leak fix demands that `fn b`'s `TestCases::new()` chain is
+    // NOT recognized — `TestCases` is not imported at the file level
+    // and `fn a`'s body-scoped `use` must not leak. The chain is a
+    // 2-segment local-name path that is not in `imported_testcases`,
+    // not in `aliased_testcases`, and not the canonical 3-segment
+    // form, so it is silently dropped (consistent with the visitor's
+    // false-negative-over-false-positive policy on unknown shapes).
+    assert!(
+        out.fixtures.is_empty(),
+        "no fixtures — `fn b`'s call must NOT match because `TestCases` \
+         is not actually in scope there (the `use` inside `fn a` does not \
+         leak). got {:?}",
+        out.fixtures
+            .iter()
+            .map(|f| f.relative_path.as_str())
+            .collect::<Vec<_>>()
+    );
+    // No unrecognized entries either — the call is an unknown shape
+    // that gets silently dropped, not flagged. This matches the
+    // existing alias-flag and 2-segment-path policies.
+    assert!(
+        out.unrecognized.is_empty(),
+        "no unrecognized entries expected for unknown call shapes; got {:?}",
+        out.unrecognized
+    );
+}
+
 /// **Round-6 BLOCK regression: `#[cfg(...)]`-gated inline modules emit
 /// `discovery_unrecognized` and do NOT contribute fixtures.** A
 /// `#[cfg(feature = "x")] mod gated { ... trybuild call ... }` is

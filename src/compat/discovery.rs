@@ -765,9 +765,31 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // Save and reset both the enclosing-test marker and the
         // per-function bindings so cross-function leakage is
         // impossible.
+        //
+        // Round-6 BLOCK fix (Gemini): `use` declarations inside a
+        // function body are LOCAL to that function in Rust — they do
+        // NOT leak to sibling functions in the same file. The visitor
+        // must therefore save and RESTORE `imported_testcases` and
+        // `aliased_testcases` after the body walk. Unlike `visit_item_mod`
+        // (which clears the sets on entry so the inner module starts
+        // from an empty file-scope set), functions INHERIT the enclosing
+        // file's imports — a file-level `use trybuild::TestCases;` IS
+        // visible inside every function in that file. The fix is
+        // therefore "snapshot before, restore after": any body-local
+        // `use` additions are observed during the walk but rolled back
+        // on exit so they cannot leak to siblings.
+        //
+        // Implementation: snapshot via `.clone()` (the sets are
+        // typically empty or small — a handful of imports per file),
+        // walk, then overwrite the live set with the snapshot. We
+        // cannot use `std::mem::take` because that would empty the live
+        // set BEFORE the walk, defeating inheritance from the file
+        // scope.
         let saved_enclosing = self.enclosing_test_fn.take();
         let saved_bindings = std::mem::take(&mut self.local_bindings);
         let saved_aliased_bindings = std::mem::take(&mut self.aliased_bindings);
+        let saved_imported = self.imported_testcases.clone();
+        let saved_aliased = self.aliased_testcases.clone();
 
         if is_test_attribute(&node.attrs) {
             self.enclosing_test_fn = Some(node.sig.ident.to_string());
@@ -777,6 +799,8 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         self.enclosing_test_fn = saved_enclosing;
         self.local_bindings = saved_bindings;
         self.aliased_bindings = saved_aliased_bindings;
+        self.imported_testcases = saved_imported;
+        self.aliased_testcases = saved_aliased;
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
@@ -868,9 +892,18 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // impl method gets its own fresh bindings scope; `#[test]` on
         // impl methods is exceedingly rare but supported uniformly
         // (the same `is_test_attribute` filter applies).
+        //
+        // Round-6 BLOCK fix (Gemini, mirrored from `visit_item_fn`):
+        // also snapshot/restore `imported_testcases` and `aliased_testcases`
+        // because `use` declarations inside an impl method body are
+        // local to that method in Rust. Use `.clone()` (snapshot) rather
+        // than `mem::take` so the method INHERITS file-scope imports
+        // during the walk but body-local additions roll back on exit.
         let saved_enclosing = self.enclosing_test_fn.take();
         let saved_bindings = std::mem::take(&mut self.local_bindings);
         let saved_aliased_bindings = std::mem::take(&mut self.aliased_bindings);
+        let saved_imported = self.imported_testcases.clone();
+        let saved_aliased = self.aliased_testcases.clone();
 
         if is_test_attribute(&node.attrs) {
             self.enclosing_test_fn = Some(node.sig.ident.to_string());
@@ -880,6 +913,8 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         self.enclosing_test_fn = saved_enclosing;
         self.local_bindings = saved_bindings;
         self.aliased_bindings = saved_aliased_bindings;
+        self.imported_testcases = saved_imported;
+        self.aliased_testcases = saved_aliased;
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
