@@ -52,6 +52,10 @@ path = "tests/compat/overlay_determinism.rs"
 name = "argv_baseline_no_shell"
 path = "tests/compat/argv_baseline_no_shell.rs"
 
+[[test]]
+name = "baseline_conservative"
+path = "tests/compat/baseline_conservative.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }

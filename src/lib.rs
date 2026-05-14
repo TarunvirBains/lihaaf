@@ -127,6 +127,27 @@ pub use compat::baseline::BaselineResult as CompatBaselineResult;
 #[doc(hidden)]
 pub use compat::baseline::run_baseline as compat_baseline_run;
 
+// Compat-mode conservative trybuild baseline extraction (Phase 4 of
+// compat mode, GH #9). Re-exported so `tests/compat/
+// baseline_conservative.rs` can reach the conservative parser, the
+// fixture-recognition input type, the mismatch record, and the v2
+// runner entry point through stable names. The stability contract
+// is the same as the other compat re-exports: NOT part of any v0.1
+// surface; the supported entry to compat mode is `cargo lihaaf
+// --compat`.
+#[doc(hidden)]
+pub use compat::baseline::BaselineMismatch as CompatBaselineMismatch;
+#[doc(hidden)]
+pub use compat::baseline::BaselineVerdict as CompatBaselineVerdict;
+#[doc(hidden)]
+pub use compat::baseline::FixtureId as CompatFixtureId;
+#[doc(hidden)]
+pub use compat::baseline::ParsedBaseline as CompatParsedBaseline;
+#[doc(hidden)]
+pub use compat::baseline::parse_libtest_output as compat_parse_libtest_output;
+#[doc(hidden)]
+pub use compat::baseline::run_baseline_with_recognized_fixtures as compat_baseline_run_with_recognized_fixtures;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`
