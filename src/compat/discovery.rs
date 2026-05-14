@@ -75,7 +75,7 @@
 //! - `crate::TestCases::new()` (re-exported locally) is NOT recognized
 //!   for the same reason; register via `--compat-trybuild-macro`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use syn::visit::Visit;
@@ -369,12 +369,12 @@ struct DiscoveryVisitor<'a> {
     /// Name of the enclosing `#[test]` function, or `None` for
     /// top-level / non-`#[test]` calls.
     enclosing_test_fn: Option<String>,
-    /// Per-function bindings: `local_bindings["t"] = ()` records that
-    /// `let t = trybuild::TestCases::new();` (or an alias's `new()`)
-    /// was seen inside the current `#[test]` body. The map is cleared
-    /// on function exit so cross-function tracking is impossible by
+    /// Per-function bindings: each entry records an identifier `t`
+    /// from `let t = trybuild::TestCases::new();` (or an alias's
+    /// `new()`) seen inside the current `#[test]` body. Cleared on
+    /// function exit so cross-function tracking is impossible by
     /// construction.
-    local_bindings: BTreeMap<String, ()>,
+    local_bindings: BTreeSet<String>,
 
     /// Recognized hits, awaiting glob expansion.
     hits: Vec<VisitorHit>,
@@ -388,7 +388,7 @@ impl<'a> DiscoveryVisitor<'a> {
             current_file,
             custom_macros,
             enclosing_test_fn: None,
-            local_bindings: BTreeMap::new(),
+            local_bindings: BTreeSet::new(),
             hits: Vec::new(),
             unrecognized: Vec::new(),
         }
@@ -419,7 +419,7 @@ impl<'a> DiscoveryVisitor<'a> {
                     && path_expr.qself.is_none()
                     && let Some(ident) = path_expr.path.get_ident()
                 {
-                    return self.local_bindings.contains_key(&ident.to_string());
+                    return self.local_bindings.contains(&ident.to_string());
                 }
                 false
             }
@@ -564,7 +564,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
             && pat_ident.subpat.is_none()
             && self.is_testcases_constructor_expr(&init.expr)
         {
-            self.local_bindings.insert(pat_ident.ident.to_string(), ());
+            self.local_bindings.insert(pat_ident.ident.to_string());
         }
         syn::visit::visit_local(self, node);
     }
