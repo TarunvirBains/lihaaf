@@ -56,6 +56,7 @@
 // pass. Enforcement is convention + dependency checks in CI.
 
 pub mod cli;
+pub(crate) mod compat;
 pub mod config;
 pub(crate) mod diff;
 pub(crate) mod discovery;
@@ -85,6 +86,18 @@ pub use error::{Error, Outcome};
 pub use exit::ExitCode;
 pub use session::{Report, run};
 pub use verdict::Verdict;
+
+// Compat-mode entry point. Re-exported because the
+// `cargo-lihaaf` binary lives in a separate crate (`src/bin/`) and
+// cannot reach `pub(crate)` items directly. Adopters should NOT
+// drive compat mode from Rust; the supported entry is `cargo lihaaf
+// --compat`. The Rust surface here exists for the binary and for
+// future integration tests; the path and signature are not part of
+// any v0.1 stability contract.
+#[doc(hidden)]
+pub use compat::cli::CompatArgs;
+#[doc(hidden)]
+pub use compat::run as run_compat;
 
 /// The semver-stable lihaaf release the binary identifies as.
 ///

@@ -43,6 +43,42 @@ pub struct Cli {
     #[arg(long)]
     pub bless: bool,
 
+    /// Switch the binary into compat mode. See `docs/compatibility-plan.md` §3.1.
+    /// When set, only the `--compat*` flags govern fixture/manifest selection;
+    /// `--filter` and `--manifest-path` are mode errors.
+    #[arg(long)]
+    pub compat: bool,
+
+    /// Required when `--compat` is set. JSON array passed verbatim as argv to
+    /// the baseline `cargo test` invocation (no shell). Default `["cargo","test"]`.
+    #[arg(long, value_name = "JSON")]
+    pub compat_cargo_test_argv: Option<String>,
+
+    /// Recorded in the §3.3 envelope's `commit` field for traceability.
+    #[arg(long, value_name = "SHA")]
+    pub compat_commit: Option<String>,
+
+    /// Substring filter on fixture paths in compat mode (shadows `--filter`).
+    #[arg(long, value_name = "SUBSTR")]
+    pub compat_filter: Vec<String>,
+
+    /// Sibling-manifest path override (shadows `--manifest-path`).
+    #[arg(long, value_name = "PATH")]
+    pub compat_manifest: Option<PathBuf>,
+
+    /// Required when `--compat` is set. §3.3 envelope output path.
+    #[arg(long, value_name = "PATH")]
+    pub compat_report: Option<PathBuf>,
+
+    /// Required when `--compat` is set. Target crate checkout path.
+    #[arg(long, value_name = "DIR")]
+    pub compat_root: Option<PathBuf>,
+
+    /// Additional fully-qualified macro paths the §3.2.1 AST walk treats as
+    /// aliases for `trybuild::TestCases::new()`. Repeatable; OR'd.
+    #[arg(long, value_name = "PATH")]
+    pub compat_trybuild_macro: Vec<String>,
+
     /// Run only fixtures whose relative path contains the substring.
     /// Multiple `--filter` flags are OR'd. Substring match is
     /// case-sensitive.
@@ -128,10 +164,18 @@ fn parse_jobs(s: &str) -> Result<u32, String> {
 
 /// Parse `argv` (already stripped of the cargo subcommand prefix) into a
 /// [`Cli`].
+///
+/// After clap-derive parsing succeeds, the (`pub(crate)`)
+/// `validate_mode_consistency` method is run to enforce the mode-error
+/// matrix for compat vs non-compat flag combinations. Both clap errors
+/// and validator errors return [`Error::Cli`] with `clap_exit_code = 2`;
+/// mode-error diagnostics are printed to stderr before the typed error
+/// bubbles up so the user sees the directed message even in pipelines
+/// that discard the returned error body.
 pub fn parse_from(argv: Vec<String>) -> Result<Cli, Error> {
     use clap::error::ErrorKind;
-    match Cli::try_parse_from(argv) {
-        Ok(cli) => Ok(cli),
+    let cli = match Cli::try_parse_from(argv) {
+        Ok(cli) => cli,
         Err(e) => {
             // For `--help` / `--version`, clap returns a "graceful" error
             // and should print and exit 0.
@@ -145,12 +189,25 @@ pub fn parse_from(argv: Vec<String>) -> Result<Cli, Error> {
             // Pre-print so the caller sees the message even when
             // bubbling through the typed error.
             let _ = e.print();
-            Err(Error::Cli {
+            return Err(Error::Cli {
                 clap_exit_code: exit_code,
                 message,
-            })
+            });
         }
+    };
+
+    // Phase 1 mode-error matrix. Validation runs after clap so
+    // every parsed field is observable and the diagnostic can name
+    // the replacement flag instead of clap's generic "cannot be used
+    // with" message.
+    if let Err(e) = cli.validate_mode_consistency() {
+        if let Error::Cli { message, .. } = &e {
+            eprintln!("{message}");
+        }
+        return Err(e);
     }
+
+    Ok(cli)
 }
 
 impl Cli {
@@ -163,6 +220,121 @@ impl Cli {
         std::env::var("LIHAAF_OVERWRITE")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false)
+    }
+
+    /// Reject inconsistent mode combinations between `--compat` and the
+    /// v0.1 surface.
+    ///
+    /// Called by [`parse_from`] after clap parsing succeeds. The
+    /// validator returns directed diagnostics:
+    ///
+    /// - In compat mode, `--filter` and `--manifest-path` are mode
+    ///   errors and the message names the replacement (`--compat-filter`
+    ///   / `--compat-manifest`).
+    /// - In compat mode, `--compat-root` and `--compat-report` are
+    ///   required; their absence is a mode error.
+    /// - Outside compat mode, any `--compat*` flag is a mode error.
+    ///
+    /// The implementation is a hand-rolled validator rather than clap's
+    /// `requires` / `conflicts_with` annotations because the spec
+    /// requires the diagnostic to name the replacement flag. clap's
+    /// generic "the argument '--filter' cannot be used with '--compat'"
+    /// message does not give the adopter that pointer.
+    pub(crate) fn validate_mode_consistency(&self) -> Result<(), Error> {
+        if self.compat {
+            // In compat mode: shadowed flags are mode errors.
+            if !self.filter.is_empty() {
+                return Err(cli_mode_error(
+                    "--filter",
+                    "--compat-filter",
+                    "compat mode owns the fixture-path filter surface",
+                ));
+            }
+            if self.manifest_path.is_some() {
+                return Err(cli_mode_error(
+                    "--manifest-path",
+                    "--compat-manifest",
+                    "compat mode owns the manifest-path surface",
+                ));
+            }
+            // In compat mode: required compat flags must be present.
+            if self.compat_root.is_none() {
+                return Err(missing_required_compat_flag("--compat-root"));
+            }
+            if self.compat_report.is_none() {
+                return Err(missing_required_compat_flag("--compat-report"));
+            }
+        } else {
+            // Outside compat mode: every --compat-* flag is a mode error.
+            // Order matters here only for the first-error-wins diagnostic;
+            // alphabetical keeps the surface predictable.
+            if self.compat_cargo_test_argv.is_some() {
+                return Err(non_compat_mode_error("--compat-cargo-test-argv"));
+            }
+            if self.compat_commit.is_some() {
+                return Err(non_compat_mode_error("--compat-commit"));
+            }
+            if !self.compat_filter.is_empty() {
+                return Err(non_compat_mode_error("--compat-filter"));
+            }
+            if self.compat_manifest.is_some() {
+                return Err(non_compat_mode_error("--compat-manifest"));
+            }
+            if self.compat_report.is_some() {
+                return Err(non_compat_mode_error("--compat-report"));
+            }
+            if self.compat_root.is_some() {
+                return Err(non_compat_mode_error("--compat-root"));
+            }
+            if !self.compat_trybuild_macro.is_empty() {
+                return Err(non_compat_mode_error("--compat-trybuild-macro"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Build the `Error::Cli` for a compat-mode shadowed-flag rejection.
+///
+/// `bare_flag` is the v0.1 flag that the user passed; `compat_flag` is
+/// the compat-mode replacement; `rationale` is the short phrase that
+/// explains *why* the v0.1 flag is rejected. The rendered diagnostic
+/// names all three so the user can fix the invocation without reading
+/// the spec.
+fn cli_mode_error(bare_flag: &str, compat_flag: &str, rationale: &str) -> Error {
+    Error::Cli {
+        clap_exit_code: 2,
+        message: format!(
+            "error: `{bare_flag}` cannot be combined with `--compat`: {rationale}. \
+             Use `{compat_flag}` instead."
+        ),
+    }
+}
+
+/// Build the `Error::Cli` for a non-compat-mode rejection of a
+/// `--compat*` flag.
+///
+/// The diagnostic names the offending flag and points the user at the
+/// `--compat` switch as the prerequisite.
+fn non_compat_mode_error(flag: &str) -> Error {
+    Error::Cli {
+        clap_exit_code: 2,
+        message: format!(
+            "error: `{flag}` requires `--compat` (compat-mode-only flag). \
+             Pass `--compat` to switch the binary into compat mode, or remove `{flag}`."
+        ),
+    }
+}
+
+/// Build the `Error::Cli` for a missing required `--compat*` flag in
+/// compat mode.
+fn missing_required_compat_flag(flag: &str) -> Error {
+    Error::Cli {
+        clap_exit_code: 2,
+        message: format!(
+            "error: `{flag}` is required when `--compat` is set. \
+             See `cargo lihaaf --help` for the compat-mode invocation shape."
+        ),
     }
 }
 
@@ -190,6 +362,24 @@ mod tests {
         assert!(!c.verbose);
         assert!(!c.use_symlink);
         assert!(!c.keep_output);
+    }
+
+    /// Every compat field defaults to its empty / `None` / `false`
+    /// posture when no `--compat*` flag is on the command line. The
+    /// v0.1 surface stays in the "compat is off" branch of the
+    /// validator, so adopters who never opt in see no behavioral
+    /// drift.
+    #[test]
+    fn defaults_for_compat_fields_are_safe_posture() {
+        let c = parse(&[]);
+        assert!(!c.compat);
+        assert!(c.compat_cargo_test_argv.is_none());
+        assert!(c.compat_commit.is_none());
+        assert!(c.compat_filter.is_empty());
+        assert!(c.compat_manifest.is_none());
+        assert!(c.compat_report.is_none());
+        assert!(c.compat_root.is_none());
+        assert!(c.compat_trybuild_macro.is_empty());
     }
 
     #[test]

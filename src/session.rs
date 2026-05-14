@@ -826,32 +826,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parallelism_respects_explicit_jobs() {
-        let mut cli = Cli {
+    /// Helper: build a `Cli` with every flag in its non-compat default
+    /// posture, then let each test override the specific fields it
+    /// cares about. Keeps unit tests insulated from purely-additive
+    /// struct extensions (Phase 1 compat-mode fields, etc.).
+    fn default_test_cli() -> Cli {
+        Cli {
             bless: false,
-            filter: vec![],
-            jobs: Some(2),
-            suite: vec![],
-            no_cache: false,
-            manifest_path: None,
-            list: false,
-            quiet: true,
-            verbose: false,
-            use_symlink: false,
-            keep_output: false,
-        };
-        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
-        assert!(p <= 2);
-        cli.jobs = Some(1);
-        let p2 = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
-        assert_eq!(p2, 1);
-    }
-
-    #[test]
-    fn parallelism_is_at_least_one() {
-        let cli = Cli {
-            bless: false,
+            compat: false,
+            compat_cargo_test_argv: None,
+            compat_commit: None,
+            compat_filter: vec![],
+            compat_manifest: None,
+            compat_report: None,
+            compat_root: None,
+            compat_trybuild_macro: vec![],
             filter: vec![],
             jobs: None,
             suite: vec![],
@@ -862,7 +851,23 @@ mod tests {
             verbose: false,
             use_symlink: false,
             keep_output: false,
-        };
+        }
+    }
+
+    #[test]
+    fn parallelism_respects_explicit_jobs() {
+        let mut cli = default_test_cli();
+        cli.jobs = Some(2);
+        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
+        assert!(p <= 2);
+        cli.jobs = Some(1);
+        let p2 = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
+        assert_eq!(p2, 1);
+    }
+
+    #[test]
+    fn parallelism_is_at_least_one() {
+        let cli = default_test_cli();
         // Even with an absurd per-fixture cap, the result must not be 0.
         let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, u32::MAX / 2));
         assert!(p >= 1);

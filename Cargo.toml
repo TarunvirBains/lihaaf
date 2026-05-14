@@ -36,6 +36,14 @@ publish = true
 name = "cargo-lihaaf"
 path = "src/bin/cargo-lihaaf.rs"
 
+# Compat-mode integration tests live under `tests/compat/`. Cargo's
+# auto-discovery only picks up files at the top of `tests/`; for files
+# inside a subdirectory the `[[test]]` entry below registers them so
+# `cargo test --test cli_mode_errors` works.
+[[test]]
+name = "cli_mode_errors"
+path = "tests/compat/cli_mode_errors.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }

@@ -22,7 +22,7 @@
 use std::process::ExitCode as ProcessExitCode;
 
 use lihaaf::cli;
-use lihaaf::{Error, ExitCode, run};
+use lihaaf::{CompatArgs, Error, ExitCode, run, run_compat};
 
 fn main() -> ProcessExitCode {
     // Cargo passes `lihaaf` as the first positional. Strip it if present.
@@ -36,12 +36,61 @@ fn main() -> ProcessExitCode {
 
     let parsed = match cli::parse_from(argv) {
         Ok(p) => p,
+        Err(Error::Cli { clap_exit_code, .. }) => {
+            // clap (and `validate_mode_consistency`) print their own
+            // diagnostic to stderr; `parse_from` re-prints the
+            // validator message via `eprintln!`. The exit code is
+            // propagated verbatim — `0` for `--help` / `--version`,
+            // `2` for clap usage errors and mode-error rejections.
+            // This is the documented promise in `Error::exit_code`'s
+            // doc comment: "CLI errors carry clap's recommended code
+            // (typically 2)." The map to `u8` is safe because
+            // `clap_exit_code` is always a small non-negative value
+            // assigned by `parse_from` (currently `0` or `2`).
+            return ProcessExitCode::from(clap_exit_code.clamp(0, 255) as u8);
+        }
         Err(e) => {
-            // clap prints its own diagnostic on `--help` / `--version`
-            // and on parse errors; the exit code is propagated directly.
-            return ProcessExitCode::from(e.exit_code() as u8);
+            // Defensive fallback: any non-CLI error from `parse_from`
+            // means the parser surfaced something unexpected. Map to
+            // CONFIG_INVALID so the operator sees the failure rather
+            // than a silent exit 0.
+            eprintln!("lihaaf: {e}");
+            return ProcessExitCode::from(ExitCode::ConfigInvalid as u8);
         }
     };
+
+    // Branch on `--compat` after parsing. The validator inside
+    // `cli::parse_from` already guarantees that when `cli.compat` is
+    // true, the required `--compat*` flags are present, so
+    // `CompatArgs::from_cli` only fails on a malformed
+    // `--compat-cargo-test-argv` JSON value.
+    if parsed.compat {
+        let args = match CompatArgs::from_cli(parsed) {
+            Ok(a) => a,
+            Err(Error::Cli {
+                clap_exit_code,
+                message,
+            }) => {
+                eprintln!("{message}");
+                return ProcessExitCode::from(clap_exit_code.clamp(0, 255) as u8);
+            }
+            Err(e) => {
+                eprintln!("lihaaf: {e}");
+                return ProcessExitCode::from(ExitCode::ConfigInvalid as u8);
+            }
+        };
+        return match run_compat(args) {
+            Ok(()) => ProcessExitCode::from(ExitCode::Ok as u8),
+            Err(Error::Session(outcome)) => {
+                eprintln!("{outcome}");
+                ProcessExitCode::from(outcome.exit_code() as u8)
+            }
+            Err(other) => {
+                eprintln!("lihaaf: {other}");
+                ProcessExitCode::from(ExitCode::ConfigInvalid as u8)
+            }
+        };
+    }
 
     match run(parsed) {
         Ok(report) => ProcessExitCode::from(report.exit_code() as u8),
