@@ -502,11 +502,16 @@ fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
 ///
 /// On Windows, `DeleteFileW` refuses to operate on a directory
 /// symlink or junction — the entry must be removed via
-/// `RemoveDirectoryW` (`std::fs::remove_dir`). We follow the link
-/// once to inspect the target: target-is-directory uses
-/// `remove_dir`, target-is-file (or a broken link) falls back to
-/// `remove_file`. `remove_dir` does not recurse, so the target
-/// tree is preserved either way.
+/// `RemoveDirectoryW` (`std::fs::remove_dir`). We classify the link
+/// itself (NOT its target) by inspecting the file attributes returned
+/// by `symlink_metadata`: `FILE_ATTRIBUTE_DIRECTORY` (0x10) is set on
+/// directory symlinks even when the target is missing. The previous
+/// implementation called `std::fs::metadata`, which follows the link
+/// and errors on a broken target — causing the dispatch to fall
+/// through to `remove_file`, which `DeleteFileW` then refuses for a
+/// directory symlink, leaving the broken link in place.
+/// `remove_dir` does not recurse, so a live target tree is preserved
+/// either way.
 #[cfg(unix)]
 fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
     std::fs::remove_file(path)
@@ -514,9 +519,19 @@ fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
 
 #[cfg(windows)]
 fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
-    match std::fs::metadata(path) {
-        Ok(target_md) if target_md.is_dir() => std::fs::remove_dir(path),
-        _ => std::fs::remove_file(path),
+    use std::os::windows::fs::MetadataExt;
+    // FILE_ATTRIBUTE_DIRECTORY per MSDN; not exposed as a Rust
+    // stdlib constant. Inspecting the link itself (via
+    // `symlink_metadata`) avoids following a potentially broken
+    // target — the bug case where `metadata` errors and forces the
+    // wrong removal call.
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    let link_md = std::fs::symlink_metadata(path)?;
+    let is_dir_symlink = (link_md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    if is_dir_symlink {
+        std::fs::remove_dir(path)
+    } else {
+        std::fs::remove_file(path)
     }
 }
 
