@@ -260,6 +260,19 @@ LLVM version: 22.1.2";
         }
     }
 
+    /// Shared body for the four comparator-test cases. Builds the baseline,
+    /// clones into `b`, applies the caller's `mutate` to `b`, and asserts
+    /// that the comparator detects the per-field difference. Mirrors the
+    /// `assert_only_field_drifts` helper in `freshness.rs::tests` so the
+    /// same parameterization pattern applies to both layers of the
+    /// four-field comparator.
+    fn assert_field_mutation_differs(mutate: impl FnOnce(&mut Toolchain)) {
+        let a = baseline_toolchain();
+        let mut b = a.clone();
+        mutate(&mut b);
+        assert!(!matches(&a, &b));
+    }
+
     #[test]
     fn matches_identical_toolchains() {
         let a = baseline_toolchain();
@@ -269,40 +282,36 @@ LLVM version: 22.1.2";
 
     #[test]
     fn matches_compares_full_key_release_line_differs() {
-        let a = baseline_toolchain();
-        let mut b = a.clone();
-        b.release_line = "rustc 1.96.0 (deadbeef 2026-07-01)".into();
-        assert!(!matches(&a, &b));
+        assert_field_mutation_differs(|b| {
+            b.release_line = "rustc 1.96.0 (deadbeef 2026-07-01)".into();
+        });
     }
 
+    /// Same release line, different host (cross-compile or architecture
+    /// migration). This is the case Codex slice B called out: two
+    /// materially different toolchains with the same release_line
+    /// previously compared equal.
     #[test]
     fn matches_compares_full_key_host_differs() {
-        // Same release line, different host (cross-compile or
-        // architecture migration). This is the case Codex slice B
-        // called out: two materially different toolchains with the
-        // same release_line previously compared equal.
-        let a = baseline_toolchain();
-        let mut b = a.clone();
-        b.host = "aarch64-apple-darwin".into();
-        assert!(!matches(&a, &b));
+        assert_field_mutation_differs(|b| {
+            b.host = "aarch64-apple-darwin".into();
+        });
     }
 
     #[test]
     fn matches_compares_full_key_commit_hash_differs() {
-        let a = baseline_toolchain();
-        let mut b = a.clone();
-        b.commit_hash = "0000000000000000000000000000000000000000".into();
-        assert!(!matches(&a, &b));
+        assert_field_mutation_differs(|b| {
+            b.commit_hash = "0000000000000000000000000000000000000000".into();
+        });
     }
 
+    /// Channel-switch case: same rustc identity strings but installed under
+    /// a different rustup prefix.
     #[test]
     fn matches_compares_full_key_sysroot_differs() {
-        // Channel-switch case: same rustc identity strings but
-        // installed under a different rustup prefix.
-        let a = baseline_toolchain();
-        let mut b = a.clone();
-        b.sysroot = PathBuf::from("/home/user/.rustup/toolchains/nightly-x86_64");
-        assert!(!matches(&a, &b));
+        assert_field_mutation_differs(|b| {
+            b.sysroot = PathBuf::from("/home/user/.rustup/toolchains/nightly-x86_64");
+        });
     }
 
     #[test]
