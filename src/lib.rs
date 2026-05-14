@@ -203,6 +203,42 @@ pub use compat::cleanup::install_panic_hook as compat_install_panic_hook;
 #[doc(hidden)]
 pub use normalize::{NormalizationContext, normalize};
 
+// Compat-mode §3.3 deterministic envelope (Phase 8 of compat mode).
+// Re-exported for the same reason as the other compat surfaces above —
+// `tests/compat/report_determinism.rs` lives in a separate test crate
+// and reaches the envelope struct + writer through these
+// `#[doc(hidden)]` re-exports. The stability contract is the same: NOT
+// part of any v0.1 surface; the supported entry to compat mode is
+// `cargo lihaaf --compat`. Phase 9 (issue #13 — driver body) wires
+// `write_envelope` into `compat::run`; until then the re-exports exist
+// solely to let the Phase 8 integration tests reach the writer.
+#[doc(hidden)]
+pub use compat::report::BaselineCounts as CompatBaselineCounts;
+#[doc(hidden)]
+pub use compat::report::Commands as CompatCommands;
+#[doc(hidden)]
+pub use compat::report::CompatEnvelope;
+#[doc(hidden)]
+pub use compat::report::EnvelopeError as CompatEnvelopeError;
+#[doc(hidden)]
+pub use compat::report::ExcludedFixture as CompatExcludedFixture;
+#[doc(hidden)]
+pub use compat::report::GeneratedPath as CompatEnvelopeGeneratedPath;
+#[doc(hidden)]
+pub use compat::report::LihaafCounts as CompatLihaafCounts;
+#[doc(hidden)]
+pub use compat::report::MismatchExample as CompatMismatchExample;
+#[doc(hidden)]
+pub use compat::report::OverlayMetadata as CompatOverlayMetadata;
+#[doc(hidden)]
+pub use compat::report::Results as CompatResults;
+#[doc(hidden)]
+pub use compat::report::canonicalize as compat_canonicalize_envelope;
+#[doc(hidden)]
+pub use compat::report::generated_path_from_cleanup as compat_envelope_generated_path_from_cleanup;
+#[doc(hidden)]
+pub use compat::report::write_envelope as compat_write_envelope;
+
 /// The semver-stable lihaaf release the binary identifies as.
 ///
 /// This is the value that lands in `manifest.json`'s `lihaaf_version`
