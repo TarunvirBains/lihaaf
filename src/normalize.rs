@@ -336,6 +336,19 @@ mod tests {
         }
     }
 
+    /// Run `normalize` against `input` with the standard "/p" workspace,
+    /// "/r" sysroot, and "/p/x" fixture-directory triplet, and assert the
+    /// output is byte-equal to `expected`. Used by the cluster of
+    /// text-handling tests below whose only varying inputs are `input` and
+    /// `expected` — the path-rewriting tests that need a non-default
+    /// workspace/sysroot/dir keep their own setup.
+    fn assert_normalizes(input: &str, expected: &str) {
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, expected);
+    }
+
     #[test]
     fn rewrites_dir_prefix_then_workspace_prefix() {
         // rustc preserves indentation in path-marker lines as part of
@@ -374,59 +387,41 @@ mod tests {
 
     #[test]
     fn type_id_rewrite_replaces_hash_digits() {
-        let input = "expected `Foo#0`, found `Bar#42`\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "expected `Foo$TYPEID`, found `Bar$TYPEID`");
+        assert_normalizes(
+            "expected `Foo#0`, found `Bar#42`\n",
+            "expected `Foo$TYPEID`, found `Bar$TYPEID`",
+        );
     }
 
     #[test]
     fn type_id_does_not_touch_hash_without_digits() {
-        let input = "see issue #[123] (a TODO comment)\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
         // `#[` is not `#<digit>` so it must pass through.
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "see issue #[123] (a TODO comment)");
+        assert_normalizes(
+            "see issue #[123] (a TODO comment)\n",
+            "see issue #[123] (a TODO comment)",
+        );
     }
 
     #[test]
     fn collapses_blank_line_runs() {
-        let input = "alpha\n\n\n\nomega\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "alpha\n\nomega");
+        assert_normalizes("alpha\n\n\n\nomega\n", "alpha\n\nomega");
     }
 
     #[test]
     fn strips_trailing_whitespace() {
-        let input = "alpha   \nbeta\t\t\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "alpha\nbeta");
+        assert_normalizes("alpha   \nbeta\t\t\n", "alpha\nbeta");
     }
 
     #[test]
     fn unifies_crlf_and_lone_cr_to_lf() {
-        let input = "a\r\nb\rc\nd\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "a\nb\nc\nd");
+        assert_normalizes("a\r\nb\rc\nd\n", "a\nb\nc\nd");
     }
 
     #[test]
     fn does_not_touch_diagnostic_text() {
-        let input = "error: unknown on_delete value `bogus`; expected one of: cascade\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(
-            out,
-            "error: unknown on_delete value `bogus`; expected one of: cascade"
+        assert_normalizes(
+            "error: unknown on_delete value `bogus`; expected one of: cascade\n",
+            "error: unknown on_delete value `bogus`; expected one of: cascade",
         );
     }
 
@@ -437,46 +432,35 @@ mod tests {
         // default ("Diagnostic text …").
         // preserved byte-for-byte"). Earlier drafts dropped this line;
         // Cluster 10.3 of the Codex Spark xhigh review reverted that.
-        let input = "error: bad\nerror: aborting due to 1 previous error\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "error: bad\nerror: aborting due to 1 previous error");
+        assert_normalizes(
+            "error: bad\nerror: aborting due to 1 previous error\n",
+            "error: bad\nerror: aborting due to 1 previous error",
+        );
     }
 
     #[test]
     fn preserves_rustc_aborting_plural() {
-        let input = "error: a\nerror: b\nerror: aborting due to 42 previous errors\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(
-            out,
-            "error: a\nerror: b\nerror: aborting due to 42 previous errors"
+        assert_normalizes(
+            "error: a\nerror: b\nerror: aborting due to 42 previous errors\n",
+            "error: a\nerror: b\nerror: aborting due to 42 previous errors",
         );
     }
 
     #[test]
     fn preserves_unrelated_aborting_text() {
-        let input = "error: aborting due to user request\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(out, "error: aborting due to user request");
+        assert_normalizes(
+            "error: aborting due to user request\n",
+            "error: aborting due to user request",
+        );
     }
 
     #[test]
     fn preserves_rustc_explain_pointer() {
         // The explain pointer is preserved byte-for-byte. Earlier drafts
         // dropped it; Codex Spark review reverted that.
-        let input =
-            "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(
-            out,
-            "error: bad\n\nFor more information about this error, try `rustc --explain E0463`."
+        assert_normalizes(
+            "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.\n",
+            "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.",
         );
     }
 
@@ -628,13 +612,8 @@ error: aborting due to 1 previous error
         // through untouched. Specifically, the `--verbose` hint that
         // rustc emits on the same diagnostic must not be confused with
         // a long-type note even though it shares the "note:" prefix.
-        let input =
-            "   = note: consider using `--verbose` to print the full type name to the console\n";
-        let c = ctx("/p", "/r");
-        let dir = PathBuf::from("/p/x");
-        let out = normalize(input, &c, &dir);
-        assert_eq!(
-            out,
+        assert_normalizes(
+            "   = note: consider using `--verbose` to print the full type name to the console\n",
             "   = note: consider using `--verbose` to print the full type name to the console",
         );
     }
