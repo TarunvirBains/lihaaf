@@ -25,18 +25,24 @@
 //!
 //! ## Pilot gate (§5) rules
 //!
-//! The gate accepts an envelope when EVERY rule below is satisfied:
+//! The gate accepts an envelope when EVERY rule below is satisfied,
+//! mirroring the field list in `docs/compatibility-plan.md:239-244`:
 //!
 //! 1. `crate_name` exists in `baseline.toml` (otherwise the pilot is not
 //!    enrolled and the gate is a NO-OP — the workflow shows a "no
 //!    ceiling configured" message and lets the PR proceed).
-//! 2. `results.mismatch_count <= N_<crate>` (the shrinking-only rule).
-//! 3. `results.baseline.unknown_count == 0` (no unrecognized libtest
+//! 2. `errors` is empty (§5: `errors == []` — any envelope-recorded
+//!    error invalidates the run).
+//! 3. `results.mismatch_count <= N_<crate>` (the shrinking-only rule).
+//! 4. `results.baseline.unknown_count == 0` (no unrecognized libtest
 //!    lines — the §1 conservatism rule must produce a clean signal).
-//! 4. `results.baseline.exit_code == 0` (the baseline `cargo test`
+//! 5. `results.baseline.exit_code == 0` (the baseline `cargo test`
 //!    succeeded; a failed baseline produces meaningless deltas).
-//! 5. `results.lihaaf.exit_code == 0` (the inner lihaaf run produced
+//! 6. `results.lihaaf.exit_code == 0` (the inner lihaaf run produced
 //!    a clean session).
+//! 7. `baseline.pass + baseline.fail == lihaaf.pass + lihaaf.fail +
+//!    excluded_fixtures.len()` (§5: the per-side totals must match
+//!    unless the `excluded_fixtures` set accounts for the delta).
 //!
 //! Any rule violation produces [`GateOutcome::Block`] with a directed
 //! diagnostic naming the offending field and threshold; otherwise
@@ -183,6 +189,16 @@ pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelop
         return GateOutcome::NotEnrolled;
     };
 
+    if !envelope.errors.is_empty() {
+        return GateOutcome::Block(format!(
+            "envelope.errors carries {} entry/entries (must be empty; the §5 gate refuses to \
+             score a run that recorded an error). First error: type=`{}` detail=`{}`",
+            envelope.errors.len(),
+            envelope.errors[0].error_type,
+            envelope.errors[0].detail,
+        ));
+    }
+
     if envelope.results.baseline.unknown_count != 0 {
         return GateOutcome::Block(format!(
             "baseline.unknown_count = {} (must be 0; the §1 conservatism rule requires every \
@@ -213,6 +229,20 @@ pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelop
             "mismatch_count = {} exceeds ceiling `{}.n_max = {}` (the §5 shrinking-only rule: \
              a PR may decrease but not increase the per-crate ceiling)",
             envelope.results.mismatch_count, ceiling.crate_name, ceiling.n_max,
+        ));
+    }
+
+    let baseline_total =
+        u64::from(envelope.results.baseline.pass) + u64::from(envelope.results.baseline.fail);
+    let lihaaf_total =
+        u64::from(envelope.results.lihaaf.pass) + u64::from(envelope.results.lihaaf.fail);
+    let excluded_count = envelope.excluded_fixtures.len() as u64;
+    if baseline_total != lihaaf_total + excluded_count {
+        return GateOutcome::Block(format!(
+            "per-side totals diverge: baseline.pass+fail = {} but lihaaf.pass+fail = {} and \
+             excluded_fixtures.len() = {} (§5 rule: baseline total must equal lihaaf total \
+             plus excluded count)",
+            baseline_total, lihaaf_total, excluded_count,
         ));
     }
 
@@ -417,5 +447,87 @@ mod tests {
             GateOutcome::Block(msg) => assert!(msg.contains("lihaaf.exit_code"), "got: {msg}"),
             other => panic!("expected Block, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn check_gate_blocks_when_errors_nonempty() {
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                crate_name: "demo".into(),
+                n_max: 5,
+            },
+        );
+        let mut env = envelope_with("demo", 0, 0, 0, 0);
+        env.errors.push(crate::compat::report::EnvelopeError {
+            error_type: "discovery_unrecognized".into(),
+            fixture: None,
+            file: "tests/trybuild.rs".into(),
+            line: 42,
+            detail: "unrecognized test pattern".into(),
+        });
+        match check_gate(&baseline, &env) {
+            GateOutcome::Block(msg) => {
+                assert!(msg.contains("envelope.errors"), "got: {msg}");
+                assert!(msg.contains("discovery_unrecognized"), "got: {msg}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_gate_blocks_when_totals_diverge_without_excluded() {
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                crate_name: "demo".into(),
+                n_max: 5,
+            },
+        );
+        let mut env = envelope_with("demo", 0, 0, 0, 0);
+        env.results.baseline.pass = 10;
+        env.results.baseline.fail = 0;
+        env.results.lihaaf.pass = 8;
+        env.results.lihaaf.fail = 0;
+        // 10 != 8 + 0 — divergence not accounted for.
+        match check_gate(&baseline, &env) {
+            GateOutcome::Block(msg) => {
+                assert!(msg.contains("per-side totals"), "got: {msg}");
+                assert!(msg.contains("10"), "got: {msg}");
+                assert!(msg.contains("8"), "got: {msg}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_gate_allows_when_excluded_accounts_for_delta() {
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                crate_name: "demo".into(),
+                n_max: 5,
+            },
+        );
+        let mut env = envelope_with("demo", 0, 0, 0, 0);
+        env.results.baseline.pass = 10;
+        env.results.baseline.fail = 0;
+        env.results.lihaaf.pass = 8;
+        env.results.lihaaf.fail = 0;
+        env.excluded_fixtures
+            .push(crate::compat::report::ExcludedFixture {
+                fixture: "tests/ui/skip_a.rs".into(),
+                reason: "compat limitation".into(),
+            });
+        env.excluded_fixtures
+            .push(crate::compat::report::ExcludedFixture {
+                fixture: "tests/ui/skip_b.rs".into(),
+                reason: "compat limitation".into(),
+            });
+        // 10 == 8 + 2 — divergence accounted for.
+        assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
     }
 }

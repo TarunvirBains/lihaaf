@@ -84,6 +84,10 @@ path = "tests/compat/report_determinism.rs"
 name = "toolchain_resolution"
 path = "tests/compat/toolchain_resolution.rs"
 
+[[test]]
+name = "gate_smoke"
+path = "tests/compat/gate_smoke.rs"
+
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
 clap = { version = "4", features = ["derive"] }
