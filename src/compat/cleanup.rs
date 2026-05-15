@@ -559,7 +559,14 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
 ///      it refuses directories and directory-symlinks with
 ///      `ERROR_ACCESS_DENIED` (surfaced as `PermissionDenied`, and in
 ///      some cases `IsADirectory`).
-///    - On `IsADirectory` / `PermissionDenied` we proceed to step 2.
+///    - On `IsADirectory` we proceed to step 2 (Unix `EISDIR` and the
+///      stable mapping some Windows shapes surface).
+///    - **`PermissionDenied` is platform-specific.** On Windows it is
+///      the "this entry is a directory" signal, so we fall through.
+///      On Unix it is a real `EACCES` (parent without write
+///      permission, immutable attribute, missing search bit on an
+///      ancestor) — surfacing that as "not a file → try step 2" would
+///      mask the real cause, so we return it directly.
 /// 2. **`remove_dir`** — handles empty directories AND directory-symlinks.
 ///    - Unix: `rmdir(2)` succeeds on empty directories; fails
 ///      `ENOTEMPTY` (`DirectoryNotEmpty`) on non-empty ones.
@@ -569,6 +576,13 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
 ///      handling the old `remove_symlink_dispatch` provided, but
 ///      without a separate stat.
 ///    - On `DirectoryNotEmpty` we proceed to step 3.
+///    - **Windows-only `PermissionDenied` fall-through.** A read-only
+///      non-empty Windows directory returns `ERROR_ACCESS_DENIED`
+///      (mapped to `PermissionDenied`) from `RemoveDirectoryW` instead
+///      of `DirectoryNotEmpty`. Treat it as "not empty, try
+///      recursive" so step 3 can clear it. Unix's `PermissionDenied`
+///      from `rmdir(2)` is a real `EACCES` and surfaces directly —
+///      never silently retried as recursion.
 /// 3. **`remove_dir_all`** — recursive removal of a non-empty directory.
 ///    - Rust 1.84+ `std::fs::remove_dir_all` is race-safe internally: it
 ///      refuses to follow symlinks during the recursive walk, so even if
@@ -595,16 +609,21 @@ fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
     match std::fs::remove_file(path) {
         Ok(()) => return Ok(()),
         Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        // IsADirectory (Unix EISDIR; some platforms surface this
-        // directly). PermissionDenied is the Windows shape on a
-        // directory or directory-symlink (DeleteFileW returns
-        // ERROR_ACCESS_DENIED). Either signal means "this entry is
-        // not a file" — fall through to step 2.
-        Err(e)
-            if matches!(
-                e.kind(),
-                ErrorKind::IsADirectory | ErrorKind::PermissionDenied
-            ) => {}
+        // IsADirectory is stable across platforms as the "not a file"
+        // signal (Unix EISDIR; some Windows shapes surface here too).
+        Err(e) if e.kind() == ErrorKind::IsADirectory => {}
+        // Windows-only: DeleteFileW returns ERROR_ACCESS_DENIED for
+        // directories and directory-symlinks (mapped to
+        // PermissionDenied). Treat that as the "this is a directory"
+        // signal and fall through to step 2.
+        //
+        // On Unix, PermissionDenied is a real EACCES (parent without
+        // write permission, immutable attribute, missing search bit
+        // on an ancestor). Surfacing it directly via the catch-all
+        // below preserves the diagnostic — silently dispatching to
+        // step 2 would mask the cause.
+        #[cfg(windows)]
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
         Err(e) => {
             return Err(Error::io(
                 e,
@@ -625,6 +644,17 @@ fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
         // DirectoryNotEmpty (Unix ENOTEMPTY) means we have a non-empty
         // real directory — proceed to recursive removal.
         Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {}
+        // Windows-only: RemoveDirectoryW returns ERROR_ACCESS_DENIED
+        // (mapped to PermissionDenied) for a read-only non-empty
+        // directory instead of DirectoryNotEmpty. Treat the signal
+        // as "non-empty" so step 3's recursive walker clears it.
+        //
+        // Unix's `rmdir(2)` returns EACCES only when the *parent*
+        // denies write permission; it never returns EACCES for a
+        // non-empty directory. Surfacing Unix PermissionDenied
+        // through the catch-all therefore preserves the diagnostic.
+        #[cfg(windows)]
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
         Err(e) => {
             return Err(Error::io(
                 e,
@@ -806,5 +836,58 @@ mod tests {
         let dir = tmp.path().join("dir");
         remove_path_best_effort(&dir).expect("recursive removal");
         assert!(!dir.exists(), "directory tree must be gone after cleanup");
+    }
+
+    /// **Unix `PermissionDenied` on step 1 surfaces with the file-stage
+    /// context.** A regular file whose parent denies write permission
+    /// returns `EACCES` from `unlink(2)`. Before commit `<this round-4
+    /// commit>`, the cascade's `matches!(.., IsADirectory |
+    /// PermissionDenied)` arm conflated the Windows directory signal
+    /// with this Unix EACCES — the file fell through to step 2 (rmdir)
+    /// which surfaced an empty-dir context, then step 3 (remove_dir_all)
+    /// which surfaced the recursive-removal context. Either of those is
+    /// misleading: the failure has nothing to do with directories.
+    ///
+    /// Pin: the file-stage context (`"removing compat-generated
+    /// file/symlink"`) is what an operator sees, so they can map the
+    /// diagnostic to "fix the parent's write permission" without
+    /// hunting for a phantom directory.
+    #[cfg(unix)]
+    #[test]
+    fn unix_permission_denied_surfaces_as_file_stage_error() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir for unix-eacces test");
+        let blocked_parent = tmp.path().join("locked");
+        std::fs::create_dir(&blocked_parent).expect("create blocked parent");
+        let inside = blocked_parent.join("inside.txt");
+        std::fs::write(&inside, b"contents").expect("create file inside locked");
+
+        // Strip write permission from the parent so unlink(2) of
+        // `inside` returns EACCES (PermissionDenied).
+        let original_perms = std::fs::metadata(&blocked_parent)
+            .expect("read parent perms")
+            .permissions();
+        std::fs::set_permissions(&blocked_parent, std::fs::Permissions::from_mode(0o555))
+            .expect("strip parent write permission");
+
+        let result = remove_path_best_effort(&inside);
+
+        // Restore perms BEFORE the asserts so a panicking test still
+        // leaves the tempdir cleanable. (tempfile's drop() also walks
+        // the tree; without restored perms it would silently fail.)
+        std::fs::set_permissions(&blocked_parent, original_perms).expect("restore parent perms");
+
+        let err = result.expect_err("EACCES on file unlink must surface as error");
+        match err {
+            Error::Io { context, .. } => {
+                assert_eq!(
+                    context, "removing compat-generated file/symlink",
+                    "Unix EACCES must surface with the file-stage context, not \
+                     the empty-dir/recursive-dir context; got `{context}`"
+                );
+            }
+            other => panic!("expected Error::Io for EACCES, got {other:?}"),
+        }
     }
 }
