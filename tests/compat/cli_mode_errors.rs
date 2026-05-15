@@ -24,6 +24,7 @@
 
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::Mutex;
 
 /// Absolute path to the harness binary the test runner just built.
 /// Cargo defines `CARGO_BIN_EXE_<name>` at build time for every
@@ -31,6 +32,16 @@ use std::process::Command;
 /// compile time, so there is no `env::var` lookup at runtime and no
 /// PATH-search ambiguity.
 const CARGO_LIHAAF_BIN: &str = env!("CARGO_BIN_EXE_cargo-lihaaf");
+
+/// Serializes subprocess spawns within this test binary. Multiple
+/// test methods run in parallel (default test-threads = ncpus); each
+/// spawn of `cargo-lihaaf` recursively spawns rustc per fixture. On
+/// hosts with limited memory (notably WSL2) the parallel fan-out can
+/// trigger a global OOM kill that takes down the VM. The lock bounds
+/// in-flight subprocesses to 1 per binary; cross-binary parallelism
+/// is still possible but the per-binary cap is what prevents the
+/// runaway chain we observed.
+static SPAWN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Spawn the harness binary with the given argv and collect the
 /// process output.
@@ -41,7 +52,12 @@ const CARGO_LIHAAF_BIN: &str = env!("CARGO_BIN_EXE_cargo-lihaaf");
 /// crate's manifest dir so any relative paths in test invocations
 /// (`--compat-root .`, etc.) resolve under the lihaaf checkout, not
 /// under the test runner's cwd.
+///
+/// Acquires [`SPAWN_LOCK`] for the lifetime of the spawn so concurrent
+/// test methods do not stack subprocess chains; see the lock's docs
+/// for the OOM motivation.
 fn run_binary(args: &[&str]) -> std::process::Output {
+    let _guard = SPAWN_LOCK.lock().expect("SPAWN_LOCK poisoned");
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     Command::new(CARGO_LIHAAF_BIN)
         .args(args)
