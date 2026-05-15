@@ -6,8 +6,8 @@
 //! has returned `Ok` — by that point `compat_root` and `compat_report`
 //! are known to be present and the `compat_cargo_test_argv` JSON shape
 //! can be checked once eagerly so a malformed value fails with a
-//! Phase 1 diagnostic instead of crashing deep inside the Phase 3
-//! baseline driver.
+//! CLI-layer diagnostic instead of crashing deep inside the baseline
+//! driver.
 //!
 //! Pass-through v0.1 flags (`--bless`, `--no-cache`, `--list`,
 //! `--quiet`, `--verbose`, `--use-symlink`, `--keep-output`, `--jobs`)
@@ -28,16 +28,14 @@ use crate::error::Error;
 /// bundle from outside the crate. The supported entry to compat mode is
 /// `cargo lihaaf --compat`, not the Rust API.
 ///
-/// Phases 2+ populate this struct and pass it through the compat
-/// pipeline (manifest overlay, baseline runner, fixture discovery,
-/// report writer).
+/// Every field is read by the compat driver ([`crate::compat::run`])
+/// — `compat_root` / `compat_report` route the overlay + envelope I/O,
+/// `compat_cargo_test_argv` drives the baseline runner,
+/// `compat_manifest` / `compat_commit` flow into envelope fields,
+/// `compat_filter` translates into `--filter` on the inner Cli,
+/// `compat_trybuild_macro` extends the §3.2.1 discovery alias set, and
+/// `inner_cli` provides the pass-through v0.1 flags.
 #[derive(Debug, Clone)]
-// Fields are unread in Phase 1 — the compat driver body is stubbed.
-// Phase 2+ consumes them (manifest overlay, baseline runner, fixture
-// discovery, report writer). The struct is populated correctly today
-// so a regression in `from_cli` would fail the inline unit tests, but
-// no caller reads back the fields until the driver body fills in.
-#[allow(dead_code)]
 pub struct CompatArgs {
     /// Target crate checkout root. Always set (validated by
     /// `validate_mode_consistency`).
@@ -49,7 +47,8 @@ pub struct CompatArgs {
     /// not passed).
     pub(crate) compat_cargo_test_argv: Vec<String>,
     /// Sibling-manifest path override (`--compat-manifest`). When
-    /// `None`, Phase 2 derives the path from `--compat-root`.
+    /// `None`, the compat driver derives the path from `--compat-root`
+    /// (the upstream manifest sits at `<compat_root>/Cargo.toml`).
     pub(crate) compat_manifest: Option<PathBuf>,
     /// Commit SHA to record in the report envelope.
     pub(crate) compat_commit: Option<String>,
@@ -60,8 +59,8 @@ pub struct CompatArgs {
     pub(crate) compat_trybuild_macro: Vec<String>,
     /// The full original [`Cli`] for pass-through flag access
     /// (`--bless`, `--no-cache`, `--list`, `--quiet`, `--verbose`,
-    /// `--use-symlink`, `--keep-output`, `--jobs`). Phase 2+ forwards
-    /// the relevant fields into the inner session.
+    /// `--use-symlink`, `--keep-output`, `--jobs`). The compat driver
+    /// forwards the relevant fields into the inner session.
     pub(crate) inner_cli: Cli,
 }
 

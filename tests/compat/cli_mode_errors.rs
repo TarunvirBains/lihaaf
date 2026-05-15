@@ -1,9 +1,9 @@
-//! Phase 1 mode-error matrix integration tests — closes GH issue #12.
+//! Mode-error matrix integration tests — closes GH issue #12.
 //!
-//! Every test spawns `cargo-lihaaf` as a subprocess via
+//! Most tests in this file spawn `cargo-lihaaf` as a subprocess via
 //! [`env!("CARGO_BIN_EXE_cargo-lihaaf")`] (so the test binary path is
 //! stable across `cargo test --release` / debug, host platforms, and
-//! workspace layouts) and asserts:
+//! workspace layouts) and assert:
 //!
 //! - For "non-compat run rejects `--compat-*` flags": exit code is 2
 //!   (clap-style usage error) and stderr names the offending flag plus
@@ -13,14 +13,24 @@
 //!   `--compat-*` replacement.
 //! - For "compat run requires `--compat-*` flags": exit code is 2 and
 //!   stderr names the missing required flag.
-//! - For `compat_run_accepts_pass_through_flags`: a fully-formed compat
-//!   invocation with the pass-through flags parses successfully; Phase 1
-//!   stubs `run_compat` so the binary exits 0.
 //! - For `non_compat_run_unchanged`: a fully-formed v0.1 invocation
 //!   reaches the non-compat session path (does NOT trip the mode-error
 //!   validator). Because the synthetic manifest path is non-existent,
 //!   the run fails at config-loading with the CONFIG_INVALID exit code,
 //!   not at CLI parse — and stderr does NOT mention `--compat`.
+//!
+//! The two pass-through happy-path tests
+//! (`compat_run_accepts_pass_through_flags`,
+//! `compat_run_accepts_omitted_cargo_test_argv`) are asserted at the
+//! Rust API layer via `Cli::try_parse_from(...)` +
+//! `cli.validate_mode_consistency()`. Originally these spawned the
+//! binary against `--compat-root "."` (the lihaaf repo itself); once
+//! Phase 10 wired the stub `run_compat` into a full 12-step driver, the
+//! spawn started running `cargo test` → `rustc` against lihaaf's own
+//! tree, which OOMs WSL2-class hosts. The CLI-layer assertion still
+//! locks the parser + validator behavior the tests originally cared
+//! about; the full-driver integration belongs in a hermetic harness
+//! that knows how to stand up a synthetic compat-root.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -189,14 +199,25 @@ fn compat_run_requires_compat_report() {
     assert_cli_mode_error(&out, &["--compat-report", "required"]);
 }
 
-// --- Pass-through happy path. ---
+// --- Pass-through happy path (asserted at the CLI parser layer). ---
 
 #[test]
 fn compat_run_accepts_pass_through_flags() {
-    // Fully-formed compat invocation including every v0.1 pass-through
-    // flag. The validator must accept this combination, Phase 1's stub
-    // `compat::run` must return Ok(()), and the binary must exit 0.
-    let out = run_binary(&[
+    // Round-2 simplify pass: this assertion used to spawn the binary
+    // and expect exit 0 from the Phase 1 stub `compat::run`. Phase 10
+    // wired the stub into a full 12-step driver — the spawn now runs
+    // `cargo test` → `rustc` against lihaaf's own tree (because the
+    // test passes `--compat-root .`), and the parallel fan-out OOMs
+    // WSL2-class hosts. The assertion now operates at the CLI parser
+    // layer: a fully-formed compat invocation including every v0.1
+    // pass-through flag must parse cleanly AND survive the
+    // mode-consistency validator. That is the behavior the test
+    // originally cared about; the full-driver integration belongs in
+    // a hermetic harness that knows how to stand up a synthetic
+    // compat-root.
+    use clap::Parser;
+    let cli = lihaaf::Cli::try_parse_from([
+        "cargo-lihaaf",
         "--compat",
         "--compat-root",
         ".",
@@ -207,18 +228,44 @@ fn compat_run_accepts_pass_through_flags() {
         "--jobs",
         "4",
         "-v",
-    ]);
-    let stderr = stderr_string(&out);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "Phase 1 stub must accept the pass-through invocation (got {:?}); stderr:\n{stderr}",
-        out.status.code(),
+    ])
+    .expect("clap must accept the fully-formed compat invocation with pass-through flags");
+    // Validator must accept the combination (compat: true; both
+    // required compat flags present; no shadowed v0.1 flags). The
+    // method is `pub(crate)` for direct callers but observable via
+    // `lihaaf::run(cli)` — passing a Cli that passes the validator
+    // never returns Error::Cli with a mode-error message. To assert
+    // at this layer without invoking the full session, drive the
+    // public `lihaaf::cli::parse_from` entry the binary uses; it
+    // calls the validator internally and surfaces any mode error as
+    // `Error::Cli { clap_exit_code: 2, message }`.
+    let argv: Vec<String> = [
+        "cargo-lihaaf",
+        "--compat",
+        "--compat-root",
+        ".",
+        "--compat-report",
+        "/tmp/lihaaf-compat-report-pass-through.json",
+        "--bless",
+        "--no-cache",
+        "--jobs",
+        "4",
+        "-v",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    lihaaf::cli::parse_from(argv).expect(
+        "cli::parse_from must accept the fully-formed compat invocation: clap parse + \
+         mode-consistency validator both green",
     );
-    assert!(
-        !stderr.contains("error:"),
-        "stderr must not contain any error diagnostic; got:\n{stderr}"
-    );
+    // Sanity on the parsed Cli to ensure each pass-through field
+    // landed where expected.
+    assert!(cli.compat, "compat flag must be set");
+    assert!(cli.bless, "--bless must propagate");
+    assert!(cli.no_cache, "--no-cache must propagate");
+    assert_eq!(cli.jobs, Some(4), "--jobs must propagate");
+    assert!(cli.verbose, "-v / --verbose must propagate");
 }
 
 /// **Round-4 FIX regression: `--compat-cargo-test-argv` is optional.**
@@ -228,35 +275,47 @@ fn compat_run_accepts_pass_through_flags() {
 /// `CompatArgs::from_cli` defaults to `["cargo", "test"]` when the flag
 /// is absent. The doc is now corrected to "Optional in compat mode"
 /// with the default named explicitly. This integration test locks the
-/// runtime behavior so a future regression that tightens the validator
-/// would also fail here, not just trip the inline unit test in
-/// `src/compat/cli.rs`.
-///
-/// The assertion is the same shape as
-/// `compat_run_accepts_pass_through_flags`: a fully-formed compat
-/// invocation that DOES NOT set `--compat-cargo-test-argv` must exit 0
-/// from the Phase 1 stub.
+/// runtime behavior at the CLI parser + validator + CompatArgs::from_cli
+/// chain so a future regression that tightens the validator (e.g.
+/// makes the flag required) would bite here without needing to spawn
+/// the binary against a real compat-root.
 #[test]
 fn compat_run_accepts_omitted_cargo_test_argv() {
-    let out = run_binary(&[
+    // CLI parse + validator must accept the invocation. Then
+    // `CompatArgs::from_cli` must surface the default ["cargo",
+    // "test"] argv vector for the unset flag.
+    let argv: Vec<String> = [
+        "cargo-lihaaf",
         "--compat",
         "--compat-root",
         ".",
         "--compat-report",
         "/tmp/lihaaf-compat-report-omitted-argv.json",
-    ]);
-    let stderr = stderr_string(&out);
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "compat run without --compat-cargo-test-argv must succeed (default is `cargo test`); \
-         got {:?}; stderr:\n{stderr}",
-        out.status.code(),
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    let cli = lihaaf::cli::parse_from(argv).expect(
+        "cli::parse_from must accept compat without --compat-cargo-test-argv (validator must \
+         not require the flag)",
     );
+    assert!(cli.compat, "compat flag must be set");
     assert!(
-        !stderr.contains("--compat-cargo-test-argv"),
-        "stderr must not mention --compat-cargo-test-argv when it is omitted; got:\n{stderr}"
+        cli.compat_cargo_test_argv.is_none(),
+        "--compat-cargo-test-argv must be None when omitted; got {:?}",
+        cli.compat_cargo_test_argv,
     );
+    // CompatArgs::from_cli applies the default. The diagnostic for a
+    // regression here would name the flag, so the assert message
+    // points at the default value adopters depend on.
+    let args = lihaaf::CompatArgs::from_cli(cli)
+        .expect("CompatArgs::from_cli must succeed when --compat-cargo-test-argv is omitted");
+    // The CompatArgs fields are `pub(crate)`, so we can't read
+    // `compat_cargo_test_argv` directly across the crate boundary;
+    // the `from_cli` call success is the contract we lock here, and
+    // the inline unit test inside `src/compat/cli.rs` covers the
+    // default-argv shape byte-for-byte.
+    let _ = args;
 }
 
 // --- Rust API also enforces mode-consistency. ---
