@@ -609,10 +609,22 @@ fn cleanup_continues_after_individual_path_failure() {
     let err = result.expect_err("cleanup must surface the failed-removal error");
     match err {
         lihaaf::Error::Io { context, .. } => {
-            // The diagnostic must name the failed removal context.
+            // The diagnostic must name the failed removal context. The
+            // race-free cleanup cascade (round-3, commit `57a0e33`)
+            // replaced the single `"removing compat-generated path"`
+            // context with three step-specific contexts:
+            //   - step 1 (file/symlink unlink): "removing compat-generated file/symlink"
+            //   - step 2 (empty dir / dir-symlink): "removing compat-generated empty dir / dir-symlink"
+            //   - step 3 (recursive walk): "recursively removing compat-generated directory"
+            // The exact step depends on the platform's `unlink(2)` /
+            // `rmdir(2)` errno mapping for "parent denies write" —
+            // tying the assertion to one specific step would couple the
+            // test to a kernel/libc detail that isn't load-bearing for
+            // this test's bite. Match the common substring instead.
             assert!(
-                context.contains("removing compat-generated path"),
-                "Io context must name the removal stage; got `{context}`"
+                context.contains("removing compat-generated")
+                    || context.contains("recursively removing compat-generated"),
+                "Io context must name a removal stage; got `{context}`"
             );
         }
         other => panic!("expected Error::Io, got {other:?}"),
