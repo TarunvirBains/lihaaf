@@ -49,6 +49,12 @@ pub struct NormalizationContext {
 impl NormalizationContext {
     /// Construct a context from session-startup data. `cargo_home`
     /// defaults to `$CARGO_HOME` if set, otherwise `$HOME/.cargo`.
+    ///
+    /// `compat_short_cargo` is `false` by default. Compat-mode callers
+    /// drive the flag via the dedicated [`Self::with_compat_short_cargo`]
+    /// builder so the §3.2.2 trybuild short-form rewrite fires for the
+    /// inner session; non-compat callers leave it untouched and observe
+    /// byte-identical v0.1 output.
     pub fn new(workspace_root: PathBuf, sysroot: PathBuf) -> Self {
         let cargo_registry = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -60,6 +66,17 @@ impl NormalizationContext {
             cargo_registry,
             compat_short_cargo: false,
         }
+    }
+
+    /// Builder-style mutator to set [`Self::compat_short_cargo`].
+    ///
+    /// Returns `self` so call sites can read as
+    /// `NormalizationContext::new(...).with_compat_short_cargo(true)`.
+    /// Setting `false` is a no-op on a context built via `new` (the
+    /// default), preserved for symmetry with future overrides.
+    pub fn with_compat_short_cargo(mut self, enabled: bool) -> Self {
+        self.compat_short_cargo = enabled;
+        self
     }
 }
 

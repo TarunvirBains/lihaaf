@@ -309,6 +309,13 @@ fn basename_fallback(compat_root: &Path) -> String {
 /// (compat mode rejects them at parse time); `--compat-filter` is
 /// translated into `--filter` here so the inner session sees the
 /// adopter's fixture-substring choice.
+///
+/// `inner_compat_normalize` is set to `true` so the inner session's
+/// [`crate::normalize::NormalizationContext`] picks up the §3.2.2
+/// short-form `$CARGO/<crate>-<ver>/...` rewrite. Without this, compat
+/// snapshots expecting the trybuild short form would mismatch as
+/// non-compat `$CARGO/registry/...` strings. The field is hidden from
+/// the public CLI surface (see `Cli::inner_compat_normalize`).
 fn build_inner_cli(args: &cli::CompatArgs, overlay_manifest: &Path) -> crate::cli::Cli {
     crate::cli::Cli {
         bless: args.inner_cli.bless,
@@ -330,6 +337,7 @@ fn build_inner_cli(args: &cli::CompatArgs, overlay_manifest: &Path) -> crate::cl
         verbose: args.inner_cli.verbose,
         use_symlink: args.inner_cli.use_symlink,
         keep_output: args.inner_cli.keep_output,
+        inner_compat_normalize: true,
     }
 }
 
@@ -432,5 +440,104 @@ fn inner_error_exit_code(e: &Error) -> i32 {
     match e {
         Error::Session(outcome) => i32::from(outcome.exit_code() as u8),
         _ => i32::from(crate::exit::ExitCode::ConfigInvalid as u8),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::Cli;
+
+    /// Build a minimal `CompatArgs` with the inner Cli `compat` flag set
+    /// so the contract precondition for `build_inner_cli` is satisfied.
+    /// Every field on `CompatArgs` and the inner `Cli` is set to the
+    /// posture an empty `cargo lihaaf --compat --compat-root /tmp --compat-report /tmp/r.json`
+    /// invocation would produce.
+    fn neutral_compat_args() -> cli::CompatArgs {
+        cli::CompatArgs {
+            compat_root: PathBuf::from("/tmp/lihaaf-build-inner-cli-test-root"),
+            compat_report: PathBuf::from("/tmp/lihaaf-build-inner-cli-test-report.json"),
+            compat_cargo_test_argv: vec!["cargo".to_string(), "test".to_string()],
+            compat_manifest: None,
+            compat_commit: None,
+            compat_filter: Vec::new(),
+            compat_trybuild_macro: Vec::new(),
+            inner_cli: Cli {
+                bless: false,
+                compat: true,
+                compat_cargo_test_argv: None,
+                compat_commit: None,
+                compat_filter: Vec::new(),
+                compat_manifest: None,
+                compat_report: Some(PathBuf::from(
+                    "/tmp/lihaaf-build-inner-cli-test-report.json",
+                )),
+                compat_root: Some(PathBuf::from("/tmp/lihaaf-build-inner-cli-test-root")),
+                compat_trybuild_macro: Vec::new(),
+                filter: Vec::new(),
+                jobs: None,
+                suite: Vec::new(),
+                no_cache: false,
+                manifest_path: None,
+                list: false,
+                quiet: false,
+                verbose: false,
+                use_symlink: false,
+                keep_output: false,
+                inner_compat_normalize: false,
+            },
+        }
+    }
+
+    #[test]
+    fn build_inner_cli_sets_inner_compat_normalize_true() {
+        // The compat driver's inner session needs the §3.2.2 short-$CARGO
+        // rewrite. `build_inner_cli` is the single seam responsible for
+        // setting the hidden `inner_compat_normalize` flag on the inner
+        // Cli; `session::run` then reads that flag and constructs the
+        // `NormalizationContext` with `compat_short_cargo = true`. If
+        // this assertion regresses, compat snapshots expecting
+        // `$CARGO/<crate>-<ver>/...` will mismatch as
+        // `$CARGO/registry/...` strings without any other diagnostic.
+        let args = neutral_compat_args();
+        let overlay_manifest = PathBuf::from("/tmp/lihaaf-build-inner-cli-test/Cargo.lihaaf.toml");
+        let inner = build_inner_cli(&args, &overlay_manifest);
+        assert!(
+            inner.inner_compat_normalize,
+            "compat driver must set inner_compat_normalize=true so the inner session's \
+             NormalizationContext.compat_short_cargo is true",
+        );
+        // And the outer compat flag must be cleared on the inner Cli —
+        // the inner session is a regular v0.1 run that happens to have
+        // the compat normalizer flag set.
+        assert!(
+            !inner.compat,
+            "inner Cli must have `compat: false` so the inner session does NOT recurse into \
+             the compat driver",
+        );
+    }
+
+    #[test]
+    fn normalization_context_reads_inner_compat_normalize() {
+        // The session-construction path is
+        // `NormalizationContext::new(...).with_compat_short_cargo(cli.inner_compat_normalize)`.
+        // This test asserts the builder produces the expected flag
+        // value for both inputs so the plumbing seam in `session::run`
+        // cannot regress silently. A renamed flag, a typo'd `true`/`false`,
+        // or an inverted builder argument bites here.
+        let ctx_compat =
+            crate::normalize::NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/r"))
+                .with_compat_short_cargo(true);
+        assert!(
+            ctx_compat.compat_short_cargo,
+            "with_compat_short_cargo(true) must set the flag",
+        );
+        let ctx_non_compat =
+            crate::normalize::NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/r"))
+                .with_compat_short_cargo(false);
+        assert!(
+            !ctx_non_compat.compat_short_cargo,
+            "with_compat_short_cargo(false) must clear the flag (mirrors the default)",
+        );
     }
 }

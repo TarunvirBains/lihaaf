@@ -143,6 +143,20 @@ pub struct Cli {
     /// Local-development escape hatch only — never set in CI.
     #[arg(long)]
     pub keep_output: bool,
+
+    /// Internal flag — NOT exposed on argv. Compat mode's driver sets
+    /// this to `true` when invoking the inner `session::run` so the
+    /// inner session constructs a [`crate::normalize::NormalizationContext`]
+    /// with `compat_short_cargo = true` and the §3.2.2 short-form
+    /// `$CARGO/<crate>-<ver>/...` rewrite fires for compat snapshots.
+    ///
+    /// The clap `skip` attribute keeps the field off the CLI surface
+    /// entirely; clap does not generate a flag for it and `parse_from`
+    /// always leaves it at the default `false`. The field is set
+    /// programmatically by `compat::mod::build_inner_cli` so adopters
+    /// using `cargo lihaaf --compat` do not need to know it exists.
+    #[arg(skip)]
+    pub(crate) inner_compat_normalize: bool,
 }
 
 /// Reject `-j 0` at parse time. The default

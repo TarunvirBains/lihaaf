@@ -274,27 +274,20 @@ fn compat_run_accepts_omitted_cargo_test_argv() {
 /// 2, message names the offending flag and `--compat`).
 #[test]
 fn rust_api_run_enforces_mode_consistency() {
-    let cli = lihaaf::Cli {
-        bless: false,
-        compat: false,
-        compat_cargo_test_argv: None,
-        compat_commit: None,
-        compat_filter: vec![],
-        compat_manifest: None,
-        compat_report: None,
-        compat_root: Some(PathBuf::from("/tmp/lihaaf-rust-api-validator-test")),
-        compat_trybuild_macro: vec![],
-        filter: vec![],
-        jobs: None,
-        suite: vec![],
-        no_cache: false,
-        manifest_path: None,
-        list: false,
-        quiet: false,
-        verbose: false,
-        use_symlink: false,
-        keep_output: false,
-    };
+    // Construct the Cli via clap's `try_parse_from` (the same path
+    // `cli::parse_from` takes minus the validator call). This gives us
+    // a Cli with `compat: false` and `compat_root: Some(...)` —
+    // exactly the inconsistent shape the validator must reject — while
+    // leaving the harness-private `inner_compat_normalize` field at its
+    // clap-derive default. Then call `lihaaf::run` and assert the
+    // validator (invoked from inside `run`) fires.
+    use clap::Parser;
+    let cli = lihaaf::Cli::try_parse_from([
+        "cargo-lihaaf",
+        "--compat-root",
+        "/tmp/lihaaf-rust-api-validator-test",
+    ])
+    .expect("clap parse should succeed; validation runs inside lihaaf::run");
     let err = lihaaf::run(cli).expect_err("validator must fire on the Rust API path");
     match err {
         lihaaf::Error::Cli {

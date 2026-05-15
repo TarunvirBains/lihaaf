@@ -416,8 +416,14 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         eprintln!("lihaaf: parallelism = {parallelism}");
     }
 
-    // Build the worker context for this suite.
-    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone());
+    // Build the worker context for this suite. The compat driver
+    // (`compat::mod::build_inner_cli`) sets `inner_compat_normalize =
+    // true` on the inner Cli so this session emits trybuild-shaped
+    // short-form `$CARGO/<crate>-<ver>/...` snapshots per §3.2.2. Non-
+    // compat callers leave the flag at its default `false` and observe
+    // byte-identical v0.1 normalizer output.
+    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone())
+        .with_compat_short_cargo(cli.inner_compat_normalize);
     let mut worker_ctx = WorkerContext::new(
         crate_root.to_path_buf(),
         managed_path.clone(),
@@ -861,6 +867,7 @@ mod tests {
             verbose: false,
             use_symlink: false,
             keep_output: false,
+            inner_compat_normalize: false,
         }
     }
 
