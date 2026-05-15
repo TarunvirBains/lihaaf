@@ -5,9 +5,11 @@
 //! ## What this module owns
 //!
 //! - [`capture_active_toolchain`] — the public entry that the compat
-//!   driver calls AFTER changing cwd to `--compat-root`. Invokes `rustup
-//!   show active-toolchain`, returns the trimmed first line, or falls
-//!   back to the rustc release line on rustup absence / subprocess error.
+//!   driver calls with the `--compat-root` path. Invokes `rustup show
+//!   active-toolchain` with cwd set to the pilot fork so resolution
+//!   honors the fork's `rust-toolchain.toml`, returns the trimmed first
+//!   line, or falls back to the rustc release line on rustup absence /
+//!   subprocess error.
 //! - [`parse_active_toolchain`] — `pub(crate)` byte-level parser that
 //!   isolates the "first line, trim at first ASCII space" rule from the
 //!   subprocess plumbing so the rule is unit-testable without spawning.
@@ -38,6 +40,7 @@
 //! `crate::toolchain::Toolchain::release_line`), so the fallback adds
 //! zero new subprocess shape.
 
+use std::path::Path;
 use std::process::Command;
 
 use crate::error::Error;
@@ -53,10 +56,12 @@ use crate::error::Error;
 ///
 /// ## cwd contract
 ///
-/// The compat driver changes cwd to `--compat-root` BEFORE calling
-/// this function so `rustup show` resolves against the fork's pinned
-/// `rust-toolchain.toml`. This function does not set `current_dir`
-/// itself; the caller owns that.
+/// `compat_root` is the pilot fork's checkout root (the
+/// `--compat-root` value). The subprocess inherits this as its cwd so
+/// `rustup show` resolves against the fork's `rust-toolchain.toml`
+/// rather than the caller's cwd. Without this, running `cargo lihaaf
+/// --compat --compat-root /other/crate` from an unrelated directory
+/// would record the CALLER's pinned toolchain, not the fork's.
 ///
 /// ## Errors
 ///
@@ -64,17 +69,23 @@ use crate::error::Error;
 /// only when BOTH rustup subprocess and rustc subprocess fail — the
 /// caller's environment has neither toolchain manager available, which
 /// is fatal at the v0.1 freshness layer regardless of compat mode.
-pub fn capture_active_toolchain() -> Result<String, Error> {
-    capture_with_program("rustup")
+pub fn capture_active_toolchain(compat_root: &Path) -> Result<String, Error> {
+    capture_with_program("rustup", compat_root)
 }
 
 /// Internal variant of [`capture_active_toolchain`] that takes the
 /// program name as a parameter. The public entry calls this with
 /// `"rustup"`; integration tests call it with a path that does not
 /// exist to exercise the fallback path without mutating `PATH`.
-pub fn capture_with_program(program: &str) -> Result<String, Error> {
+///
+/// `compat_root` is forwarded to the subprocess as its working
+/// directory — the same cwd contract as the public entry. The fallback
+/// `crate::toolchain::capture` reads no manifest and is unaffected by
+/// cwd.
+pub fn capture_with_program(program: &str, compat_root: &Path) -> Result<String, Error> {
     let output = Command::new(program)
         .args(["show", "active-toolchain"])
+        .current_dir(compat_root)
         .output();
     match output {
         Ok(out) if out.status.success() => {

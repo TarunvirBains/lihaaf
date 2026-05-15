@@ -173,12 +173,36 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
         }
     };
 
-    let toolchain = rustup::capture_active_toolchain()?;
+    // Active-toolchain capture (§3.4). A failure here must NOT
+    // short-circuit the envelope write — §3.3 requires the envelope to
+    // be the single CI artifact, so an IO/spawn failure that hides every
+    // other captured signal violates the contract. Capture into an
+    // `Option<String>`; on Err, record a `toolchain_capture_failed`
+    // entry in `envelope_errors` and proceed with an empty
+    // `toolchain` field. The fallback release-line path inside
+    // `capture_active_toolchain` already absorbs ordinary rustup-absent
+    // / non-zero-exit cases — this Err branch only fires when BOTH
+    // rustup AND rustc subprocesses fail, which is a degenerate
+    // environment but not a reason to lose the rest of the run's signal.
+    let (toolchain, toolchain_capture_error) = match rustup::capture_active_toolchain(&compat_root)
+    {
+        Ok(s) => (s, None),
+        Err(e) => (String::new(), Some(format!("{e}"))),
+    };
 
     let mismatch_examples = build_mismatch_examples(&baseline_result, &converted);
     let mismatch_count = u32::try_from(mismatch_examples.len()).unwrap_or(u32::MAX);
 
     let mut envelope_errors: Vec<report::EnvelopeError> = Vec::new();
+    if let Some(detail) = toolchain_capture_error {
+        envelope_errors.push(report::EnvelopeError {
+            error_type: "toolchain_capture_failed".into(),
+            fixture: None,
+            file: String::new(),
+            line: 0,
+            detail,
+        });
+    }
     for unrecog in &discovery_output.unrecognized {
         envelope_errors.push(report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),

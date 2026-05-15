@@ -11,13 +11,14 @@
 //! ## Test choices
 //!
 //! - **`captures_active_toolchain_when_rustup_present`** calls the
-//!   public entry and asserts on the SHAPE of the returned identifier
-//!   (lowercase ASCII, no whitespace, non-empty) rather than a fixed
-//!   string. CI runners may have different `rustup default` values; a
-//!   shape assertion bites if the parser regresses (e.g. forgets to
-//!   trim the `(default)` suffix) without coupling the test to a
-//!   specific toolchain pin. Gated with a runtime `rustup --version`
-//!   probe; the test exits cleanly when rustup is absent.
+//!   public entry with the integration-test crate root and asserts on
+//!   the SHAPE of the returned identifier (lowercase ASCII, no
+//!   whitespace, non-empty) rather than a fixed string. CI runners may
+//!   have different `rustup default` values; a shape assertion bites if
+//!   the parser regresses (e.g. forgets to trim the `(default)` suffix)
+//!   without coupling the test to a specific toolchain pin. Gated with
+//!   a runtime `rustup --version` probe; the test exits cleanly when
+//!   rustup is absent.
 //!
 //! - **`falls_back_to_rustc_release_when_rustup_absent`** invokes the
 //!   `_with_program` variant with an absolute path to a binary that
@@ -26,13 +27,16 @@
 //!   would race with parallel tests). Asserts the returned string is
 //!   a rustc release line (starts with `"rustc "`).
 //!
-//! - **`respects_compat_root_cwd`** writes a `rust-toolchain.toml` to
-//!   a tempdir, sets process cwd to the tempdir, calls the public
-//!   entry, and asserts the returned identifier reflects the pin.
-//!   Serializes against any other cwd-mutating test through a static
-//!   `Mutex` so parallel test execution stays hermetic. The pin uses
-//!   `stable` so the test does not depend on `rustup` having `nightly`
-//!   installed.
+//! - **`respects_compat_root_param`** writes a `rust-toolchain.toml` to
+//!   a tempdir, passes that path as the `compat_root` parameter to the
+//!   public entry, and asserts the returned identifier reflects the pin.
+//!   The fix in this commit moved `rustup show active-toolchain`'s cwd
+//!   from "the test runner's cwd" to "the explicit `compat_root`
+//!   parameter"; without this test bites, a regression that re-introduced
+//!   the cwd-based resolution would silently re-record the wrong
+//!   toolchain. The test no longer mutates process cwd, so no
+//!   serialization mutex is needed. The pin uses `stable` so the test
+//!   does not depend on `rustup` having `nightly` installed.
 //!
 //! ## Why no PATH mutation
 //!
@@ -42,16 +46,10 @@
 //! fallback test exercise the spawn-error path through a localized
 //! argument override, not a global state change.
 
+use std::path::PathBuf;
 use std::process::Command;
-use std::sync::Mutex;
 
 use lihaaf::{compat_capture_active_toolchain, compat_capture_with_program};
-
-/// Process-wide serialization for tests that mutate `current_dir`. Two
-/// such tests would race because cwd is per-process state, not per-thread.
-/// Only `respects_compat_root_cwd` mutates cwd today; the static is in
-/// place so future cwd-mutating tests in this crate can lock against it.
-static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 /// True if `rustup --version` returns a successful exit. Used to gate
 /// the rustup-dependent tests so CI runners without rustup still get a
@@ -70,7 +68,12 @@ fn captures_active_toolchain_when_rustup_present() {
         eprintln!("rustup not available; skipping");
         return;
     }
-    let captured = compat_capture_active_toolchain()
+    // Use the test crate's own checkout root as the compat_root —
+    // every contributor / CI machine has rustup configured here, so
+    // the call resolves the same active toolchain it would for the
+    // unit-test runner itself.
+    let compat_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let captured = compat_capture_active_toolchain(&compat_root)
         .expect("rustup is on PATH and rustc is on PATH; capture must succeed");
     assert!(
         !captured.is_empty(),
@@ -104,7 +107,8 @@ fn falls_back_to_rustc_release_when_rustup_absent() {
     #[cfg(windows)]
     let missing = r"C:\lihaaf-phase9-rustup-does-not-exist.exe";
 
-    let captured = compat_capture_with_program(missing)
+    let compat_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let captured = compat_capture_with_program(missing, &compat_root)
         .expect("rustc is on PATH; fallback to rustc release line must succeed");
     assert!(
         captured.starts_with("rustc "),
@@ -120,7 +124,7 @@ fn falls_back_to_rustc_release_when_rustup_absent() {
 }
 
 #[test]
-fn respects_compat_root_cwd() {
+fn respects_compat_root_param() {
     if !rustup_available() {
         eprintln!("rustup not available; skipping");
         return;
@@ -136,22 +140,19 @@ fn respects_compat_root_cwd() {
     std::fs::write(&manifest, format!("[toolchain]\nchannel = \"{pin}\"\n"))
         .expect("write rust-toolchain.toml");
 
-    let _guard = CWD_LOCK.lock().expect("cwd lock poisoned");
-
-    let original_cwd = std::env::current_dir().expect("read process cwd");
-    std::env::set_current_dir(temp.path()).expect("change cwd to tempdir");
-
-    let result = compat_capture_active_toolchain();
-
-    // Restore cwd before unwrapping so a failed assertion does not
-    // leave the test binary in the tempdir (which would break later
-    // tempdir cleanup on Drop).
-    std::env::set_current_dir(&original_cwd).expect("restore cwd");
-
-    let captured = result.expect("rustup capture under pinned cwd must succeed");
+    // Pass the tempdir as the compat_root parameter — no cwd mutation
+    // required. The fix in this commit moved the rustup-resolution cwd
+    // from the test runner's cwd to this explicit parameter; if a
+    // regression drops the `current_dir(compat_root)` call on the
+    // subprocess, the capture would record the test runner's pinned
+    // toolchain instead of `stable` (the test runner pins lihaaf's own
+    // toolchain, typically a fixed version like `1.95.0`).
+    let captured = compat_capture_active_toolchain(temp.path())
+        .expect("rustup capture under pinned compat_root must succeed");
     assert!(
         captured.starts_with(pin),
-        "captured toolchain {captured:?} must start with the pinned channel {pin:?}; the cwd-based resolution did not take effect"
+        "captured toolchain {captured:?} must start with the pinned channel {pin:?}; the \
+         compat_root-based resolution did not take effect"
     );
     // `temp` is dropped here — TempDir's Drop cleans the directory.
     drop(temp);
