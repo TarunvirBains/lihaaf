@@ -34,22 +34,28 @@
 //! 2. `errors` is empty (§5: `errors == []` — any envelope-recorded
 //!    error invalidates the run).
 //! 3. `results.mismatch_count <= N_<crate>` (the shrinking-only rule).
-//! 4. `results.baseline.unknown_count == 0` (no unrecognized libtest
-//!    lines — the §1 conservatism rule must produce a clean signal).
-//! 5. Exit-code rule (§5: both `0`, OR both equal and documented as
+//! 4. Exit-code rule (§5: both `0`, OR both equal and documented as
 //!    expected-fail in the crate's matrix entry):
 //!    - If the crate's [`Ceiling`] declares `expected_exit_code =
 //!      Some(N)`, BOTH `results.baseline.exit_code` and
 //!      `results.lihaaf.exit_code` must equal `N`.
 //!    - If `expected_exit_code` is `None` (the default), BOTH must
 //!      equal `0`.
-//! 6. `baseline.pass + baseline.fail == lihaaf.pass + lihaaf.fail +
+//! 5. `baseline.pass + baseline.fail == lihaaf.pass + lihaaf.fail +
 //!    excluded_fixtures.len()` (§5: the per-side totals must match
 //!    unless the `excluded_fixtures` set accounts for the delta).
 //!
 //! Any rule violation produces [`GateOutcome::Block`] with a directed
 //! diagnostic naming the offending field and threshold; otherwise
 //! [`GateOutcome::Allow`].
+//!
+//! `results.baseline.unknown_count` is **not** a gate input — the spec
+//! at `docs/compatibility-plan.md:239-244` lists only the four field
+//! groups above, and trybuild's wrapper pattern (one libtest test for N
+//! fixtures) makes `unknown_count >= 1` the common case for trybuild
+//! adopters. The field is still serialized in the envelope as a
+//! diagnostic signal so adopters can inspect parser-correlation issues;
+//! the gate just does not enforce it.
 //!
 //! ## v0.1.0-beta.4 dry-run note
 //!
@@ -248,15 +254,6 @@ pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelop
             envelope.errors.len(),
             envelope.errors[0].error_type,
             envelope.errors[0].detail,
-        ));
-    }
-
-    if envelope.results.baseline.unknown_count != 0 {
-        return GateOutcome::Block(format!(
-            "baseline.unknown_count = {} (must be 0; the §1 conservatism rule requires every \
-             libtest verdict to correlate to a recognized fixture before the pilot gate is \
-             meaningful)",
-            envelope.results.baseline.unknown_count,
         ));
     }
 
@@ -478,23 +475,6 @@ mod tests {
                 assert!(msg.contains("mismatch_count"), "got: {msg}");
                 assert!(msg.contains("n_max"), "got: {msg}");
             }
-            other => panic!("expected Block, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn check_gate_blocks_on_baseline_unknown_count() {
-        let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                n_max: 5,
-                expected_exit_code: None,
-            },
-        );
-        let env = envelope_with("demo", 0, 1, 0, 0);
-        match check_gate(&baseline, &env) {
-            GateOutcome::Block(msg) => assert!(msg.contains("unknown_count"), "got: {msg}"),
             other => panic!("expected Block, got {other:?}"),
         }
     }

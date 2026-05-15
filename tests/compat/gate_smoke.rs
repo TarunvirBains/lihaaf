@@ -229,19 +229,6 @@ fn lihaaf_exit_code_nonzero_blocks() {
 }
 
 #[test]
-fn baseline_unknown_count_blocks() {
-    let baseline = one_crate_baseline("demo", 5);
-    let mut env = neutral_envelope("demo");
-    env.results.baseline.unknown_count = 2;
-    match compat_check_gate(&baseline, &env) {
-        CompatGateOutcome::Block(msg) => {
-            assert!(msg.contains("unknown_count"), "diagnostic: {msg}");
-        }
-        other => panic!("expected Block, got {other:?}"),
-    }
-}
-
-#[test]
 fn totals_divergence_without_excluded_blocks() {
     let baseline = one_crate_baseline("demo", 5);
     let mut env = neutral_envelope("demo");
