@@ -75,13 +75,7 @@ fn neutral_envelope(crate_name: &str) -> CompatEnvelope {
 
 fn one_crate_baseline(name: &str, n_max: u32) -> BTreeMap<String, CompatGateCeiling> {
     let mut m = BTreeMap::new();
-    m.insert(
-        name.to_string(),
-        CompatGateCeiling {
-            crate_name: name.into(),
-            n_max,
-        },
-    );
+    m.insert(name.to_string(), CompatGateCeiling { n_max });
     m
 }
 
@@ -102,8 +96,8 @@ fn parses_baseline_toml_with_one_crate() {
     let map =
         compat_parse_baseline(toml, Path::new("baseline.toml")).expect("baseline.toml must parse");
     assert_eq!(map.len(), 1);
+    // The crate name is the BTreeMap key; the entry only carries `n_max`.
     let ceiling = &map["example-crate"];
-    assert_eq!(ceiling.crate_name, "example-crate");
     assert_eq!(ceiling.n_max, 7);
 }
 

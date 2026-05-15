@@ -94,6 +94,16 @@ pub struct OverlayPlan {
     /// WITHOUT surrounding whitespace, so the envelope can render the
     /// list directly.
     pub dropped_comments: Vec<String>,
+    /// Upstream `[package].name` read out of the same Cargo.toml the
+    /// overlay parsed. `Some(name)` when the upstream manifest has a
+    /// non-empty string value at `package.name`; `None` for malformed
+    /// manifests or workspace roots that lack the `[package]` table.
+    ///
+    /// Captured here so the compat driver does not have to read and
+    /// parse Cargo.toml a second time to populate the §3.3 envelope's
+    /// `crate_name` field — the overlay code already has the parsed
+    /// `toml::Value` in hand.
+    pub upstream_crate_name: Option<String>,
 }
 
 /// Synthetic `[package.metadata.lihaaf]` table the Phase 10 driver
@@ -166,6 +176,42 @@ pub fn materialize_overlay_with_metadata(
     upstream_manifest_path: &Path,
     synthetic_metadata: Option<&SyntheticMetadata>,
 ) -> Result<OverlayPlan, Error> {
+    // Bridge to the builder-shaped entry: the builder ignores the
+    // upstream name and returns the caller's pre-constructed metadata
+    // (cloned because the builder owns the returned value).
+    materialize_overlay_inner(upstream_manifest_path, |_name| synthetic_metadata.cloned())
+}
+
+/// Variant of [`materialize_overlay_with_metadata`] whose synthetic
+/// metadata is constructed by a builder closure given the upstream
+/// crate name. Lets the compat driver build the synthetic block
+/// `[package.metadata.lihaaf]` using the crate name without parsing
+/// `Cargo.toml` a second time — the overlay code passes the parsed
+/// `[package].name` directly into the builder.
+///
+/// `builder` receives `Some(name)` when the upstream manifest carries a
+/// non-empty `[package].name` string, and `None` for workspace roots /
+/// malformed manifests (where the caller decides on a fallback). The
+/// builder may return `None` to skip metadata injection entirely.
+///
+/// **Errors.** Same shape as [`materialize_overlay`].
+pub fn materialize_overlay_with_synthetic_metadata_builder<F>(
+    upstream_manifest_path: &Path,
+    builder: F,
+) -> Result<OverlayPlan, Error>
+where
+    F: FnOnce(Option<&str>) -> SyntheticMetadata,
+{
+    materialize_overlay_inner(upstream_manifest_path, |name| Some(builder(name)))
+}
+
+fn materialize_overlay_inner<F>(
+    upstream_manifest_path: &Path,
+    synthetic_metadata: F,
+) -> Result<OverlayPlan, Error>
+where
+    F: FnOnce(Option<&str>) -> Option<SyntheticMetadata>,
+{
     let raw_bytes = std::fs::read(upstream_manifest_path).map_err(|e| {
         Error::io(
             e,
@@ -212,6 +258,8 @@ pub fn materialize_overlay_with_metadata(
     }
 
     let upstream_already_has_dylib = inspect_existing_crate_type(&value);
+    let upstream_crate_name = read_upstream_crate_name(&value);
+    let synthetic = synthetic_metadata(upstream_crate_name.as_deref());
 
     if let toml::Value::Table(top) = &mut value {
         // Insert/extend [lib] crate-type. The canonicalization is
@@ -228,7 +276,7 @@ pub fn materialize_overlay_with_metadata(
             });
         }
 
-        if let Some(meta) = synthetic_metadata {
+        if let Some(meta) = synthetic.as_ref() {
             inject_synthetic_metadata(top, meta);
         }
     }
@@ -260,7 +308,22 @@ pub fn materialize_overlay_with_metadata(
         sibling_manifest: sibling_path,
         upstream_already_has_dylib,
         dropped_comments,
+        upstream_crate_name,
     })
+}
+
+/// Read the upstream `[package].name` out of an already-parsed
+/// `toml::Value`. Returns `Some(name)` when the field is a non-empty
+/// string; `None` for missing tables, non-string values, or
+/// workspace-root manifests that lack `[package]`. The caller falls
+/// back to a basename heuristic in those cases.
+fn read_upstream_crate_name(value: &toml::Value) -> Option<String> {
+    value
+        .get("package")
+        .and_then(|p| p.get("name"))
+        .and_then(|n| n.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 /// Splice the synthetic `[package.metadata.lihaaf]` table into `top`.

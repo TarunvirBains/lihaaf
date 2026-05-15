@@ -72,11 +72,10 @@ use crate::error::Error;
 /// module — the gate only reads the current ceiling).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ceiling {
-    /// Crate name from upstream `[package].name`. Matched against
-    /// [`CompatEnvelope::crate_name`].
-    pub crate_name: String,
     /// Maximum number of `results.mismatch_count` entries the gate
     /// allows. Per §5 the value shrinks over time as the pilot stabilizes.
+    ///
+    /// The crate name is the BTreeMap key — not duplicated here.
     pub n_max: u32,
 }
 
@@ -166,13 +165,7 @@ pub fn parse_baseline(
                 "baseline.toml `{crate_name}.n_max = {n_max_i64}` exceeds the u32 range"
             ),
         })?;
-        out.insert(
-            crate_name.clone(),
-            Ceiling {
-                crate_name: crate_name.clone(),
-                n_max,
-            },
-        );
+        out.insert(crate_name.clone(), Ceiling { n_max });
     }
     Ok(out)
 }
@@ -185,7 +178,7 @@ pub fn parse_baseline(
 /// and does not write to stdout/stderr; the caller renders the
 /// [`GateOutcome`] for the workflow log.
 pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelope) -> GateOutcome {
-    let Some(ceiling) = baseline.get(&envelope.crate_name) else {
+    let Some((crate_name, ceiling)) = baseline.get_key_value(&envelope.crate_name) else {
         return GateOutcome::NotEnrolled;
     };
 
@@ -228,7 +221,7 @@ pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelop
         return GateOutcome::Block(format!(
             "mismatch_count = {} exceeds ceiling `{}.n_max = {}` (the §5 shrinking-only rule: \
              a PR may decrease but not increase the per-crate ceiling)",
-            envelope.results.mismatch_count, ceiling.crate_name, ceiling.n_max,
+            envelope.results.mismatch_count, crate_name, ceiling.n_max,
         ));
     }
 
@@ -324,7 +317,6 @@ mod tests {
         let map = parse_baseline(toml, Path::new("baseline.toml")).expect("must parse");
         assert_eq!(map.len(), 1);
         assert_eq!(map["serde-json"].n_max, 12);
-        assert_eq!(map["serde-json"].crate_name, "serde-json");
     }
 
     #[test]
@@ -353,13 +345,7 @@ mod tests {
     #[test]
     fn check_gate_under_ceiling_passes() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 3, 0, 0, 0);
         assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
     }
@@ -367,13 +353,7 @@ mod tests {
     #[test]
     fn check_gate_at_ceiling_passes() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 5, 0, 0, 0);
         assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
     }
@@ -381,13 +361,7 @@ mod tests {
     #[test]
     fn check_gate_over_ceiling_blocks() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 6, 0, 0, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => {
@@ -401,13 +375,7 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_baseline_unknown_count() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 0, 1, 0, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("unknown_count"), "got: {msg}"),
@@ -418,13 +386,7 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_baseline_exit_code_nonzero() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 0, 0, 1, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("baseline.exit_code"), "got: {msg}"),
@@ -435,13 +397,7 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_lihaaf_exit_code_nonzero() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let env = envelope_with("demo", 0, 0, 0, 1);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("lihaaf.exit_code"), "got: {msg}"),
@@ -452,13 +408,7 @@ mod tests {
     #[test]
     fn check_gate_blocks_when_errors_nonempty() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.errors.push(crate::compat::report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),
@@ -479,13 +429,7 @@ mod tests {
     #[test]
     fn check_gate_blocks_when_totals_diverge_without_excluded() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.results.baseline.pass = 10;
         env.results.baseline.fail = 0;
@@ -505,13 +449,7 @@ mod tests {
     #[test]
     fn check_gate_allows_when_excluded_accounts_for_delta() {
         let mut baseline = BTreeMap::new();
-        baseline.insert(
-            "demo".into(),
-            Ceiling {
-                crate_name: "demo".into(),
-                n_max: 5,
-            },
-        );
+        baseline.insert("demo".into(), Ceiling { n_max: 5 });
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.results.baseline.pass = 10;
         env.results.baseline.fail = 0;

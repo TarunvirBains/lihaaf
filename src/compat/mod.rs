@@ -78,19 +78,33 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     let compat_report = args.compat_report.clone();
     let upstream_manifest = resolve_upstream_manifest(&args)?;
 
-    let crate_name = resolve_crate_name(&upstream_manifest, &compat_root)?;
-
     let guard = cleanup::CleanupGuard::new(args.inner_cli.keep_output);
 
     let converted_root = compat_root.join("target").join("lihaaf-compat-converted");
-    let synthetic_meta = overlay::SyntheticMetadata {
-        dylib_crate: crate_name.clone(),
-        extern_crates: vec![crate_name.clone()],
-        fixture_dirs: vec![converted_root.to_string_lossy().into_owned()],
-    };
-
-    let overlay_plan =
-        overlay::materialize_overlay_with_metadata(&upstream_manifest, Some(&synthetic_meta))?;
+    // The synthetic `[package.metadata.lihaaf]` block embedded in the
+    // overlay needs the crate name BEFORE the overlay serializer runs.
+    // We hand `materialize_overlay_with_synthetic_metadata_builder` a
+    // closure that constructs the metadata once the overlay code has
+    // parsed Cargo.toml and read `[package].name` — that way the file
+    // is opened once and the synthetic block carries the right name on
+    // the same write.
+    let overlay_plan = overlay::materialize_overlay_with_synthetic_metadata_builder(
+        &upstream_manifest,
+        |upstream_name| {
+            let name = upstream_name
+                .map(str::to_string)
+                .unwrap_or_else(|| basename_fallback(&compat_root));
+            overlay::SyntheticMetadata {
+                dylib_crate: name.clone(),
+                extern_crates: vec![name],
+                fixture_dirs: vec![converted_root.to_string_lossy().into_owned()],
+            }
+        },
+    )?;
+    let crate_name = overlay_plan
+        .upstream_crate_name
+        .clone()
+        .unwrap_or_else(|| basename_fallback(&compat_root));
     guard.track(overlay_plan.sibling_manifest.clone(), &compat_root);
 
     let discovery_output = discovery::discover(&compat_root, &args.compat_trybuild_macro)?;
@@ -157,7 +171,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
         envelope_errors.push(report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),
             fixture: None,
-            file: relative_forward_slash(&unrecog.file, &compat_root),
+            file: crate::util::relative_to(&unrecog.file, &compat_root),
             line: u32::try_from(unrecog.line).unwrap_or(u32::MAX),
             detail: unrecog.detail.clone(),
         });
@@ -263,33 +277,6 @@ fn resolve_upstream_manifest(args: &cli::CompatArgs) -> Result<PathBuf, Error> {
         return Ok(m.clone());
     }
     Ok(args.compat_root.join("Cargo.toml"))
-}
-
-/// Read the upstream `[package].name` to populate the §3.3 envelope's
-/// `crate_name` field. Falls back to `--compat-root`'s basename when
-/// the manifest has no `[package]` table (e.g. a malformed pilot).
-///
-/// This is the Q1 design answer: upstream package name with basename
-/// fallback.
-fn resolve_crate_name(manifest_path: &Path, compat_root: &Path) -> Result<String, Error> {
-    let bytes = match std::fs::read(manifest_path) {
-        Ok(b) => b,
-        Err(_) => return Ok(basename_fallback(compat_root)),
-    };
-    let text = match std::str::from_utf8(&bytes) {
-        Ok(t) => t,
-        Err(_) => return Ok(basename_fallback(compat_root)),
-    };
-    let value: toml::Value = match toml::from_str(text) {
-        Ok(v) => v,
-        Err(_) => return Ok(basename_fallback(compat_root)),
-    };
-    let name = value
-        .get("package")
-        .and_then(|p| p.get("name"))
-        .and_then(|n| n.as_str())
-        .map(str::to_string);
-    Ok(name.unwrap_or_else(|| basename_fallback(compat_root)))
 }
 
 fn basename_fallback(compat_root: &Path) -> String {
@@ -419,13 +406,6 @@ fn build_mismatch_examples(
             }
         })
         .collect()
-}
-
-/// Convert an absolute path to a repo-relative forward-slash string for
-/// the §3.3 envelope. Falls back to the full forward-slash path when
-/// `path` is not under `base`.
-fn relative_forward_slash(path: &Path, base: &Path) -> String {
-    crate::util::relative_to(path, base)
 }
 
 /// Map an inner [`crate::session::run`] error to the §3.3 envelope's
