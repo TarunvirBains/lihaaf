@@ -75,7 +75,32 @@ fn neutral_envelope(crate_name: &str) -> CompatEnvelope {
 
 fn one_crate_baseline(name: &str, n_max: u32) -> BTreeMap<String, CompatGateCeiling> {
     let mut m = BTreeMap::new();
-    m.insert(name.to_string(), CompatGateCeiling { n_max });
+    m.insert(
+        name.to_string(),
+        CompatGateCeiling {
+            n_max,
+            expected_exit_code: None,
+        },
+    );
+    m
+}
+
+/// Variant with an explicit `expected_exit_code` — used by the §5
+/// expected-fail tests below to exercise the documented-non-zero exit
+/// path through the re-exported gate surface.
+fn one_crate_baseline_with_expected_exit(
+    name: &str,
+    n_max: u32,
+    expected_exit_code: i32,
+) -> BTreeMap<String, CompatGateCeiling> {
+    let mut m = BTreeMap::new();
+    m.insert(
+        name.to_string(),
+        CompatGateCeiling {
+            n_max,
+            expected_exit_code: Some(expected_exit_code),
+        },
+    );
     m
 }
 
@@ -274,4 +299,49 @@ fn parse_baseline_rejects_non_table_entry() {
         .expect_err("non-table entry must reject");
     let msg = format!("{err:?}");
     assert!(msg.contains("must be a table"), "diagnostic: {msg}");
+}
+
+#[test]
+fn parse_baseline_reads_expected_exit_code_through_reexport() {
+    // The integration boundary asserts the new field flows through the
+    // re-exported parser. A missing field on the CompatGateCeiling
+    // re-export or a serialization break in `parse_baseline` would
+    // bite here without needing to dig into the in-crate unit suite.
+    let toml = b"[fixture-crate]\nn_max = 0\nexpected_exit_code = 101\n";
+    let map = compat_parse_baseline(toml, Path::new("baseline.toml"))
+        .expect("expected_exit_code must parse via re-export");
+    assert_eq!(map["fixture-crate"].n_max, 0);
+    assert_eq!(map["fixture-crate"].expected_exit_code, Some(101));
+}
+
+#[test]
+fn check_gate_allows_matching_expected_nonzero_exit_through_reexport() {
+    // §5 expected-fail surface: both sides exit at the documented
+    // value, the gate allows. Mirrors the unit test in `src/compat/gate.rs`
+    // but exercises the re-exported `compat_check_gate` and
+    // `CompatGateCeiling` so out-of-tree CI runners depending on the
+    // re-export surface get the same regression bite.
+    let baseline = one_crate_baseline_with_expected_exit("demo", 5, 101);
+    let mut env = neutral_envelope("demo");
+    env.results.baseline.exit_code = 101;
+    env.results.lihaaf.exit_code = 101;
+    assert_eq!(compat_check_gate(&baseline, &env), CompatGateOutcome::Allow);
+}
+
+#[test]
+fn check_gate_blocks_mismatched_expected_nonzero_exit_through_reexport() {
+    // Baseline matches the documented expected_exit_code but lihaaf
+    // exits 0 — the two sides disagree, gate blocks. The diagnostic
+    // must surface the required value so the operator understands why.
+    let baseline = one_crate_baseline_with_expected_exit("demo", 5, 101);
+    let mut env = neutral_envelope("demo");
+    env.results.baseline.exit_code = 101;
+    env.results.lihaaf.exit_code = 0;
+    match compat_check_gate(&baseline, &env) {
+        CompatGateOutcome::Block(msg) => {
+            assert!(msg.contains("lihaaf.exit_code"), "diagnostic: {msg}");
+            assert!(msg.contains("must be 101"), "diagnostic: {msg}");
+        }
+        other => panic!("expected Block, got {other:?}"),
+    }
 }

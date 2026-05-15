@@ -36,11 +36,14 @@
 //! 3. `results.mismatch_count <= N_<crate>` (the shrinking-only rule).
 //! 4. `results.baseline.unknown_count == 0` (no unrecognized libtest
 //!    lines — the §1 conservatism rule must produce a clean signal).
-//! 5. `results.baseline.exit_code == 0` (the baseline `cargo test`
-//!    succeeded; a failed baseline produces meaningless deltas).
-//! 6. `results.lihaaf.exit_code == 0` (the inner lihaaf run produced
-//!    a clean session).
-//! 7. `baseline.pass + baseline.fail == lihaaf.pass + lihaaf.fail +
+//! 5. Exit-code rule (§5: both `0`, OR both equal and documented as
+//!    expected-fail in the crate's matrix entry):
+//!    - If the crate's [`Ceiling`] declares `expected_exit_code =
+//!      Some(N)`, BOTH `results.baseline.exit_code` and
+//!      `results.lihaaf.exit_code` must equal `N`.
+//!    - If `expected_exit_code` is `None` (the default), BOTH must
+//!      equal `0`.
+//! 6. `baseline.pass + baseline.fail == lihaaf.pass + lihaaf.fail +
 //!    excluded_fixtures.len()` (§5: the per-side totals must match
 //!    unless the `excluded_fixtures` set accounts for the delta).
 //!
@@ -70,6 +73,14 @@ use crate::error::Error;
 /// reduces its ceiling); the gate REJECTS any PR that increases the
 /// ceiling without explicit review (enforced in PR review, not by this
 /// module — the gate only reads the current ceiling).
+///
+/// `expected_exit_code` is the §5 expected-fail surface: when set, the
+/// gate allows BOTH baseline and lihaaf exit codes to be `N` (not `0`)
+/// without flagging the run as broken. Used by pilot crates whose
+/// baseline `cargo test` legitimately exits non-zero (e.g. the
+/// baseline tests are expected to fail — the pilot is enrolled
+/// specifically to measure compat-mode behavior under that condition).
+/// Default `None` — the gate requires both exit codes to be `0`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ceiling {
     /// Maximum number of `results.mismatch_count` entries the gate
@@ -77,6 +88,15 @@ pub struct Ceiling {
     ///
     /// The crate name is the BTreeMap key — not duplicated here.
     pub n_max: u32,
+    /// Optional documented expected exit code. When `Some(N)`, the
+    /// gate requires `baseline.exit_code == N` AND `lihaaf.exit_code
+    /// == N` — both equal AND matching the declared expectation. When
+    /// `None`, the gate requires both `== 0`.
+    ///
+    /// Source: the TOML key `expected_exit_code = <integer>` on the
+    /// crate's row in `compat/baseline.toml`. Omitting the key leaves
+    /// this field `None`.
+    pub expected_exit_code: Option<i32>,
 }
 
 /// Outcome of a single [`check_gate`] invocation.
@@ -99,7 +119,8 @@ pub enum GateOutcome {
 /// crate name.
 ///
 /// The schema is a flat top-level table where each key is a crate name
-/// and the value is a table with an `n_max` integer. Example:
+/// and the value is a table with a required `n_max` integer and an
+/// optional `expected_exit_code` integer. Example:
 ///
 /// ```toml
 /// [serde-json]
@@ -107,12 +128,21 @@ pub enum GateOutcome {
 ///
 /// [anyhow]
 /// n_max = 3
+///
+/// [some-pilot-with-expected-fail]
+/// n_max = 0
+/// expected_exit_code = 101
 /// ```
+///
+/// `expected_exit_code` enables the §5 expected-fail surface — both
+/// baseline and lihaaf exit codes must equal the documented value for
+/// the gate to pass. Omitting the key leaves the rule at "both exit
+/// codes must be `0`".
 ///
 /// Empty input (the v0.1.0-beta.4 default) produces an empty map.
 ///
-/// **Errors.** Returns [`Error::TomlParse`] on malformed TOML or
-/// non-integer / negative `n_max` values.
+/// **Errors.** Returns [`Error::TomlParse`] on malformed TOML, missing
+/// or negative `n_max`, or a non-integer `expected_exit_code` value.
 pub fn parse_baseline(
     toml_bytes: &[u8],
     source: &Path,
@@ -165,7 +195,36 @@ pub fn parse_baseline(
                 "baseline.toml `{crate_name}.n_max = {n_max_i64}` exceeds the u32 range"
             ),
         })?;
-        out.insert(crate_name.clone(), Ceiling { n_max });
+        // `expected_exit_code` is optional. When present it must be an
+        // integer; the range is i32 because process exit codes on
+        // every platform fit (TOML integers are i64, the gate field
+        // is i32 to match the envelope). A non-integer value is
+        // rejected; absence is a documented no-op.
+        let expected_exit_code = match sub.get("expected_exit_code") {
+            None => None,
+            Some(v) => {
+                let raw = v.as_integer().ok_or_else(|| Error::TomlParse {
+                    path: source.to_path_buf(),
+                    message: format!(
+                        "baseline.toml `{crate_name}.expected_exit_code` must be an integer"
+                    ),
+                })?;
+                let n = i32::try_from(raw).map_err(|_| Error::TomlParse {
+                    path: source.to_path_buf(),
+                    message: format!(
+                        "baseline.toml `{crate_name}.expected_exit_code = {raw}` does not fit i32"
+                    ),
+                })?;
+                Some(n)
+            }
+        };
+        out.insert(
+            crate_name.clone(),
+            Ceiling {
+                n_max,
+                expected_exit_code,
+            },
+        );
     }
     Ok(out)
 }
@@ -201,19 +260,31 @@ pub fn check_gate(baseline: &BTreeMap<String, Ceiling>, envelope: &CompatEnvelop
         ));
     }
 
-    if envelope.results.baseline.exit_code != 0 {
+    // §5 exit-code rule. The spec allows non-zero exits IF both sides
+    // match AND the crate's baseline.toml row documents the
+    // expectation. `expected_exit_code` (when set) is the documented
+    // target value; otherwise both must be 0.
+    let required_exit = ceiling.expected_exit_code.unwrap_or(0);
+    if envelope.results.baseline.exit_code != required_exit {
         return GateOutcome::Block(format!(
-            "baseline.exit_code = {} (must be 0; the baseline `cargo test` invocation must \
-             succeed before deltas are meaningful)",
+            "baseline.exit_code = {} (must be {required_exit}; {})",
             envelope.results.baseline.exit_code,
+            if ceiling.expected_exit_code.is_some() {
+                "the crate's baseline.toml documents expected_exit_code"
+            } else {
+                "the baseline `cargo test` invocation must succeed before deltas are meaningful"
+            },
         ));
     }
-
-    if envelope.results.lihaaf.exit_code != 0 {
+    if envelope.results.lihaaf.exit_code != required_exit {
         return GateOutcome::Block(format!(
-            "lihaaf.exit_code = {} (must be 0; the inner lihaaf compat run must produce a \
-             clean session)",
+            "lihaaf.exit_code = {} (must be {required_exit}; {})",
             envelope.results.lihaaf.exit_code,
+            if ceiling.expected_exit_code.is_some() {
+                "the crate's baseline.toml documents expected_exit_code"
+            } else {
+                "the inner lihaaf compat run must produce a clean session"
+            },
         ));
     }
 
@@ -317,6 +388,27 @@ mod tests {
         let map = parse_baseline(toml, Path::new("baseline.toml")).expect("must parse");
         assert_eq!(map.len(), 1);
         assert_eq!(map["serde-json"].n_max, 12);
+        // expected_exit_code defaults to None when the key is omitted.
+        assert_eq!(map["serde-json"].expected_exit_code, None);
+    }
+
+    #[test]
+    fn parse_baseline_reads_expected_exit_code() {
+        let toml = b"[fixture-crate]\nn_max = 0\nexpected_exit_code = 101\n";
+        let map = parse_baseline(toml, Path::new("baseline.toml"))
+            .expect("expected_exit_code row must parse");
+        assert_eq!(map["fixture-crate"].n_max, 0);
+        assert_eq!(map["fixture-crate"].expected_exit_code, Some(101));
+    }
+
+    #[test]
+    fn parse_baseline_rejects_non_integer_expected_exit_code() {
+        let toml = b"[foo]\nn_max = 0\nexpected_exit_code = \"oops\"\n";
+        let err = parse_baseline(toml, Path::new("baseline.toml"))
+            .expect_err("non-integer expected_exit_code must reject");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("expected_exit_code"), "got: {msg}");
+        assert!(msg.contains("must be an integer"), "got: {msg}");
     }
 
     #[test]
@@ -345,7 +437,13 @@ mod tests {
     #[test]
     fn check_gate_under_ceiling_passes() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 3, 0, 0, 0);
         assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
     }
@@ -353,7 +451,13 @@ mod tests {
     #[test]
     fn check_gate_at_ceiling_passes() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 5, 0, 0, 0);
         assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
     }
@@ -361,7 +465,13 @@ mod tests {
     #[test]
     fn check_gate_over_ceiling_blocks() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 6, 0, 0, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => {
@@ -375,7 +485,13 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_baseline_unknown_count() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 0, 1, 0, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("unknown_count"), "got: {msg}"),
@@ -386,7 +502,13 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_baseline_exit_code_nonzero() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 0, 0, 1, 0);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("baseline.exit_code"), "got: {msg}"),
@@ -397,7 +519,13 @@ mod tests {
     #[test]
     fn check_gate_blocks_on_lihaaf_exit_code_nonzero() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let env = envelope_with("demo", 0, 0, 0, 1);
         match check_gate(&baseline, &env) {
             GateOutcome::Block(msg) => assert!(msg.contains("lihaaf.exit_code"), "got: {msg}"),
@@ -408,7 +536,13 @@ mod tests {
     #[test]
     fn check_gate_blocks_when_errors_nonempty() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.errors.push(crate::compat::report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),
@@ -429,7 +563,13 @@ mod tests {
     #[test]
     fn check_gate_blocks_when_totals_diverge_without_excluded() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.results.baseline.pass = 10;
         env.results.baseline.fail = 0;
@@ -449,7 +589,13 @@ mod tests {
     #[test]
     fn check_gate_allows_when_excluded_accounts_for_delta() {
         let mut baseline = BTreeMap::new();
-        baseline.insert("demo".into(), Ceiling { n_max: 5 });
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: None,
+            },
+        );
         let mut env = envelope_with("demo", 0, 0, 0, 0);
         env.results.baseline.pass = 10;
         env.results.baseline.fail = 0;
@@ -467,5 +613,50 @@ mod tests {
             });
         // 10 == 8 + 2 — divergence accounted for.
         assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
+    }
+
+    #[test]
+    fn check_gate_allows_matching_expected_nonzero_exit() {
+        // §5 expected-fail surface: when the crate's baseline.toml row
+        // declares `expected_exit_code = N`, both baseline and lihaaf
+        // exit codes matching N satisfy the gate (otherwise the gate
+        // would block any pilot whose baseline legitimately exits
+        // non-zero).
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: Some(101),
+            },
+        );
+        // Both sides exit 101 — matches the documented expectation.
+        let env = envelope_with("demo", 0, 0, 101, 101);
+        assert_eq!(check_gate(&baseline, &env), GateOutcome::Allow);
+    }
+
+    #[test]
+    fn check_gate_blocks_mismatched_expected_nonzero_exit() {
+        // Baseline matches the documented expected_exit_code but
+        // lihaaf exits 0 — the two sides do not agree, so the gate
+        // blocks. (Symmetric mirror: lihaaf=101, baseline=0 would also
+        // block; this test exercises the more common "lihaaf claims
+        // clean when baseline didn't" direction.)
+        let mut baseline = BTreeMap::new();
+        baseline.insert(
+            "demo".into(),
+            Ceiling {
+                n_max: 5,
+                expected_exit_code: Some(101),
+            },
+        );
+        let env = envelope_with("demo", 0, 0, 101, 0);
+        match check_gate(&baseline, &env) {
+            GateOutcome::Block(msg) => {
+                assert!(msg.contains("lihaaf.exit_code"), "got: {msg}");
+                assert!(msg.contains("must be 101"), "got: {msg}");
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
     }
 }

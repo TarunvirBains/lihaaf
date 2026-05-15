@@ -17,6 +17,13 @@
 #
 #     [crate-name]
 #     n_max = <non-negative integer>
+#     expected_exit_code = <integer, optional>
+#
+# `expected_exit_code` is the §5 expected-fail surface: when set, the
+# gate allows BOTH baseline and lihaaf exit codes to equal that value
+# (not `0`) without flagging the run as broken. Used by pilots whose
+# baseline `cargo test` legitimately exits non-zero. Omit the key to
+# require both exit codes equal `0`.
 #
 # Example (do not uncomment; left here for reference):
 #
@@ -25,3 +32,8 @@
 #
 #     [anyhow]
 #     n_max = 3
+#
+#     [pilot-with-documented-fail]
+#     n_max = 0
+#     expected_exit_code = 101
+#
