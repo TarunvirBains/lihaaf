@@ -531,152 +531,20 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
     }
 }
 
-/// Remove `path` from the filesystem without relying on a prior
-/// `symlink_metadata` stat. Best-effort: a non-existent path is treated
-/// as already-cleaned (no error) so the cleanup is idempotent across
-/// reruns.
+/// Remove a compat-generated `path` from the filesystem without
+/// relying on a prior `symlink_metadata` stat. Best-effort: a
+/// non-existent path is treated as already-cleaned (no error) so the
+/// cleanup is idempotent across reruns.
 ///
-/// ## Race-free cascade
-///
-/// The previous implementation did `symlink_metadata(path)` → branch on
-/// `file_type` → call one of `remove_dir_all` / `remove_symlink_dispatch`
-/// / `remove_file`. That shape is TOCTOU-vulnerable: between the stat
-/// and the removal call, the path entry could be swapped to a different
-/// entry kind (e.g. a symlink pointing outside the intended scope), and
-/// the wrong syscall would fire. On Windows the old dispatch did a
-/// SECOND `symlink_metadata` call inside `remove_symlink_dispatch`,
-/// widening the race window further.
-///
-/// The current cascade eliminates the stat-then-dispatch entirely. Each
-/// step operates on the path's current state via a single syscall, and
-/// each step's error space tells us which step to try next:
-///
-/// 1. **`remove_file`** — handles regular files AND file-symlinks.
-///    - Unix: `unlink(2)` removes the directory entry for both regular
-///      files and symlinks (regardless of target type) — never follows
-///      the link.
-///    - Windows: `DeleteFileW` handles regular files and file-symlinks;
-///      it refuses directories and directory-symlinks with
-///      `ERROR_ACCESS_DENIED` (surfaced as `PermissionDenied`, and in
-///      some cases `IsADirectory`).
-///    - On `IsADirectory` we proceed to step 2 (Unix `EISDIR` and the
-///      stable mapping some Windows shapes surface).
-///    - **`PermissionDenied` is platform-specific.** On Windows it is
-///      the "this entry is a directory" signal, so we fall through.
-///      On Unix it is a real `EACCES` (parent without write
-///      permission, immutable attribute, missing search bit on an
-///      ancestor) — surfacing that as "not a file → try step 2" would
-///      mask the real cause, so we return it directly.
-/// 2. **`remove_dir`** — handles empty directories AND directory-symlinks.
-///    - Unix: `rmdir(2)` succeeds on empty directories; fails
-///      `ENOTEMPTY` (`DirectoryNotEmpty`) on non-empty ones.
-///    - Windows: `RemoveDirectoryW` removes empty directories AND
-///      directory-symlinks AND junctions — it removes the LINK, not the
-///      target tree. This is exactly the platform-aware symlink
-///      handling the old `remove_symlink_dispatch` provided, but
-///      without a separate stat.
-///    - On `DirectoryNotEmpty` we proceed to step 3.
-///    - **Windows-only `PermissionDenied` fall-through.** A read-only
-///      non-empty Windows directory returns `ERROR_ACCESS_DENIED`
-///      (mapped to `PermissionDenied`) from `RemoveDirectoryW` instead
-///      of `DirectoryNotEmpty`. Treat it as "not empty, try
-///      recursive" so step 3 can clear it. Unix's `PermissionDenied`
-///      from `rmdir(2)` is a real `EACCES` and surfaces directly —
-///      never silently retried as recursion.
-/// 3. **`remove_dir_all`** — recursive removal of a non-empty directory.
-///    - Rust 1.84+ `std::fs::remove_dir_all` is race-safe internally: it
-///      refuses to follow symlinks during the recursive walk, so even if
-///      the entry is concurrently swapped between step 2 and step 3, we
-///      will not delete the target of a freshly-planted symlink. MSRV
-///      is 1.95 (see `Cargo.toml`), so the race-safe behavior is
-///      guaranteed.
-///
-/// Each step independently checks `NotFound` — a concurrent unlink
-/// between steps is treated as already-cleaned (idempotent).
-///
-/// **Why not pre-stat to pick the cheap path?** Picking the cheap path
-/// based on a stat is exactly what introduces the race. The cascade
-/// runs at most three syscalls in the worst case (file with wrong
-/// permissions falling all the way through), and the common cases (a
-/// regular file or empty directory) terminate in one or two syscalls
-/// without any stat at all. The previous code paid one stat plus one
-/// removal in the common case; the cascade pays one or two removals.
-/// The cost is comparable, and the safety is strictly better.
+/// Thin wrapper that delegates to [`crate::util::remove_path_race_free`]
+/// with the `"compat-generated"` context prefix. The race-free cascade
+/// itself lives in `util` (Round-4) because the same TOCTOU shape
+/// existed at `src/dylib.rs`'s managed-dylib swap; sharing the
+/// cascade keeps both call sites in sync. The full cascade design,
+/// platform-specific cfg arms, and "why not pre-stat" rationale are
+/// documented on [`crate::util::remove_path_race_free`].
 fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
-    use std::io::ErrorKind;
-
-    // Step 1: try to unlink as a file or file-symlink.
-    match std::fs::remove_file(path) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        // IsADirectory is stable across platforms as the "not a file"
-        // signal (Unix EISDIR; some Windows shapes surface here too).
-        Err(e) if e.kind() == ErrorKind::IsADirectory => {}
-        // Windows-only: DeleteFileW returns ERROR_ACCESS_DENIED for
-        // directories and directory-symlinks (mapped to
-        // PermissionDenied). Treat that as the "this is a directory"
-        // signal and fall through to step 2.
-        //
-        // On Unix, PermissionDenied is a real EACCES (parent without
-        // write permission, immutable attribute, missing search bit
-        // on an ancestor). Surfacing it directly via the catch-all
-        // below preserves the diagnostic — silently dispatching to
-        // step 2 would mask the cause.
-        #[cfg(windows)]
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
-        Err(e) => {
-            return Err(Error::io(
-                e,
-                "removing compat-generated file/symlink",
-                Some(path.to_path_buf()),
-            ));
-        }
-    }
-
-    // Step 2: try to remove as an empty directory or a directory-symlink.
-    // RemoveDirectoryW on Windows handles directory-symlinks and
-    // junctions by removing the LINK entry (the target tree is
-    // preserved). On Unix, rmdir(2) succeeds on empty real
-    // directories and falls through to step 3 on non-empty ones.
-    match std::fs::remove_dir(path) {
-        Ok(()) => return Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
-        // DirectoryNotEmpty (Unix ENOTEMPTY) means we have a non-empty
-        // real directory — proceed to recursive removal.
-        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {}
-        // Windows-only: RemoveDirectoryW returns ERROR_ACCESS_DENIED
-        // (mapped to PermissionDenied) for a read-only non-empty
-        // directory instead of DirectoryNotEmpty. Treat the signal
-        // as "non-empty" so step 3's recursive walker clears it.
-        //
-        // Unix's `rmdir(2)` returns EACCES only when the *parent*
-        // denies write permission; it never returns EACCES for a
-        // non-empty directory. Surfacing Unix PermissionDenied
-        // through the catch-all therefore preserves the diagnostic.
-        #[cfg(windows)]
-        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
-        Err(e) => {
-            return Err(Error::io(
-                e,
-                "removing compat-generated empty dir / dir-symlink",
-                Some(path.to_path_buf()),
-            ));
-        }
-    }
-
-    // Step 3: recursive removal of a non-empty directory.
-    // std::fs::remove_dir_all (Rust 1.84+) refuses to follow symlinks
-    // during the recursive walk; MSRV is 1.95 so this race-safe
-    // behavior is guaranteed.
-    match std::fs::remove_dir_all(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(Error::io(
-            e,
-            "recursively removing compat-generated directory",
-            Some(path.to_path_buf()),
-        )),
-    }
+    crate::util::remove_path_race_free(path, "compat-generated")
 }
 
 /// Install a panic hook that names compat-generated paths in the

@@ -294,15 +294,12 @@ pub fn copy_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
     }
     // Remove any prior file/symlink at the destination to avoid
     // silently overwriting a symlink with a copy or vice versa.
-    if managed.exists() || managed.symlink_metadata().is_ok() {
-        std::fs::remove_file(managed).map_err(|e| {
-            Error::io(
-                e,
-                "removing prior managed dylib",
-                Some(managed.to_path_buf()),
-            )
-        })?;
-    }
+    // The race-free cascade replaces the previous stat-then-act
+    // `exists() || symlink_metadata().is_ok()` shape, which had two
+    // independent bugs: a TOCTOU window between the check and the
+    // removal, and a Windows-side dir-symlink case where
+    // DeleteFileW returns PermissionDenied for directories.
+    crate::util::remove_path_race_free(managed, "prior managed dylib")?;
     std::fs::copy(cargo_dylib, managed).map_err(|e| {
         Error::io(
             e,
@@ -326,15 +323,9 @@ pub fn symlink_dylib(cargo_dylib: &Path, managed: &Path) -> Result<(), Error> {
             )
         })?;
     }
-    if managed.exists() || managed.symlink_metadata().is_ok() {
-        std::fs::remove_file(managed).map_err(|e| {
-            Error::io(
-                e,
-                "removing prior managed dylib",
-                Some(managed.to_path_buf()),
-            )
-        })?;
-    }
+    // Same race-free cascade as `copy_dylib` — see that function's
+    // comment for the rationale.
+    crate::util::remove_path_race_free(managed, "prior managed dylib")?;
     #[cfg(unix)]
     {
         std::os::unix::fs::symlink(cargo_dylib, managed)
