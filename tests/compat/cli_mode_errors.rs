@@ -24,13 +24,14 @@
 //! `compat_run_accepts_omitted_cargo_test_argv`) are asserted at the
 //! Rust API layer via `Cli::try_parse_from(...)` +
 //! `cli.validate_mode_consistency()`. Originally these spawned the
-//! binary against `--compat-root "."` (the lihaaf repo itself); once
-//! Phase 10 wired the stub `run_compat` into a full 12-step driver, the
-//! spawn started running `cargo test` → `rustc` against lihaaf's own
-//! tree, which OOMs WSL2-class hosts. The CLI-layer assertion still
-//! locks the parser + validator behavior the tests originally cared
-//! about; the full-driver integration belongs in a hermetic harness
-//! that knows how to stand up a synthetic compat-root.
+//! binary against `--compat-root "."` (the lihaaf repo itself); the
+//! stub `run_compat` is now a full end-to-end driver, so the spawn
+//! would run `cargo test` → `rustc` against lihaaf's own tree (because
+//! the test passes `--compat-root .`), and the parallel fan-out OOMs
+//! WSL2-class hosts. The CLI-layer assertion still locks the parser +
+//! validator behavior the tests originally cared about; the
+//! full-driver integration belongs in a hermetic harness that knows
+//! how to stand up a synthetic compat-root.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -204,12 +205,12 @@ fn compat_run_requires_compat_report() {
 #[test]
 fn compat_run_accepts_pass_through_flags() {
     // Round-2 simplify pass: this assertion used to spawn the binary
-    // and expect exit 0 from the Phase 1 stub `compat::run`. Phase 10
-    // wired the stub into a full 12-step driver — the spawn now runs
-    // `cargo test` → `rustc` against lihaaf's own tree (because the
-    // test passes `--compat-root .`), and the parallel fan-out OOMs
-    // WSL2-class hosts. The assertion now operates at the CLI parser
-    // layer: a fully-formed compat invocation including every v0.1
+    // and expect exit 0 from the stub `compat::run`. The stub is now
+    // a full end-to-end driver — the spawn would run `cargo test` →
+    // `rustc` against lihaaf's own tree (because the test passes
+    // `--compat-root .`), and the parallel fan-out OOMs WSL2-class
+    // hosts. The assertion now operates at the CLI parser layer: a
+    // fully-formed compat invocation including every v0.1
     // pass-through flag must parse cleanly AND survive the
     // mode-consistency validator. That is the behavior the test
     // originally cared about; the full-driver integration belongs in

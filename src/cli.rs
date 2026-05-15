@@ -211,10 +211,9 @@ pub fn parse_from(argv: Vec<String>) -> Result<Cli, Error> {
         }
     };
 
-    // Phase 1 mode-error matrix. Validation runs after clap so
-    // every parsed field is observable and the diagnostic can name
-    // the replacement flag instead of clap's generic "cannot be used
-    // with" message.
+    // Mode-error matrix. Validation runs after clap so every parsed
+    // field is observable and the diagnostic can name the replacement
+    // flag instead of clap's generic "cannot be used with" message.
     if let Err(e) = cli.validate_mode_consistency() {
         if let Error::Cli { message, .. } = &e {
             eprintln!("{message}");
