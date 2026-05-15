@@ -152,19 +152,30 @@ pub fn convert_fixtures(
         })?;
         cleanup.track(dest_path.clone(), compat_root);
 
+        // Copy the `.stderr` snapshot when present. Avoid the
+        // `src_stderr.exists()` pre-check: the file could be removed
+        // between the check and the copy syscall (TOCTOU). The
+        // copy-then-handle-NotFound pattern collapses the race window
+        // to zero — the syscall returns ENOENT when the snapshot is
+        // missing, which is the expected case for compile_pass
+        // fixtures and an acceptable no-op for compile_fail fixtures
+        // whose snapshot was deleted mid-run.
         let mut dest_stderr: Option<PathBuf> = None;
         let src_stderr = fixture.fixture_path.with_extension("stderr");
-        if src_stderr.exists() {
-            let dest_stderr_path = dest_path.with_extension("stderr");
-            std::fs::copy(&src_stderr, &dest_stderr_path).map_err(|e| {
-                Error::io(
+        let dest_stderr_path = dest_path.with_extension("stderr");
+        match std::fs::copy(&src_stderr, &dest_stderr_path) {
+            Ok(_) => {
+                cleanup.track(dest_stderr_path.clone(), compat_root);
+                dest_stderr = Some(dest_stderr_path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(Error::io(
                     e,
                     "copying trybuild .stderr snapshot to compat-converted tree",
                     Some(src_stderr.clone()),
-                )
-            })?;
-            cleanup.track(dest_stderr_path.clone(), compat_root);
-            dest_stderr = Some(dest_stderr_path);
+                ));
+            }
         }
 
         out.push(ConvertedFixture {
