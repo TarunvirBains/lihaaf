@@ -531,88 +531,121 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
     }
 }
 
-/// Remove `path` from the filesystem, picking the right syscall for
-/// the kind of entry it names. Best-effort: a non-existent path is
-/// treated as already-cleaned (no error) so the cleanup is idempotent
-/// across reruns.
+/// Remove `path` from the filesystem without relying on a prior
+/// `symlink_metadata` stat. Best-effort: a non-existent path is treated
+/// as already-cleaned (no error) so the cleanup is idempotent across
+/// reruns.
 ///
-/// Symlinks route through [`remove_symlink_dispatch`], which uses
-/// `unlink` on Unix (works on any symlink target) and a target-
-/// inspecting dispatch on Windows (dir symlinks need `remove_dir`;
-/// `remove_file`/`DeleteFileW` refuses them). In either case the
-/// target tree under the link is preserved.
+/// ## Race-free cascade
+///
+/// The previous implementation did `symlink_metadata(path)` → branch on
+/// `file_type` → call one of `remove_dir_all` / `remove_symlink_dispatch`
+/// / `remove_file`. That shape is TOCTOU-vulnerable: between the stat
+/// and the removal call, the path entry could be swapped to a different
+/// entry kind (e.g. a symlink pointing outside the intended scope), and
+/// the wrong syscall would fire. On Windows the old dispatch did a
+/// SECOND `symlink_metadata` call inside `remove_symlink_dispatch`,
+/// widening the race window further.
+///
+/// The current cascade eliminates the stat-then-dispatch entirely. Each
+/// step operates on the path's current state via a single syscall, and
+/// each step's error space tells us which step to try next:
+///
+/// 1. **`remove_file`** — handles regular files AND file-symlinks.
+///    - Unix: `unlink(2)` removes the directory entry for both regular
+///      files and symlinks (regardless of target type) — never follows
+///      the link.
+///    - Windows: `DeleteFileW` handles regular files and file-symlinks;
+///      it refuses directories and directory-symlinks with
+///      `ERROR_ACCESS_DENIED` (surfaced as `PermissionDenied`, and in
+///      some cases `IsADirectory`).
+///    - On `IsADirectory` / `PermissionDenied` we proceed to step 2.
+/// 2. **`remove_dir`** — handles empty directories AND directory-symlinks.
+///    - Unix: `rmdir(2)` succeeds on empty directories; fails
+///      `ENOTEMPTY` (`DirectoryNotEmpty`) on non-empty ones.
+///    - Windows: `RemoveDirectoryW` removes empty directories AND
+///      directory-symlinks AND junctions — it removes the LINK, not the
+///      target tree. This is exactly the platform-aware symlink
+///      handling the old `remove_symlink_dispatch` provided, but
+///      without a separate stat.
+///    - On `DirectoryNotEmpty` we proceed to step 3.
+/// 3. **`remove_dir_all`** — recursive removal of a non-empty directory.
+///    - Rust 1.84+ `std::fs::remove_dir_all` is race-safe internally: it
+///      refuses to follow symlinks during the recursive walk, so even if
+///      the entry is concurrently swapped between step 2 and step 3, we
+///      will not delete the target of a freshly-planted symlink. MSRV
+///      is 1.95 (see `Cargo.toml`), so the race-safe behavior is
+///      guaranteed.
+///
+/// Each step independently checks `NotFound` — a concurrent unlink
+/// between steps is treated as already-cleaned (idempotent).
+///
+/// **Why not pre-stat to pick the cheap path?** Picking the cheap path
+/// based on a stat is exactly what introduces the race. The cascade
+/// runs at most three syscalls in the worst case (file with wrong
+/// permissions falling all the way through), and the common cases (a
+/// regular file or empty directory) terminate in one or two syscalls
+/// without any stat at all. The previous code paid one stat plus one
+/// removal in the common case; the cascade pays one or two removals.
+/// The cost is comparable, and the safety is strictly better.
 fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
-    let metadata = match std::fs::symlink_metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+    use std::io::ErrorKind;
+
+    // Step 1: try to unlink as a file or file-symlink.
+    match std::fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        // IsADirectory (Unix EISDIR; some platforms surface this
+        // directly). PermissionDenied is the Windows shape on a
+        // directory or directory-symlink (DeleteFileW returns
+        // ERROR_ACCESS_DENIED). Either signal means "this entry is
+        // not a file" — fall through to step 2.
+        Err(e)
+            if matches!(
+                e.kind(),
+                ErrorKind::IsADirectory | ErrorKind::PermissionDenied
+            ) => {}
         Err(e) => {
             return Err(Error::io(
                 e,
-                "reading metadata for compat cleanup",
+                "removing compat-generated file/symlink",
                 Some(path.to_path_buf()),
             ));
         }
-    };
+    }
 
-    let file_type = metadata.file_type();
-    let result = if file_type.is_dir() {
-        std::fs::remove_dir_all(path)
-    } else if file_type.is_symlink() {
-        remove_symlink_dispatch(path)
-    } else {
-        std::fs::remove_file(path)
-    };
+    // Step 2: try to remove as an empty directory or a directory-symlink.
+    // RemoveDirectoryW on Windows handles directory-symlinks and
+    // junctions by removing the LINK entry (the target tree is
+    // preserved). On Unix, rmdir(2) succeeds on empty real
+    // directories and falls through to step 3 on non-empty ones.
+    match std::fs::remove_dir(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        // DirectoryNotEmpty (Unix ENOTEMPTY) means we have a non-empty
+        // real directory — proceed to recursive removal.
+        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {}
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                "removing compat-generated empty dir / dir-symlink",
+                Some(path.to_path_buf()),
+            ));
+        }
+    }
 
-    match result {
+    // Step 3: recursive removal of a non-empty directory.
+    // std::fs::remove_dir_all (Rust 1.84+) refuses to follow symlinks
+    // during the recursive walk; MSRV is 1.95 so this race-safe
+    // behavior is guaranteed.
+    match std::fs::remove_dir_all(path) {
         Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
         Err(e) => Err(Error::io(
             e,
-            "removing compat-generated path",
+            "recursively removing compat-generated directory",
             Some(path.to_path_buf()),
         )),
-    }
-}
-
-/// Platform-aware symlink removal: removes the link entry itself
-/// without recursing into the target tree.
-///
-/// On Unix, `unlink(2)` (the syscall behind `std::fs::remove_file`)
-/// removes the link regardless of what it points to, so the
-/// dispatch is unconditional.
-///
-/// On Windows, `DeleteFileW` refuses to operate on a directory
-/// symlink or junction — the entry must be removed via
-/// `RemoveDirectoryW` (`std::fs::remove_dir`). We classify the link
-/// itself (NOT its target) by inspecting the file attributes returned
-/// by `symlink_metadata`: `FILE_ATTRIBUTE_DIRECTORY` (0x10) is set on
-/// directory symlinks even when the target is missing. The previous
-/// implementation called `std::fs::metadata`, which follows the link
-/// and errors on a broken target — causing the dispatch to fall
-/// through to `remove_file`, which `DeleteFileW` then refuses for a
-/// directory symlink, leaving the broken link in place.
-/// `remove_dir` does not recurse, so a live target tree is preserved
-/// either way.
-#[cfg(unix)]
-fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
-    std::fs::remove_file(path)
-}
-
-#[cfg(windows)]
-fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
-    use std::os::windows::fs::MetadataExt;
-    // FILE_ATTRIBUTE_DIRECTORY per MSDN; not exposed as a Rust
-    // stdlib constant. Inspecting the link itself (via
-    // `symlink_metadata`) avoids following a potentially broken
-    // target — the bug case where `metadata` errors and forces the
-    // wrong removal call.
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    let link_md = std::fs::symlink_metadata(path)?;
-    let is_dir_symlink = (link_md.file_attributes() & FILE_ATTRIBUTE_DIRECTORY) != 0;
-    if is_dir_symlink {
-        std::fs::remove_dir(path)
-    } else {
-        std::fs::remove_file(path)
     }
 }
 
@@ -718,12 +751,14 @@ mod tests {
     }
 
     /// **`remove_path_best_effort` removes a symlink-to-directory
-    /// without following.** On Unix, `std::fs::remove_file` works on
-    /// dir symlinks; the targeted fix is for Windows, where dir
-    /// symlinks/junctions need `remove_dir`. This Unix-side test
-    /// proves the new dispatch (`metadata` → `remove_dir` when target
-    /// is a directory) still leaves the target tree untouched on
-    /// platforms where the older `remove_file` path also worked.
+    /// without following.** On Unix, step 1 of the cascade
+    /// (`std::fs::remove_file` → `unlink(2)`) unlinks the symlink
+    /// regardless of target kind, so this case terminates at step 1
+    /// without touching the target tree. On Windows the same case
+    /// falls through to step 2 (`std::fs::remove_dir` →
+    /// `RemoveDirectoryW`), which removes the directory-symlink LINK
+    /// without recursing into the target. Either way the target tree
+    /// is preserved.
     #[cfg(unix)]
     #[test]
     fn remove_symlink_to_directory_unix() {
