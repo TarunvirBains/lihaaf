@@ -200,46 +200,12 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     let mismatch_examples = build_mismatch_examples(&baseline_result, &converted);
     let mismatch_count = u32::try_from(mismatch_examples.len()).unwrap_or(u32::MAX);
 
-    let mut envelope_errors: Vec<report::EnvelopeError> = Vec::new();
-    if let Some(detail) = toolchain_capture_error {
-        envelope_errors.push(report::EnvelopeError {
-            error_type: "toolchain_capture_failed".into(),
-            fixture: None,
-            file: String::new(),
-            line: 0,
-            detail,
-        });
-    }
-    for unrecog in &discovery_output.unrecognized {
-        envelope_errors.push(report::EnvelopeError {
-            error_type: "discovery_unrecognized".into(),
-            fixture: None,
-            file: crate::util::relative_to(&unrecog.file, &compat_root),
-            line: u32::try_from(unrecog.line).unwrap_or(u32::MAX),
-            detail: unrecog.detail.clone(),
-        });
-    }
-    if baseline_result.unknown_count > 0 {
-        envelope_errors.push(report::EnvelopeError {
-            error_type: "baseline_unknown".into(),
-            fixture: None,
-            file: String::new(),
-            line: 0,
-            detail: format!(
-                "baseline parser produced {} unrecognized libtest verdict line(s)",
-                baseline_result.unknown_count,
-            ),
-        });
-    }
-    if let Some(detail) = inner_session_error {
-        envelope_errors.push(report::EnvelopeError {
-            error_type: "lihaaf_session_failed".into(),
-            fixture: None,
-            file: String::new(),
-            line: 0,
-            detail,
-        });
-    }
+    let mut envelope_errors = assemble_diagnostic_errors(
+        toolchain_capture_error,
+        &discovery_output.unrecognized,
+        inner_session_error,
+        &compat_root,
+    );
 
     let generated_paths_envelope = match guard.finalize() {
         Ok(entries) => entries
@@ -474,6 +440,63 @@ fn inner_error_exit_code(e: &Error) -> i32 {
     }
 }
 
+/// Assemble the “diagnostic side-channel” entries for the §3.3 envelope's
+/// `errors[]` field — toolchain-capture failure, discovery-unrecognized
+/// items, and the inner-session error (if any).
+///
+/// Deliberately does NOT take `baseline_result.unknown_count`. The
+/// baseline parser's `unknown_count` is a diagnostic counter that lives
+/// in `results.baseline.unknown_count` for the operator to inspect; it
+/// is NOT an envelope-level error condition. Pushing a `baseline_unknown`
+/// entry into `errors[]` from a positive `unknown_count` is what
+/// recreates the §5 gate coupling that was explicitly removed in
+/// `89fec16` (round-3): every trybuild adopter run produces
+/// `unknown_count >= 1` (the libtest wrapper line) so making the gate
+/// key off `errors.is_empty()` would always block. Encoding the
+/// invariant in the function signature ensures that future edits to
+/// the envelope-construction path cannot reintroduce the coupling.
+///
+/// Cleanup-finalize errors are appended by the caller — `finalize`
+/// consumes the [`cleanup::CleanupGuard`] and its result is bound up
+/// with the [`report::generated_paths`] vector, which is built in the
+/// same expression.
+fn assemble_diagnostic_errors(
+    toolchain_capture_error: Option<String>,
+    discovery_unrecognized: &[discovery::DiscoveryUnrecognized],
+    inner_session_error: Option<String>,
+    compat_root: &Path,
+) -> Vec<report::EnvelopeError> {
+    let mut errors: Vec<report::EnvelopeError> = Vec::new();
+    if let Some(detail) = toolchain_capture_error {
+        errors.push(report::EnvelopeError {
+            error_type: "toolchain_capture_failed".into(),
+            fixture: None,
+            file: String::new(),
+            line: 0,
+            detail,
+        });
+    }
+    for unrecog in discovery_unrecognized {
+        errors.push(report::EnvelopeError {
+            error_type: "discovery_unrecognized".into(),
+            fixture: None,
+            file: crate::util::relative_to(&unrecog.file, compat_root),
+            line: u32::try_from(unrecog.line).unwrap_or(u32::MAX),
+            detail: unrecog.detail.clone(),
+        });
+    }
+    if let Some(detail) = inner_session_error {
+        errors.push(report::EnvelopeError {
+            error_type: "lihaaf_session_failed".into(),
+            fixture: None,
+            file: String::new(),
+            line: 0,
+            detail,
+        });
+    }
+    errors
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -569,6 +592,76 @@ mod tests {
         assert!(
             !ctx_non_compat.compat_short_cargo,
             "with_compat_short_cargo(false) must clear the flag (mirrors the default)",
+        );
+    }
+
+    /// **Diagnostic-errors do NOT couple to `baseline.unknown_count`.**
+    /// Round-3 commit `89fec16` removed the direct `unknown_count != 0`
+    /// rule from the §5 gate, but a positive `unknown_count` was still
+    /// pushing a `baseline_unknown` entry into `envelope.errors[]`. Every
+    /// trybuild adopter run produces `unknown_count >= 1` (the libtest
+    /// wrapper line), so any gate that keys off `errors.is_empty()`
+    /// would always block. This test pins the invariant in the function
+    /// signature: `assemble_diagnostic_errors` does not take a
+    /// `unknown_count` input, so the only way to regress this is a
+    /// deliberate refactor that re-introduces the parameter. The
+    /// `unknown_count` value still flows into the envelope at
+    /// `results.baseline.unknown_count` for operator visibility.
+    #[test]
+    fn assemble_diagnostic_errors_ignores_baseline_unknown_count() {
+        let errors = assemble_diagnostic_errors(
+            None,                          // toolchain capture clean
+            &[],                           // no discovery_unrecognized
+            None,                          // inner session clean
+            Path::new("/tmp/compat-root"), // path used only for forward-slash mapping
+        );
+        assert!(
+            errors.is_empty(),
+            "with no toolchain / discovery / session errors, errors[] must be \
+             empty regardless of how many baseline `unknown_count` lines the \
+             libtest parser saw; got {errors:?}",
+        );
+        // Belt-and-braces: no entry of type `baseline_unknown` may ever
+        // appear in the assembled vec. A future refactor that wires
+        // unknown_count back into the assembler would fail this even if
+        // the call above somehow stayed empty.
+        assert!(
+            !errors.iter().any(|e| e.error_type == "baseline_unknown"),
+            "no `baseline_unknown` entry may appear in errors[]; the field \
+             lives in results.baseline.unknown_count as a diagnostic counter"
+        );
+    }
+
+    /// **`assemble_diagnostic_errors` preserves the historical ordering**
+    /// across the three live entry kinds: `toolchain_capture_failed`,
+    /// `discovery_unrecognized`, `lihaaf_session_failed`. Cleanup-failed
+    /// is appended by the caller after `guard.finalize()` and lives
+    /// outside this helper. The §3.3 schema sorts `errors[]` by
+    /// `(file, line, error_type)` at the writer, so this ordering only
+    /// matters for in-memory traversal — but pinning it makes the
+    /// helper's contract obvious to future readers.
+    #[test]
+    fn assemble_diagnostic_errors_orders_kinds_by_source_seam() {
+        let unrec = discovery::DiscoveryUnrecognized {
+            file: PathBuf::from("/tmp/compat-root/tests/ui.rs"),
+            line: 7,
+            detail: "non-literal arg".into(),
+        };
+        let errors = assemble_diagnostic_errors(
+            Some("rustup spawn failed".into()),
+            std::slice::from_ref(&unrec),
+            Some("inner panicked".into()),
+            Path::new("/tmp/compat-root"),
+        );
+        let types: Vec<&str> = errors.iter().map(|e| e.error_type.as_str()).collect();
+        assert_eq!(
+            types,
+            vec![
+                "toolchain_capture_failed",
+                "discovery_unrecognized",
+                "lihaaf_session_failed",
+            ],
+            "in-memory order is toolchain → discovery → session; got {types:?}"
         );
     }
 }
