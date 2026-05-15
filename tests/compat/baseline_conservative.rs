@@ -16,10 +16,11 @@
 //! the end-to-end [`lihaaf::compat_baseline_run_with_recognized_fixtures`])
 //! with a precisely-chosen recognized-fixture set, and asserts on the
 //! returned [`lihaaf::CompatParsedBaseline`] (or [`lihaaf::CompatBaselineResult`])
-//! shape. The pilot gate's `unknown == 0` requirement is implementable
-//! only because empty-recognition input produces zero pass/fail signal;
-//! [`recognized_fixtures_empty_yields_all_unknown`] is the acid test for
-//! that property.
+//! shape. The §3.3 envelope's `results.baseline.{pass,fail}` are
+//! honest about absence — empty-recognition input produces zero
+//! pass/fail signal rather than inferred counts;
+//! [`recognized_fixtures_empty_yields_all_unknown`] is the acid test
+//! for that property.
 //!
 //! ## Reaching the parser
 //!
@@ -63,8 +64,10 @@ fn fid(path: &str) -> CompatFixtureId {
 /// - Every libtest verdict line counts toward `unknown_count`.
 ///
 /// A regression that infers `pass`/`fail` from arbitrary libtest
-/// output would violate the §1 contract and break the v0.1 pilot
-/// gate's `unknown == 0` property.
+/// output would violate the §1 contract and diverge from §3.3's
+/// conservatism: the envelope's `results.baseline.{pass,fail}` would
+/// claim fixture-level truth that the parser did not actually
+/// derive from recognized trybuild invocations.
 #[test]
 fn recognized_fixtures_empty_yields_all_unknown() {
     let stdout = "\

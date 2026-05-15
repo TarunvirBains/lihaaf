@@ -1,4 +1,4 @@
-//! Phase 7 of compat mode (§3.2.2) — cross-module integration tests
+//! Compat-mode normalizer (§3.2.2) — cross-module integration tests
 //! for the `NormalizationContext::compat_short_cargo` flag.
 //!
 //! These tests sit against the `NormalizationContext` / `normalize`

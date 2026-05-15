@@ -15,7 +15,7 @@ The compat driver runs both halves:
 
 The two formats stay distinct on disk (libtest output is structurally different from lihaaf's verdict catalog), and the aggregation step is the only translator. That keeps the design honest: lihaaf owns its own report, and the baseline comparison is bounded to the fields §3.3 names.
 
-Baseline extraction is intentionally conservative. Compat mode records the original `cargo test` command result as the coarse baseline. Fixture-level baseline status may only be reported when it is derived from explicitly recognized trybuild invocations and stable path matches; otherwise the fixture baseline is `unknown` and the report must say why. The v0.1 pilot gate may require `unknown == 0` for selected crates, but the implementation must not infer fixture-level truth from arbitrary libtest output.
+Baseline extraction is intentionally conservative. Compat mode records the original `cargo test` command result as the coarse baseline. Fixture-level baseline status may only be reported when it is derived from explicitly recognized trybuild invocations and stable path matches; otherwise the fixture baseline is `unknown` and the report must say why. The v0.1 §5 pilot gate enforces the §3.3 envelope's mismatch ceiling and per-side exit-code rule; it does NOT enforce `unknown_count == 0` (the libtest wrapper line alone produces `unknown_count >= 1` on every adopter run). `results.baseline.unknown_count` remains a diagnostic field operators can inspect; the implementation must not infer fixture-level truth from arbitrary libtest output.
 
 ## 2) What we want to validate
 

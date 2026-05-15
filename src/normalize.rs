@@ -825,8 +825,10 @@ error: aborting due to 1 previous error
         // With `compat_short_cargo = false`, the literal-prefix path
         // (`$CARGO/registry`) substitution fires exactly as in v0.1.
         // Regression bite for the v0.1 stable contract: identical
-        // input must produce byte-identical output before and after
-        // Phase 7 lands.
+        // input must produce byte-identical output regardless of the
+        // compat-short-CARGO opt-in (compat mode flips the flag on;
+        // every other run leaves it off and must match v0.1 byte
+        // for byte).
         let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
         let c = ctx_non_compat_no_collision("/p", "/sysroot");
         let dir = PathBuf::from("/p/x");

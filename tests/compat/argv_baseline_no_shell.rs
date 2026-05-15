@@ -321,7 +321,7 @@ fn wall_clock_is_recorded() {
 }
 
 /// Sidecar JSON records argv byte-for-byte. This is the structural
-/// guarantee that the §3.3 envelope writer (Phase 7) can render
+/// guarantee that the §3.3 envelope writer can render
 /// `commands.baseline` exactly as the operator invoked it. A
 /// regression that base64-encoded, escaped, or normalized argv would
 /// silently fail this test.
@@ -360,7 +360,7 @@ fn sidecar_records_argv_verbatim() {
 }
 
 /// The sidecar path the runner returns matches the path the caller
-/// supplied. This is the contract Phase 7's envelope writer relies on:
+/// supplied. This is the contract the §3.3 envelope writer relies on:
 /// it must be able to construct the sidecar path from configuration
 /// and trust that the runner wrote there.
 #[test]

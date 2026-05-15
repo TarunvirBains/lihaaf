@@ -86,9 +86,13 @@
 //! > baseline. Fixture-level baseline status may only be reported when
 //! > it is derived from explicitly recognized trybuild invocations and
 //! > stable path matches; otherwise the fixture baseline is `unknown`
-//! > and the report must say why. The v0.1 pilot gate may require
-//! > `unknown == 0` for selected crates, but the implementation must
-//! > not infer fixture-level truth from arbitrary libtest output.
+//! > and the report must say why. The v0.1 §5 pilot gate enforces the
+//! > §3.3 envelope's mismatch ceiling and per-side exit-code rule; it
+//! > does NOT enforce `unknown_count == 0` (the libtest wrapper line
+//! > alone produces `unknown_count >= 1` on every adopter run).
+//! > `results.baseline.unknown_count` remains a diagnostic field;
+//! > the implementation must not infer fixture-level truth from
+//! > arbitrary libtest output.
 //!
 //! Practically: [`parse_libtest_output`] only emits `Some(pass)` /
 //! `Some(fail)` counts when the caller supplied at least one
@@ -96,8 +100,11 @@
 //! Every other libtest line (unrecognized test names, recognized
 //! fixtures absent from output, garbled lines) is `unknown_count++`.
 //! Empty recognized-fixture set ⇒ `pass.is_none() && fail.is_none()`,
-//! and every parsed line counts as unknown. This is the property that
-//! makes the §5 pilot gate's `unknown == 0` requirement meaningful.
+//! and every parsed line counts as unknown. The `unknown_count`
+//! itself is kept for diagnostic visibility in the §3.3 envelope's
+//! `results.baseline.unknown_count` — the §5 pilot gate does NOT
+//! key off `unknown_count` (every adopter run produces a wrapper
+//! libtest line so `unknown_count >= 1` is the steady state).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -117,12 +124,10 @@ use crate::util;
 /// `results.baseline` subset) plus the §3.3 envelope's
 /// `commands.baseline` field for `argv`.
 #[derive(Debug)]
-// Fields are unread in Phase 3 — the §3.3 envelope writer (Phase 7)
-// reads them when wiring `results.baseline` and `commands.baseline`.
-// Carrying them today keeps the §3.3 envelope schema additive across
-// Phase 3 → Phase 7 (no field renames mid-implementation) and lets the
-// integration tests in `tests/compat/argv_baseline_no_shell.rs` assert
-// the captured shape.
+// The §3.3 envelope writer reads these when wiring `results.baseline`
+// and `commands.baseline`. The fields are carried as part of the
+// envelope schema and the integration tests in
+// `tests/compat/argv_baseline_no_shell.rs` assert the captured shape.
 #[allow(dead_code)]
 pub struct BaselineResult {
     /// Number of fixtures libtest reported as passing. Populated only
@@ -227,14 +232,15 @@ pub struct FixtureId {
 /// [`BaselineResult::mismatch_entries`] for that downstream step.
 ///
 /// One `BaselineMismatch` is emitted per recognized fixture for which
-/// the parser saw a libtest verdict line. Phase 4 carries the raw
-/// libtest verdict (`Pass` / `Fail`) plus the fixture path; Phase 8
-/// joins this with the lihaaf-side outcome to decide the §3.3
-/// `mismatch_type` (`baseline_only_fail`, `lihaaf_only_fail`, etc.).
+/// the parser saw a libtest verdict line. The parser carries the raw
+/// libtest verdict (`Pass` / `Fail`) plus the fixture path; the §3.3
+/// envelope assembly joins this with the lihaaf-side outcome to
+/// decide the `mismatch_type` (`baseline_only_fail`,
+/// `lihaaf_only_fail`, etc.).
 ///
-/// `baseline_verdict` is the libtest reading; Phase 4 deliberately
+/// `baseline_verdict` is the libtest reading; the parser deliberately
 /// does **not** synthesize a comparison against lihaaf here (that is
-/// Phase 7/8's job).
+/// the envelope-assembly step's job).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineMismatch {
     /// Repo-relative, forward-slash path to the fixture. Sorted on
@@ -575,9 +581,11 @@ pub fn parse_libtest_output(stdout: &str, recognized_fixtures: &[FixtureId]) -> 
 
     // `pass` / `fail` populated only when the parser had a recognized
     // set to work with. Empty recognized set ⇒ both `None` even if
-    // `unknown_count > 0`. This is the key distinction the §5 pilot
-    // gate keys off — `Some(0)` (recognized fixtures, none passed)
-    // is meaningfully different from `None` (no fixtures recognized).
+    // `unknown_count > 0`. Parser-internal invariant: `Some(0)`
+    // (recognized fixtures present, none passed) is meaningfully
+    // different from `None` (no fixtures recognized) — the §3.3
+    // envelope writer keys off this distinction when rendering the
+    // baseline counts.
     let (pass, fail) = if normalized.is_empty() {
         (None, None)
     } else {
@@ -740,8 +748,9 @@ pub fn run_baseline(
 /// [`BaselineResult::pass`] and [`BaselineResult::fail`] stay [`None`]
 /// and every verdict line in `stdout` increments
 /// [`BaselineResult::unknown_count`]. This is the §1 rule — the
-/// v0.1 pilot gate's `unknown == 0` requirement is implementable
-/// because absence of recognition produces zero pass/fail signal.
+/// envelope's `results.baseline.{pass,fail}` are honest about
+/// fixture-level absence rather than inferring counts from arbitrary
+/// libtest output.
 ///
 /// Errors: same shape as [`run_baseline`] — `Cli` on empty argv,
 /// `SubprocessSpawn` on OS spawn refusal, `Io` on wait/write, and
