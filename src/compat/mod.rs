@@ -2,16 +2,15 @@
 //!
 //! Implements `docs/compatibility-plan.md` §3 end-to-end. The driver
 //! wires the supporting modules (`overlay`, `baseline`, `discovery`,
-//! `fixture_convert`, `cleanup`, `report`, `rustup`, `gate`) into the
-//! Phase 10 final integration: read upstream `Cargo.toml`, synthesize
-//! a sibling `Cargo.lihaaf.toml` with an in-memory `[package.metadata.
-//! lihaaf]` block (Q2), run the argv-only baseline (§3.4 / Phase 3),
-//! discover trybuild fixtures via syn AST walk (Phase 6 / §3.2.1),
-//! copy fixtures into `<compat_root>/target/lihaaf-compat-converted/`
-//! (Q3), invoke `lihaaf::run` in-process for the inner session (Q5),
-//! capture the active toolchain (§3.4 / Phase 9), and write the §3.3
-//! envelope (Phase 8). The Phase 5 cleanup guard catches panic /
-//! early-return paths and removes registered transient paths.
+//! `fixture_convert`, `cleanup`, `report`, `rustup`, `gate`) into a
+//! single end-to-end run: read upstream `Cargo.toml`, synthesize a
+//! sibling `Cargo.lihaaf.toml` with an in-memory `[package.metadata.
+//! lihaaf]` block, run the argv-only baseline (§3.4), discover
+//! trybuild fixtures via syn AST walk (§3.2.1), convert each fixture
+//! to the lihaaf-compatible directory tree, invoke `lihaaf::run`
+//! in-process for the inner session, capture the active toolchain
+//! (§3.4), and write the §3.3 envelope. The cleanup guard catches
+//! panic / early-return paths and removes registered transient paths.
 //!
 //! Adopters opt in via `cargo lihaaf --compat --compat-root <DIR>
 //! --compat-report <PATH>`. The Rust API is not part of the v0.1
@@ -35,34 +34,33 @@ use crate::error::Error;
 /// Top-level compat-mode entry. Called from `cargo-lihaaf.rs` when
 /// `cli.compat` is true.
 ///
-/// Phase 10 wires the supporting modules into the final flow. The
-/// 12-step sequence (mirroring the Phase 10 plan deliverables):
+/// The 12-step sequence:
 ///
 /// 1. Resolve the upstream `Cargo.toml` path (`--compat-manifest`
 ///    overrides `--compat-root/Cargo.toml`).
-/// 2. Read `[package].name` for the §3.3 envelope's `crate_name` field
-///    (basename fallback per Q1).
-/// 3. Install the Phase 5 panic hook + construct the cleanup guard.
-/// 4. Materialize the sibling overlay with a synthetic
-///    `[package.metadata.lihaaf]` table (Q2).
-/// 5. Track the overlay path for the cleanup classifier.
-/// 6. Run the argv-only baseline `cargo test` invocation (the recognized-
-///    fixture set is populated post-discovery; the conservative parser
-///    is invoked once with the recognized list so the v2 sidecar's
-///    `pass` / `fail` / `unknown_count` fields are populated).
-/// 7. Run the syn AST discovery walk over the upstream `tests/*.rs`
-///    files (Phase 6 / §3.2.1).
-/// 8. Convert each recognized fixture to the lihaaf-compatible
+/// 2. Install the panic hook + construct the cleanup guard.
+/// 3. Materialize the sibling overlay with a synthetic
+///    `[package.metadata.lihaaf]` table; the builder closure reads
+///    `[package].name` from the parsed manifest in a single pass.
+/// 4. Track the overlay path for the cleanup classifier.
+/// 5. Run the argv-only baseline `cargo test` invocation (the
+///    recognized-fixture set is populated post-discovery; the
+///    conservative parser is invoked once with the recognized list so
+///    the v2 sidecar's `pass` / `fail` / `unknown_count` fields are
+///    populated).
+/// 6. Run the syn AST discovery walk over the upstream `tests/*.rs`
+///    files (§3.2.1).
+/// 7. Convert each recognized fixture to the lihaaf-compatible
 ///    directory tree under `<compat_root>/target/lihaaf-compat-
-///    converted/{compile_pass,compile_fail}/` (Q3); the conversion
-///    tracks every output path with the cleanup guard.
-/// 9. Invoke `lihaaf::run` in-process (Q5) with the overlay manifest
-///    path so the inner session reads the synthetic metadata block.
-/// 10. Capture the active toolchain via `rustup show active-toolchain`
-///     (Phase 9 / §3.4) with the rustc release-line fallback.
-/// 11. Build the §3.3 envelope from every component above and write it
+///    converted/{compile_pass,compile_fail}/`; the conversion tracks
+///    every output path with the cleanup guard.
+/// 8. Invoke `lihaaf::run` in-process with the overlay manifest path
+///    so the inner session reads the synthetic metadata block.
+/// 9. Capture the active toolchain via `rustup show active-toolchain`
+///    (§3.4) with the rustc release-line fallback.
+/// 10. Build the §3.3 envelope from every component above and write it
 ///     atomically via [`report::write_envelope`].
-/// 12. Run the explicit cleanup finalize; the guard's Drop is the
+/// 11. Run the explicit cleanup finalize; the guard's Drop is the
 ///     safety net for panic / early-return paths.
 ///
 /// This is `pub` so the crate's binary (`src/bin/cargo-lihaaf.rs`) and
@@ -287,8 +285,8 @@ fn basename_fallback(compat_root: &Path) -> String {
 }
 
 /// Build the [`crate::cli::Cli`] passed into the in-process
-/// `lihaaf::run` invocation (Q5). The manifest path is overridden to
-/// the sibling overlay so `config::load` reads the synthetic
+/// `lihaaf::run` invocation. The manifest path is overridden to the
+/// sibling overlay so `config::load` reads the synthetic
 /// `[package.metadata.lihaaf]` block; pass-through flags
 /// (`--bless`, `--no-cache`, `--jobs`, `--verbose`, `--use-symlink`,
 /// `--keep-output`, `--quiet`) forward verbatim.

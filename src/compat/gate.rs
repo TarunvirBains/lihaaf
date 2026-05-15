@@ -1,4 +1,4 @@
-//! Phase 10 of compat mode — §5 pilot gate logic.
+//! §5 pilot gate logic for compat mode.
 //!
 //! Reads a `compat/baseline.toml` ceiling table and validates a §3.3
 //! [`CompatEnvelope`](crate::compat::report::CompatEnvelope) against the

@@ -1,5 +1,5 @@
-//! Phase 8 of compat mode (§3.3 of `docs/compatibility-plan.md`) —
-//! deterministic JSON envelope writer.
+//! Deterministic JSON envelope writer for compat mode (§3.3 of
+//! `docs/compatibility-plan.md`).
 //!
 //! The §3.3 envelope is the single artifact CI consumes to make the
 //! pilot-gate pass/fail decision. The byte layout must be reproducible:
@@ -23,10 +23,10 @@
 //!
 //! ## What this module does NOT own
 //!
-//! - Construction of the envelope. Each upstream phase (overlay,
-//!   baseline, discovery, normalizer, cleanup) is responsible for
-//!   producing its own contribution; the driver (Phase 9+) assembles
-//!   the pieces and hands the final struct to [`write_envelope`].
+//! - Construction of the envelope. Each contributing module (overlay,
+//!   baseline, discovery, normalizer, cleanup) produces its own piece;
+//!   the compat driver assembles the pieces and hands the final
+//!   struct to [`write_envelope`].
 //! - Conversion from absolute filesystem paths to the repo-relative
 //!   forward-slash form the envelope stores. Callers are responsible
 //!   for that conversion at construction time (e.g. via the
@@ -73,8 +73,8 @@
 //!    classification enum; the envelope-side type carries a
 //!    repo-relative forward-slash `String` path and a string-valued
 //!    class for additive v0.2 evolution. [`generated_path_from_cleanup`]
-//!    converts between the two — the driver calls this after Phase 5
-//!    cleanup finalizes, before envelope construction.
+//!    converts between the two — the driver calls this after the
+//!    cleanup guard finalizes, before envelope construction.
 
 use std::path::Path;
 
@@ -119,7 +119,8 @@ pub struct CompatEnvelope {
     pub errors: Vec<EnvelopeError>,
     /// Fixtures intentionally skipped, sorted by `fixture`.
     pub excluded_fixtures: Vec<ExcludedFixture>,
-    /// Generated paths, sorted by `path`. Per Phase 5 / issue #10.
+    /// Generated paths, sorted by `path`. Populated by the cleanup
+    /// guard's finalize step (issue #10).
     pub generated_paths: Vec<GeneratedPath>,
     /// Overlay metadata (`dropped_comments`, etc.).
     pub overlay: OverlayMetadata,
@@ -168,8 +169,8 @@ pub struct BaselineCounts {
     /// Number of fixtures the baseline reported `fail` for.
     pub fail: u32,
     /// Number of libtest output lines the conservative parser
-    /// (Phase 4 / issue #9) could not correlate to a recognized
-    /// fixture. Always present (`0` when every line correlated).
+    /// (issue #9) could not correlate to a recognized fixture. Always
+    /// present (`0` when every line correlated).
     pub unknown_count: u32,
     /// `cargo test`'s process exit code.
     pub exit_code: i32,
@@ -273,7 +274,8 @@ pub struct GeneratedPath {
     pub class: String,
 }
 
-/// Overlay metadata recorded by Phase 2.
+/// Overlay metadata recorded by the overlay materialization step
+/// (issue #11).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverlayMetadata {
     /// `true` when the overlay was materialized this run. Always
@@ -305,7 +307,6 @@ pub struct OverlayMetadata {
 /// lower-case discriminant name for v0.2-additive evolution. See the
 /// `class` field documentation on [`GeneratedPath`] for the known
 /// value set.
-#[allow(dead_code)] // Phase 9 wires this in `compat::run`; tests exercise it via the re-export.
 pub fn generated_path_from_cleanup(
     cleanup_entry: &crate::compat::cleanup::GeneratedPath,
     compat_root: &Path,

@@ -1,10 +1,10 @@
-//! Phase 9 of compat mode (§3.4 of `docs/compatibility-plan.md`) — active
-//! toolchain capture for the §3.3 envelope's `results.lihaaf.toolchain`
-//! field.
+//! Active toolchain capture for the §3.3 envelope's
+//! `results.lihaaf.toolchain` field (§3.4 of
+//! `docs/compatibility-plan.md`).
 //!
 //! ## What this module owns
 //!
-//! - [`capture_active_toolchain`] — the public entry that the Phase 10
+//! - [`capture_active_toolchain`] — the public entry that the compat
 //!   driver calls AFTER changing cwd to `--compat-root`. Invokes `rustup
 //!   show active-toolchain`, returns the trimmed first line, or falls
 //!   back to the rustc release line on rustup absence / subprocess error.
@@ -19,8 +19,8 @@
 //!
 //! ## Why subprocess `rustup`, not `cargo --version` or manifest parsing
 //!
-//! Locked decision 1 of Phase 9 (plan doc): §3.4 of the compatibility
-//! plan names `rustup show active-toolchain` specifically. Parsing
+//! §3.4 of the compatibility plan names `rustup show active-toolchain`
+//! specifically. Parsing
 //! `rust-toolchain.toml` directly would re-implement rustup's resolution
 //! rules (the `channel` / `path` / `components` keys, the upward search,
 //! the `RUSTUP_TOOLCHAIN` override) and drift from rustup's behavior.
@@ -30,8 +30,8 @@
 //!
 //! ## Why the rustc release-line fallback
 //!
-//! Locked decision 2 of Phase 9: the §3.3 envelope schema (Phase 8)
-//! requires a non-empty `toolchain` field. Adopters who run lihaaf
+//! The §3.3 envelope schema requires a non-empty `toolchain` field.
+//! Adopters who run lihaaf
 //! without rustup installed (e.g. distro rustc, custom CI images) must
 //! still produce a parseable envelope. The rustc release line is what
 //! the v0.1 freshness machinery already captures (see
@@ -53,7 +53,7 @@ use crate::error::Error;
 ///
 /// ## cwd contract
 ///
-/// The Phase 10 driver changes cwd to `--compat-root` BEFORE calling
+/// The compat driver changes cwd to `--compat-root` BEFORE calling
 /// this function so `rustup show` resolves against the fork's pinned
 /// `rust-toolchain.toml`. This function does not set `current_dir`
 /// itself; the caller owns that.

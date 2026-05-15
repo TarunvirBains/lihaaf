@@ -1,10 +1,13 @@
-//! Phase 10 of compat mode — trybuild → lihaaf fixture conversion.
+//! Trybuild → lihaaf fixture conversion for compat mode.
 //!
-//! Walks the [`crate::compat::discovery::DiscoveryOutput`] list produced
-//! in Phase 6 and copies each fixture (`.rs` file plus matching
-//! `.stderr` snapshot if present) into the converted-fixtures tree under
+//! Walks the [`crate::compat::discovery::DiscoveryOutput`] produced by
+//! the syn-AST discovery pass and copies each fixture (`.rs` file plus
+//! matching `.stderr` snapshot if present) into the converted-fixtures
+//! tree under
 //! `<compat_root>/target/lihaaf-compat-converted/{compile_pass,
-//! compile_fail}/` per Q3 of the Phase 10 design.
+//! compile_fail}/`. The destination directory lives under the
+//! cargo-owned `target/` so the dirty-worktree rule (§3.2.3) never
+//! fires.
 //!
 //! ## Why `target/`?
 //!
@@ -13,7 +16,7 @@
 //!
 //! 1. The dirty-worktree rule (§3.2.3) never fires — cargo's own
 //!    `.gitignore` semantics cover the directory.
-//! 2. The Phase 5 cleanup classifier ([`crate::compat::cleanup::classify`])
+//! 2. The cleanup classifier ([`crate::compat::cleanup::classify`])
 //!    reports the path as `Ignored` without invoking git, so the §3.3
 //!    envelope's `generated_paths` entry is uniform across fork-CI
 //!    environments that may or may not have git available.
@@ -42,8 +45,8 @@
 //! ## Errors
 //!
 //! Returns `Error::Io` on the first filesystem failure (mkdir / copy).
-//! Partial state may remain on disk — the Phase 5 cleanup guard's Drop
-//! safety net removes whatever was tracked before the failure, so the
+//! Partial state may remain on disk — the cleanup guard's Drop safety
+//! net removes whatever was tracked before the failure, so the
 //! adopter's `target/lihaaf-compat-converted/` tree stays consistent
 //! with the on-exit envelope.
 
@@ -58,12 +61,12 @@ use crate::error::Error;
 /// adopter-facing source path while lihaaf's per-fixture worker reads
 /// from `dest_path`.
 #[derive(Debug, Clone)]
-// Fields are read by the Phase 10 driver and by integration tests via
-// the `#[doc(hidden)]` re-export at the crate root; the lint sees only
-// the in-tree `compat::run` call path which currently consumes
-// `dest_path` directly. Kept on the struct so adopters' downstream
-// envelope-consumers and the v0.2 "join per-fixture verdicts" surface
-// have the data they need without a re-walk.
+// `src_path`, `dest_stderr`, and `kind` are not consumed by the
+// in-tree compat driver (which only reads `dest_path`), but the
+// `#[doc(hidden)]` re-export makes the full struct available to
+// integration tests and out-of-tree CI runners. Kept on the struct so
+// downstream envelope-consumers and the v0.2 "join per-fixture
+// verdicts" surface have the data they need without a re-walk.
 #[allow(dead_code)]
 pub struct ConvertedFixture {
     /// Absolute path to the original trybuild fixture (the
@@ -88,8 +91,8 @@ pub struct ConvertedFixture {
 /// `<compat_root>/target/lihaaf-compat-converted/{compile_pass,
 /// compile_fail}/` tree.
 ///
-/// `cleanup` tracks every produced path so the Phase 5 dirty-worktree
-/// guard cleans up the tree on exit (the path lives under `target/` so
+/// `cleanup` tracks every produced path so the dirty-worktree guard
+/// cleans up the tree on exit (the path lives under `target/` so
 /// classification is `Ignored`; the tracking still produces the
 /// `generated_paths` envelope entry the operator may inspect).
 ///
@@ -99,8 +102,8 @@ pub struct ConvertedFixture {
 /// converted copy must follow).
 ///
 /// **Errors.** Returns `Error::Io` on the first directory-creation or
-/// file-copy failure; the partial tree is left behind for the Phase 5
-/// cleanup guard's Drop safety net to remove on exit.
+/// file-copy failure; the partial tree is left behind for the cleanup
+/// guard's Drop safety net to remove on exit.
 pub fn convert_fixtures(
     compat_root: &Path,
     fixtures: &[DiscoveredFixture],

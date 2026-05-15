@@ -61,7 +61,7 @@ use crate::util;
 /// One materialized overlay run. Constructed by [`materialize_overlay`]
 /// after the sibling manifest is written (or skipped as idempotent).
 ///
-/// The bundle is consumed by Phase 8's §3.3 envelope writer — the
+/// The bundle is consumed by the §3.3 envelope writer — the
 /// `overlay.generated` classification reads from this struct.
 ///
 /// `pub` (with the parent module pinned at `pub(crate)`) so the crate
@@ -106,27 +106,26 @@ pub struct OverlayPlan {
     pub upstream_crate_name: Option<String>,
 }
 
-/// Synthetic `[package.metadata.lihaaf]` table the Phase 10 driver
+/// Synthetic `[package.metadata.lihaaf]` table the compat driver
 /// injects into the sibling overlay so the upstream pilot fork does not
-/// need to hand-author a metadata block. See `docs/superpowers/plans/
-/// 2026-05-13-compat-mode-implementation-plan.md` Q2 for the rationale.
+/// need to hand-author a metadata block.
 ///
-/// Constructed by the Phase 10 driver after it has resolved the crate
+/// Constructed by the compat driver after it has resolved the crate
 /// name + converted-fixtures directory; passed to
 /// [`materialize_overlay_with_metadata`]. The fields map 1:1 to the
 /// keys the v0.1 [`crate::config::Config`] loader expects.
 #[derive(Debug, Clone)]
 pub struct SyntheticMetadata {
-    /// `dylib_crate` — the workspace-member crate name. Phase 10's
+    /// `dylib_crate` — the workspace-member crate name. The compat
     /// driver reads this from upstream `[package].name`.
     pub dylib_crate: String,
     /// `extern_crates` — list of `--extern` names handed to per-fixture
-    /// rustc. Phase 10's driver always sets this to `[dylib_crate]`;
+    /// rustc. The compat driver always sets this to `[dylib_crate]`;
     /// the v0.1 config loader enforces `extern_crates[0] == dylib_crate`
     /// anyway.
     pub extern_crates: Vec<String>,
-    /// `fixture_dirs` — list of directories to walk for fixtures. Phase
-    /// 10's driver populates this with the converted-fixtures path
+    /// `fixture_dirs` — list of directories to walk for fixtures. The
+    /// compat driver populates this with the converted-fixtures path
     /// under `<compat_root>/target/lihaaf-compat-converted/`. Paths
     /// are written verbatim into the TOML.
     pub fixture_dirs: Vec<String>,
@@ -164,12 +163,11 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
 ///
 /// **Conflict policy.** If the upstream `Cargo.toml` already has a
 /// `[package.metadata.lihaaf]` table, the synthetic metadata is
-/// OVERWRITTEN with the synthetic values. This matches the Q2 design
-/// decision: compat mode owns the inner-session config; an existing
-/// metadata block in a pilot fork would have been written under v0.1
-/// semantics that may not match the compat-driver-synthesized
-/// `fixture_dirs` path under `<compat_root>/target/lihaaf-compat-
-/// converted/`.
+/// OVERWRITTEN with the synthetic values: compat mode owns the
+/// inner-session config; an existing metadata block in a pilot fork
+/// would have been written under v0.1 semantics that may not match
+/// the compat-driver-synthesized `fixture_dirs` path under
+/// `<compat_root>/target/lihaaf-compat-converted/`.
 ///
 /// **Errors.** Same shape as [`materialize_overlay`].
 pub fn materialize_overlay_with_metadata(
@@ -486,8 +484,7 @@ pub(crate) fn canonicalize_crate_type(
 /// this slice) is sorted alphabetically when serialized.
 ///
 /// This list is intentionally hardcoded; a configuration option would
-/// expand the v0.1 surface for no adopter benefit (locked decision 4
-/// in the Phase 2 plan).
+/// expand the v0.1 surface for no adopter benefit.
 pub(crate) fn canonical_key_order() -> &'static [&'static str] {
     &[
         "package",

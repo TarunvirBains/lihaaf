@@ -640,7 +640,6 @@ fn remove_symlink_dispatch(path: &Path) -> std::io::Result<()> {
 ///
 /// `pub` to allow the test crate's `#[doc(hidden)]` re-export to
 /// reach this function.
-#[allow(dead_code)] // Phase 9 wires this in `compat::run`; isolated install needed in tests.
 pub fn install_panic_hook() {
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::SeqCst) {
