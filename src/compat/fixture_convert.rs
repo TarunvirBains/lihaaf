@@ -97,9 +97,15 @@ pub struct ConvertedFixture {
 /// `generated_paths` envelope entry the operator may inspect).
 ///
 /// The root directory `<compat_root>/target/lihaaf-compat-converted/`
-/// is created if it does not exist; pre-existing files inside it are
-/// OVERWRITTEN on conflict (the fixture source has shifted; the
-/// converted copy must follow).
+/// is REMOVED at the start of every call and recreated from scratch.
+/// Without this, a previous run's `<basename>.stderr` could outlive
+/// its source: if the adopter deletes or renames the upstream
+/// `.stderr` between runs, the conversion's "source missing → don't
+/// copy" path would leave the stale converted `.stderr` in place, and
+/// the inner `lihaaf::run` would pick it up via `snapshot_path` and
+/// corrupt verdicts. Recreating from scratch every run guarantees
+/// idempotency — the converted tree always matches the current
+/// fixture set.
 ///
 /// **Errors.** Returns `Error::Io` on the first directory-creation or
 /// file-copy failure; the partial tree is left behind for the cleanup
@@ -112,6 +118,25 @@ pub fn convert_fixtures(
     let converted_root = compat_root.join("target").join("lihaaf-compat-converted");
     let compile_pass_dir = converted_root.join("compile_pass");
     let compile_fail_dir = converted_root.join("compile_fail");
+
+    // Nuke the previous run's converted tree. Idempotency: the new
+    // run rebuilds exactly the fixture set present today, so any
+    // child file/dir that existed before this call must go. Without
+    // this, a `.stderr` whose source was deleted or renamed would
+    // linger and corrupt the inner session's snapshot read. The
+    // `match` collapses the "already absent" case (NotFound) into a
+    // no-op so a clean-state first run still works.
+    match std::fs::remove_dir_all(&converted_root) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                "clearing prior compat-converted tree before re-conversion",
+                Some(converted_root.clone()),
+            ));
+        }
+    }
 
     std::fs::create_dir_all(&compile_pass_dir).map_err(|e| {
         Error::io(
@@ -311,6 +336,61 @@ mod tests {
             "output must be sorted; got {:?} then {:?}",
             out[0].dest_path,
             out[1].dest_path,
+        );
+    }
+
+    #[test]
+    fn convert_removes_stale_stderr_when_source_disappears() {
+        // Setup: a previous run converted `bad.rs` + `bad.stderr` into
+        // the compat-converted tree. The adopter then deletes the
+        // upstream `.stderr` (e.g. expected behavior shifted and the
+        // fixture now compiles cleanly). On rerun, the new conversion
+        // sees no source `.stderr` to copy. Without the recreate-from-
+        // scratch behavior, the old converted `.stderr` lingers and
+        // the inner `lihaaf::run` would pick it up via
+        // `snapshot_path(fixture_path)`, corrupting verdicts.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let compat_root = tmp.path();
+        let src_dir = compat_root.join("tests").join("ui");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        let src_rs = src_dir.join("bad.rs");
+        let src_stderr = src_dir.join("bad.stderr");
+        std::fs::write(&src_rs, b"compile error here").expect("write rs");
+        std::fs::write(&src_stderr, b"expected: error[E0...]").expect("write stderr");
+
+        // First run: both .rs and .stderr land in the converted tree.
+        let cleanup1 = CleanupGuard::new(false);
+        let fixtures = vec![DiscoveredFixture {
+            fixture_path: src_rs.clone(),
+            relative_path: "tests/ui/bad.rs".into(),
+            kind: FixtureKind::CompileFail,
+            call_site: dummy_call_site(src_dir.join("trybuild.rs")),
+        }];
+        let out1 = convert_fixtures(compat_root, &fixtures, &cleanup1).expect("first convert");
+        let dest_stderr = compat_root
+            .join("target")
+            .join("lihaaf-compat-converted")
+            .join("compile_fail")
+            .join("bad.stderr");
+        assert!(
+            dest_stderr.exists(),
+            "first run must produce converted stderr at {dest_stderr:?}",
+        );
+        assert_eq!(out1[0].dest_stderr.as_ref(), Some(&dest_stderr));
+
+        // Adopter deletes the upstream .stderr (e.g. fixture now
+        // compile_pass'es, or the .stderr was renamed). The discovery
+        // pass still sees the .rs and yields the same DiscoveredFixture.
+        std::fs::remove_file(&src_stderr).expect("delete upstream stderr");
+
+        // Second run: dest_stderr must NOT linger.
+        let cleanup2 = CleanupGuard::new(false);
+        let out2 = convert_fixtures(compat_root, &fixtures, &cleanup2).expect("second convert");
+        assert_eq!(out2[0].dest_stderr, None, "no stderr should be tracked");
+        assert!(
+            !dest_stderr.exists(),
+            "stale converted stderr must be removed when upstream stderr is gone; \
+             {dest_stderr:?} still exists",
         );
     }
 }
