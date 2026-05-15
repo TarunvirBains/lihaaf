@@ -78,7 +78,6 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
 
     let guard = cleanup::CleanupGuard::new(args.inner_cli.keep_output);
 
-    let converted_root = compat_root.join("target").join("lihaaf-compat-converted");
     // The synthetic `[package.metadata.lihaaf]` block embedded in the
     // overlay needs the crate name BEFORE the overlay serializer runs.
     // We hand `materialize_overlay_with_synthetic_metadata_builder` a
@@ -86,6 +85,18 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // parsed Cargo.toml and read `[package].name` — that way the file
     // is opened once and the synthetic block carries the right name on
     // the same write.
+    //
+    // `fixture_dirs` points at the two CHILD directories where the
+    // §3.2.1 conversion writes converted fixtures, NOT the parent
+    // `<target>/lihaaf-compat-converted/`. Reason: lihaaf's discovery
+    // (`src/discovery.rs`) is non-recursive — it lists immediate
+    // `is_file()` children only. If `fixture_dirs` pointed at the
+    // parent, discovery would skip the `.rs` files that sit under
+    // `compile_pass/` / `compile_fail/` and the inner session would see
+    // zero fixtures. Paths are repo-relative (resolved against the
+    // overlay manifest dir, which is `<compat_root>`) with forward
+    // slashes — §3.2.3's byte-determinism requirement bars absolute
+    // platform-dependent paths from the envelope/manifest.
     let overlay_plan = overlay::materialize_overlay_with_synthetic_metadata_builder(
         &upstream_manifest,
         |upstream_name| {
@@ -95,7 +106,10 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             overlay::SyntheticMetadata {
                 dylib_crate: name.clone(),
                 extern_crates: vec![name],
-                fixture_dirs: vec![converted_root.to_string_lossy().into_owned()],
+                fixture_dirs: vec![
+                    "./target/lihaaf-compat-converted/compile_pass".to_string(),
+                    "./target/lihaaf-compat-converted/compile_fail".to_string(),
+                ],
             }
         },
     )?;
