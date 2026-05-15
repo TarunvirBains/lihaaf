@@ -10,6 +10,12 @@ docs/superpowers/
 /target/lihaaf
 /target/lihaaf-build
 
+# Compat-mode overlay artifact: `materialize_overlay` writes a sibling
+# `Cargo.lihaaf.toml` next to the upstream manifest. Running compat
+# against this repo (`cargo lihaaf --compat --compat-root .`) lands the
+# overlay here.
+/Cargo.lihaaf.toml
+
 # Editor / OS noise
 .DS_Store
 .idea/

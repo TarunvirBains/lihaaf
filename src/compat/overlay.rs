@@ -96,6 +96,32 @@ pub struct OverlayPlan {
     pub dropped_comments: Vec<String>,
 }
 
+/// Synthetic `[package.metadata.lihaaf]` table the Phase 10 driver
+/// injects into the sibling overlay so the upstream pilot fork does not
+/// need to hand-author a metadata block. See `docs/superpowers/plans/
+/// 2026-05-13-compat-mode-implementation-plan.md` Q2 for the rationale.
+///
+/// Constructed by the Phase 10 driver after it has resolved the crate
+/// name + converted-fixtures directory; passed to
+/// [`materialize_overlay_with_metadata`]. The fields map 1:1 to the
+/// keys the v0.1 [`crate::config::Config`] loader expects.
+#[derive(Debug, Clone)]
+pub struct SyntheticMetadata {
+    /// `dylib_crate` — the workspace-member crate name. Phase 10's
+    /// driver reads this from upstream `[package].name`.
+    pub dylib_crate: String,
+    /// `extern_crates` — list of `--extern` names handed to per-fixture
+    /// rustc. Phase 10's driver always sets this to `[dylib_crate]`;
+    /// the v0.1 config loader enforces `extern_crates[0] == dylib_crate`
+    /// anyway.
+    pub extern_crates: Vec<String>,
+    /// `fixture_dirs` — list of directories to walk for fixtures. Phase
+    /// 10's driver populates this with the converted-fixtures path
+    /// under `<compat_root>/target/lihaaf-compat-converted/`. Paths
+    /// are written verbatim into the TOML.
+    pub fixture_dirs: Vec<String>,
+}
+
 /// Read the upstream `Cargo.toml`, materialize the sibling overlay, and
 /// return the plan.
 ///
@@ -114,6 +140,32 @@ pub struct OverlayPlan {
 /// TOML. The compat driver maps both into the §3.3 envelope's
 /// `overlay.*` error category.
 pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan, Error> {
+    materialize_overlay_with_metadata(upstream_manifest_path, None)
+}
+
+/// Variant of [`materialize_overlay`] that also injects a synthetic
+/// `[package.metadata.lihaaf]` table into the sibling overlay.
+///
+/// When `synthetic_metadata` is `Some`, the table is spliced into the
+/// parsed `package.metadata.lihaaf` location BEFORE the canonical
+/// serializer runs, so the on-disk overlay carries the metadata block
+/// the v0.1 [`crate::config::load`] entry needs to drive a compat-mode
+/// inner session.
+///
+/// **Conflict policy.** If the upstream `Cargo.toml` already has a
+/// `[package.metadata.lihaaf]` table, the synthetic metadata is
+/// OVERWRITTEN with the synthetic values. This matches the Q2 design
+/// decision: compat mode owns the inner-session config; an existing
+/// metadata block in a pilot fork would have been written under v0.1
+/// semantics that may not match the compat-driver-synthesized
+/// `fixture_dirs` path under `<compat_root>/target/lihaaf-compat-
+/// converted/`.
+///
+/// **Errors.** Same shape as [`materialize_overlay`].
+pub fn materialize_overlay_with_metadata(
+    upstream_manifest_path: &Path,
+    synthetic_metadata: Option<&SyntheticMetadata>,
+) -> Result<OverlayPlan, Error> {
     let raw_bytes = std::fs::read(upstream_manifest_path).map_err(|e| {
         Error::io(
             e,
@@ -175,6 +227,10 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
                 message: "`[lib]` must be a table, not an inline value".to_string(),
             });
         }
+
+        if let Some(meta) = synthetic_metadata {
+            inject_synthetic_metadata(top, meta);
+        }
     }
 
     let serialized = serialize_canonical(&value)?;
@@ -205,6 +261,64 @@ pub fn materialize_overlay(upstream_manifest_path: &Path) -> Result<OverlayPlan,
         upstream_already_has_dylib,
         dropped_comments,
     })
+}
+
+/// Splice the synthetic `[package.metadata.lihaaf]` table into `top`.
+///
+/// Creates the `[package]` and `[package.metadata]` parent tables as
+/// needed; replaces any pre-existing `[package.metadata.lihaaf]` entry
+/// in full (the v0.1 config loader treats the table as a single typed
+/// bundle, so partial merging would produce undefined behavior when the
+/// adopter's pre-existing table has different `extern_crates` or
+/// `fixture_dirs`).
+///
+/// The inserted values are typed: `dylib_crate` is a string,
+/// `extern_crates` is an array of strings, `fixture_dirs` is an array of
+/// strings. These match the v0.1 [`crate::config::RawMetadata`] schema.
+fn inject_synthetic_metadata(
+    top: &mut toml::map::Map<String, toml::Value>,
+    meta: &SyntheticMetadata,
+) {
+    let package_entry = top
+        .entry("package".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(package) = package_entry else {
+        return;
+    };
+    let metadata_entry = package
+        .entry("metadata".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(metadata) = metadata_entry else {
+        return;
+    };
+
+    let mut lihaaf_table = toml::map::Map::new();
+    lihaaf_table.insert(
+        "dylib_crate".to_string(),
+        toml::Value::String(meta.dylib_crate.clone()),
+    );
+    lihaaf_table.insert(
+        "extern_crates".to_string(),
+        toml::Value::Array(
+            meta.extern_crates
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    lihaaf_table.insert(
+        "fixture_dirs".to_string(),
+        toml::Value::Array(
+            meta.fixture_dirs
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+
+    metadata.insert("lihaaf".to_string(), toml::Value::Table(lihaaf_table));
 }
 
 /// Return `true` when `value` is a workspace-root manifest: declares a

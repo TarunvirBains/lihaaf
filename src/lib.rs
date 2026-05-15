@@ -239,6 +239,21 @@ pub use compat::report::generated_path_from_cleanup as compat_envelope_generated
 #[doc(hidden)]
 pub use compat::report::write_envelope as compat_write_envelope;
 
+// Compat-mode §5 pilot gate (Phase 10 of compat mode). Re-exported for
+// the gate_smoke integration test crate and for the (future) CI runner
+// that invokes the gate against an envelope artifact. Not part of any
+// v0.1 stability contract.
+#[doc(hidden)]
+pub use compat::gate::Ceiling as CompatGateCeiling;
+#[doc(hidden)]
+pub use compat::gate::GateOutcome as CompatGateOutcome;
+#[doc(hidden)]
+pub use compat::gate::check_gate as compat_check_gate;
+#[doc(hidden)]
+pub use compat::gate::load_baseline as compat_load_baseline;
+#[doc(hidden)]
+pub use compat::gate::parse_baseline as compat_parse_baseline;
+
 // Compat-mode §3.4 active-toolchain capture (Phase 9 of compat mode).
 // Re-exported for the same reason as the other compat surfaces above —
 // `tests/compat/toolchain_resolution.rs` lives in a separate test crate
