@@ -169,13 +169,9 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     if cli.no_cache {
         for suite in &config.suites {
             let manifest_dest = manifest::manifest_path_for_suite(&workspace_target, &suite.name);
-            if manifest_dest.exists() {
-                let _ = std::fs::remove_file(&manifest_dest);
-            }
+            util::remove_path_race_free(&manifest_dest, "prior session cache manifest")?;
             let build_dir = dylib::build_dir_for_suite(&workspace_target, &suite.name);
-            if build_dir.exists() {
-                let _ = std::fs::remove_dir_all(&build_dir);
-            }
+            util::remove_path_race_free(&build_dir, "prior session cache build dir")?;
         }
         if !cli.quiet {
             let n = config.suites.len();
