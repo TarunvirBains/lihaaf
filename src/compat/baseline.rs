@@ -94,9 +94,11 @@
 //! > the implementation must not infer fixture-level truth from
 //! > arbitrary libtest output.
 //!
-//! Practically: [`parse_libtest_output`] only emits `Some(pass)` /
-//! `Some(fail)` counts when the caller supplied at least one
-//! recognized fixture AND at least one libtest line correlated to it.
+//! Practically: [`parse_libtest_output`] emits `Some(pass)` / `Some(fail)`
+//! counts whenever the caller supplied at least one recognized fixture.
+//! Both counts are `0` when no libtest line correlates to any recognized
+//! fixture (rather than `None`); uncorrelated libtest lines and recognized
+//! fixtures absent from output both bump `unknown_count`.
 //! Every other libtest line (unrecognized test names, recognized
 //! fixtures absent from output, garbled lines) is `unknown_count++`.
 //! Empty recognized-fixture set ⇒ `pass.is_none() && fail.is_none()`,
