@@ -56,6 +56,7 @@
 // pass. Enforcement is convention + dependency checks in CI.
 
 pub mod cli;
+pub(crate) mod compat;
 pub mod config;
 pub(crate) mod diff;
 pub(crate) mod discovery;
@@ -85,6 +86,177 @@ pub use error::{Error, Outcome};
 pub use exit::ExitCode;
 pub use session::{Report, run};
 pub use verdict::Verdict;
+
+// Compat-mode entry point. Re-exported because the
+// `cargo-lihaaf` binary lives in a separate crate (`src/bin/`) and
+// cannot reach `pub(crate)` items directly. Adopters should NOT
+// drive compat mode from Rust; the supported entry is `cargo lihaaf
+// --compat`. The Rust surface here exists for the binary and for
+// future integration tests; the path and signature are not part of
+// any v0.1 stability contract.
+#[doc(hidden)]
+pub use compat::cli::CompatArgs;
+#[doc(hidden)]
+pub use compat::run as run_compat;
+
+// Compat-mode overlay (GH #11). Re-exported for the same reason as
+// `CompatArgs` above — `tests/compat/overlay_determinism.rs` lives in
+// a separate test crate and reaches the overlay module through this
+// `#[doc(hidden)]` re-export. The stability contract is the same:
+// NOT part of any v0.1 surface.
+//
+// Only `materialize_overlay` is re-exported because that is what the
+// integration tests exercise; the canonicalizer, key-order helper, and
+// serializer are unit-tested inline within `src/compat/overlay.rs`.
+// `compat::run` reaches them through `crate::compat::overlay::*`, not
+// through a crate-root re-export.
+#[doc(hidden)]
+pub use compat::overlay::materialize_overlay as compat_overlay_materialize;
+
+// Compat-mode baseline runner (GH #8). Re-exported for the same
+// reason as the overlay above — `tests/compat/argv_baseline_no_shell.rs`
+// lives in a separate test crate and reaches the baseline module
+// through these `#[doc(hidden)]` re-exports. The stability contract
+// is the same: NOT part of any v0.1 surface.
+#[doc(hidden)]
+pub use compat::baseline::BaselineResult as CompatBaselineResult;
+#[doc(hidden)]
+pub use compat::baseline::run_baseline as compat_baseline_run;
+
+// Compat-mode conservative trybuild baseline extraction (GH #9).
+// Re-exported so `tests/compat/baseline_conservative.rs` can reach the
+// conservative parser, the fixture-recognition input type, the
+// mismatch record, and the v2 runner entry point through stable names.
+// The stability contract is the same as the other compat re-exports:
+// NOT part of any v0.1 surface; the supported entry to compat mode is
+// `cargo lihaaf --compat`.
+#[doc(hidden)]
+pub use compat::baseline::BaselineMismatch as CompatBaselineMismatch;
+#[doc(hidden)]
+pub use compat::baseline::BaselineVerdict as CompatBaselineVerdict;
+#[doc(hidden)]
+pub use compat::baseline::FixtureId as CompatFixtureId;
+#[doc(hidden)]
+pub use compat::baseline::ParsedBaseline as CompatParsedBaseline;
+#[doc(hidden)]
+pub use compat::baseline::parse_libtest_output as compat_parse_libtest_output;
+#[doc(hidden)]
+pub use compat::baseline::run_baseline_with_recognized_fixtures as compat_baseline_run_with_recognized_fixtures;
+
+// Compat-mode fixture-invocation discovery (§3.2.1 of the
+// compatibility plan). Re-exported for the same reason as the overlay
+// above — `tests/compat/discovery_syn.rs` lives in a separate test
+// crate and reaches the discovery types through these `#[doc(hidden)]`
+// re-exports. The stability contract is the same: NOT part of any
+// v0.1 surface; the supported entry to compat mode is `cargo lihaaf
+// --compat`. `compat::run` consumes `discover` directly via the
+// in-crate path; the re-exports exist for the integration test crate.
+#[doc(hidden)]
+pub use compat::discovery::CallSite as CompatDiscoveryCallSite;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveredFixture as CompatDiscoveredFixture;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveryOutput as CompatDiscoveryOutput;
+#[doc(hidden)]
+pub use compat::discovery::DiscoveryUnrecognized as CompatDiscoveryUnrecognized;
+#[doc(hidden)]
+pub use compat::discovery::FixtureKind as CompatFixtureKind;
+#[doc(hidden)]
+pub use compat::discovery::discover as compat_discover;
+
+// Compat-mode dirty-worktree cleanup (GH #10). Re-exported for the
+// same reason as the overlay above — `tests/compat/cleanup_dirty_worktree.rs`
+// lives in a separate test crate and reaches the cleanup types through
+// these `#[doc(hidden)]` re-exports. The stability contract is the
+// same: NOT part of any v0.1 surface; the supported entry to compat
+// mode is `cargo lihaaf --compat`.
+//
+// `install_panic_hook` is re-exported alongside the guard types
+// because `compat::run` calls it and integration tests may need to
+// drive it directly (in a child process so the process-wide hook does
+// not perturb libtest's panic capture in the outer test runner).
+#[doc(hidden)]
+pub use compat::cleanup::CleanupGuard as CompatCleanupGuard;
+#[doc(hidden)]
+pub use compat::cleanup::GeneratedPath as CompatGeneratedPath;
+#[doc(hidden)]
+pub use compat::cleanup::GeneratedPathClass as CompatGeneratedPathClass;
+#[doc(hidden)]
+pub use compat::cleanup::install_panic_hook as compat_install_panic_hook;
+
+// Compat-mode normalizer flag plumbing (§3.2.2 of the compatibility
+// plan). Re-exported for the same reason as the other compat surfaces
+// above — `tests/compat/normalizer_compat_cargo.rs` lives in a
+// separate test crate and reaches the public `NormalizationContext` /
+// `normalize` entry points through these `#[doc(hidden)]` re-exports.
+// The stability contract is the same: NOT part of any v0.1 surface;
+// the supported entry to compat mode is `cargo lihaaf --compat`.
+#[doc(hidden)]
+pub use normalize::{NormalizationContext, normalize};
+
+// Compat-mode §3.3 deterministic envelope. Re-exported for the same
+// reason as the other compat surfaces above —
+// `tests/compat/report_determinism.rs` lives in a separate test crate
+// and reaches the envelope struct + writer through these
+// `#[doc(hidden)]` re-exports. The stability contract is the same:
+// NOT part of any v0.1 surface; the supported entry to compat mode
+// is `cargo lihaaf --compat`. `compat::run` consumes `write_envelope`
+// directly via the in-crate path; the re-exports exist for the
+// integration test crate and out-of-tree CI runners.
+#[doc(hidden)]
+pub use compat::report::BaselineCounts as CompatBaselineCounts;
+#[doc(hidden)]
+pub use compat::report::Commands as CompatCommands;
+#[doc(hidden)]
+pub use compat::report::CompatEnvelope;
+#[doc(hidden)]
+pub use compat::report::EnvelopeError as CompatEnvelopeError;
+#[doc(hidden)]
+pub use compat::report::ExcludedFixture as CompatExcludedFixture;
+#[doc(hidden)]
+pub use compat::report::GeneratedPath as CompatEnvelopeGeneratedPath;
+#[doc(hidden)]
+pub use compat::report::LihaafCounts as CompatLihaafCounts;
+#[doc(hidden)]
+pub use compat::report::MismatchExample as CompatMismatchExample;
+#[doc(hidden)]
+pub use compat::report::OverlayMetadata as CompatOverlayMetadata;
+#[doc(hidden)]
+pub use compat::report::Results as CompatResults;
+#[doc(hidden)]
+pub use compat::report::canonicalize as compat_canonicalize_envelope;
+#[doc(hidden)]
+pub use compat::report::generated_path_from_cleanup as compat_envelope_generated_path_from_cleanup;
+#[doc(hidden)]
+pub use compat::report::write_envelope as compat_write_envelope;
+
+// Compat-mode §5 pilot gate. Re-exported for the gate_smoke integration
+// test crate and for the (future) CI runner that invokes the gate
+// against an envelope artifact. Not part of any v0.1 stability contract.
+#[doc(hidden)]
+pub use compat::gate::Ceiling as CompatGateCeiling;
+#[doc(hidden)]
+pub use compat::gate::GateOutcome as CompatGateOutcome;
+#[doc(hidden)]
+pub use compat::gate::check_gate as compat_check_gate;
+#[doc(hidden)]
+pub use compat::gate::load_baseline as compat_load_baseline;
+#[doc(hidden)]
+pub use compat::gate::parse_baseline as compat_parse_baseline;
+
+// Compat-mode §3.4 active-toolchain capture. Re-exported for the same
+// reason as the other compat surfaces above —
+// `tests/compat/toolchain_resolution.rs` lives in a separate test crate
+// and reaches the capture entry point + its internal "swap the program
+// name" variant through these `#[doc(hidden)]` re-exports. The
+// stability contract is the same: NOT part of any v0.1 surface; the
+// supported entry to compat mode is `cargo lihaaf --compat`.
+// `compat::run` calls `capture_active_toolchain` directly through
+// `crate::compat::rustup::*`, not through this re-export.
+#[doc(hidden)]
+pub use compat::rustup::capture_active_toolchain as compat_capture_active_toolchain;
+#[doc(hidden)]
+pub use compat::rustup::capture_with_program as compat_capture_with_program;
 
 /// The semver-stable lihaaf release the binary identifies as.
 ///

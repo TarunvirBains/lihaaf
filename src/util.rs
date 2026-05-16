@@ -111,6 +111,132 @@ pub fn relative_to(path: &Path, base: &Path) -> String {
     }
 }
 
+/// Remove `path` from the filesystem without relying on a prior
+/// `symlink_metadata` stat. Best-effort: a non-existent path is treated
+/// as already-cleaned (no error) so cleanup is idempotent across reruns.
+///
+/// ## Race-free cascade
+///
+/// The naïve shape is `symlink_metadata(path)` → branch on `file_type`
+/// → dispatch to `remove_file` / `remove_dir` / `remove_dir_all`. That
+/// is TOCTOU-vulnerable: between the stat and the removal call, the
+/// path entry can be swapped to a different entry kind (e.g. a symlink
+/// pointing outside the intended scope), and the wrong syscall fires.
+///
+/// This cascade eliminates the stat-then-dispatch. Each step operates
+/// on the path's current state via a single syscall, and each step's
+/// error space tells us which step to try next:
+///
+/// 1. **`remove_file`** — handles regular files AND file-symlinks.
+///    - Unix: `unlink(2)` removes the directory entry for both regular
+///      files and symlinks (regardless of target type) — never follows
+///      the link.
+///    - Windows: `DeleteFileW` handles regular files and file-symlinks;
+///      it refuses directories and directory-symlinks with
+///      `ERROR_ACCESS_DENIED` (surfaced as `PermissionDenied`, and in
+///      some cases `IsADirectory`).
+///    - On `IsADirectory` we proceed to step 2 (Unix EISDIR and the
+///      stable mapping some Windows shapes surface).
+///    - **`PermissionDenied` is platform-specific.** On Windows it is
+///      the "this entry is a directory" signal, so we fall through.
+///      On Unix it is a real EACCES (parent without write permission,
+///      immutable attribute, missing search bit on an ancestor) —
+///      surfacing that as "not a file → try step 2" would mask the
+///      cause, so we return it directly.
+/// 2. **`remove_dir`** — handles empty directories AND directory-symlinks.
+///    - Unix: `rmdir(2)` succeeds on empty directories; fails
+///      `ENOTEMPTY` (`DirectoryNotEmpty`) on non-empty ones.
+///    - Windows: `RemoveDirectoryW` removes empty directories AND
+///      directory-symlinks AND junctions — it removes the LINK, not the
+///      target tree.
+///    - On `DirectoryNotEmpty` we proceed to step 3.
+///    - **Windows-only `PermissionDenied` fall-through.** A read-only
+///      non-empty Windows directory returns `ERROR_ACCESS_DENIED`
+///      from `RemoveDirectoryW` instead of `DirectoryNotEmpty`. Treat
+///      it as "non-empty, try recursive" so step 3 can clear it.
+/// 3. **`remove_dir_all`** — recursive removal of a non-empty directory.
+///    - Rust 1.84+ `std::fs::remove_dir_all` is race-safe internally: it
+///      refuses to follow symlinks during the recursive walk. MSRV is
+///      1.95 (see `Cargo.toml`), so the race-safe behavior is
+///      guaranteed.
+///
+/// Each step independently checks `NotFound` — a concurrent unlink
+/// between steps is treated as already-cleaned (idempotent).
+///
+/// ## `context_prefix`
+///
+/// Callers supply a short noun phrase that describes the artifact
+/// being removed. The three step-specific error contexts are built by
+/// concatenating:
+///
+/// - `"removing {context_prefix} file/symlink"`
+/// - `"removing {context_prefix} empty dir / dir-symlink"`
+/// - `"recursively removing {context_prefix} directory"`
+///
+/// For compat-cleanup the prefix is `"compat-generated"`; for the
+/// managed-dylib swap it is `"prior managed dylib"`. Keep the prefix
+/// short and noun-shaped — the surrounding template names the syscall
+/// stage.
+pub(crate) fn remove_path_race_free(path: &Path, context_prefix: &str) -> Result<(), Error> {
+    use std::io::ErrorKind;
+
+    // Step 1: try to unlink as a file or file-symlink.
+    match std::fs::remove_file(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        // IsADirectory is stable across platforms as the "not a file"
+        // signal (Unix EISDIR; some Windows shapes surface here too).
+        Err(e) if e.kind() == ErrorKind::IsADirectory => {}
+        // Windows-only: DeleteFileW returns ERROR_ACCESS_DENIED for
+        // directories and directory-symlinks (mapped to
+        // PermissionDenied). Treat as "this is a directory" → step 2.
+        // Unix PermissionDenied is a real EACCES; let it surface
+        // via the catch-all so the diagnostic stays honest.
+        #[cfg(windows)]
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                format!("removing {context_prefix} file/symlink"),
+                Some(path.to_path_buf()),
+            ));
+        }
+    }
+
+    // Step 2: try to remove as an empty directory or a directory-symlink.
+    match std::fs::remove_dir(path) {
+        Ok(()) => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == ErrorKind::DirectoryNotEmpty => {}
+        // Windows-only: RemoveDirectoryW returns ERROR_ACCESS_DENIED
+        // (PermissionDenied) for a read-only non-empty directory
+        // instead of DirectoryNotEmpty. Treat as "non-empty" so step
+        // 3 clears it. Unix's `rmdir(2)` does not return EACCES for
+        // a non-empty directory; the catch-all preserves the
+        // diagnostic.
+        #[cfg(windows)]
+        Err(e) if e.kind() == ErrorKind::PermissionDenied => {}
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                format!("removing {context_prefix} empty dir / dir-symlink"),
+                Some(path.to_path_buf()),
+            ));
+        }
+    }
+
+    // Step 3: recursive removal of a non-empty directory.
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(Error::io(
+            e,
+            format!("recursively removing {context_prefix} directory"),
+            Some(path.to_path_buf()),
+        )),
+    }
+}
+
 /// Read total system RAM in MB.
 ///
 /// Linux: `/proc/meminfo`'s `MemTotal:` line in KiB.

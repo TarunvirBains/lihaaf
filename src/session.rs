@@ -99,6 +99,16 @@ impl Report {
 /// failure (config invalid, dylib build failed, etc.), returns
 /// [`Error::Session`].
 pub fn run(cli: Cli) -> Result<Report, Error> {
+    // Mode-consistency validation. This is also enforced in
+    // `cli::parse_from`, but a Rust caller that builds `Cli` via
+    // direct field initialization (or via `Cli::try_parse_from`) would
+    // otherwise bypass it — `--compat-root` without `--compat` is a
+    // silent no-op in the non-compat session path, which is exactly
+    // the shape the validator exists to reject. Calling here closes
+    // the gap on both entry points. Idempotent: a second invocation
+    // (after `parse_from` already validated) returns `Ok(())`.
+    cli.validate_mode_consistency()?;
+
     // Stage 1 — configuration load.
     let manifest_path = resolve_manifest_path(&cli)?;
     let crate_root = derive_crate_root(&manifest_path);
@@ -159,13 +169,9 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     if cli.no_cache {
         for suite in &config.suites {
             let manifest_dest = manifest::manifest_path_for_suite(&workspace_target, &suite.name);
-            if manifest_dest.exists() {
-                let _ = std::fs::remove_file(&manifest_dest);
-            }
+            util::remove_path_race_free(&manifest_dest, "prior session cache manifest")?;
             let build_dir = dylib::build_dir_for_suite(&workspace_target, &suite.name);
-            if build_dir.exists() {
-                let _ = std::fs::remove_dir_all(&build_dir);
-            }
+            util::remove_path_race_free(&build_dir, "prior session cache build dir")?;
         }
         if !cli.quiet {
             let n = config.suites.len();
@@ -406,8 +412,14 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         eprintln!("lihaaf: parallelism = {parallelism}");
     }
 
-    // Build the worker context for this suite.
-    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone());
+    // Build the worker context for this suite. The compat driver
+    // (`compat::mod::build_inner_cli`) sets `inner_compat_normalize =
+    // true` on the inner Cli so this session emits trybuild-shaped
+    // short-form `$CARGO/<crate>-<ver>/...` snapshots per §3.2.2. Non-
+    // compat callers leave the flag at its default `false` and observe
+    // byte-identical v0.1 normalizer output.
+    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone())
+        .with_compat_short_cargo(cli.inner_compat_normalize);
     let mut worker_ctx = WorkerContext::new(
         crate_root.to_path_buf(),
         managed_path.clone(),
@@ -826,32 +838,21 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parallelism_respects_explicit_jobs() {
-        let mut cli = Cli {
+    /// Helper: build a `Cli` with every flag in its non-compat default
+    /// posture, then let each test override the specific fields it
+    /// cares about. Keeps unit tests insulated from purely-additive
+    /// struct extensions (Phase 1 compat-mode fields, etc.).
+    fn default_test_cli() -> Cli {
+        Cli {
             bless: false,
-            filter: vec![],
-            jobs: Some(2),
-            suite: vec![],
-            no_cache: false,
-            manifest_path: None,
-            list: false,
-            quiet: true,
-            verbose: false,
-            use_symlink: false,
-            keep_output: false,
-        };
-        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
-        assert!(p <= 2);
-        cli.jobs = Some(1);
-        let p2 = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
-        assert_eq!(p2, 1);
-    }
-
-    #[test]
-    fn parallelism_is_at_least_one() {
-        let cli = Cli {
-            bless: false,
+            compat: false,
+            compat_cargo_test_argv: None,
+            compat_commit: None,
+            compat_filter: vec![],
+            compat_manifest: None,
+            compat_report: None,
+            compat_root: None,
+            compat_trybuild_macro: vec![],
             filter: vec![],
             jobs: None,
             suite: vec![],
@@ -862,7 +863,24 @@ mod tests {
             verbose: false,
             use_symlink: false,
             keep_output: false,
-        };
+            inner_compat_normalize: false,
+        }
+    }
+
+    #[test]
+    fn parallelism_respects_explicit_jobs() {
+        let mut cli = default_test_cli();
+        cli.jobs = Some(2);
+        let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
+        assert!(p <= 2);
+        cli.jobs = Some(1);
+        let p2 = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, 1024));
+        assert_eq!(p2, 1);
+    }
+
+    #[test]
+    fn parallelism_is_at_least_one() {
+        let cli = default_test_cli();
         // Even with an absurd per-fixture cap, the result must not be 0.
         let p = compute_parallelism(&cli, &suite(DEFAULT_SUITE_NAME, u32::MAX / 2));
         assert!(p >= 1);

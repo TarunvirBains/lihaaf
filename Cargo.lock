@@ -275,13 +275,15 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "lihaaf"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 dependencies = [
  "clap",
  "libc",
+ "proc-macro2",
  "serde",
  "serde_json",
  "sha2",
+ "syn",
  "tempfile",
  "toml",
  "windows-sys 0.59.0",

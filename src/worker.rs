@@ -1504,6 +1504,7 @@ plain text line
                 workspace_root: PathBuf::from("/p"),
                 sysroot: PathBuf::from("/r"),
                 cargo_registry: None,
+                compat_short_cargo: false,
             },
             sysroot_lib_dir: PathBuf::from("/r/lib"),
             freshness_snapshot: FreshnessSnapshot {

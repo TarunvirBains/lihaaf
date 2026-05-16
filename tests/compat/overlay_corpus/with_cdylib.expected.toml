@@ -1,0 +1,10 @@
+[package]
+edition = "2021"
+name = "demo"
+version = "0.1.0"
+
+[lib]
+crate-type = ["dylib", "rlib", "cdylib"]
+
+[dependencies]
+serde = "1"

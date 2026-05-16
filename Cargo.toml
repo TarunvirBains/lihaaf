@@ -1,6 +1,6 @@
 [package]
 name = "lihaaf"
-version = "0.1.0-beta.3"
+version = "0.1.0-beta.4"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Tarunvir Bains"]
@@ -20,6 +20,14 @@ readme = "README.md"
 # `cargo publish` for lihaaf itself would try to interpret the nested
 # manifests as part of the package and the corpus would ship to
 # crates.io.
+#
+# The Phase 6 (§3.2.1) `tests/compat/discovery_corpus/` fixtures are
+# DELIBERATELY NOT excluded — the `discovery_syn` integration test
+# registered below asserts that the corpus exists on disk and feeds
+# each scenario to the syn AST walker. Excluding them would ship a
+# .crate artifact whose `cargo test` invocation fails on a missing
+# corpus, defeating the purpose of `cargo publish --dry-run` as a
+# release-gate signal.
 exclude = ["tests/integration_corpus/"]
 
 # Pre-release alpha — adopters must pin the exact version
@@ -35,6 +43,50 @@ publish = true
 [[bin]]
 name = "cargo-lihaaf"
 path = "src/bin/cargo-lihaaf.rs"
+
+# Compat-mode integration tests live under `tests/compat/`. Cargo's
+# auto-discovery only picks up files at the top of `tests/`; for files
+# inside a subdirectory the `[[test]]` entry below registers them so
+# `cargo test --test cli_mode_errors` works.
+[[test]]
+name = "cli_mode_errors"
+path = "tests/compat/cli_mode_errors.rs"
+
+[[test]]
+name = "overlay_determinism"
+path = "tests/compat/overlay_determinism.rs"
+
+[[test]]
+name = "argv_baseline_no_shell"
+path = "tests/compat/argv_baseline_no_shell.rs"
+
+[[test]]
+name = "baseline_conservative"
+path = "tests/compat/baseline_conservative.rs"
+
+[[test]]
+name = "cleanup_dirty_worktree"
+path = "tests/compat/cleanup_dirty_worktree.rs"
+
+[[test]]
+name = "discovery_syn"
+path = "tests/compat/discovery_syn.rs"
+
+[[test]]
+name = "normalizer_compat_cargo"
+path = "tests/compat/normalizer_compat_cargo.rs"
+
+[[test]]
+name = "report_determinism"
+path = "tests/compat/report_determinism.rs"
+
+[[test]]
+name = "toolchain_resolution"
+path = "tests/compat/toolchain_resolution.rs"
+
+[[test]]
+name = "gate_smoke"
+path = "tests/compat/gate_smoke.rs"
 
 [dependencies]
 # CLI parsing — derive feature for the typed argument struct in `cli.rs`.
@@ -64,6 +116,40 @@ sha2 = "0.11"
 # it wrong on macOS where the system can rotate temp roots.
 tempfile = "3"
 
+# Static AST analysis for compat-mode fixture-invocation discovery
+# (Spec §3.2.1, Phase 6). A string-scan over `tests/*.rs` would
+# produce non-deterministic matches across crate styles; `syn`'s typed
+# visitor (`syn::visit::Visit<'_>`) bounds the recognized set to the
+# three patterns the spec names (direct `TestCases` calls, glob
+# arguments, `#[test]`-wrapped invocations) and produces the same
+# result on every clean-state run.
+#
+# Features:
+#   - `full`     — needed for `#[test] fn ...` item parsing (`syn::ItemFn`).
+#   - `visit`    — exposes the `syn::visit::Visit<'ast>` trait.
+#   - `parsing`  — `syn::parse_file(&str)` entry point.
+#
+# Pin to the major: `2` is current stable; `2.0.x` is already in the
+# build tree transitively via `clap_derive` and `serde_derive`, so
+# adding it as a direct dependency adds no new graph node — the
+# additional compile cost is only the lihaaf code that calls into the
+# visitor.
+#
+# The §6.1 "no regex" rule is preserved — `syn = "2"` does NOT pull a
+# `regex` / `regex-syntax` / `regex-automata` crate (verified by
+# `cargo tree | grep -E "regex(-syntax|-automata)?"` returning zero
+# lines after this dep is added).
+syn = { version = "2", features = ["full", "visit", "parsing"] }
+
+# `Span::start()` is gated on proc-macro2's `span-locations` feature
+# (see proc-macro2's `#[cfg(span_locations)]` in `lib.rs`). The compat
+# discovery walk needs line numbers to emit `discovery_unrecognized`
+# entries with file + line citations and to stamp `CallSite.line` on
+# every recognized fixture, so the feature must be activated. The
+# dependency is already in the graph transitively via `syn` and
+# `clap_derive`; declaring it explicitly here only toggles the feature.
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
 # Unix syscalls — `kill(2)` for spec §5.4 worker termination and
 # `sysconf(_SC_PAGESIZE)` for spec §5.4 RSS conversion. The `libc`
 # crate is the canonical curated source for POSIX FFI signatures and
@@ -90,7 +176,10 @@ windows-sys = { version = "0.59", features = [
 # No regex engine, ever. Spec §6.1. Every string match in this crate
 # goes through stdlib `str::find`, `split_once`, `starts_with`, byte
 # iteration, or sorted-slice lookup. Linux per-process RSS uses
-# `/proc/<pid>/statm` directly via stdlib file I/O.
+# `/proc/<pid>/statm` directly via stdlib file I/O. The §3.2.1 fixture
+# discovery walk uses `syn` (declared above) for AST analysis — `syn`
+# does NOT pull a regex crate (verified by `cargo tree | grep regex`
+# returning zero lines).
 
 [features]
 # Self-test marker for the multi-suite end-to-end corpus

@@ -1,0 +1,142 @@
+name: lihaaf compat gate (§5 dry-run)
+
+# Implements the v0.1.0-beta.4 dry-run scaffolding for the §5 pilot
+# gate (see `docs/compatibility-plan.md` §5 and
+# `docs/superpowers/plans/2026-05-13-compat-mode-implementation-plan.md`
+# Phase 10).
+#
+# For v0.1.0-beta.4 this is a NO-OP gate — no pilot crates are enrolled
+# in `compat/baseline.toml`, no pilot fork emits a §3.3 envelope yet,
+# and the gate-evaluation step is documentation only. The workflow
+# itself is wired up so subsequent pilot-PR additions don't need to add
+# net-new CI machinery.
+#
+# Security:
+# - Trigger is `pull_request_target` per the project's repo-wide GH
+#   Actions policy. The workflow checks out the BASE ref explicitly —
+#   fork-PR head code is NEVER executed in this workflow's elevated
+#   context.
+# - `permissions: contents: read` is the only token grant. No issue
+#   comments, no PR comments, no checks-API writes.
+# - The dry-run step is `echo` and a small TOML-parse sanity check
+#   against the BASE-ref `compat/baseline.toml` via the Python 3.11+
+#   stdlib `tomllib`. No cargo, no rustup, no untrusted code.
+
+on:
+  pull_request_target:
+    branches: [main]
+    paths:
+      - 'compat/**'
+      - 'src/compat/gate.rs'
+      - 'tests/compat/gate_smoke.rs'
+      - '.github/workflows/lihaaf-compat-gate.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'compat/**'
+      - 'src/compat/gate.rs'
+      - 'tests/compat/gate_smoke.rs'
+      - '.github/workflows/lihaaf-compat-gate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  dry-run:
+    name: §5 pilot gate (dry-run)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout BASE ref only
+        # `pull_request_target` defaults to the BASE ref, but we pin to
+        # the BASE SHA explicitly so a malicious PR cannot influence the
+        # ref resolution. `persist-credentials: false` prevents the
+        # write-scoped GITHUB_TOKEN from leaking into subsequent steps —
+        # nothing in this workflow needs it.
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Validate compat/baseline.toml schema (BASE ref)
+        # `cargo test --test gate_smoke` in the main `ci.yml` workflow
+        # exhaustively covers the TOML parse-rejection paths. This step
+        # is a cheap sanity check that the BASE-ref baseline file
+        # parses as valid TOML and every enrolled crate row has the
+        # expected `n_max` non-negative integer. The check is in Python
+        # (3.11+ stdlib `tomllib`) so we avoid the cargo build cost on
+        # every PR that touches `compat/`.
+        run: |
+          set -euo pipefail
+
+          if [ ! -f compat/baseline.toml ]; then
+            echo "::error::compat/baseline.toml is missing from the BASE ref"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import sys
+          import tomllib
+
+          with open("compat/baseline.toml", "rb") as f:
+              data = tomllib.load(f)
+
+          if not isinstance(data, dict):
+              print("compat/baseline.toml top level must be a table", file=sys.stderr)
+              sys.exit(1)
+
+          for crate, entry in data.items():
+              if not isinstance(entry, dict):
+                  print(
+                      f"compat/baseline.toml entry for `{crate}` must be a table",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              if "n_max" not in entry:
+                  print(
+                      f"compat/baseline.toml entry for `{crate}` is missing required key `n_max`",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+              n_max = entry["n_max"]
+              if not isinstance(n_max, int) or isinstance(n_max, bool) or n_max < 0:
+                  print(
+                      f"compat/baseline.toml `{crate}.n_max` must be a non-negative integer (got {n_max!r})",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+
+          print(f"compat/baseline.toml: schema valid, {len(data)} crate ceiling(s) enrolled")
+          PY
+
+      - name: §5 dry-run gate verdict (v0.1.0-beta.4)
+        run: |
+          set -euo pipefail
+          echo "================================================================"
+          echo "lihaaf-compat-gate v0.1.0-beta.4 — §5 DRY-RUN"
+          echo "================================================================"
+          echo
+          echo "This workflow is wired up for the §5 pilot-gate flow."
+          echo "v0.1.0-beta.4 ships with an empty compat/baseline.toml — no"
+          echo "pilot crates are enrolled yet, and no pilot fork emits a §3.3"
+          echo "envelope. The gate step below is a NO-OP for this release."
+          echo
+          echo "Future pilot-fork PRs to this repository will:"
+          echo "  1. add their crate to compat/baseline.toml (with the"
+          echo "     initial N_<crate> ceiling derived from their first"
+          echo "     stable run);"
+          echo "  2. wire envelope production into their fork's CI so a"
+          echo "     compat-report.json artifact is uploaded on each PR;"
+          echo "  3. extend this workflow to download that artifact and"
+          echo "     invoke lihaaf::compat_check_gate against the BASE-ref"
+          echo "     compat/baseline.toml."
+          echo
+          if [ -s compat/baseline.toml ]; then
+            ROWS=$(grep -c '^\[' compat/baseline.toml || true)
+            echo "compat/baseline.toml: present, ${ROWS} crate ceiling(s) enrolled"
+          else
+            echo "compat/baseline.toml: present, empty (v0.1.0-beta.4 default)"
+          fi
+          echo
+          echo "gate verdict: ALLOW (dry-run; no envelope to evaluate)"

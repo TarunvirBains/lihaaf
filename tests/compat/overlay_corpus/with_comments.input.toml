@@ -1,0 +1,8 @@
+# Top-level header comment
+[package]
+name = "demo"          # crate name
+version = "0.1.0"
+
+# pin reason: 1.x has a known regression
+[dependencies]
+serde = "1" # critical bound
