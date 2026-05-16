@@ -48,10 +48,26 @@ invocation:
 - Workflow logs and uploaded artifacts appear in **lihaaf's Actions
   tab**, not each fork's Actions tab. `gh run download` examples
   below pass `--repo TarunvirBains/lihaaf`.
-- The fork's resolved HEAD SHA is captured by a dedicated step
-  (`git rev-parse HEAD` after checkout) and threaded into the §3.3
-  envelope via `cargo lihaaf --compat-commit "$FORK_SHA"`. Stage-3
-  PR reviewers reproduce from envelope alone.
+- The fork's resolved HEAD SHA is recorded via the native `commit`
+  output of `actions/checkout` (no separate `git rev-parse` step) and
+  threaded into the §3.3 envelope via `cargo lihaaf --compat-commit
+  "$FORK_SHA"`. Stage-3 PR reviewers reproduce from envelope alone.
+
+### Public-only forks (v0.1)
+
+v0.1 pilot forks MUST be public repositories. The orchestrator's
+GITHUB_TOKEN is scoped to `TarunvirBains/lihaaf` only; cross-repo
+`actions/checkout` against a private fork returns 403 because that
+token carries zero scope on the fork repo. The four v0.1 forks
+(`cxx-lihaaf-pilot`, `serde-json-lihaaf-pilot`, `anyhow-lihaaf-pilot`,
+`thiserror-lihaaf-pilot`) are forks of public upstream crates, so they
+default to public. Verify each fork's **Settings → General → Danger
+Zone** shows "Public repository" before enrolling.
+
+Private-fork support is **v0.2 work** and requires a PAT-based
+dispatch design (the orchestrator would need a PAT scoped across each
+fork, with the corresponding rotation procedure — out of scope for
+v0.1 GA).
 
 ## One-time fork setup
 
@@ -184,7 +200,8 @@ under one orchestrator run.
    `<pilot-name>` is one of `cxx`, `serde-json`, `anyhow`,
    `thiserror`. Artifact names include `<pilot-name>` because all
    four shards share the orchestrator's `github.run_id` and
-   `upload-artifact@v4` rejects duplicate names within a run.
+   `actions/upload-artifact@v4.6.2` (the SHA pinned in
+   `pilot-stage2.yml`) rejects duplicate names within a run.
 
 ## Opening a stage-3 PR
 

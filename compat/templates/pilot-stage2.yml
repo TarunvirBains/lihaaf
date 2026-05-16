@@ -84,7 +84,7 @@ on:
         description: 'Name of the uploaded envelope artifact (download via `gh run download`)'
         value: ${{ jobs.compat-run.outputs.envelope_artifact_name }}
       fork_sha:
-        description: 'Resolved fork HEAD SHA (`git rev-parse HEAD` after checkout). Recorded in the §3.3 envelope `commit` field via `--compat-commit`.'
+        description: 'Resolved fork HEAD SHA (native `commit` output from actions/checkout). Recorded in the §3.3 envelope `commit` field via `--compat-commit`.'
         value: ${{ jobs.compat-run.outputs.fork_sha }}
 
 permissions:
@@ -104,7 +104,11 @@ jobs:
       baseline_exit_code: ${{ steps.parse.outputs.baseline_exit_code }}
       lihaaf_exit_code: ${{ steps.parse.outputs.lihaaf_exit_code }}
       envelope_artifact_name: ${{ steps.artifact-name.outputs.name }}
-      fork_sha: ${{ steps.fork_sha.outputs.sha }}
+      # Native `commit` output from actions/checkout (pinned SHA above
+      # is v6.0.2; the action exposes the resolved HEAD SHA as
+      # `steps.<id>.outputs.commit`). No separate `git rev-parse` step
+      # needed — the action already does it.
+      fork_sha: ${{ steps.checkout.outputs.commit }}
 
     steps:
       - name: Checkout fork
@@ -116,23 +120,20 @@ jobs:
         # `persist-credentials: false` prevents the (read-only)
         # GITHUB_TOKEN from leaking into later steps; `cargo install`
         # and the compat run never need it.
+        #
+        # `id: checkout` is load-bearing: the action's `commit` output
+        # is consumed by the `--compat-commit` flag (writes the SHA
+        # into the §3.3 envelope's `commit` field) and by the
+        # workflow-level `fork_sha` output (surfaced to the
+        # orchestrator for cross-fork audit). Prior to round-3 a
+        # separate `git rev-parse HEAD` step recomputed this — that
+        # step is removed because actions/checkout already exposes
+        # the value natively.
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2 as of 2026-05-16
         with:
           repository: ${{ inputs.fork_repo }}
           ref: ${{ inputs.fork_ref }}
           persist-credentials: false
-
-      - name: Capture fork commit SHA
-        id: fork_sha
-        # Captures the resolved HEAD SHA of the fork after checkout.
-        # This feeds two consumers: the `--compat-commit` flag below
-        # (writes the SHA into the §3.3 envelope's `commit` field, so
-        # stage-3 PR reviewers can reproduce from envelope alone) and
-        # the `fork_sha` workflow output (surfaced to the orchestrator
-        # for cross-fork audit).
-        run: |
-          set -euo pipefail
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install Rust toolchain (MSRV-pinned)
         # MSRV-pinned per lihaaf's published Cargo.toml `rust-version =
@@ -152,18 +153,29 @@ jobs:
         # `--locked` honors lihaaf's published Cargo.lock so transitive
         # deps are deterministic across pilot runs.
         #
-        # Injection-defense: `lihaaf_version` is read via env: (not
-        # direct ${{ }} interpolation into the script body) AND a
-        # strict semver regex rejects any value containing shell
-        # metacharacters before `cargo install` is invoked. The regex
-        # accepts `MAJOR.MINOR.PATCH` and an optional pre-release tag
-        # `-foo.bar` (e.g. `0.1.0-beta.4`).
+        # Injection-defense (round-3 hardening):
+        # - `lihaaf_version` is read via env: (not direct ${{ }}
+        #   interpolation into the script body), so GitHub never
+        #   expands operator input into the shell command line.
+        # - A strict SemVer regex rejects any value containing shell
+        #   metacharacters BEFORE `cargo install` is invoked.
+        # - The match uses bash's `[[ =~ ]]` (whole-string match), not
+        #   `grep -qE` (per-line match). `grep -qE` would accept
+        #   `0.1.0\nmalicious` because the first line satisfies the
+        #   anchored regex; `[[ =~ ]]` anchors against the entire
+        #   value, so any embedded newline is rejected.
+        # - The regex accepts `MAJOR.MINOR.PATCH`, an optional
+        #   pre-release tag `-IDS` (alphanumerics, dots, hyphens —
+        #   covers `0.1.0-rc-1` and `0.1.0-beta.4`), and an optional
+        #   build-metadata tag `+IDS` (`0.1.0+build.1`). Per SemVer
+        #   §9-10 the prerelease and build segments may contain
+        #   hyphens, which round-2's `[a-zA-Z0-9.]` class rejected.
         env:
           LIHAAF_VERSION: ${{ inputs.lihaaf_version }}
         run: |
           set -euo pipefail
-          if ! printf '%s' "$LIHAAF_VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?$'; then
-            echo "::error::Invalid lihaaf_version (must be semver, optionally with prerelease tag): $LIHAAF_VERSION"
+          if [[ ! "$LIHAAF_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.-]+)?(\+[a-zA-Z0-9.-]+)?$ ]]; then
+            echo "::error::Invalid lihaaf_version (must be semver, optionally with prerelease and/or build metadata): $LIHAAF_VERSION"
             exit 1
           fi
           cargo install lihaaf --version "$LIHAAF_VERSION" --locked
@@ -192,7 +204,7 @@ jobs:
         # non-zero exit.
         continue-on-error: true
         env:
-          FORK_SHA: ${{ steps.fork_sha.outputs.sha }}
+          FORK_SHA: ${{ steps.checkout.outputs.commit }}
         run: |
           set -uo pipefail
           mkdir -p target/lihaaf-compat
@@ -258,11 +270,34 @@ jobs:
         # same `github.run_id` (the orchestrator's). Without the
         # pilot-name discriminator, `upload-artifact@v4` would reject
         # the second uploader with a duplicate-name error.
-        run: echo "name=compat-envelope-${{ inputs.pilot_name }}-${{ github.run_id }}" >> "$GITHUB_OUTPUT"
+        #
+        # Injection-defense (round-3): `pilot_name` reaches the shell
+        # via env: rather than direct ${{ }} interpolation. Even though
+        # pilot_name is set by the orchestrator (not an untrusted
+        # external party), the consistent env-only rule for every
+        # run: body removes the audit burden of identifying which
+        # individual inputs are operator-controlled vs lihaaf-controlled.
+        # `github.run_id` is integer-valued and safe but is routed the
+        # same way for the same audit-uniformity reason.
+        env:
+          PILOT_NAME: ${{ inputs.pilot_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: echo "name=compat-envelope-$PILOT_NAME-$RUN_ID" >> "$GITHUB_OUTPUT"
 
       - name: Upload §3.3 envelope artifact
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v7.0.1 as of 2026-05-16
+        # SHA `ea165f8d65b6e75b540449e92b4886f43607fa02` resolves to
+        # actions/upload-artifact v4.6.2 (2025-03-19), NOT v7.0.1 as a
+        # prior comment misstated. Staying on v4.x for v0.1: v7
+        # introduced a breaking compression-default change
+        # (zstd-vs-gzip) plus altered concurrency semantics, and the
+        # v0.1 envelope artifact is small JSON — no v7-specific
+        # capability is required. Rotation to v7.x is a v0.2 task and
+        # gated on a re-pinning audit.
+        # TODO(pre-merge): verify SHA→version mapping against
+        # https://github.com/actions/upload-artifact/releases before
+        # the v0.1.0 GA cut.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 as of 2025-03-19
         with:
           name: ${{ steps.artifact-name.outputs.name }}
           path: target/lihaaf-compat/compat-report.json
@@ -274,34 +309,59 @@ jobs:
 
       - name: Write step summary
         if: always()
-        # The "stage-3 enrollment" TOML block is only meaningful when
-        # the parse step succeeded (i.e. an envelope was produced and
-        # `crate_name` was extracted). If parse failed, emit a
-        # diagnostic instead so the operator is not handed a
-        # misleading TOML row.
+        # Injection-defense (round-3 hardening):
+        # Same pattern as the install step above — every `${{ ... }}`
+        # expression that would otherwise be expanded INTO the shell
+        # script body is lifted into an env: block and referenced as
+        # a quoted "$VAR". Reason: under `if: always()`, this step
+        # runs even when the install step's regex check rejected and
+        # exited 1. If `inputs.lihaaf_version` were spliced directly
+        # into `echo "${{ inputs.lihaaf_version }}"`, an attacker who
+        # dispatched the orchestrator with `0.1.0$(id)` could still
+        # cause `$(id)` to execute here — the regex guard above only
+        # protects `cargo install`, not subsequent step bodies. The
+        # env: block defeats that vector for the whole step.
+        #
+        # The TOML-row gate moves INSIDE the run body as a shell-side
+        # `if [ -n "$CRATE_NAME" ]` test rather than a step-level
+        # `if:` predicate, so the diagnostic table is still rendered
+        # even when crate_name is empty (envelope missing/malformed)
+        # — operators get the exit codes and artifact name even on
+        # the failure path.
+        env:
+          PILOT_NAME: ${{ inputs.pilot_name }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          FORK_REF: ${{ inputs.fork_ref }}
+          FORK_SHA: ${{ steps.checkout.outputs.commit }}
+          LIHAAF_VERSION: ${{ inputs.lihaaf_version }}
+          CRATE_NAME: ${{ steps.parse.outputs.crate_name }}
+          MISMATCH_COUNT: ${{ steps.parse.outputs.mismatch_count }}
+          BASELINE_EXIT: ${{ steps.parse.outputs.baseline_exit_code }}
+          LIHAAF_EXIT: ${{ steps.parse.outputs.lihaaf_exit_code }}
+          ARTIFACT_NAME: ${{ steps.artifact-name.outputs.name }}
         run: |
           set -euo pipefail
           {
-            echo "## lihaaf compat stage-2 — \`${{ inputs.pilot_name }}\`"
+            echo "## lihaaf compat stage-2 — \`$PILOT_NAME\`"
             echo
             echo "| field | value |"
             echo "| --- | --- |"
-            echo "| fork repo | \`${{ inputs.fork_repo }}\` |"
-            echo "| fork ref | \`${{ inputs.fork_ref }}\` |"
-            echo "| fork SHA | \`${{ steps.fork_sha.outputs.sha }}\` |"
-            echo "| lihaaf version | \`${{ inputs.lihaaf_version }}\` |"
-            echo "| crate_name | \`${{ steps.parse.outputs.crate_name }}\` |"
-            echo "| mismatch_count | \`${{ steps.parse.outputs.mismatch_count }}\` |"
-            echo "| baseline.exit_code | \`${{ steps.parse.outputs.baseline_exit_code }}\` |"
-            echo "| lihaaf.exit_code | \`${{ steps.parse.outputs.lihaaf_exit_code }}\` |"
-            echo "| envelope artifact | \`${{ steps.artifact-name.outputs.name }}\` |"
+            echo "| fork repo | \`$FORK_REPO\` |"
+            echo "| fork ref | \`$FORK_REF\` |"
+            echo "| fork SHA | \`$FORK_SHA\` |"
+            echo "| lihaaf version | \`$LIHAAF_VERSION\` |"
+            echo "| crate_name | \`$CRATE_NAME\` |"
+            echo "| mismatch_count | \`$MISMATCH_COUNT\` |"
+            echo "| baseline.exit_code | \`$BASELINE_EXIT\` |"
+            echo "| lihaaf.exit_code | \`$LIHAAF_EXIT\` |"
+            echo "| envelope artifact | \`$ARTIFACT_NAME\` |"
             echo
-            if [ -n "${{ steps.parse.outputs.crate_name }}" ]; then
+            if [ -n "$CRATE_NAME" ]; then
               echo "Stage-3 enrollment: open a PR to \`TarunvirBains/lihaaf\` adding a row to \`compat/baseline.toml\`:"
               echo
               echo "\`\`\`toml"
-              echo "[${{ steps.parse.outputs.crate_name }}]"
-              echo "n_max = ${{ steps.parse.outputs.mismatch_count }}"
+              echo "[$CRATE_NAME]"
+              echo "n_max = $MISMATCH_COUNT"
               echo "\`\`\`"
             else
               echo "Stage-3 enrollment row NOT generated: the parse step did not produce a crate_name (envelope missing or malformed). Inspect the previous step's logs."
