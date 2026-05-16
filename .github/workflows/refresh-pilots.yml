@@ -1,0 +1,85 @@
+name: refresh pilots (stage-2 cross-repo)
+
+# v0.1 pilot-refresh orchestrator. Invokes the reusable
+# `pilot-stage2.yml` workflow over every enrolled pilot fork
+# synchronously via cross-repo `workflow_call`. See
+# `compat/PILOTS.md` for the full operational flow and the v0.2
+# refresh strategy.
+#
+# Auth: each cross-repo `uses:` call runs in the CALLED workflow's
+# own context with its OWN default GITHUB_TOKEN (issued by GitHub for
+# that workflow run). No PAT is required, and lihaaf's own
+# GITHUB_TOKEN is NOT forwarded to the called workflow. The user
+# owns all four pilot forks listed below, so cross-org governance is
+# not a concern.
+#
+# Security:
+# - `workflow_dispatch` ONLY. NO `pull_request` / `pull_request_target`
+#   trigger. Reason: cross-repo `workflow_call` from a PR-triggered
+#   workflow risks exposing lihaaf's GITHUB_TOKEN to the called
+#   workflow's environment, and the called workflow runs in the FORK's
+#   context. Manual-only invocation eliminates that surface and matches
+#   the v0.1 manual drift-detection cadence.
+# - `permissions: contents: read` at workflow level. No issue / PR /
+#   checks-API writes.
+# - The matrix list is HARDCODED here. Adding a new pilot requires a PR
+#   to this file; this is intentional — pilot enrollment is a
+#   review-gated event, not a config-file dynamic.
+#
+# v0.2 may add a scheduled trigger:
+#   schedule:
+#     - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+# Intentionally NOT enabled for v0.1: scheduled refreshes blur the
+# stage-3 enrollment audit trail (a baseline.toml ceiling drift caused
+# by a midnight refresh is harder to attribute than one tied to an
+# explicit `Run workflow` click).
+
+on:
+  workflow_dispatch:
+    inputs:
+      lihaaf_version:
+        description: 'lihaaf version each pilot installs via `cargo install` (published crates.io version)'
+        required: false
+        type: string
+        default: '0.1.0-beta.4'
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    name: refresh ${{ matrix.pilot }}
+    # `fail-fast: false` so one fork's failure (build break, lihaaf
+    # version mismatch, etc.) does not cancel the other three. Each
+    # pilot is independent for §5 baseline.toml purposes.
+    strategy:
+      fail-fast: false
+      matrix:
+        # Hardcoded for v0.1. Naming convention:
+        # `TarunvirBains/<upstream-crate-name>-lihaaf-pilot`.
+        # `<crate-name>` is read from each fork's envelope at runtime,
+        # so renaming the fork repo here suffices.
+        pilot:
+          - cxx-lihaaf-pilot
+          - serde-json-lihaaf-pilot
+          - anyhow-lihaaf-pilot
+          - thiserror-lihaaf-pilot
+
+    # Cross-repo reusable-workflow call. The called workflow runs in
+    # `TarunvirBains/${{ matrix.pilot }}`'s own context — its own
+    # GITHUB_TOKEN, its own runner — and exposes the §3.3 envelope as
+    # an artifact in THAT repo's Actions tab. Operators inspect results
+    # per-fork (see `compat/PILOTS.md` for the workflow).
+    #
+    # Matrix-job outputs in GitHub Actions only retain the LAST
+    # matrix entry's values (silent overwrite). We intentionally do NOT
+    # consume `needs.refresh.outputs.*` from a downstream summarize
+    # job for v0.1 — operator inspects each fork's Actions tab
+    # directly. v0.2 may aggregate via a dedicated artifact-collection
+    # step that re-downloads each pilot's envelope into a single
+    # summary blob.
+    uses: TarunvirBains/${{ matrix.pilot }}/.github/workflows/pilot-stage2.yml@main
+    with:
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
