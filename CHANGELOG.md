@@ -6,6 +6,133 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.4] — 2026-05-16
+
+Headline addition: **compat mode** — a fork-driven workflow letting
+adopters compare their trybuild baseline against lihaaf's per-fixture
+verdicts via a deterministic §3.3 JSON envelope. Adopters opt in with
+`cargo lihaaf --compat --compat-root <DIR> --compat-report <PATH>`. The
+companion `compat/baseline.toml` ceiling table + `lihaaf-compat-gate.yml`
+workflow ship empty / dry-run for beta-4 — pilot crates enroll
+post-cut by PR-ing rows to `baseline.toml`. Closes #8 #9 #10 #11 #12.
+
+The `[package.metadata.lihaaf]` schema, §3.3 envelope shape, exit codes,
+and snapshot byte format are unchanged from v0.1.0-beta.3 — compat
+mode is a NEW surface, not a modification of existing ones.
+
+### Added
+- **Compat-mode driver** (`src/compat/`): 10-step pipeline reading
+  upstream `Cargo.toml`, materializing a sibling overlay (`Cargo.lihaaf.toml`)
+  with synthetic `[package.metadata.lihaaf]`, running an argv-only
+  baseline `cargo test`, discovering trybuild fixtures via syn AST walk,
+  converting fixtures to `<compat_root>/target/lihaaf-compat-converted/{compile_pass,compile_fail}/`,
+  invoking `lihaaf::run` in-process for the inner session, capturing
+  the active toolchain via `rustup show active-toolchain`, and writing
+  the §3.3 envelope atomically.
+- **§5 pilot gate primitives** (`src/compat/gate.rs`): `Ceiling`,
+  `GateOutcome::{Allow, NotEnrolled, Block}`, `parse_baseline`,
+  `load_baseline`, `check_gate`. Gate enforces 5 rules from
+  `docs/compatibility-plan.md:239-244`: errors empty, mismatch_count
+  ≤ N_<crate>, both baseline+lihaaf exit codes equal expected,
+  per-side totals match (with `excluded_fixtures` accounting).
+- **§5 baseline schema**: `compat/baseline.toml` (top-level table per
+  crate with `n_max: u32` + optional `expected_exit_code: Option<i32>`).
+  Ships empty for v0.1.0-beta.4.
+- **`compat/KNOWN_DIFFS.md`**: documents tracked divergences and v0.2
+  resolution paths (wrapper-vs-per-fixture totals; Windows read-only
+  cleanup; baseline.toml schema versioning).
+- **CI workflow `lihaaf-compat-gate.yml`** (dry-run for beta-4): runs
+  on `pull_request_target` against `compat/**` changes; BASE-ref-only
+  checkout via `${{ github.event.pull_request.base.sha }}`;
+  `permissions: contents: read`; embedded Python `tomllib` validator
+  asserts `baseline.toml` schema. No untrusted code execution in
+  elevated context.
+- **Doc-hidden re-exports** (`src/lib.rs`): `CompatEnvelope` + 9 nested
+  types + `compat_check_gate` / `compat_parse_baseline` /
+  `compat_load_baseline` / `CompatGateCeiling` / `CompatGateOutcome`
+  for the in-tree `gate_smoke` integration test and future out-of-tree
+  CI runners.
+- **`compat::cli::CompatArgs`** + 7 compat-mode CLI flags
+  (`--compat`, `--compat-root`, `--compat-report`, `--compat-manifest`,
+  `--compat-commit`, `--compat-filter`, `--compat-trybuild-macro`,
+  `--compat-cargo-test-argv`). `Cli::validate_mode_consistency` blocks
+  cross-mode mistakes at parse time.
+- **Race-free path removal** (`src/util.rs::remove_path_race_free`):
+  shared `remove_file` → `remove_dir` → `remove_dir_all` cascade with
+  `#[cfg(windows)]` arms for ACCESS_DENIED dispatch. Used by
+  `compat::cleanup`, `dylib::copy_dylib`, `dylib::symlink_dylib`,
+  `session` `--no-cache` cleanup.
+
+### Changed
+- **Normalizer** (`src/normalize.rs`): added `compat_short_cargo: bool`
+  flag and `$CARGO/<crate>-<ver>/...` short-form rewrite (§3.2.2 spec).
+  Plumbed through `pub(crate) Cli::inner_compat_normalize` (`#[arg(skip)]`)
+  + `NormalizationContext::with_compat_short_cargo` builder; compat
+  driver flips the flag for inner-session normalization.
+- **`session.rs` `--no-cache`**: replaced two `if .exists() { let _ = ... }`
+  stat-then-act blocks with `util::remove_path_race_free` calls;
+  errors now propagate instead of being silently swallowed.
+- **`dylib.rs::copy_dylib` / `symlink_dylib`**: stat-then-act removal
+  pattern replaced with `util::remove_path_race_free`.
+
+### Fixed
+- TOCTOU race in `compat::cleanup::remove_path_best_effort` (the
+  stat-then-branch pattern that could follow a freshly-planted symlink
+  out of the intended target tree).
+- Linux EACCES misclassified as Windows ACCESS_DENIED in the cleanup
+  cascade — `PermissionDenied` arm now `#[cfg(windows)]`-only.
+- Windows read-only non-empty directory regression in cleanup step 2
+  (RemoveDirectoryW returns `PermissionDenied`; now falls through to
+  step 3).
+- `compat::run` no longer pushes `baseline_unknown` into
+  `envelope.errors[]`; the §5 gate's errors-empty rule consequently
+  doesn't fire on the libtest wrapper line that every trybuild adopter
+  produces.
+- `rustup show active-toolchain` failure no longer short-circuits the
+  envelope write; failures flow into `envelope.errors[]` as
+  `toolchain_capture_failed` and the envelope is still emitted.
+- `compat::run` calls `rustup` with `current_dir(&compat_root)` so the
+  pilot fork's `rust-toolchain.toml` resolves correctly.
+- `fixture_convert::convert_fixtures` removes the prior converted tree
+  before recreating, eliminating stale `.stderr` snapshots that could
+  corrupt re-run verdicts.
+- TOCTOU in `fixture_convert.rs` stderr snapshot copy: replaced
+  `src_stderr.exists()` pre-check with `match remove_file → ErrorKind::NotFound`.
+- §5 gate now honors `expected_exit_code: Option<i32>` per crate row —
+  pilots with documented non-zero baseline exits can pass the gate.
+- `fixture_dirs` in the synthetic metadata block now points at the
+  `compile_pass/` and `compile_fail/` child directories (lihaaf's
+  discovery is non-recursive) and emits repo-relative forward-slash
+  strings (byte-deterministic across Linux/macOS/Windows). Previous
+  code pointed at the parent and used `to_string_lossy()` (platform-
+  dependent backslashes on Windows).
+
+### Internal
+- **5 rounds of adversarial review** converged on triple-ALLOW. Codex
+  (xhigh) + Gemini 3.1-pro-preview (plan mode) + strict-swe (Opus,
+  --effort max for round 3+; Sonnet for rounds 1-2). Round 1 surfaced
+  8 critical bugs (incl. the fixture_dirs / non-recursive discovery
+  mismatch that defeated the entire driver, and the `compat_short_cargo`
+  flag never reaching the inner session); rounds 2-5 progressively
+  surfaced smaller real bugs as family-completeness sweeps deepened.
+- Strict-swe was escalated from Sonnet to Opus mid-cycle after Sonnet
+  missed Codex's critical fixture_dirs finding in round 1 — the diff
+  needed multi-file context Sonnet couldn't sustain.
+- Codex round-3 caught the deepest finding of the cycle: the
+  `unknown_count == 0` gate rule that was nominally removed in round-2
+  commit `89fec16` was still firing via `errors.is_empty()` because
+  `compat::run` was still pushing `baseline_unknown` into `errors[]`.
+  Type-system fix in round-4 commit `e851d94`: `assemble_diagnostic_errors`
+  helper's signature CANNOT take `unknown_count` as a parameter.
+- Test parallelism: added `static SPAWN_LOCK: Mutex<()>` in
+  `tests/compat/cli_mode_errors.rs` to serialize cargo-lihaaf
+  subprocess spawns within the binary (root cause of WSL2 global OOM
+  observed in the development cycle).
+- Two `compat_run_accepts_*` tests in `cli_mode_errors.rs` rewritten
+  at parser layer using `Cli::try_parse_from` — no longer spawn
+  cargo-lihaaf against the lihaaf repo itself (Phase-1-stub-era
+  assumption broken by the real Phase-10 driver).
+
 ## [0.1.0-beta.3] — 2026-05-14
 
 Follow-up simplification pass closing the three deferred Codex SIBLING
