@@ -293,10 +293,8 @@ jobs:
         # (zstd-vs-gzip) plus altered concurrency semantics, and the
         # v0.1 envelope artifact is small JSON — no v7-specific
         # capability is required. Rotation to v7.x is a v0.2 task and
-        # gated on a re-pinning audit.
-        # TODO(pre-merge): verify SHA→version mapping against
-        # https://github.com/actions/upload-artifact/releases before
-        # the v0.1.0 GA cut.
+        # gated on a re-pinning audit. SHA→tag mapping verified
+        # 2026-05-16 via `gh api repos/actions/upload-artifact/git/refs/tags/v4.6.2`.
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 as of 2025-03-19
         with:
           name: ${{ steps.artifact-name.outputs.name }}
