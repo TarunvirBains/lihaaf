@@ -252,6 +252,100 @@ fn json_value_kind(v: &serde_json::Value) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Global mutex that serializes any test that mutates `std::env::current_dir`.
+    ///
+    /// Rust's test runner executes unit tests in parallel within a single process.
+    /// `set_current_dir` writes process-global state, so concurrent mutations
+    /// would race. Tests that call `set_current_dir` must hold this lock for
+    /// the duration of the mutation + restore cycle.
+    static CWD_MUTEX: Mutex<()> = Mutex::new(());
+
+    /// **`CompatArgs::from_cli` absolutizes a relative `--compat-root`.**
+    ///
+    /// Production CI invokes compat mode with `--compat-root .` (see
+    /// `compat/templates/pilot-stage2.yml`). This test exercises
+    /// `CompatArgs::from_cli` end-to-end with a relative path and asserts
+    /// that the resulting `compat_root` field is absolute, proving that a
+    /// future regression removing the `absolutize_required_path` call would
+    /// break this test.
+    ///
+    /// **Test design.** We create a tempdir, `cd` into it, pass a relative
+    /// sub-directory name (just the basename) as `--compat-root`, and assert
+    /// `compat_root.is_absolute()` on the resulting `CompatArgs`. We also
+    /// assert that the absolute path ends with the subdir basename so the
+    /// test is not trivially satisfied by an unrelated absolute path.
+    #[test]
+    fn from_cli_absolutizes_relative_compat_root() {
+        let tmp = tempfile::tempdir().expect("creating tempdir for cli absolutize test");
+        let subdir_name = "my-crate-root";
+        let subdir = tmp.path().join(subdir_name);
+        std::fs::create_dir_all(&subdir).expect("creating subdir inside tempdir");
+
+        let original_cwd = std::env::current_dir().expect("getting cwd before test");
+
+        let result = {
+            // Scope the mutex guard tightly: acquire, mutate cwd, run
+            // `from_cli`, restore cwd, release.  Panic-safety: if
+            // `from_cli` panics the guard is poisoned, not worse.
+            let _guard = CWD_MUTEX
+                .lock()
+                .expect("CWD_MUTEX lock should not be poisoned");
+            std::env::set_current_dir(tmp.path()).expect("cd into tempdir");
+
+            // Build a minimal Cli with compat_root set to the RELATIVE subdir name.
+            // compat_report is also required by validate_mode_consistency but the
+            // test only exercises compat_root; give it an absolute path to avoid
+            // a second relative-path interaction.
+            let cli = crate::cli::Cli {
+                bless: false,
+                compat: true,
+                compat_cargo_test_argv: None,
+                compat_commit: None,
+                compat_filter: Vec::new(),
+                compat_manifest: None,
+                compat_report: Some(tmp.path().join("report.json")),
+                compat_root: Some(std::path::PathBuf::from(subdir_name)),
+                compat_trybuild_macro: Vec::new(),
+                filter: Vec::new(),
+                jobs: None,
+                suite: Vec::new(),
+                no_cache: false,
+                manifest_path: None,
+                list: false,
+                quiet: false,
+                verbose: false,
+                use_symlink: false,
+                keep_output: false,
+                inner_compat_normalize: false,
+            };
+
+            let r = CompatArgs::from_cli(cli);
+
+            // Restore cwd before releasing the lock so other tests see a
+            // clean process state even if the assertion below panics.
+            std::env::set_current_dir(&original_cwd)
+                .expect("restoring original cwd after absolutize test");
+
+            r
+        };
+
+        let args = result.expect("from_cli must succeed with a valid relative compat_root");
+        assert!(
+            args.compat_root.is_absolute(),
+            "from_cli must absolutize --compat-root; got `{}`",
+            args.compat_root.display()
+        );
+        assert!(
+            args.compat_root
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n == subdir_name),
+            "absolutized compat_root must end with `{subdir_name}`; got `{}`",
+            args.compat_root.display()
+        );
+    }
 
     #[test]
     fn default_argv_parses_to_cargo_test() {

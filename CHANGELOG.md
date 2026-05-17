@@ -40,7 +40,10 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   `[package].workspace`, `[package] build`, and
   `[patch.<registry>.X] path` (the `git`/`branch`/`tag`/`rev` fields
   in `[patch]` pass through verbatim; only `path`-form overrides are
-  rewritten — fixing the cxx pilot pattern `cxx = { path = "." }`).
+  rewritten — fixing the cxx pilot pattern `cxx = { path = "." }`),
+  and `[replace."<source-id>"] path` (the older soft-deprecated
+  replacement form; same absolutization semantics and same family of
+  failure as `[patch]` — R3 FIX class IV).
   Auto-discovery for `[[bin]]` / `[[example]]` / `[[test]]` /
   `[[bench]]` is explicitly disabled (`autobins = false`, etc.) so a
   future cargo version that hardens the empty-discovery case does not
@@ -65,6 +68,16 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   `<compat_root>` directly so the inner session sees the real
   on-disk locations regardless of where the overlay manifest is
   staged.
+- **`commands.lihaaf` envelope field no longer leaks absolute paths**
+  (`src/compat/mod.rs` `render_inner_command`): the `--manifest-path`
+  argument was previously serialized via `overlay_manifest.to_string_lossy()`,
+  embedding the runner-specific absolute checkout path (e.g.
+  `/home/runner/work/my-crate/my-crate/target/lihaaf-overlay/Cargo.toml`).
+  This violated the §3.3 determinism rule: two CI runners at different
+  checkout roots produced non-identical envelope bytes. Fix: strip the
+  `compat_root` prefix via `Path::strip_prefix` before serialization,
+  producing the canonical repo-relative form `target/lihaaf-overlay/Cargo.toml`
+  on every runner (R3 FIX class III).
 
 ### Changed
 - **`docs/compatibility-plan.md` §3.2.3** rewritten to describe the
@@ -122,7 +135,27 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   `absolutizes_workspace_default_members`,
   `absolutizes_workspace_dependencies_path`) and two unit tests for
   FIX class C (`absolutizes_patch_registry_path`,
-  `absolutize_leaves_absolute_patch_path_unchanged`).
+  `absolutize_leaves_absolute_patch_path_unchanged`). Round-4 (R3
+  panel): corrects the two failing class-B/C unit-test expectations to
+  match `Path::join` semantics (no normalization — `..` and `.` are
+  preserved), adds `absolutizes_replace_path` for FIX class IV
+  (`[replace]`), and adds
+  `render_inner_command_manifest_path_is_repo_relative` (FIX class III
+  — §3.3 envelope determinism).
+- `src/compat/cli.rs`: `from_cli_absolutizes_relative_compat_root`
+  (R3 FIX class II) exercises `CompatArgs::from_cli` end-to-end with
+  a relative `--compat-root` basename and asserts the resulting
+  `compat_root` is absolute. Previously the test suite only checked
+  absolutization implicitly via the overlay layer; this test bites a
+  future regression that removes the `absolutize_required_path` call
+  from `from_cli`.
+- `tests/compat/overlay_determinism.rs`:
+  `replace_paths_are_absolutized` (R3 FIX class IV) pins that
+  `[replace."<source-id>"].path` entries are absolutized in the
+  overlay.
+- `tests/compat/overlay_corpus/with_replace_section.{input,expected}.toml`
+  added to the cross-binary determinism corpus so any regression to
+  `[replace]` path absolutization is caught by the corpus test.
 
 ## [0.1.0-beta.4] — 2026-05-16
 

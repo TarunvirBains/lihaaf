@@ -412,6 +412,7 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         "with_cdylib",
         "with_patch_section",
         "with_comments",
+        "with_replace_section",
     ];
     let mut checked = 0usize;
     for name in &names {
@@ -448,8 +449,8 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         checked += 1;
     }
     assert_eq!(
-        checked, 5,
-        "corpus must include all 5 representative fixtures"
+        checked, 6,
+        "corpus must include all 6 representative fixtures"
     );
 }
 
@@ -1234,5 +1235,54 @@ rich-demo = { path = "." }
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **`[replace]` path entries are absolutized in the overlay.**
+///
+/// `[replace]` is cargo's older, soft-deprecated replacement form.  Like
+/// `[patch]`, its relative `path` entries would point into the staged
+/// manifest dir after overlay materialization — the same failure mode
+/// Round-2 FIX class C fixed for `[patch]`. This test pins FIX class IV
+/// (Round-3): a future regression removing `absolutize_replace_paths` would
+/// produce a relative path in the overlay and fail this assertion.
+#[test]
+fn replace_paths_are_absolutized() {
+    let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[replace]
+"old-dep:0.2.0" = { path = "vendor/old-dep" }
+"serde:1.0.0" = { git = "https://example.com/serde", rev = "abc123" }
+"#;
+    let (tmp, upstream) = write_upstream(input);
+    let plan = materialize_overlay(&upstream).expect("overlay must succeed");
+    let content = read_overlay(&plan.sibling_manifest);
+
+    let upstream_dir_str = tmp.path().to_string_lossy().replace('\\', "/");
+
+    // path-form entry must be absolutized.
+    let expected_path = format!("{upstream_dir_str}/vendor/old-dep");
+    assert!(
+        content.contains(&format!(r#"path = "{expected_path}""#)),
+        "[replace.\"old-dep:0.2.0\"].path must be absolutized; overlay:\n{content}"
+    );
+
+    // git-form entry must NOT have a path key added.
+    // The relative `path = "vendor/old-dep"` literal must be gone.
+    assert!(
+        !content.contains(r#"path = "vendor/old-dep""#),
+        "relative [replace] path must not survive in overlay; overlay:\n{content}"
+    );
+
+    // git/rev fields must pass through verbatim.
+    assert!(
+        content.contains(r#"git = "https://example.com/serde""#),
+        "git-form [replace] git field must be unchanged; overlay:\n{content}"
+    );
+    assert!(
+        content.contains(r#"rev = "abc123""#),
+        "git-form [replace] rev field must be unchanged; overlay:\n{content}"
     );
 }

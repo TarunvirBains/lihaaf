@@ -689,6 +689,17 @@ fn absolutize_path_bearing_keys(
     //    Only the `path` sub-key is rewritten; `git`, `branch`, `tag`, and
     //    `rev` pass through verbatim per spec §3.2.3.
     absolutize_patch_paths(top, upstream_dir);
+
+    // 10. `[replace."<source-id>"].path` — the older replacement form
+    //     (`[patch]` superseded it but `[replace]` is still valid cargo
+    //     grammar).  The structure is a flat table where each key is a
+    //     source-id string (`"<package_name>:<version>"`) and the value is
+    //     a table possibly containing a `path` sub-key.  Without
+    //     absolutization, a relative `path = "vendor/cxx"` entry would
+    //     resolve against the staged manifest dir — the same failure mode
+    //     `[patch]` had (Round-2 FIX class C). Only `path` is rewritten;
+    //     `git`, `branch`, `tag`, and `rev` pass through verbatim.
+    absolutize_replace_paths(top, upstream_dir);
 }
 
 /// Absolutize `[patch.<registry>.X].path` entries in the top-level manifest
@@ -727,6 +738,47 @@ fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstrea
                         krate_table.insert("path".to_string(), toml::Value::String(abs));
                     }
                 }
+            }
+        }
+    }
+}
+
+/// Absolutize `[replace."<source-id>"].path` entries in the top-level manifest
+/// table.
+///
+/// `[replace]` is the older, soft-deprecated replacement form that `[patch]`
+/// superseded in Cargo. It is still valid grammar and must be absolutized
+/// for the same reason as `[patch]`: relative `path` values would resolve
+/// against the staged manifest dir after the overlay is written to
+/// `target/lihaaf-overlay/`, not against the upstream crate root.
+///
+/// Structure: `[replace]` is a flat table where each key is a source-id
+/// string (`"<package_name>:<version>"`, e.g. `"cxx:0.3.0"`) and the value
+/// is a table possibly containing a `path` sub-key.  Only `path` is
+/// rewritten; `git`, `branch`, `tag`, and `rev` pass through verbatim (same
+/// policy as `[patch]`).
+///
+/// This is intentionally a mirror of [`absolutize_patch_paths`] for the
+/// simpler (one-level-deep) `[replace]` structure.
+fn absolutize_replace_paths(top: &mut toml::map::Map<String, toml::Value>, upstream_dir: &Path) {
+    let Some(toml::Value::Table(replace)) = top.get_mut("replace") else {
+        return;
+    };
+    for (_source_id, entry_value) in replace.iter_mut() {
+        if let toml::Value::Table(entry_table) = entry_value {
+            // Only rewrite `path`; leave `git`, `branch`, `tag`, `rev`
+            // untouched (same policy as [patch]).
+            let needs_rewrite = entry_table
+                .get("path")
+                .and_then(|v| v.as_str())
+                .is_some_and(|s| !Path::new(s).is_absolute());
+            if needs_rewrite {
+                let s = entry_table
+                    .get("path")
+                    .and_then(|v| v.as_str())
+                    .expect("needs_rewrite implies path exists");
+                let abs = crate::util::to_forward_slash(&upstream_dir.join(s).to_string_lossy());
+                entry_table.insert("path".to_string(), toml::Value::String(abs));
             }
         }
     }
@@ -1712,14 +1764,13 @@ version = "0.1.0"
 
         let pkg = top.get("package").and_then(|v| v.as_table()).unwrap();
         let ws_ptr = pkg.get("workspace").and_then(|v| v.as_str()).unwrap();
-        // `upstream_dir.join("../")` collapses to `/work` on POSIX.
-        assert!(
-            Path::new(ws_ptr).is_absolute(),
-            "[package].workspace must be absolutized; got `{ws_ptr}`"
-        );
-        assert!(
-            !ws_ptr.contains(".."),
-            "[package].workspace must not contain `..` after absolutization; got `{ws_ptr}`"
+        // `Path::join` does not normalize: `..` and `.` are preserved in the output
+        // (use canonicalize() for normalization). Cargo's manifest resolver treats
+        // `/work/cxx/.` and `/work/cxx/../` as equivalent to `/work/cxx` and the parent
+        // dir respectively. Verified end-to-end by `cargo_accepts_rich_overlay_for_dylib_build`.
+        assert_eq!(
+            ws_ptr, "/work/cxx/../",
+            "[package].workspace must be absolutized as Path::join (no normalization); got `{ws_ptr}`"
         );
     }
 
@@ -1875,7 +1926,8 @@ version = "0.1.0"
         let patch = top.get("patch").and_then(|v| v.as_table()).unwrap();
         let crates_io = patch.get("crates-io").and_then(|v| v.as_table()).unwrap();
 
-        // cxx path = "." → "/work/cxx"
+        // cxx path = "." → "/work/cxx/." (Path::join preserves `.`; cargo treats
+        // `/work/cxx/.` as equivalent to `/work/cxx`).
         let cxx_path = crates_io
             .get("cxx")
             .and_then(|v| v.as_table())
@@ -1883,8 +1935,9 @@ version = "0.1.0"
             .and_then(|v| v.as_str())
             .unwrap();
         assert_eq!(
-            cxx_path, "/work/cxx",
-            "[patch.crates-io.cxx].path must be absolutized; got `{cxx_path}`"
+            cxx_path, "/work/cxx/.",
+            "[patch.crates-io.cxx].path absolutized via Path::join preserves the `.`; \
+             cargo treats `/work/cxx/.` as equivalent to `/work/cxx`; got `{cxx_path}`"
         );
 
         // cxx-build path = "gen/build" → "/work/cxx/gen/build"
@@ -1958,6 +2011,102 @@ version = "0.1.0"
         assert_eq!(
             path, "/absolute/path/to/cxx",
             "an absolute [patch.*.*].path must be left unchanged; got `{path}`"
+        );
+    }
+
+    // ── FIX class IV unit tests ─────────────────────────────────────────────
+
+    /// **`[replace."<source-id>"].path` entries are absolutized.**
+    ///
+    /// `[replace]` is cargo's older, soft-deprecated replacement form.
+    /// Its structure differs from `[patch]`: the keys are source-id strings
+    /// (`"<name>:<version>"`) rather than crate names under a registry table.
+    /// Without absolutization, a `path = "vendor/cxx"` entry would resolve
+    /// against the staged manifest dir after overlay materialization — the
+    /// same failure mode `[patch]` had before Round-2 FIX class C.
+    ///
+    /// This test would fail if `absolutize_replace_paths` were removed from
+    /// `absolutize_path_bearing_keys`.
+    #[test]
+    fn absolutizes_replace_path() {
+        let upstream_dir = Path::new("/work/project");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("project".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        // A path-form [replace] entry (source-id key, path-dep value).
+        let mut cxx_entry = toml::map::Map::new();
+        cxx_entry.insert("path".to_string(), toml::Value::String("vendor/cxx".into()));
+
+        // A git-form [replace] entry — must be left untouched.
+        let mut serde_entry = toml::map::Map::new();
+        serde_entry.insert(
+            "git".to_string(),
+            toml::Value::String("https://github.com/serde-rs/serde".into()),
+        );
+        serde_entry.insert("rev".to_string(), toml::Value::String("abc123".into()));
+
+        // An already-absolute path — must be left unchanged.
+        let mut abs_entry = toml::map::Map::new();
+        abs_entry.insert(
+            "path".to_string(),
+            toml::Value::String("/pre-existing/absolute/path".into()),
+        );
+
+        let mut replace = toml::map::Map::new();
+        replace.insert("cxx:0.3.0".to_string(), toml::Value::Table(cxx_entry));
+        replace.insert("serde:1.0.0".to_string(), toml::Value::Table(serde_entry));
+        replace.insert("abs-dep:0.1.0".to_string(), toml::Value::Table(abs_entry));
+        top.insert("replace".to_string(), toml::Value::Table(replace));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let replace_out = top.get("replace").and_then(|v| v.as_table()).unwrap();
+
+        // path-form entry: "vendor/cxx" → "/work/project/vendor/cxx"
+        let cxx_path = replace_out
+            .get("cxx:0.3.0")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            cxx_path, "/work/project/vendor/cxx",
+            "[replace.\"cxx:0.3.0\"].path must be absolutized; got `{cxx_path}`"
+        );
+
+        // git-form entry: no `path` key must appear.
+        let serde_t = replace_out
+            .get("serde:1.0.0")
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert!(
+            !serde_t.contains_key("path"),
+            "git-form [replace] entry must not gain a `path` key"
+        );
+        assert_eq!(
+            serde_t.get("git").and_then(|v| v.as_str()),
+            Some("https://github.com/serde-rs/serde"),
+            "git URL in git-form [replace] entry must be unchanged"
+        );
+
+        // already-absolute entry must not be modified.
+        let abs_path = replace_out
+            .get("abs-dep:0.1.0")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            abs_path, "/pre-existing/absolute/path",
+            "an already-absolute [replace] path must be left unchanged; got `{abs_path}`"
         );
     }
 }
