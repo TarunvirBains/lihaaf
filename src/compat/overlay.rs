@@ -71,43 +71,85 @@
 //! - Every other top-level table (`dependencies`, `dev-dependencies`,
 //!   `features`, `[[bin]]`, …) is preserved as parsed.
 //!
-//! ## Workspace-inheritance override (`[workspace] = {}` injection)
+//! ## Workspace-inheritance override (selective `[workspace]` rewrite)
 //!
-//! The staged overlay always ends with an empty `[workspace]` table,
-//! regardless of whether the upstream manifest declared one. This is
-//! the workspace-identity fix for the v0.1.0-beta.5 regression on
-//! workspace-style pilots (see issue #36).
+//! The staged overlay always carries a `[workspace]` table, regardless
+//! of whether the upstream manifest declared one — but the rewrite is
+//! SELECTIVE, not a full clobber. We keep every workspace-inheritance
+//! TABLE the upstream declared (`workspace.dependencies`,
+//! `workspace.package`, `workspace.lints`, `workspace.metadata`,
+//! `workspace.resolver`, plus any future `[workspace.*]` cargo adds)
+//! and strip only the MEMBERSHIP keys (`members`, `exclude`,
+//! `default-members`). This is the workspace-identity fix for the
+//! v0.1.0-beta.5 regression on workspace-style pilots (see issue #36)
+//! combined with the R2 follow-up that preserves inheritance for
+//! manifests that use `{ workspace = true }` references (issue #38 /
+//! PR #37 Codex + Gemini panel BLOCK).
 //!
-//! **Why this is necessary.** Cargo determines a manifest's workspace
-//! root by walking UP the filesystem from the manifest until it finds
-//! another `Cargo.toml` with a `[workspace]` table. For the staged
-//! overlay at `<upstream>/target/lihaaf-overlay/Cargo.toml`, that walk
-//! reaches `<upstream>/Cargo.toml` — and for workspace-style pilots
-//! (cxx, serde-json, thiserror) the upstream IS a workspace root. Cargo
+//! **Why a `[workspace]` table at all (cargo walk-up).** Cargo
+//! determines a manifest's workspace root by walking UP the filesystem
+//! from the manifest until it finds another `Cargo.toml` with a
+//! `[workspace]` table. For the staged overlay at
+//! `<upstream>/target/lihaaf-overlay/Cargo.toml`, that walk reaches
+//! `<upstream>/Cargo.toml` — and for workspace-style pilots (cxx,
+//! serde-json, thiserror) the upstream IS a workspace root. Cargo
 //! then tries to attach the overlay's package to the upstream
 //! workspace, but the overlay's package name isn't in the upstream's
 //! `members` array. Result: `package <X>/Cargo.toml is a member of the
-//! wrong workspace` and the build fails.
+//! wrong workspace` and the build fails. Declaring the overlay as its
+//! own workspace root (any `[workspace]` table, even empty) makes
+//! cargo stop the walk-up at the overlay manifest.
 //!
-//! Adding `[workspace]` (even an empty table) to the overlay makes
-//! cargo treat the overlay AS ITS OWN workspace root and stop walking
-//! up. The overlay is then a standalone, self-contained workspace
-//! whose path-deps reference packages in OTHER workspaces (the
-//! upstream's) — which is valid in cargo.
+//! **Why the inheritance tables are preserved (`{ workspace = true }`).**
+//! Cargo's workspace-inheritance feature lets a member crate write
+//! `[dependencies] foo = { workspace = true }` and inherit the actual
+//! version/path/features from `[workspace.dependencies.foo]` on the
+//! workspace root. The same pattern exists for `[package]
+//! version.workspace = true` (inherits from `[workspace.package]`),
+//! `[lints] rust.workspace = true` (inherits from `[workspace.lints]`),
+//! `[dev-dependencies]`, `[build-dependencies]`, and
+//! `[target.<cfg>.dependencies]`. If we clobber the upstream's
+//! `[workspace.dependencies]` / `[workspace.package]` / `[workspace.lints]`
+//! tables, any surviving `{ workspace = true }` reference in the
+//! overlay manifest fails cargo's parser with `"workspace inheritance
+//! was specified but [workspace.<X>] was not defined"`. R1
+//! (v0.1.0-beta.6 attempt 1) clobbered these unconditionally and broke
+//! every pilot fork that uses inheritance; R2 preserves them.
 //!
-//! **Why the table is empty (no members inherited).** If the overlay's
-//! `[workspace]` carried the upstream's `members = [...]` (absolutized
-//! to abs paths), the overlay AND the upstream would both claim those
+//! **Why ONLY the membership keys are stripped.** If the overlay
+//! claimed the upstream's `members = [...]` (even absolutized to abs
+//! paths), the overlay AND the upstream would both claim those
 //! path-dep crates as members → `package <X> is a member of the wrong
-//! workspace`. An empty `[workspace]` declares no members, leaving
-//! ownership exclusively with the upstream workspace where it was
-//! originally declared.
+//! workspace`. Same trap for `exclude` and `default-members`.
+//! Stripping these three keys leaves member-ownership exclusively with
+//! the upstream workspace where it was originally declared.
 //!
-//! **Why `[package].workspace` is removed.** A package cannot
+//! **Why unknown `[workspace.X]` tables pass through.** If cargo adds
+//! a new `[workspace.<future>]` table in a later release, a hardcoded
+//! preserve-list would silently drop it. The R2 implementation
+//! preserves anything that is NOT one of the three membership keys, so
+//! the overlay stays forward-compatible with future cargo additions.
+//!
+//! **`[package].workspace` is REJECTED.** A package cannot
 //! simultaneously declare itself as a workspace root (`[workspace]`)
 //! AND as a member of an ancestor workspace (`[package] workspace =
-//! "..."`). The overlay always elects the workspace-root role, so the
-//! ancestor-pointer is stripped at the same time.
+//! "..."`). The overlay always elects the workspace-root role. The R1
+//! implementation silently stripped the ancestor-pointer, which is
+//! wrong when the upstream manifest IS itself a workspace member
+//! pointing at an ancestor workspace root: that ancestor is where the
+//! actual `[workspace.dependencies]` / `[workspace.package]` /
+//! `[workspace.lints]` tables live, and stripping the pointer strands
+//! every `{ workspace = true }` reference in the overlay. Preserving
+//! the pointer would require READING the ancestor manifest to copy the
+//! inheritance tables down into the overlay — out-of-scope for
+//! v0.1.0-beta.6. So the workspace-member case (`[package].workspace`
+//! present) is REJECTED with a directed diagnostic, the same way
+//! `is_workspace_root_manifest` rejects a virtual workspace root.
+//! All four Round-1 pilots (cxx, serde-json, anyhow, thiserror) invoke
+//! lihaaf from the upstream ROOT, which carries `[package]` +
+//! `[workspace]` (workspace-root case) — NOT from a sub-crate that
+//! carries `[package] workspace = "..."` — so this rejection does not
+//! affect any currently-enrolled pilot.
 
 use std::path::{Path, PathBuf};
 
@@ -359,16 +401,26 @@ where
         }
 
         // Override workspace inheritance: declare the overlay as its own
-        // workspace root with no members, and strip any `[package].workspace`
-        // ancestor pointer. Runs AFTER `absolutize_path_bearing_keys` so the
-        // earlier absolutization of `[workspace] members`/`exclude`/
-        // `default-members`/`dependencies.<X>.path` is harmlessly clobbered;
-        // those values are not needed because cargo resolves the overlay's
-        // path-deps from `[dependencies.<X>] path` directly, and the
-        // upstream's actual workspace still owns those member crates from
-        // their own perspective. See the module-level "Workspace-inheritance
-        // override" section and issue #36 for the full rationale.
-        override_workspace_inheritance(top);
+        // workspace root (so cargo stops walking up to the upstream
+        // workspace) but PRESERVE the upstream's `[workspace.dependencies]`
+        // / `[workspace.package]` / `[workspace.lints]` / `[workspace.metadata]`
+        // / `[workspace.resolver]` (and any unknown `[workspace.X]`) so any
+        // `{ workspace = true }` inheritance reference in the overlay
+        // continues to resolve. Only the membership keys (`members`,
+        // `exclude`, `default-members`) are stripped — those are the keys
+        // that cause the "wrong workspace" error. Runs AFTER
+        // `absolutize_path_bearing_keys` so absolutized values inside the
+        // preserved tables (e.g. `[workspace.dependencies.X].path`) are
+        // carried through, while the absolutization of the stripped
+        // `members` / `exclude` / `default-members` is harmlessly discarded.
+        //
+        // REJECTS the workspace-member case (`[package].workspace =
+        // "<path>"`) — the overlay cannot self-declare as a workspace
+        // root and a workspace member simultaneously, and copying the
+        // ancestor workspace's inheritance tables down into the overlay
+        // is out-of-scope for v0.1.0-beta.6. See module-level docs and
+        // issue #38 / PR #37 R2 BLOCK fixup for the full rationale.
+        override_workspace_inheritance(top, upstream_manifest_path)?;
     }
 
     let serialized = serialize_canonical(&value)?;
@@ -432,13 +484,39 @@ fn read_upstream_crate_name(value: &toml::Value) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Override the overlay's workspace inheritance: replace any existing
-/// `[workspace]` table with an empty one, and remove any
-/// `[package].workspace` ancestor pointer.
+/// Membership keys of `[workspace]` that must be stripped from the
+/// staged overlay. Every OTHER key in `[workspace]` is preserved.
 ///
-/// **Why this is necessary.** When cargo resolves the staged overlay
-/// at `<upstream>/target/lihaaf-overlay/Cargo.toml`, it walks UP the
-/// filesystem to find the overlay's workspace root. For
+/// Keeping this list as a single source of truth makes the
+/// selective-rewrite intent explicit: an addition to this list strips
+/// more, a removal preserves more. The R1 implementation effectively
+/// listed every workspace key (full clobber); the R2 implementation
+/// lists only the three keys that actually cause the "wrong workspace"
+/// error.
+const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-members"];
+
+/// Override the overlay's workspace inheritance: declare the overlay
+/// as its own workspace root, but PRESERVE the upstream's workspace
+/// inheritance tables.
+///
+/// **What this does:**
+///
+/// 1. If the upstream had `[workspace]`, we CLONE it and strip only
+///    the membership keys (`members`, `exclude`, `default-members`).
+///    Every other key — `dependencies`, `package`, `lints`, `metadata`,
+///    `resolver`, plus any unknown `[workspace.X]` cargo may add in
+///    future releases — is preserved verbatim.
+/// 2. If the upstream had no `[workspace]`, we inject an empty
+///    `[workspace] = {}`. (For workspace-style pilots this case is
+///    rare, but it covers single-crate forks whose upstream is the
+///    workspace root and whose path-deps reach back up.)
+/// 3. If the upstream has `[package].workspace = "<ancestor>"` (the
+///    workspace-member case), we REJECT the manifest with a directed
+///    diagnostic. See "Workspace-member case is out of scope" below.
+///
+/// **Why this is necessary (cargo walk-up).** When cargo resolves the
+/// staged overlay at `<upstream>/target/lihaaf-overlay/Cargo.toml`, it
+/// walks UP the filesystem to find the overlay's workspace root. For
 /// workspace-style upstreams (cxx, serde-json, thiserror) it reaches
 /// the upstream `Cargo.toml` first, which declares `[workspace]`. The
 /// overlay's package isn't in the upstream's `members`, so cargo errors
@@ -446,52 +524,108 @@ fn read_upstream_crate_name(value: &toml::Value) -> Option<String> {
 /// See issue #36 for the v0.1.0-beta.5 GitHub Actions run that surfaced
 /// this on every workspace-style pilot.
 ///
-/// **Mechanism.** A manifest containing `[workspace]` is treated by
-/// cargo as its own workspace root — cargo stops the walk-up at that
-/// point. We write an EMPTY `[workspace]` table so the overlay declares
-/// no members, leaving member ownership of any path-dep packages
-/// exclusively with the upstream workspace they were originally
-/// declared in. Cargo handles this cross-workspace path-dep pattern
-/// correctly.
+/// **Why we don't simply clobber (the R1 failure mode).** Cargo's
+/// workspace-inheritance feature lets a manifest write
+/// `[dependencies] foo = { workspace = true }` and inherit the actual
+/// dep spec from `[workspace.dependencies.foo]`. The same pattern
+/// applies to `[package].version.workspace = true` (from
+/// `[workspace.package]`), `[lints].rust.workspace = true` (from
+/// `[workspace.lints]`), and all dep tables (`dev-dependencies`,
+/// `build-dependencies`, `target.<cfg>.dependencies`). R1 replaced
+/// `[workspace]` with an empty table — which is correct for the
+/// `members` problem but wrong because surviving `{ workspace = true }`
+/// references in `[dependencies]` / `[package]` / `[lints]` then fail
+/// cargo's parser with "workspace inheritance was specified but
+/// `[workspace.<X>]` was not defined". This R2 implementation
+/// preserves the inheritance tables.
 ///
-/// **`[package].workspace` removal.** This ancestor-pointer key
-/// requests that the package be a member of the named workspace. It
-/// contradicts the `[workspace]` self-declaration we just made, so we
-/// strip it. The compat driver does not need the upstream's
-/// workspace-membership relationship preserved in the overlay — the
-/// overlay's sole purpose is to compile the dylib_crate as a `dylib`,
-/// not to faithfully reproduce the upstream workspace topology.
+/// **Workspace-member case is out of scope.** When the overlay
+/// manifest itself carries `[package].workspace = "<path>"`, that
+/// declares the manifest as a MEMBER of an ANCESTOR workspace — and
+/// the ancestor is where the actual `[workspace.dependencies]` /
+/// `[workspace.package]` / `[workspace.lints]` tables live. To
+/// preserve workspace-inheritance for such a manifest, we would need
+/// to read the ancestor's `Cargo.toml` and copy those tables down
+/// into the overlay. That cross-manifest read is out-of-scope for
+/// v0.1.0-beta.6; we reject the manifest with a directed diagnostic
+/// instead. None of the four Round-1 pilots (cxx, serde-json, anyhow,
+/// thiserror) invokes lihaaf from a workspace-member sub-crate — they
+/// all invoke from upstream ROOT (which carries both `[package]` and
+/// `[workspace]`, the workspace-root case) — so this rejection does
+/// not break any currently-enrolled pilot. The follow-up to enable
+/// workspace-member overlays will land separately (tracked by the R2
+/// fixup decision in PR #37).
 ///
 /// **Why this runs LAST.** The earlier `absolutize_path_bearing_keys`
-/// pass had already rewritten `[workspace] members`/`exclude`/
-/// `default-members`/`dependencies.<X>.path` against the upstream dir.
-/// Clobbering at the end discards that work, but it was not load-bearing
-/// for the staged overlay's build — cargo resolves the overlay's deps
-/// from `[dependencies.<X>] path` (already absolutized), not from
-/// `[workspace.dependencies]`. The post-absolutize clobber is the
-/// cleanest layering: the earlier pass keeps its existing tests green
-/// at the unit level, and the higher-level override is the new
-/// workspace-identity contract.
+/// pass has already rewritten `[workspace.dependencies.X].path`,
+/// `[workspace.package]` fields (if any path-bearing), and the
+/// membership arrays. Since R2 preserves the inheritance tables, the
+/// earlier absolutization is now LOAD-BEARING — the preserved
+/// `[workspace.dependencies.X].path` is consumed by cargo to resolve
+/// `{ workspace = true }` references from `[dependencies]`. The
+/// absolutization of `members` / `exclude` / `default-members` is
+/// harmlessly stripped on this pass.
 ///
-/// Idempotent: a second call on already-overridden output is a no-op.
-fn override_workspace_inheritance(top: &mut toml::map::Map<String, toml::Value>) {
-    // 1. Replace any existing `[workspace]` (or absent key) with an
-    //    empty table. Cargo accepts an empty workspace table as the
-    //    canonical "this manifest is its own workspace root" declaration
-    //    (https://doc.rust-lang.org/cargo/reference/workspaces.html).
-    top.insert(
-        "workspace".to_string(),
-        toml::Value::Table(toml::map::Map::new()),
-    );
-
-    // 2. Strip `[package].workspace` if present. The overlay always
-    //    elects the workspace-root role (step 1); a simultaneous
-    //    `[package] workspace = "..."` declaration would point at an
-    //    ancestor workspace, contradicting the self-declaration and
-    //    triggering a cargo error.
-    if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
-        pkg.remove("workspace");
+/// Idempotent: a second call on already-overridden output is a no-op
+/// (the membership keys are already absent and `[package].workspace`
+/// is absent).
+///
+/// **Errors.** Returns `Error::Cli` with `clap_exit_code = 2` when the
+/// upstream manifest is the workspace-member case (`[package].workspace
+/// = "<path>"`). All other shapes succeed.
+fn override_workspace_inheritance(
+    top: &mut toml::map::Map<String, toml::Value>,
+    upstream_manifest_path: &Path,
+) -> Result<(), Error> {
+    // 1. Reject the workspace-member case. A package declaring itself
+    //    as a member of an ancestor workspace cannot simultaneously be
+    //    declared as a workspace root — and copying the ancestor's
+    //    inheritance tables into the overlay is out-of-scope for
+    //    v0.1.0-beta.6 (see function-level docs above for the full
+    //    rationale).
+    if let Some(toml::Value::Table(pkg)) = top.get("package")
+        && pkg.contains_key("workspace")
+    {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--compat-root` `{}` declares `[package].workspace = \"...\"` \
+                 (workspace member). Compat mode currently supports only \
+                 single-crate manifests and workspace-root manifests \
+                 (where `[workspace]` lives in the same Cargo.toml). \
+                 Pass the workspace-ROOT Cargo.toml as `--compat-root` instead; \
+                 it will still resolve `{{ workspace = true }}` references in \
+                 its own manifest because `[workspace.dependencies]` / \
+                 `[workspace.package]` / `[workspace.lints]` are preserved in \
+                 the staged overlay.",
+                upstream_manifest_path.display()
+            ),
+        });
     }
+
+    // 2. Build the overlay's `[workspace]` table. If the upstream had
+    //    one, clone it and strip ONLY the membership keys. Otherwise
+    //    inject an empty table so cargo treats the overlay as its own
+    //    workspace root (terminating the walk-up).
+    let mut new_workspace = if let Some(toml::Value::Table(existing)) = top.get("workspace") {
+        let mut cloned = existing.clone();
+        for key in WORKSPACE_MEMBERSHIP_KEYS {
+            cloned.remove(*key);
+        }
+        cloned
+    } else {
+        toml::map::Map::new()
+    };
+
+    // 3. Idempotency / belt-and-braces: if a future pass re-introduces
+    //    one of the membership keys, this re-strips. Cheap; preserves
+    //    the documented idempotency contract.
+    for key in WORKSPACE_MEMBERSHIP_KEYS {
+        new_workspace.remove(*key);
+    }
+
+    top.insert("workspace".to_string(), toml::Value::Table(new_workspace));
+    Ok(())
 }
 
 /// Splice the synthetic `[package.metadata.lihaaf]` table into `top`.
@@ -2219,6 +2353,245 @@ version = "0.1.0"
         assert_eq!(
             abs_path, "/pre-existing/absolute/path",
             "an already-absolute [replace] path must be left unchanged; got `{abs_path}`"
+        );
+    }
+
+    // ── R2 (PR #37 fixup) unit tests for `override_workspace_inheritance` ────
+
+    /// Test helper: a non-existent upstream path used only to populate
+    /// the error-diagnostic string. The override function never reads
+    /// the file — only the path's `display()` is used when constructing
+    /// the workspace-member rejection diagnostic.
+    fn dummy_upstream_manifest_path() -> std::path::PathBuf {
+        std::path::PathBuf::from("/tmp/lihaaf-test-upstream/Cargo.toml")
+    }
+
+    /// **R2 invariant: only membership keys are stripped from `[workspace]`.**
+    ///
+    /// R1 replaced the entire `[workspace]` table with `{}`. R2
+    /// preserves every key EXCEPT `members`, `exclude`,
+    /// `default-members`. This test exercises the full preserve-list:
+    /// `dependencies`, `package`, `lints`, `metadata`, `resolver`.
+    #[test]
+    fn override_workspace_preserves_inheritance_tables() {
+        let mut top = toml::map::Map::new();
+        // Synthesize a fully-populated `[workspace]` table.
+        let mut ws = toml::map::Map::new();
+        ws.insert(
+            "members".to_string(),
+            toml::Value::Array(vec![toml::Value::String("crate-a".into())]),
+        );
+        ws.insert(
+            "exclude".to_string(),
+            toml::Value::Array(vec![toml::Value::String("scratch".into())]),
+        );
+        ws.insert(
+            "default-members".to_string(),
+            toml::Value::Array(vec![toml::Value::String("crate-a".into())]),
+        );
+        ws.insert("resolver".to_string(), toml::Value::String("2".into()));
+
+        // `[workspace.dependencies]` — the key R1 stranded for
+        // `{ workspace = true }` references.
+        let mut ws_deps = toml::map::Map::new();
+        let mut shared = toml::map::Map::new();
+        shared.insert("path".to_string(), toml::Value::String("/abs/utils".into()));
+        ws_deps.insert("shared-utils".to_string(), toml::Value::Table(shared));
+        ws.insert("dependencies".to_string(), toml::Value::Table(ws_deps));
+
+        // `[workspace.package]` — inherited `[package]` fields.
+        let mut ws_pkg = toml::map::Map::new();
+        ws_pkg.insert("edition".to_string(), toml::Value::String("2021".into()));
+        ws_pkg.insert("version".to_string(), toml::Value::String("0.1.0".into()));
+        ws.insert("package".to_string(), toml::Value::Table(ws_pkg));
+
+        // `[workspace.lints]` — inherited `[lints]` rulesets.
+        let mut ws_lints = toml::map::Map::new();
+        let mut ws_lints_rust = toml::map::Map::new();
+        ws_lints_rust.insert(
+            "unsafe_code".to_string(),
+            toml::Value::String("forbid".into()),
+        );
+        ws_lints.insert("rust".to_string(), toml::Value::Table(ws_lints_rust));
+        ws.insert("lints".to_string(), toml::Value::Table(ws_lints));
+
+        // `[workspace.metadata]` — tool-owned namespaced metadata.
+        let mut ws_meta = toml::map::Map::new();
+        let mut ws_meta_tool = toml::map::Map::new();
+        ws_meta_tool.insert("key".to_string(), toml::Value::String("value".into()));
+        ws_meta.insert("my-tool".to_string(), toml::Value::Table(ws_meta_tool));
+        ws.insert("metadata".to_string(), toml::Value::Table(ws_meta));
+
+        // Unknown future `[workspace.X]` table — must pass through
+        // verbatim so the override stays forward-compatible.
+        let mut ws_future = toml::map::Map::new();
+        ws_future.insert(
+            "key".to_string(),
+            toml::Value::String("future-value".into()),
+        );
+        ws.insert(
+            "future-cargo-feature".to_string(),
+            toml::Value::Table(ws_future),
+        );
+
+        top.insert("workspace".to_string(), toml::Value::Table(ws));
+
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("test".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+            .expect("workspace-root case must succeed");
+
+        let ws_out = top.get("workspace").and_then(|v| v.as_table()).unwrap();
+
+        // Membership keys stripped.
+        for stripped in ["members", "exclude", "default-members"] {
+            assert!(
+                !ws_out.contains_key(stripped),
+                "membership key `{stripped}` MUST be stripped; got keys: {:?}",
+                ws_out.keys().collect::<Vec<_>>()
+            );
+        }
+
+        // Inheritance tables preserved.
+        assert!(
+            ws_out.contains_key("dependencies"),
+            "workspace.dependencies must survive"
+        );
+        assert!(
+            ws_out.contains_key("package"),
+            "workspace.package must survive"
+        );
+        assert!(ws_out.contains_key("lints"), "workspace.lints must survive");
+        assert!(
+            ws_out.contains_key("metadata"),
+            "workspace.metadata must survive"
+        );
+        assert!(
+            ws_out.contains_key("resolver"),
+            "workspace.resolver must survive"
+        );
+        assert!(
+            ws_out.contains_key("future-cargo-feature"),
+            "unknown `[workspace.X]` table must pass through (forward-compat)"
+        );
+
+        // Deep-equality on a couple of preserved entries to confirm
+        // the rewrite is structure-preserving (not a stub).
+        let ws_deps_out = ws_out
+            .get("dependencies")
+            .and_then(|v| v.as_table())
+            .unwrap();
+        let shared_out = ws_deps_out
+            .get("shared-utils")
+            .and_then(|v| v.as_table())
+            .unwrap();
+        assert_eq!(
+            shared_out.get("path").and_then(|v| v.as_str()),
+            Some("/abs/utils"),
+            "workspace.dependencies.shared-utils.path must pass through verbatim"
+        );
+
+        let ws_pkg_out = ws_out.get("package").and_then(|v| v.as_table()).unwrap();
+        assert_eq!(
+            ws_pkg_out.get("edition").and_then(|v| v.as_str()),
+            Some("2021"),
+            "workspace.package.edition must pass through verbatim"
+        );
+    }
+
+    /// **R2 invariant: missing `[workspace]` injects an empty one.**
+    ///
+    /// For single-crate forks the upstream `Cargo.toml` may have no
+    /// `[workspace]` declaration of its own. The overlay still needs
+    /// `[workspace]` to terminate cargo's walk-up.
+    #[test]
+    fn override_workspace_injects_empty_when_absent() {
+        let mut top = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("test".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        // No `[workspace]` in input.
+        assert!(!top.contains_key("workspace"));
+
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+            .expect("missing `[workspace]` must inject an empty one");
+
+        let ws_out = top.get("workspace").and_then(|v| v.as_table()).unwrap();
+        assert!(
+            ws_out.is_empty(),
+            "injected `[workspace]` must be empty when upstream had none; got: {:?}",
+            ws_out.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// **R2 invariant: workspace-member case is REJECTED.**
+    ///
+    /// `[package].workspace = "<path>"` declares the manifest as a
+    /// member of an ANCESTOR workspace. Copying the ancestor's
+    /// inheritance tables into the overlay is out-of-scope for
+    /// v0.1.0-beta.6, so the manifest is rejected with a directed
+    /// diagnostic instead of being silently overlayed (with stripped
+    /// inheritance) or silently emptied (R1's behavior, which stranded
+    /// `{ workspace = true }` references).
+    #[test]
+    fn override_workspace_rejects_workspace_member_manifest() {
+        let mut top = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("member".into()));
+        pkg.insert("workspace".to_string(), toml::Value::String("../".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        let err = override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+            .expect_err("workspace-member manifest must be rejected");
+
+        let s = format!("{err:?}");
+        assert!(
+            s.contains("workspace member"),
+            "rejection diagnostic must name the failure category; got: {s}"
+        );
+        assert!(
+            s.contains("[package].workspace"),
+            "rejection diagnostic must name the offending key; got: {s}"
+        );
+        assert!(
+            s.contains("/tmp/lihaaf-test-upstream/Cargo.toml"),
+            "rejection diagnostic must include the offending manifest path; got: {s}"
+        );
+    }
+
+    /// **R2 invariant: idempotent on already-overridden output.**
+    ///
+    /// Running the override twice must produce the same result as
+    /// running it once. R1's full-clobber was trivially idempotent;
+    /// R2's selective rewrite requires verification because the
+    /// preserved tables flow through unmodified on the second call.
+    #[test]
+    fn override_workspace_is_idempotent() {
+        let mut top = toml::map::Map::new();
+        let mut ws = toml::map::Map::new();
+        ws.insert(
+            "members".to_string(),
+            toml::Value::Array(vec![toml::Value::String("crate-a".into())]),
+        );
+        let mut ws_deps = toml::map::Map::new();
+        let mut shared = toml::map::Map::new();
+        shared.insert("path".to_string(), toml::Value::String("/abs/utils".into()));
+        ws_deps.insert("shared".to_string(), toml::Value::Table(shared));
+        ws.insert("dependencies".to_string(), toml::Value::Table(ws_deps));
+        top.insert("workspace".to_string(), toml::Value::Table(ws));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("test".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path()).unwrap();
+        let after_first = top.clone();
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path()).unwrap();
+        assert_eq!(
+            top, after_first,
+            "second call must be a no-op on already-overridden output"
         );
     }
 }

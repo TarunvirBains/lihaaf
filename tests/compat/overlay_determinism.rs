@@ -43,13 +43,22 @@
 //! 8. Richer cargo-build regression (`cargo_accepts_rich_overlay_for_dylib_build`)
 //!    exercising path-dep + `[patch.crates-io]` path entry + relative
 //!    `--compat-root` — the production failure shapes from the Round-2 panel.
-//! 9. Workspace-identity fix for issue #36
-//!    (`staged_overlay_overrides_upstream_workspace_inheritance` and
-//!    `cargo_accepts_workspace_style_overlay_for_dylib_build`) — the
-//!    staged overlay always writes an empty `[workspace]` table and
-//!    strips `[package].workspace`, so cargo treats the overlay as its
-//!    own workspace root and never tries to attach it to an upstream
-//!    workspace.
+//! 9. Workspace-identity fix for issue #36 + R2 inheritance-preservation
+//!    fixup (PR #37 Codex + Gemini BLOCK):
+//!    - `staged_overlay_overrides_upstream_workspace_inheritance`
+//!      pins the R2 selective-rewrite contract: the staged overlay
+//!      strips only `members` / `exclude` / `default-members` from
+//!      `[workspace]` and preserves `dependencies`, `package`,
+//!      `lints`, `metadata`, `resolver`, plus any unknown
+//!      `[workspace.X]`.
+//!    - `staged_overlay_rejects_workspace_member_manifest` pins the
+//!      Option-C decision: `[package].workspace = "<path>"` manifests
+//!      are REJECTED (out-of-scope for v0.1.0-beta.6).
+//!    - `cargo_accepts_workspace_style_overlay_for_dylib_build` is
+//!      the cargo-level proof for the membership-stripping case.
+//!    - `cargo_accepts_workspace_inheritance_reference_in_overlay`
+//!      is the cargo-level proof for the R2 inheritance-preservation
+//!      contract (the Codex repro that BLOCKed R1).
 //!
 //! ## Why every test is hermetic
 //!
@@ -1005,59 +1014,85 @@ serde = { git = "https://example.com/serde", branch = "main" }
     );
 }
 
-/// **Workspace inheritance is OVERRIDDEN in the staged overlay (issue #36).**
+/// **Workspace identity in the staged overlay: membership keys stripped,
+/// inheritance tables PRESERVED (issues #36 + PR #37 R2 fixup).**
 ///
-/// After v0.1.0-beta.5 (PR #34), the v0.1.0-beta.6 fix replaces any
-/// upstream `[workspace]` declaration with an empty `[workspace]` table
-/// in the overlay AND strips `[package].workspace` if present. The
-/// rationale (per `src/compat/overlay.rs` module docs and issue #36):
-/// cargo walks UP from the overlay manifest to find its workspace root,
-/// reaches `<upstream>/Cargo.toml`, and tries to attach the overlay to
-/// the upstream workspace — failing with `package <X> is a member of
-/// the wrong workspace` for every workspace-style pilot (cxx,
-/// serde-json, thiserror).
+/// History:
+/// - v0.1.0-beta.5 (PR #34): no `[workspace]` override at all → cargo
+///   walked UP and attached the overlay to the upstream workspace,
+///   failing every workspace-style pilot with `package <X> is a member
+///   of the wrong workspace`.
+/// - v0.1.0-beta.6 R1 (PR #37 commit 1f6520b): replaced `[workspace]`
+///   with an empty table → fixed the "wrong workspace" error but
+///   stranded `{ workspace = true }` inheritance references (Codex +
+///   Gemini panel BLOCK: "workspace inheritance was specified but
+///   `[workspace.dependencies]` was not defined").
+/// - v0.1.0-beta.6 R2 (this commit): selective rewrite — strip ONLY
+///   the membership keys (`members`, `exclude`, `default-members`)
+///   from `[workspace]`, preserve every other table.
 ///
-/// This test pins the new invariant: regardless of what `[workspace]`
-/// and `[package].workspace` looked like in the upstream, the overlay's
-/// `[workspace]` is empty and `[package].workspace` is absent.
+/// This test pins the R2 invariant on a workspace-ROOT upstream
+/// (`[package]` + `[workspace]` in the same Cargo.toml — the actual
+/// shape of cxx / serde-json / anyhow / thiserror upstreams).
 ///
 /// **Why this replaces the prior `…absolutizes_workspace_key_classes`
 /// test.** That test verified an intermediate behavior: workspace
-/// key-class paths were absolutized and survived in the overlay. The
-/// new fix CLOBBERS them on purpose, so the prior contract no longer
-/// holds. The low-level absolutization step (`absolutize_path_bearing_keys`)
-/// still runs and is still covered by the unit-level tests in
-/// `src/compat/overlay.rs::tests` (`absolutizes_workspace_default_members`,
-/// `absolutizes_package_workspace_pointer`, `absolutizes_workspace_dependencies_path`);
-/// what changes is the higher-level result on the materialized overlay.
+/// key-class paths were absolutized and survived. R1 clobbered them.
+/// R2 preserves the inheritance tables (`workspace.dependencies`,
+/// `workspace.package`, `workspace.lints`, `workspace.metadata`,
+/// `workspace.resolver`, plus any unknown `[workspace.X]`) while
+/// stripping only the membership keys. The low-level absolutization
+/// step (`absolutize_path_bearing_keys`) still runs and is still
+/// covered by the unit-level tests in
+/// `src/compat/overlay.rs::tests`. The earlier-pass
+/// absolutization of `[workspace.dependencies.X].path` is now
+/// LOAD-BEARING (R2-preserved tables carry it through).
+///
+/// **The workspace-MEMBER case (`[package].workspace = "../"`) is
+/// covered by a separate test** —
+/// `staged_overlay_rejects_workspace_member_manifest` — because R2
+/// rejects that shape rather than overlaying it. See the module-level
+/// "Workspace-inheritance override" section in `src/compat/overlay.rs`
+/// for the full rationale.
 #[test]
 fn staged_overlay_overrides_upstream_workspace_inheritance() {
     let tmp = tempfile::tempdir().expect("tempdir for workspace override test");
     let upstream_dir = tmp.path();
     let upstream_manifest = upstream_dir.join("Cargo.toml");
 
-    // Upstream manifest carries every shape the prior test exercised:
-    //   - `[package].workspace = "../"`   (ancestor pointer)
-    //   - `[workspace] members = [...]`   (member declarations)
-    //   - `[workspace] default-members`   (default-build subset)
-    //   - `[workspace.dependencies.X].path = "..."` (workspace-inherited path-dep)
-    //
-    // All of these MUST be either removed or emptied in the staged overlay
-    // — the workspace-identity fix demands that the overlay declares itself
-    // as a standalone workspace root with no inherited workspace metadata.
+    // Upstream manifest is the workspace-ROOT case — `[package]` +
+    // `[workspace]` in the SAME file. Carries:
+    //   - `[workspace] members = [...]`           (stripped)
+    //   - `[workspace] exclude = [...]`           (stripped)
+    //   - `[workspace] default-members`           (stripped)
+    //   - `[workspace.dependencies.X].path = "..."` (PRESERVED — R2)
+    //   - `[workspace.package].edition`           (PRESERVED — R2)
+    //   - `[workspace.lints].rust.unsafe_code`    (PRESERVED — R2)
+    //   - `[workspace.metadata].my-tool.key`      (PRESERVED — R2)
+    //   - `[workspace.resolver]`                  (PRESERVED — R2)
     std::fs::write(
         &upstream_manifest,
         r#"[package]
-name = "member"
+name = "ws-root"
 version = "0.1.0"
-workspace = "../"
 
 [workspace]
 members = ["crate-a"]
-default-members = ["crate-a", "crate-b"]
+exclude = ["scratch"]
+default-members = ["crate-a"]
+resolver = "2"
 
 [workspace.dependencies]
 shared-utils = { path = "utils" }
+
+[workspace.package]
+edition = "2021"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.metadata.my-tool]
+key = "value"
 
 [dependencies]
 serde = "1"
@@ -1078,63 +1113,111 @@ serde = "1"
     // overlay still parses as valid TOML after the override).
     let parsed: toml::Value = toml::from_str(&content).expect("overlay must parse as TOML");
 
-    // 1. `[workspace]` MUST exist and MUST be empty. Presence is the
-    //    cargo-walk-up terminator; emptiness ensures the overlay claims
-    //    no members and therefore cannot conflict with the upstream
-    //    workspace's claims on its path-dep crates.
+    // 1. `[workspace]` MUST exist (so cargo treats the overlay as its
+    //    own workspace root; the walk-up terminates here).
     let ws = parsed
         .get("workspace")
         .and_then(|v| v.as_table())
-        .expect("overlay must declare `[workspace]` (even if empty) to be a workspace root");
+        .expect("overlay must declare `[workspace]` (even if only inheritance tables) to be a workspace root");
+
+    // 2. Membership keys MUST be stripped. These are the keys that
+    //    caused the v0.1.0-beta.5 "wrong workspace" failure — claiming
+    //    the upstream's path-dep crates as overlay members.
+    for stripped_key in ["members", "exclude", "default-members"] {
+        assert!(
+            !ws.contains_key(stripped_key),
+            "overlay's `[workspace].{stripped_key}` MUST be stripped to avoid \
+             cross-workspace membership conflicts; got entries: {:?}",
+            ws.keys().collect::<Vec<_>>()
+        );
+    }
+
+    // 3. Inheritance tables MUST survive — this is the R2 invariant
+    //    that the R1 attempt got wrong. Each of these tables backs
+    //    a `{ workspace = true }` reference shape in cargo.
     assert!(
-        ws.is_empty(),
-        "overlay's `[workspace]` MUST be empty so the overlay claims no \
-         members; got entries: {:?}",
+        ws.contains_key("dependencies"),
+        "overlay must preserve `[workspace.dependencies]` (R2 — used by \
+         `{{ workspace = true }}` references in `[dependencies]`); got entries: {:?}",
+        ws.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        ws.contains_key("package"),
+        "overlay must preserve `[workspace.package]` (R2 — used by \
+         `{{ workspace = true }}` references in `[package]`); got entries: {:?}",
+        ws.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        ws.contains_key("lints"),
+        "overlay must preserve `[workspace.lints]` (R2 — used by \
+         `{{ workspace = true }}` references in `[lints]`); got entries: {:?}",
+        ws.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        ws.contains_key("metadata"),
+        "overlay must preserve `[workspace.metadata]` (R2 — passes through \
+         tool-owned namespaced metadata); got entries: {:?}",
+        ws.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        ws.contains_key("resolver"),
+        "overlay must preserve `[workspace.resolver]` (R2 — cargo's deps resolver \
+         version); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
 
-    // 2. `[package].workspace` MUST be absent. The overlay elects the
-    //    workspace-root role; a simultaneous ancestor-pointer would
-    //    contradict that and trigger a cargo error.
+    // 4. R2 fix-specific: `[workspace.dependencies.shared-utils]` must
+    //    SURVIVE (R1 stripped it). The earlier `absolutize_path_bearing_keys`
+    //    pass has rewritten the `path = "utils"` to an absolute path; we
+    //    verify the dep entry is there.
+    let ws_deps = ws
+        .get("dependencies")
+        .and_then(|v| v.as_table())
+        .expect("`[workspace.dependencies]` must be a table");
+    assert!(
+        ws_deps.contains_key("shared-utils"),
+        "R2 invariant: `[workspace.dependencies.shared-utils]` MUST survive \
+         (R1 stripped it; this is the regression Codex + Gemini caught); \
+         got workspace.dependencies entries: {:?}",
+        ws_deps.keys().collect::<Vec<_>>()
+    );
+
+    // 5. R2 fix-specific: `[workspace.package].edition` must SURVIVE so
+    //    a future `[package] edition.workspace = true` reference would
+    //    resolve correctly.
+    let ws_pkg = ws
+        .get("package")
+        .and_then(|v| v.as_table())
+        .expect("`[workspace.package]` must be a table");
+    assert_eq!(
+        ws_pkg.get("edition").and_then(|v| v.as_str()),
+        Some("2021"),
+        "R2 invariant: `[workspace.package].edition` MUST survive so \
+         `{{ workspace = true }}` in `[package].edition` resolves; got: {:?}",
+        ws_pkg
+    );
+
+    // 6. R2 fix-specific: `[workspace.lints]` content must SURVIVE.
+    let ws_lints = ws
+        .get("lints")
+        .and_then(|v| v.as_table())
+        .expect("`[workspace.lints]` must be a table");
+    assert!(
+        ws_lints.contains_key("rust"),
+        "R2 invariant: `[workspace.lints.rust]` MUST survive so `{{ workspace = true }}` \
+         in `[lints.rust]` resolves; got: {:?}",
+        ws_lints
+    );
+
+    // 7. The non-workspace part of the overlay (the actual buildable
+    //    crate identity) MUST be preserved.
     let pkg_table = parsed
         .get("package")
         .and_then(|v| v.as_table())
         .expect("overlay must preserve `[package]` table");
-    assert!(
-        !pkg_table.contains_key("workspace"),
-        "overlay must strip `[package].workspace`; got pkg keys: {:?}",
-        pkg_table.keys().collect::<Vec<_>>()
-    );
-
-    // 3. Defense-in-depth on the serialized bytes — the original
-    //    relative pointer must not survive in any form.
-    assert!(
-        !content.contains(r#"workspace = "../""#),
-        "relative [package].workspace must not survive in overlay; got:\n{content}"
-    );
-    // 4. Defense-in-depth: none of the original `[workspace]`-nested
-    //    arrays/path-deps must survive (they're either absolutized then
-    //    clobbered by the empty-`[workspace]` write, OR never copied —
-    //    in either case the serialized bytes must not contain them).
-    assert!(
-        !content.contains("members"),
-        "[workspace] members must not survive in overlay; got:\n{content}"
-    );
-    assert!(
-        !content.contains("default-members"),
-        "[workspace] default-members must not survive in overlay; got:\n{content}"
-    );
-    assert!(
-        !content.contains("shared-utils"),
-        "[workspace.dependencies.shared-utils] must not survive in overlay; got:\n{content}"
-    );
-
-    // 5. The non-workspace part of the overlay (the actual buildable
-    //    crate identity) MUST be preserved — the override only touches
-    //    `[workspace]` and `[package].workspace`, not the rest of `[package]`.
     assert_eq!(
         pkg_table.get("name").and_then(|v| v.as_str()),
-        Some("member"),
+        Some("ws-root"),
         "overlay must preserve `[package].name`"
     );
     assert_eq!(
@@ -1142,8 +1225,9 @@ serde = "1"
         Some("0.1.0"),
         "overlay must preserve `[package].version`"
     );
-    // The regular `[dependencies]` table must also pass through (the
-    // override only targets workspace inheritance, not deps).
+
+    // 8. The regular `[dependencies]` table must also pass through (the
+    //    override only targets `[workspace]`, not deps).
     let deps = parsed
         .get("dependencies")
         .and_then(|v| v.as_table())
@@ -1151,6 +1235,95 @@ serde = "1"
     assert!(
         deps.contains_key("serde"),
         "overlay must preserve `[dependencies.serde]`"
+    );
+
+    // 9. Defense-in-depth on the serialized bytes — neither the
+    //    `members` nor `default-members` keys must survive in any form
+    //    (the absolutization-then-strip path could in principle have a
+    //    leak; this catches it). `exclude` would have been absolutized
+    //    to a path starting with the tempdir prefix; we check the bare
+    //    key, which still appears in the absolutized array form.
+    //
+    //    Note: we cannot blindly `!contains("members")` because
+    //    `default-members` would match; we use precise key syntax.
+    assert!(
+        !content.contains("\nmembers ="),
+        "[workspace] members must not survive in overlay; got:\n{content}"
+    );
+    assert!(
+        !content.contains("\ndefault-members ="),
+        "[workspace] default-members must not survive in overlay; got:\n{content}"
+    );
+    assert!(
+        !content.contains("\nexclude ="),
+        "[workspace] exclude must not survive in overlay; got:\n{content}"
+    );
+}
+
+/// **Workspace-MEMBER manifest is REJECTED (PR #37 R2 — Option C).**
+///
+/// When the overlay manifest itself declares `[package].workspace =
+/// "<path>"`, it is a member of an ANCESTOR workspace — and the
+/// ancestor (not the manifest itself) is where the actual
+/// `[workspace.dependencies]` / `[workspace.package]` / `[workspace.lints]`
+/// tables live. To overlay this shape and keep inheritance working,
+/// we would need to read the ancestor's `Cargo.toml` and copy those
+/// tables down. That cross-manifest read is out-of-scope for
+/// v0.1.0-beta.6 (the R2 fix).
+///
+/// All four Round-1 pilots (cxx, serde-json, anyhow, thiserror) invoke
+/// lihaaf from the upstream ROOT (workspace-root shape: `[package]` +
+/// `[workspace]` in the same file). NONE invoke from a workspace-member
+/// sub-crate. So this rejection does not affect any currently-enrolled
+/// pilot. The follow-up to enable workspace-member overlays will land
+/// separately.
+///
+/// **What this test pins:** when `[package].workspace = "../"` is
+/// present in the upstream manifest, `materialize_overlay` returns an
+/// `Error::Cli` with a directed diagnostic — NOT a silently-stripped
+/// pointer (R1's behavior) or a silently-overlayed manifest.
+#[test]
+fn staged_overlay_rejects_workspace_member_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir for workspace-member rejection test");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Workspace-member shape: `[package]` + `[package].workspace = "../"`
+    // (pointing at an ancestor workspace root that lives in `../`).
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+workspace = "../"
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let result = materialize_overlay(&upstream_manifest);
+    let err = result.expect_err(
+        "workspace-member manifest (`[package].workspace = \"...\"`) MUST be rejected \
+         under R2 — copying the ancestor's inheritance tables down into the overlay \
+         is out-of-scope for v0.1.0-beta.6",
+    );
+
+    let s = format!("{err:?}");
+    assert!(
+        s.contains("workspace member"),
+        "rejection diagnostic must name the failure category; got: {s}"
+    );
+    assert!(
+        s.contains("[package].workspace"),
+        "rejection diagnostic must name the offending key; got: {s}"
     );
 }
 
@@ -1410,24 +1583,32 @@ ws-demo-impl = { path = "impl" }
         "overlay must be staged at <upstream>/target/lihaaf-overlay/Cargo.toml"
     );
 
-    // Pre-cargo sanity: the overlay must carry an empty `[workspace]`
-    // and the upstream's `members` array (in any form — relative or
-    // absolutized) must NOT survive. (The dedicated
+    // Pre-cargo sanity: the overlay must carry a `[workspace]` table
+    // (so cargo stops the walk-up at the overlay) and the upstream's
+    // `members` array (in any form — relative or absolutized) must NOT
+    // survive. (The dedicated
     // `staged_overlay_overrides_upstream_workspace_inheritance` test
     // pins this contract at the structural level; this assertion is
     // defense-in-depth at the cargo-test layer, catching the case where
     // the override stops running but the absolutization still does.)
+    //
+    // Under R2 (PR #37 fixup), `[workspace]` may carry inheritance
+    // tables (`dependencies`, `package`, `lints`, `metadata`,
+    // `resolver`). This test's input has no inheritance tables so
+    // the overlay's `[workspace]` will be empty in practice — but the
+    // assertion below only checks that `members` is stripped, which
+    // is the load-bearing R2 invariant.
     let content = read_overlay(&plan.sibling_manifest);
     assert!(
         content.contains("[workspace]"),
-        "staged overlay must declare `[workspace]` (even empty) so cargo \
-         treats it as its own workspace root; got overlay:\n{content}"
+        "staged overlay must declare `[workspace]` (so cargo treats it as its \
+         own workspace root); got overlay:\n{content}"
     );
     assert!(
-        !content.contains("members"),
+        !content.contains("\nmembers ="),
         "staged overlay must NOT preserve any form of the upstream's \
-         `[workspace] members` array (the empty-workspace override clobbers \
-         both the original relative form and the absolutized form); got overlay:\n{content}"
+         `[workspace] members` array (the override strips it in both relative \
+         and absolutized form); got overlay:\n{content}"
     );
 
     // The acid test: cargo rustc against the staged overlay. Without the
@@ -1452,6 +1633,172 @@ ws-demo-impl = { path = "impl" }
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the workspace-style staged overlay; \
+         got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **R2 regression: `{ workspace = true }` inheritance reference resolves
+/// against the preserved `[workspace.dependencies]` in the staged overlay.**
+///
+/// This is the exact production failure shape Codex's BLOCK identified
+/// on PR #37 R1 (commit 1f6520b). R1 replaced `[workspace]` with `{}`,
+/// which broke any overlay manifest that used cargo's workspace
+/// inheritance feature. The Codex repro:
+///
+/// ```toml
+/// [package]
+/// name = "ws-demo"
+/// version = "0.1.0"
+///
+/// [workspace]
+/// members = ["impl"]
+///
+/// [workspace.dependencies]
+/// ws-demo-impl = { path = "impl" }
+///
+/// [dependencies]
+/// ws-demo-impl = { workspace = true }   # ← inherits from above
+/// ```
+///
+/// Under R1: `[workspace.dependencies]` was clobbered to `{}`, so the
+/// surviving `{ workspace = true }` reference produced cargo's
+/// "workspace inheritance was specified but `[workspace.dependencies]`
+/// was not defined" error.
+///
+/// Under R2 (this commit): `[workspace.dependencies]` is preserved
+/// (only `members` / `exclude` / `default-members` are stripped), so
+/// the inheritance reference resolves correctly.
+///
+/// **Why this test is gated.** Runs `cargo rustc` as a subprocess —
+/// same OOM concern as the other `cargo_accepts_*` tests. CI sets
+/// `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; local runs skip by default.
+///
+/// **Why this test is load-bearing for the R2 fixup.** Mentally
+/// disabling the R2 selective rewrite (reverting to R1's full clobber)
+/// would cause `[workspace.dependencies]` to be `{}` in the overlay,
+/// and the `{ workspace = true }` reference would fail cargo's parser.
+/// This test catches that regression at the cargo-test layer; the
+/// structural unit test
+/// (`override_workspace_preserves_inheritance_tables`) catches it
+/// faster but doesn't prove cargo accepts the result.
+#[test]
+fn cargo_accepts_workspace_inheritance_reference_in_overlay() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_workspace_inheritance_reference_in_overlay: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp =
+        tempfile::tempdir().expect("creating tempdir for workspace-inheritance cargo build test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Member sub-crate at `<upstream>/impl/`.
+    let impl_dir = upstream_dir.join("impl");
+    std::fs::create_dir_all(impl_dir.join("src")).expect("creating impl/src/");
+    std::fs::write(
+        impl_dir.join("Cargo.toml"),
+        r#"[package]
+name = "ws-demo-impl"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .expect("writing impl/Cargo.toml");
+    std::fs::write(
+        impl_dir.join("src").join("lib.rs"),
+        "pub fn helper() -> u32 { 1 }\n",
+    )
+    .expect("writing impl/src/lib.rs");
+
+    // Root upstream: workspace ROOT carrying both `[package]` and
+    // `[workspace.dependencies]`, plus a `{ workspace = true }`
+    // reference in `[dependencies]`. The Codex repro shape exactly.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "ws-demo"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = ["impl"]
+
+[workspace.dependencies]
+ws-demo-impl = { path = "impl" }
+
+[dependencies]
+ws-demo-impl = { workspace = true }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn api() -> u32 { ws_demo_impl::helper() }\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Pre-cargo sanity: parsed overlay must carry
+    // `[workspace.dependencies.ws-demo-impl]` (with absolutized path).
+    // This is the R2 invariant the cargo build below tests end-to-end.
+    let content = read_overlay(&plan.sibling_manifest);
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
+    let ws_deps = parsed
+        .get("workspace")
+        .and_then(|v| v.as_table())
+        .and_then(|ws| ws.get("dependencies"))
+        .and_then(|v| v.as_table())
+        .expect(
+            "R2 invariant: `[workspace.dependencies]` MUST survive in the overlay so \
+             `{ workspace = true }` references resolve",
+        );
+    assert!(
+        ws_deps.contains_key("ws-demo-impl"),
+        "[workspace.dependencies.ws-demo-impl] MUST survive (Codex repro shape); \
+         got entries: {:?}",
+        ws_deps.keys().collect::<Vec<_>>()
+    );
+
+    // The acid test: cargo rustc against the staged overlay. Under R1
+    // (the BLOCKed attempt), this produces: "workspace inheritance was
+    // specified but `[workspace.dependencies]` was not defined". Under
+    // R2 (this commit), it succeeds.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("ws-demo")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must accept the workspace-inheritance overlay (Codex repro); \
          got exit {:?}\n\
          stdout:\n{}\n\
          stderr:\n{}",
