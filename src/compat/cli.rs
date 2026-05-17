@@ -19,6 +19,55 @@ use std::path::PathBuf;
 use crate::cli::Cli;
 use crate::error::Error;
 
+/// Absolutize a `compat_root` path (or `compat_manifest` path) that may have
+/// arrived as a relative value from the CLI.
+///
+/// **Why this is necessary.** The production shape in
+/// `compat/templates/pilot-stage2.yml` is `--compat-root .`, which is a
+/// relative path evaluated in the context of the CI checkout directory.
+/// Every downstream consumer in `overlay.rs` and `mod.rs` joins paths against
+/// `compat_root` (e.g. `upstream_dir`, `converted_fixtures_root`).  If
+/// `compat_root` is `"."` those joins produce relative strings like
+/// `./target/lihaaf-compat-converted/`, which cargo resolves against the
+/// staged manifest dir (`<upstream>/target/lihaaf-overlay/`) — not the crate
+/// root — causing the double-`target/` nonexistent-path failure.
+///
+/// The fix: absolutize ONCE here at the CLI boundary so all downstream code
+/// receives an absolute path.  We use `current_dir().join()` rather than
+/// `canonicalize()` because the directory may not exist yet (e.g. an
+/// operator-controlled path that will be created by a preceding checkout step)
+/// and `canonicalize` fails on non-existent paths on most platforms.
+fn absolutize_optional_path(base: Option<PathBuf>) -> Result<Option<PathBuf>, Error> {
+    match base {
+        None => Ok(None),
+        Some(p) if p.is_absolute() => Ok(Some(p)),
+        Some(p) => {
+            let cwd = std::env::current_dir().map_err(|e| Error::Io {
+                source: e,
+                context: "obtaining cwd to absolutize --compat-root / --compat-manifest"
+                    .to_string(),
+                path: None,
+            })?;
+            Ok(Some(cwd.join(p)))
+        }
+    }
+}
+
+/// Absolutize a required path that is guaranteed non-`None` by
+/// `validate_mode_consistency`. Extracts and absolutizes in one call so the
+/// caller at the `compat_root` and `compat_report` sites stays one line each.
+fn absolutize_required_path(base: PathBuf) -> Result<PathBuf, Error> {
+    if base.is_absolute() {
+        return Ok(base);
+    }
+    let cwd = std::env::current_dir().map_err(|e| Error::Io {
+        source: e,
+        context: "obtaining cwd to absolutize --compat-root / --compat-report".to_string(),
+        path: None,
+    })?;
+    Ok(cwd.join(base))
+}
+
 /// Typed bundle of compat-mode arguments.
 ///
 /// The struct is `pub` because the crate's binary lives in a separate
@@ -87,20 +136,33 @@ impl CompatArgs {
             "CompatArgs::from_cli called outside compat mode; validate_mode_consistency \
              must have been bypassed"
         );
-        let compat_root = cli
-            .compat_root
-            .clone()
-            .expect("validate_mode_consistency ensures compat_root is set");
-        let compat_report = cli
-            .compat_report
-            .clone()
-            .expect("validate_mode_consistency ensures compat_report is set");
+        // Absolutize compat_root at the CLI entry boundary. Production usage
+        // passes `--compat-root .` (see `compat/templates/pilot-stage2.yml:209`),
+        // which is a relative path. Every downstream consumer joins additional
+        // sub-paths against compat_root; if compat_root stays as `"."` those
+        // joins produce relative paths like `./target/lihaaf-compat-converted/`
+        // that cargo resolves against the staged manifest dir
+        // (`<upstream>/target/lihaaf-overlay/`) — not the crate root — causing
+        // the double-`target/` nonexistent-path failure first caught in the
+        // Round-2 panel. Fix once here so all consumers see an absolute path.
+        let compat_root = absolutize_required_path(
+            cli.compat_root
+                .clone()
+                .expect("validate_mode_consistency ensures compat_root is set"),
+        )?;
+        let compat_report = absolutize_required_path(
+            cli.compat_report
+                .clone()
+                .expect("validate_mode_consistency ensures compat_report is set"),
+        )?;
         let compat_cargo_test_argv = parse_argv_json(
             cli.compat_cargo_test_argv
                 .as_deref()
                 .unwrap_or(DEFAULT_CARGO_TEST_ARGV_JSON),
         )?;
-        let compat_manifest = cli.compat_manifest.clone();
+        // --compat-manifest is optional; absolutize it too so callers in
+        // overlay.rs never receive a relative manifest path.
+        let compat_manifest = absolutize_optional_path(cli.compat_manifest.clone())?;
         let compat_commit = cli.compat_commit.clone();
         let compat_filter = cli.compat_filter.clone();
         let compat_trybuild_macro = cli.compat_trybuild_macro.clone();
