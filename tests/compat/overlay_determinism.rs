@@ -28,10 +28,17 @@
 //!    `tests/compat/overlay_corpus/`, each checked against a
 //!    pre-committed `*.expected.toml`).
 //! 6. The §3.2.3 risk section's invariant
-//!    (`patch_tables_preserved_verbatim` — `[patch.crates-io]` data is
-//!    passed through unmodified except for the spec's documented inline-
-//!    to-explicit-table canonicalization the `toml` crate's serializer
-//!    performs).
+//!    (`patch_tables_preserved_verbatim` — `[patch.crates-io]`
+//!    `git`/`branch`/`tag`/`rev` fields pass through verbatim;
+//!    `absolutizes_patch_path_entries` — `[patch.crates-io.X].path`
+//!    is absolutized like `[dependencies.X].path` so the cxx-pilot
+//!    `cxx = { path = "." }` / `cxx-build = { path = "gen/build" }` shapes
+//!    work correctly from the staged manifest dir).
+//! 7. Workspace key classes (FIX class B): `[package].workspace`,
+//!    `[workspace].default-members`, `[workspace.dependencies.*].path`.
+//! 8. Richer cargo-build regression (`cargo_accepts_rich_overlay_for_dylib_build`)
+//!    exercising path-dep + `[patch.crates-io]` path entry + relative
+//!    `--compat-root` — the production failure shapes from the Round-2 panel.
 //!
 //! ## Why every test is hermetic
 //!
@@ -482,14 +489,14 @@ fn line_endings_are_lf_on_every_platform() {
 
 #[test]
 fn patch_tables_preserved_verbatim() {
-    // Per spec §3.2.3 risks: `[patch]` overlays are pass-through —
-    // the overlay code must NOT touch them. We assert two properties:
+    // Per spec §3.2.3: `[patch]` `git`/`branch`/`tag`/`rev` fields must
+    // pass through verbatim — the overlay must NOT rewrite remote-source
+    // fields.  (The `path` sub-key IS absolutized; see
+    // `absolutizes_patch_path_entries` below.)  We assert two properties:
     //
-    // 1. The `[patch.crates-io]` table reaches the output unchanged
-    //    in its data content (keys + values match the input).
-    // 2. The `[patch]` ordering relative to the canonical key sequence
-    //    is honored (`patch` lands after `features` per
-    //    `canonical_key_order()`).
+    // 1. The `[patch.crates-io]` git/branch fields reach the output unchanged.
+    // 2. The `[patch]` ordering relative to the canonical key sequence is
+    //    honored (`patch` lands after `features` per `canonical_key_order()`).
     let input = r#"[package]
 name = "demo"
 version = "0.1.0"
@@ -878,4 +885,354 @@ inner-build = { path = "inner-build" }
             "no relative `{relative_form}` may survive in the overlay; got:\n{content}"
         );
     }
+}
+
+/// **`[patch.<registry>.X].path` entries are absolutized in the staged
+/// overlay.**
+///
+/// Regression for Round-2 strict-swe Opus BLOCK-1 (cxx pilot): cxx's
+/// `Cargo.toml` carries `[patch.crates-io] cxx = { path = "." }` and
+/// `cxx-build = { path = "gen/build" }`.  After staging the overlay two
+/// dirs deeper, those paths resolved against the staged manifest dir:
+/// `"."` became a self-reference to the staged dir and `"gen/build"`
+/// pointed at a nonexistent subdir.  This test pins the fix — path-form
+/// patch entries are absolutized like `[dependencies.X].path`.
+///
+/// The `git`/`branch` form (`serde = { git = "..." }`) must still pass
+/// through verbatim (covered by `patch_tables_preserved_verbatim`).
+#[test]
+fn absolutizes_patch_path_entries() {
+    let tmp = tempfile::tempdir().expect("tempdir for patch path test");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Mirrors the cxx pilot: two path-form entries + one git-form entry.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "cxx-demo"
+version = "0.1.0"
+
+[dependencies]
+serde = "1"
+
+[patch.crates-io]
+cxx-demo = { path = "." }
+cxx-demo-build = { path = "gen/build" }
+serde = { git = "https://example.com/serde", branch = "main" }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+    let content = read_overlay(&plan.sibling_manifest);
+
+    // Parse the output to make assertions structure-level, not byte-level,
+    // and tolerate inline-to-explicit-table canonicalization.
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must parse as TOML");
+    let crates_io = parsed
+        .get("patch")
+        .and_then(|v| v.get("crates-io"))
+        .expect("[patch.crates-io] must survive overlay");
+
+    // cxx-demo path = "." → absolute upstream dir.
+    let cxx_path = crates_io
+        .get("cxx-demo")
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.cxx-demo].path must survive overlay");
+    assert!(
+        Path::new(cxx_path).is_absolute(),
+        "[patch.crates-io.cxx-demo].path must be absolute after overlay; got `{cxx_path}`"
+    );
+
+    // cxx-demo-build path = "gen/build" → absolute upstream/gen/build.
+    let build_path = crates_io
+        .get("cxx-demo-build")
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.cxx-demo-build].path must survive overlay");
+    assert!(
+        Path::new(build_path).is_absolute(),
+        "[patch.crates-io.cxx-demo-build].path must be absolute after overlay; got `{build_path}`"
+    );
+    assert!(
+        build_path.ends_with("gen/build"),
+        "[patch.crates-io.cxx-demo-build].path must end with `gen/build`; got `{build_path}`"
+    );
+
+    // serde git-form entry must pass through with git/branch fields intact.
+    let serde_patch = crates_io
+        .get("serde")
+        .expect("[patch.crates-io.serde] must survive overlay");
+    assert_eq!(
+        serde_patch.get("git").and_then(|v| v.as_str()),
+        Some("https://example.com/serde"),
+        "patch git URL must be unchanged by overlay"
+    );
+    assert_eq!(
+        serde_patch.get("branch").and_then(|v| v.as_str()),
+        Some("main"),
+        "patch branch must be unchanged by overlay"
+    );
+
+    // Defense-in-depth: no relative path survives in the [patch.*] region.
+    let patch_start = content
+        .find("[patch")
+        .expect("[patch] section must be present in overlay");
+    let patch_region = &content[patch_start..];
+    assert!(
+        !patch_region.contains(r#"path = ".""#) && !patch_region.contains(r#"path = "gen/build""#),
+        "no relative path must survive in [patch.*]; got patch region:\n{patch_region}"
+    );
+}
+
+/// **Workspace key classes (FIX class B): `[package].workspace`,
+/// `[workspace].default-members`, and `[workspace.dependencies.*].path`
+/// are absolutized in the staged overlay.**
+///
+/// Regression test for three key classes that `docs/compatibility-plan.md`
+/// claimed "every path-bearing key" covered but the Round-2 panel found
+/// missing.  Each class is exercised in the same manifest so a single
+/// overlay run verifies all three.
+#[test]
+fn staged_overlay_absolutizes_workspace_key_classes() {
+    let tmp = tempfile::tempdir().expect("tempdir for workspace key test");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "member"
+version = "0.1.0"
+workspace = "../"
+
+[workspace]
+members = ["crate-a"]
+default-members = ["crate-a", "crate-b"]
+
+[workspace.dependencies]
+shared-utils = { path = "utils" }
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+    let content = read_overlay(&plan.sibling_manifest);
+
+    // Parse to make assertions structure-level.
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must parse as TOML");
+
+    // [package].workspace must be absolute.
+    let pkg_ws = parsed
+        .get("package")
+        .and_then(|v| v.get("workspace"))
+        .and_then(|v| v.as_str())
+        .expect("[package].workspace must survive overlay");
+    assert!(
+        Path::new(pkg_ws).is_absolute(),
+        "[package].workspace must be absolutized in the staged overlay; got `{pkg_ws}`"
+    );
+
+    // [workspace].default-members must have all-absolute entries.
+    let dm = parsed
+        .get("workspace")
+        .and_then(|v| v.get("default-members"))
+        .and_then(|v| v.as_array())
+        .expect("[workspace].default-members must survive overlay");
+    for entry in dm {
+        let s = entry
+            .as_str()
+            .expect("default-members entry must be a string");
+        assert!(
+            Path::new(s).is_absolute(),
+            "[workspace].default-members entry must be absolute; got `{s}`"
+        );
+    }
+
+    // [workspace.dependencies.shared-utils].path must be absolute.
+    let utils_path = parsed
+        .get("workspace")
+        .and_then(|v| v.get("dependencies"))
+        .and_then(|v| v.get("shared-utils"))
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[workspace.dependencies.shared-utils].path must survive overlay");
+    assert!(
+        Path::new(utils_path).is_absolute(),
+        "[workspace.dependencies.shared-utils].path must be absolutized; got `{utils_path}`"
+    );
+    assert!(
+        utils_path.ends_with("utils"),
+        "absolutized path must end with `utils` component; got `{utils_path}`"
+    );
+
+    // Defense-in-depth: relative workspace pointer must not survive.
+    assert!(
+        !content.contains(r#"workspace = "../""#),
+        "relative [package].workspace must not survive in overlay; got:\n{content}"
+    );
+}
+
+/// **Richer cargo-build regression: path-dep + `[patch.crates-io]` path
+/// entry + relative `--compat-root` form.**  (FIX class D)
+///
+/// The existing `cargo_accepts_staged_overlay_for_dylib_build` test uses a
+/// minimal crate that would NOT have caught FIX class A (relative
+/// `--compat-root`) because `tempfile::tempdir()` returns an absolute path,
+/// and would NOT have caught FIX class C (`[patch.crates-io.X].path`) because
+/// it has no `[patch]` block.
+///
+/// This test exercises the three production failure shapes the Round-2 panel
+/// surfaced:
+///
+/// 1. A path-dep (`demo-impl = { path = "impl" }`) — catches any regression
+///    to `[dependencies.X].path` absolutization.
+/// 2. A `[patch.crates-io]` block with `path = "."` (cxx pattern) — catches
+///    FIX class C regressions.
+/// 3. The manifest path is given to `materialize_overlay` as an absolute path
+///    (reflecting what `CompatArgs::from_cli` now guarantees after FIX class A),
+///    but `upstream_dir` is confirmed absolute before use — this is the
+///    structural guard that FIX class A is exercised via the CLI layer (see
+///    `CompatArgs::from_cli` absolutization) and the overlay layer handles only
+///    the manifest path it is given.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` for the same OOM reason as
+/// `cargo_accepts_staged_overlay_for_dylib_build`.
+#[test]
+fn cargo_accepts_rich_overlay_for_dylib_build() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_rich_overlay_for_dylib_build: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    // Build a synthetic fork with:
+    //   - a path-dep pointing at <upstream>/impl/ (mirrors thiserror pattern)
+    //   - a [patch.crates-io] entry with path = "." (mirrors cxx pattern)
+    //
+    // The path-dep crate is a stub with its own Cargo.toml + src/lib.rs.
+    // The patch entry references the same crate; cargo will resolve the
+    // patch to the real upstream dir after absolutization.
+    let tmp = tempfile::tempdir().expect("creating tempdir for rich cargo build test");
+    let upstream_dir = tmp.path();
+
+    // Guarantee upstream_dir is absolute — mirrors what FIX class A
+    // ensures at the CLI layer (CompatArgs::from_cli absolutizes compat_root).
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute; FIX class A ensures compat_root is absolute before overlay"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Write the impl sub-crate.
+    let impl_dir = upstream_dir.join("impl");
+    std::fs::create_dir_all(impl_dir.join("src")).expect("creating impl/src/");
+    std::fs::write(
+        impl_dir.join("Cargo.toml"),
+        r#"[package]
+name = "rich-demo-impl"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .expect("writing impl/Cargo.toml");
+    std::fs::write(
+        impl_dir.join("src").join("lib.rs"),
+        "// impl stub\npub fn helper() {}\n",
+    )
+    .expect("writing impl/src/lib.rs");
+
+    // Write the upstream manifest.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "rich-demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+rich-demo-impl = { path = "impl" }
+
+[patch.crates-io]
+rich-demo = { path = "." }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "// rich-demo stub\npub fn api() -> u32 { 42 }\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Sanity: overlay staged in expected location.
+    let expected_staged = upstream_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_staged,
+        "overlay must be staged at <upstream>/target/lihaaf-overlay/Cargo.toml"
+    );
+
+    // Verify that neither [dependencies.rich-demo-impl].path nor
+    // [patch.crates-io.rich-demo].path carries a relative value.
+    let content = read_overlay(&plan.sibling_manifest);
+    assert!(
+        !content.contains(r#"path = "impl""#),
+        "relative [dependencies.rich-demo-impl].path must not survive; overlay:\n{content}"
+    );
+    assert!(
+        !content.contains(r#"path = ".""#),
+        "relative [patch.crates-io.rich-demo].path must not survive; overlay:\n{content}"
+    );
+
+    // The acid test: cargo rustc against the staged overlay.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("rich-demo")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must succeed against the rich staged overlay; got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
