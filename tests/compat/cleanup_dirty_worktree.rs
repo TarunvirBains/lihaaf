@@ -151,7 +151,15 @@ fn committed_path_is_not_cleaned() {
     let root = tmp.path();
     git_init(root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
     git_add_and_commit(root, &path, "compat: committed overlay");
 
@@ -300,10 +308,18 @@ fn gitignored_path_is_not_cleaned() {
     git_init(root);
 
     let gitignore = root.join(".gitignore");
-    std::fs::write(&gitignore, "Cargo.lihaaf.toml\n").expect("write .gitignore");
+    std::fs::write(&gitignore, "lihaaf-compat-fixture.toml\n").expect("write .gitignore");
     git_add_and_commit(root, &gitignore, "compat: ignore overlay");
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     let guard = CleanupGuard::new(/*keep_output=*/ false);
@@ -334,7 +350,15 @@ fn untracked_unignored_path_classified_cleaned_and_removed() {
     let root = tmp.path();
     git_init(root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     let guard = CleanupGuard::new(/*keep_output=*/ false);
@@ -367,7 +391,15 @@ fn keep_output_converts_cleaned_to_kept() {
     let root = tmp.path();
     git_init(root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     let guard = CleanupGuard::new(/*keep_output=*/ true);
@@ -438,7 +470,15 @@ fn rerun_idempotent_two_finalize_calls() {
     let root = tmp.path();
     git_init(root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     let first = CleanupGuard::new(/*keep_output=*/ false);
@@ -479,7 +519,15 @@ fn drop_runs_cleanup_on_panic() {
     let root = tmp.path().to_path_buf();
     git_init(&root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     let path_for_closure = path.clone();
@@ -518,7 +566,15 @@ fn finalize_consumes_guard_drop_is_noop() {
     let root = tmp.path();
     git_init(root);
 
-    let path = root.join("Cargo.lihaaf.toml");
+    // Synthetic test artifact: a root-level non-`target/` filename
+    // exercises the git-ls-files / git-check-ignore / default-Cleaned
+    // classifier branches. The production overlay path is
+    // `<root>/target/lihaaf-overlay/Cargo.toml`, which always
+    // short-circuits to `Ignored` via the `<target_root>/target/` rule —
+    // tested separately by `target_directory_path_classified_as_ignored`
+    // (and the same short-circuit is what makes the production layout
+    // safe under the dirty-worktree rule).
+    let path = root.join("lihaaf-compat-fixture.toml");
     write_artifact(&path, b"# overlay\n");
 
     // Scope the guard so the implicit Drop fires before the

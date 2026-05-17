@@ -6,6 +6,85 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] — next
+
+Targeted GA-blocker fix for the compat-mode manifest staging path. The
+v0.1.0-beta.4 release shipped the compat driver with the overlay
+materialized as `<upstream>/Cargo.lihaaf.toml` (a sibling of the
+upstream `Cargo.toml`). Cargo validates `--manifest-path` filenames at
+startup and rejects any path whose last component is not literally
+`Cargo.toml` — every stage-2 pilot fork (cxx, serde-json, anyhow,
+thiserror) failed with `lihaaf_session_failed` / detail "the
+manifest-path must be a path to a Cargo.toml file" on every CI run
+([Actions run 25994537438](https://github.com/TarunvirBains/lihaaf/actions/runs/25994537438)).
+
+### Fixed
+- **Overlay staging path** (`src/compat/overlay.rs`): the materialized
+  overlay now writes to `<upstream>/target/lihaaf-overlay/Cargo.toml`
+  so cargo accepts `--manifest-path` without error. The `target/`
+  subtree is treated as implicitly ignored by the cleanup classifier
+  (existing `<target_root>/target/` short-circuit), so no fork-side
+  `.gitignore` change is required.
+- **Path-bearing TOML keys absolutized in the staged overlay**: cargo
+  resolves every path-bearing manifest key against the parent
+  directory of the manifest being parsed. The staged overlay lives
+  two dirs deeper than the upstream `Cargo.toml`, so without
+  absolutization cargo would search the empty staged dir for
+  `src/lib.rs`, `build.rs`, path-deps, and workspace members. The
+  overlay now absolutizes `[lib] path`, `[[bin]] path`,
+  `[[example]] path`, `[[test]] path`, `[[bench]] path`,
+  `[dependencies.X] path`, `[dev-dependencies.X] path`,
+  `[build-dependencies.X] path`, `[target.*.<deps>] path`,
+  `[workspace] members`, `[workspace] exclude`, and `[package] build`.
+  Auto-discovery for `[[bin]]` / `[[example]]` / `[[test]]` /
+  `[[bench]]` is explicitly disabled (`autobins = false`, etc.) so a
+  future cargo version that hardens the empty-discovery case does not
+  break the overlay.
+- **`fixture_dirs` resolution under the new staging path**
+  (`src/compat/mod.rs`): the synthetic `[package.metadata.lihaaf]`
+  block previously wrote `fixture_dirs` as repo-relative strings
+  (`./target/lihaaf-compat-converted/{compile_pass,compile_fail}`).
+  lihaaf's `discovery::collect` resolves relative paths against the
+  manifest's parent dir, which under the new staging is
+  `<compat_root>/target/lihaaf-overlay/` — a double-`target/` lookup
+  that does not exist. The driver now absolutizes both paths against
+  `<compat_root>` directly so the inner session sees the real
+  on-disk locations regardless of where the overlay manifest is
+  staged.
+
+### Changed
+- **`docs/compatibility-plan.md` §3.2.3** rewritten to describe the
+  staged-target overlay shape, the path-absolutization sub-procedure,
+  and the cleanup-classifier short-circuit that covers it. The
+  "sibling vs rewrite-then-restore vs `[patch]`" rationale subsection
+  now reads as "staged-target vs sibling vs rewrite-then-restore vs
+  `[patch]`", with the sibling row added as the v0.1.0-beta.4
+  approach this PR superseded.
+- **`.gitignore`** no longer carries a dedicated `/Cargo.lihaaf.toml`
+  entry — the staged overlay lives under `target/`, which the
+  existing `/target` rule already covers.
+
+### Tests
+- `tests/compat/overlay_determinism.rs`: new
+  `cargo_accepts_staged_overlay_for_dylib_build` test (gated behind
+  `LIHAAF_RUN_CARGO_BUILD_TESTS=1`) invokes `cargo rustc` against the
+  staged overlay with a synthetic `<upstream>/Cargo.toml` +
+  `<upstream>/src/lib.rs` and asserts exit 0 — codifies the manual
+  repro from the PR #34 adversarial review.
+- `tests/compat/overlay_determinism.rs`:
+  `staged_overlay_carries_absolute_lib_path` and
+  `staged_overlay_absolutizes_path_dependencies` pin the
+  path-absolutization contract at the byte level so every CI lane
+  (without the cargo-build env-var gate) bites a regression that
+  drops or downgrades the rewrite.
+- `src/compat/overlay.rs` unit tests cover the explicit / implicit
+  `[lib] path` injection, the `[target.*.dependencies.X] path`
+  rewrite, the `[workspace] members` / `[workspace] exclude` rewrite,
+  the `[package] build` injection rule (only when
+  `<upstream>/build.rs` exists), the `autoX = false` disabling for
+  non-lib targets, and the `[[bin]]` / `[[example]]` / `[[test]]` /
+  `[[bench]]` `path =` rewrite.
+
 ## [0.1.0-beta.4] — 2026-05-16
 
 Headline addition: **compat mode** — a fork-driven workflow letting

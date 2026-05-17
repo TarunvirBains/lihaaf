@@ -165,7 +165,7 @@ fn envelope_round_trips_through_disk() {
         reason: "manual --compat-exclude".into(),
     }];
     original.generated_paths = vec![GeneratedPath {
-        path: "Cargo.lihaaf.toml".into(),
+        path: "target/lihaaf-overlay/Cargo.toml".into(),
         class: "cleaned".into(),
     }];
 
@@ -358,32 +358,43 @@ fn excluded_fixtures_sorted_by_fixture() {
 }
 
 /// Test 6 — `generated_paths` sorted by `path` ASCII byte order.
+///
+/// The three paths below mirror the actual production output of a
+/// compat run after the PR #34 redesign: a staged overlay under
+/// `target/lihaaf-overlay/`, a converted-fixtures tree under
+/// `target/lihaaf-compat-converted/`, and a snapshot file under
+/// `tests/snapshots/`. The sort honors strict lexicographic byte
+/// order — `target/lihaaf-compat-converted/` precedes
+/// `target/lihaaf-overlay/Cargo.toml` because at byte position 14 a
+/// `c` (0x63) precedes an `o` (0x6f), and `target/...` precedes
+/// `tests/...` because at byte position 1 an `a` (0x61) precedes an
+/// `e` (0x65).
 #[test]
 fn generated_paths_sorted_by_path() {
     let mut env = empty_envelope();
     env.generated_paths = vec![
         GeneratedPath {
-            path: "target/lihaaf-compat-converted/".into(),
-            class: "kept".into(),
+            path: "tests/snapshots/foo.stderr".into(),
+            class: "committed".into(),
         },
         GeneratedPath {
-            path: "Cargo.lihaaf.toml".into(),
+            path: "target/lihaaf-overlay/Cargo.toml".into(),
             class: "cleaned".into(),
         },
         GeneratedPath {
-            path: "tests/snapshots/foo.stderr".into(),
-            class: "committed".into(),
+            path: "target/lihaaf-compat-converted/".into(),
+            class: "kept".into(),
         },
     ];
 
     let (_tmp, _path, _bytes) = write_to_tmp(&mut env);
-    // ASCII: `C` (0x43) < `t` (0x74). `Cargo` precedes both `target`
-    // and `tests`; `target/` precedes `tests/` because `target` < `tests`
-    // (compared char-by-char until the differing position).
-    assert_eq!(env.generated_paths[0].path, "Cargo.lihaaf.toml");
+    assert_eq!(
+        env.generated_paths[0].path,
+        "target/lihaaf-compat-converted/"
+    );
     assert_eq!(
         env.generated_paths[1].path,
-        "target/lihaaf-compat-converted/"
+        "target/lihaaf-overlay/Cargo.toml"
     );
     assert_eq!(env.generated_paths[2].path, "tests/snapshots/foo.stderr");
 }
@@ -420,7 +431,7 @@ fn paths_are_repo_relative_forward_slash() {
         reason: "skip".into(),
     }];
     env.generated_paths = vec![GeneratedPath {
-        path: "Cargo.lihaaf.toml".into(),
+        path: "target/lihaaf-overlay/Cargo.toml".into(),
         class: "cleaned".into(),
     }];
 
@@ -682,11 +693,14 @@ fn generated_path_from_cleanup_round_trip() {
     ];
     for (cleanup_class, expected_label) in cases {
         let cleanup_entry = CleanupGeneratedPath {
-            path: compat_root.join("Cargo.lihaaf.toml"),
+            path: compat_root
+                .join("target")
+                .join("lihaaf-overlay")
+                .join("Cargo.toml"),
             class: cleanup_class,
         };
         let envelope_entry = from_cleanup(&cleanup_entry, &compat_root);
-        assert_eq!(envelope_entry.path, "Cargo.lihaaf.toml");
+        assert_eq!(envelope_entry.path, "target/lihaaf-overlay/Cargo.toml");
         assert_eq!(envelope_entry.class, expected_label);
     }
 

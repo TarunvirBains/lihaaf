@@ -10,11 +10,12 @@ docs/superpowers/
 /target/lihaaf
 /target/lihaaf-build
 
-# Compat-mode overlay artifact: `materialize_overlay` writes a sibling
-# `Cargo.lihaaf.toml` next to the upstream manifest. Running compat
-# against this repo (`cargo lihaaf --compat --compat-root .`) lands the
-# overlay here.
-/Cargo.lihaaf.toml
+# Compat-mode overlay artifact: `materialize_overlay` writes the
+# staged overlay at `<upstream>/target/lihaaf-overlay/Cargo.toml`. The
+# `target/` subtree is already cargo-ignored by the `/target` rule
+# above, so no dedicated `.gitignore` entry is required — but the
+# cleanup classifier's `<target_root>/target/` short-circuit still
+# applies on first-run worktrees that lack an explicit `target/` rule.
 
 # Editor / OS noise
 .DS_Store

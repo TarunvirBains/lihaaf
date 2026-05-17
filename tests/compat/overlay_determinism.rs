@@ -36,9 +36,10 @@
 //! ## Why every test is hermetic
 //!
 //! Each test owns a `tempfile::TempDir` and operates exclusively within
-//! it. The overlay generator writes `Cargo.lihaaf.toml` next to the
-//! input it reads, so the tempdir layout mirrors a real fork checkout
-//! without polluting the lihaaf source tree.
+//! it. The overlay generator writes the staged manifest under
+//! `<tempdir>/target/lihaaf-overlay/Cargo.toml` (the same shape every
+//! production compat run produces), so the tempdir layout mirrors a
+//! real fork checkout without polluting the lihaaf source tree.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -54,10 +55,11 @@ fn write_upstream(input: &str) -> (tempfile::TempDir, PathBuf) {
     (tmp, path)
 }
 
-/// Helper: read the sibling overlay bytes as a UTF-8 string.
+/// Helper: read the staged overlay bytes as a UTF-8 string.
 fn read_overlay(sibling_path: &Path) -> String {
-    let bytes = std::fs::read(sibling_path).expect("sibling Cargo.lihaaf.toml must exist");
-    String::from_utf8(bytes).expect("sibling overlay must be valid UTF-8")
+    let bytes = std::fs::read(sibling_path)
+        .expect("staged overlay `target/lihaaf-overlay/Cargo.toml` must exist");
+    String::from_utf8(bytes).expect("staged overlay must be valid UTF-8")
 }
 
 #[test]
@@ -385,6 +387,14 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
     // test in CI; the careful-coder handling the bump regenerates the
     // corpus and re-asserts the `overlay_serializer_drift` envelope
     // contract (Phase 8 surfaces this).
+    //
+    // **Path-absolutization caveat.** After the PR #34 redesign, the
+    // staged overlay carries absolute paths in its `[lib] path` and
+    // path-dep entries (resolved against the upstream crate dir). The
+    // corpus expected files hold a `__UPSTREAM_DIR__` placeholder that
+    // this test substitutes with the real tempdir before comparing —
+    // the determinism guarantee is "same upstream dir → byte-identical
+    // overlay", which the substitution restores.
     let corpus_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("compat")
@@ -402,12 +412,23 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         let expected_path = corpus_dir.join(format!("{name}.expected.toml"));
         let input = std::fs::read_to_string(&input_path)
             .unwrap_or_else(|e| panic!("reading corpus input {input_path:?}: {e}"));
-        let expected = std::fs::read_to_string(&expected_path)
+        let expected_template = std::fs::read_to_string(&expected_path)
             .unwrap_or_else(|e| panic!("reading corpus expected {expected_path:?}: {e}"));
 
         let (_tmp, upstream) = write_upstream(&input);
         let plan = materialize_overlay(&upstream).expect("overlay must succeed");
         let actual = read_overlay(&plan.sibling_manifest);
+
+        // Substitute the `__UPSTREAM_DIR__` placeholder in the expected
+        // template with the real tempdir (forward-slash form, matching
+        // the overlay code's `to_forward_slash` call). The placeholder
+        // is a fixed-string substitution — no regex, per spec §6.1.
+        let upstream_dir = upstream
+            .parent()
+            .expect("upstream manifest has a parent dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let expected = expected_template.replace("__UPSTREAM_DIR__", &upstream_dir);
 
         assert_eq!(
             actual, expected,
@@ -576,4 +597,285 @@ version = "0.1.0"
         content.contains(r#"crate-type = ["dylib", "rlib"]"#),
         "staged overlay must contain canonical crate-type; got:\n{content}"
     );
+}
+
+/// **Cargo actually accepts the staged overlay and builds the dylib.**
+///
+/// This test codifies the manual repro strict-swe Opus ran in the PR #34
+/// adversarial review: build a synthetic single-crate fork with
+/// `<upstream>/Cargo.toml` + `<upstream>/src/lib.rs`, materialize the
+/// overlay, then invoke `cargo rustc --manifest-path <staged>
+/// --crate-type=dylib --lib` and assert exit 0. Without the
+/// path-absolutization fix landed in this PR, cargo emits
+/// `can't find library "demo", rename file to "src/lib.rs" or specify
+/// lib.path` and exits non-zero — every stage-2 pilot would then fail
+/// with `lihaaf_session_failed` in the §3.3 envelope.
+///
+/// **Why this is gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS`.** The test
+/// spawns a real `cargo rustc` invocation against a freshly-staged
+/// crate, which downloads no deps but still costs ~5–10 s of wall-clock
+/// and a few hundred MB of disk for the new target dir under
+/// `<tempdir>/target/`. Local CI on RAM-limited boxes (Arch / WSL2 with
+/// 4 GB cap) OOMs when this runs alongside `cargo test --all-features`;
+/// authoritative verification happens in GitHub Actions, which sets the
+/// env var. The gate fails the test loudly when the env var is set but
+/// cargo is unavailable, so CI can never accidentally skip the bite.
+///
+/// **What this test bites.** Three independent regression vectors:
+///
+/// 1. A future overlay rewrite that drops the `[lib] path` absolutization
+///    (BLOCKER class 1 from the panel review) — cargo's auto-discovery
+///    would search `<staged_manifest_dir>/src/lib.rs` and fail.
+/// 2. A future cargo version that surfaces a hard error for the
+///    "empty bin/test/example/bench auto-discovery dir" case — the
+///    overlay disables auto-discovery for non-lib targets, so this
+///    test pins that behavior.
+/// 3. A future change to the staged-path shape that drops the
+///    `target/lihaaf-overlay/` parent — cargo's `--manifest-path`
+///    filename check would then reject the overlay.
+#[test]
+fn cargo_accepts_staged_overlay_for_dylib_build() {
+    // CI gate: this test is only authoritative under the green-button
+    // CI lane that has the env var set. Local boxes opt-in by exporting
+    // the variable; the default-skip keeps RAM-limited dev machines
+    // safe.
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_staged_overlay_for_dylib_build: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this \
+             automatically)"
+        );
+        return;
+    }
+
+    // Build a synthetic single-crate fork: upstream Cargo.toml + src/lib.rs.
+    // The crate is intentionally minimal so the build is fast and
+    // deterministic; the test bites the manifest-resolution path, not
+    // the actual library code.
+    let tmp = tempfile::tempdir().expect("creating tempdir for cargo build test");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "// minimal library so cargo has something to compile.\npub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Sanity: the staged overlay is at <upstream>/target/lihaaf-overlay/Cargo.toml.
+    let expected_staged = upstream_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_staged,
+        "overlay must be staged at <upstream>/target/lihaaf-overlay/Cargo.toml"
+    );
+
+    // The acid test: invoke cargo rustc against the staged manifest.
+    // The flags mirror `dylib::build()`'s production invocation (see
+    // `src/dylib.rs`):
+    //
+    //   cargo rustc -p <crate> --lib --release --crate-type=dylib
+    //          --manifest-path <staged> --target-dir <isolated>
+    //
+    // We point `--target-dir` at a sibling of the staged overlay so
+    // build artifacts don't collide with the staged dir itself.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("demo")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        // `-C prefer-dynamic` mirrors production; absence wouldn't
+        // change build success on this minimal crate but keeps the
+        // invocation faithful.
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must succeed against the staged overlay; got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// **Path-absolutization fixed-point: the staged overlay contains
+/// absolute `[lib] path` pointing at the upstream `src/lib.rs`.**
+///
+/// This is the unit-style cousin of `cargo_accepts_staged_overlay_for_dylib_build`
+/// — instead of running cargo, it inspects the staged overlay bytes
+/// directly. The unit-style form runs on every CI lane (no env-var
+/// gate) and bites the same BLOCKER class 1 regression: a future
+/// refactor that drops or downgrades the path-absolutization step
+/// would leave `[lib] path` either absent or relative, and cargo would
+/// then fail to find the library.
+///
+/// The check is byte-level on the serialized overlay so it bites
+/// regardless of the exact TOML serialization shape (`[lib] path =
+/// "..."` inline vs `[lib]\npath = "..."` block form).
+#[test]
+fn staged_overlay_carries_absolute_lib_path() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+    let content = read_overlay(&plan.sibling_manifest);
+
+    // The expected absolute path uses forward-slash form (matches
+    // production: the overlay code calls `to_forward_slash` on every
+    // absolutized path so Windows backslashes never reach the TOML).
+    let expected_lib_path = upstream_dir.join("src").join("lib.rs");
+    let expected_forward = expected_lib_path.to_string_lossy().replace('\\', "/");
+
+    assert!(
+        content.contains(&format!(r#"path = "{expected_forward}""#)),
+        "staged overlay must carry an absolute `[lib] path` pointing at \
+         the upstream `src/lib.rs`; expected substring `path = \"{expected_forward}\"`, \
+         got overlay:\n{content}"
+    );
+
+    // Auto-discovery for non-lib targets must be disabled so cargo
+    // does not search the empty staged dir for `src/bin/`, `tests/`,
+    // `examples/`, `benches/`. The overlay always writes all four to
+    // make the lib-only intent explicit.
+    for key in ["autobins", "autoexamples", "autotests", "autobenches"] {
+        assert!(
+            content.contains(&format!("{key} = false")),
+            "staged overlay must declare `{key} = false` to disable cargo's \
+             auto-discovery of non-lib targets in the (empty) staged dir; \
+             got overlay:\n{content}"
+        );
+    }
+}
+
+/// **Path-bearing dependency entries are absolutized.**
+///
+/// Workspace-style pilots (cxx's `cxx-build`/`cxx-gen`/etc, thiserror's
+/// `thiserror-impl = { path = "impl" }`) declare relative path-deps
+/// pointing at sibling crates. Without absolutization, the staged
+/// overlay would tell cargo to look under
+/// `<upstream>/target/lihaaf-overlay/impl/Cargo.toml`, which doesn't
+/// exist — every workspace-style pilot would fail.
+///
+/// This test pins the rewrite across the three dependency tables
+/// (`dependencies`, `dev-dependencies`, `build-dependencies`). The
+/// platform-conditional `[target.*.dependencies]` table is covered
+/// implicitly because the same `absolutize_deps_paths` helper handles
+/// every dependency-table shape; explicit coverage there is unit-tested
+/// inside `src/compat/overlay.rs` to keep this integration test focused
+/// on the user-visible production shape.
+#[test]
+fn staged_overlay_absolutizes_path_dependencies() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+inner = { path = "inner" }
+
+[dev-dependencies]
+inner-dev = { path = "inner-dev" }
+
+[build-dependencies]
+inner-build = { path = "inner-build" }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+    let content = read_overlay(&plan.sibling_manifest);
+
+    let expected_inner = upstream_dir
+        .join("inner")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let expected_inner_dev = upstream_dir
+        .join("inner-dev")
+        .to_string_lossy()
+        .replace('\\', "/");
+    let expected_inner_build = upstream_dir
+        .join("inner-build")
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    assert!(
+        content.contains(&format!(r#"path = "{expected_inner}""#)),
+        "staged overlay must absolutize `[dependencies.inner].path`; expected \
+         `path = \"{expected_inner}\"`, got overlay:\n{content}"
+    );
+    assert!(
+        content.contains(&format!(r#"path = "{expected_inner_dev}""#)),
+        "staged overlay must absolutize `[dev-dependencies.inner-dev].path`; \
+         expected `path = \"{expected_inner_dev}\"`, got overlay:\n{content}"
+    );
+    assert!(
+        content.contains(&format!(r#"path = "{expected_inner_build}""#)),
+        "staged overlay must absolutize `[build-dependencies.inner-build].path`; \
+         expected `path = \"{expected_inner_build}\"`, got overlay:\n{content}"
+    );
+
+    // Defense-in-depth: no relative `path = "inner..."` survives. A
+    // refactor that absolutized only the first table found would slip
+    // a relative entry through one of the others.
+    for relative_form in [
+        r#"path = "inner""#,
+        r#"path = "inner-dev""#,
+        r#"path = "inner-build""#,
+    ] {
+        assert!(
+            !content.contains(relative_form),
+            "no relative `{relative_form}` may survive in the overlay; got:\n{content}"
+        );
+    }
 }
