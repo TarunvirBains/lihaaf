@@ -16,3 +16,5 @@ path = "__UPSTREAM_DIR__/vendor/old-dep"
 [replace."serde:1.0.0"]
 git = "https://example.com/serde"
 rev = "abc123"
+
+[workspace]

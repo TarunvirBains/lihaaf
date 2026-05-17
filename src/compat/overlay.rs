@@ -69,7 +69,45 @@
 //!   `[patch.crates-io]` would point cargo at the staged manifest dir after
 //!   overlay materialization — either a self-reference or a nonexistent path.
 //! - Every other top-level table (`dependencies`, `dev-dependencies`,
-//!   `features`, `[[bin]]`, `[workspace]`, …) is preserved as parsed.
+//!   `features`, `[[bin]]`, …) is preserved as parsed.
+//!
+//! ## Workspace-inheritance override (`[workspace] = {}` injection)
+//!
+//! The staged overlay always ends with an empty `[workspace]` table,
+//! regardless of whether the upstream manifest declared one. This is
+//! the workspace-identity fix for the v0.1.0-beta.5 regression on
+//! workspace-style pilots (see issue #36).
+//!
+//! **Why this is necessary.** Cargo determines a manifest's workspace
+//! root by walking UP the filesystem from the manifest until it finds
+//! another `Cargo.toml` with a `[workspace]` table. For the staged
+//! overlay at `<upstream>/target/lihaaf-overlay/Cargo.toml`, that walk
+//! reaches `<upstream>/Cargo.toml` — and for workspace-style pilots
+//! (cxx, serde-json, thiserror) the upstream IS a workspace root. Cargo
+//! then tries to attach the overlay's package to the upstream
+//! workspace, but the overlay's package name isn't in the upstream's
+//! `members` array. Result: `package <X>/Cargo.toml is a member of the
+//! wrong workspace` and the build fails.
+//!
+//! Adding `[workspace]` (even an empty table) to the overlay makes
+//! cargo treat the overlay AS ITS OWN workspace root and stop walking
+//! up. The overlay is then a standalone, self-contained workspace
+//! whose path-deps reference packages in OTHER workspaces (the
+//! upstream's) — which is valid in cargo.
+//!
+//! **Why the table is empty (no members inherited).** If the overlay's
+//! `[workspace]` carried the upstream's `members = [...]` (absolutized
+//! to abs paths), the overlay AND the upstream would both claim those
+//! path-dep crates as members → `package <X> is a member of the wrong
+//! workspace`. An empty `[workspace]` declares no members, leaving
+//! ownership exclusively with the upstream workspace where it was
+//! originally declared.
+//!
+//! **Why `[package].workspace` is removed.** A package cannot
+//! simultaneously declare itself as a workspace root (`[workspace]`)
+//! AND as a member of an ancestor workspace (`[package] workspace =
+//! "..."`). The overlay always elects the workspace-root role, so the
+//! ancestor-pointer is stripped at the same time.
 
 use std::path::{Path, PathBuf};
 
@@ -319,6 +357,18 @@ where
         if let Some(meta) = synthetic.as_ref() {
             inject_synthetic_metadata(top, meta);
         }
+
+        // Override workspace inheritance: declare the overlay as its own
+        // workspace root with no members, and strip any `[package].workspace`
+        // ancestor pointer. Runs AFTER `absolutize_path_bearing_keys` so the
+        // earlier absolutization of `[workspace] members`/`exclude`/
+        // `default-members`/`dependencies.<X>.path` is harmlessly clobbered;
+        // those values are not needed because cargo resolves the overlay's
+        // path-deps from `[dependencies.<X>] path` directly, and the
+        // upstream's actual workspace still owns those member crates from
+        // their own perspective. See the module-level "Workspace-inheritance
+        // override" section and issue #36 for the full rationale.
+        override_workspace_inheritance(top);
     }
 
     let serialized = serialize_canonical(&value)?;
@@ -380,6 +430,68 @@ fn read_upstream_crate_name(value: &toml::Value) -> Option<String> {
         .and_then(|n| n.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string)
+}
+
+/// Override the overlay's workspace inheritance: replace any existing
+/// `[workspace]` table with an empty one, and remove any
+/// `[package].workspace` ancestor pointer.
+///
+/// **Why this is necessary.** When cargo resolves the staged overlay
+/// at `<upstream>/target/lihaaf-overlay/Cargo.toml`, it walks UP the
+/// filesystem to find the overlay's workspace root. For
+/// workspace-style upstreams (cxx, serde-json, thiserror) it reaches
+/// the upstream `Cargo.toml` first, which declares `[workspace]`. The
+/// overlay's package isn't in the upstream's `members`, so cargo errors
+/// with `package <X>/Cargo.toml is a member of the wrong workspace`.
+/// See issue #36 for the v0.1.0-beta.5 GitHub Actions run that surfaced
+/// this on every workspace-style pilot.
+///
+/// **Mechanism.** A manifest containing `[workspace]` is treated by
+/// cargo as its own workspace root — cargo stops the walk-up at that
+/// point. We write an EMPTY `[workspace]` table so the overlay declares
+/// no members, leaving member ownership of any path-dep packages
+/// exclusively with the upstream workspace they were originally
+/// declared in. Cargo handles this cross-workspace path-dep pattern
+/// correctly.
+///
+/// **`[package].workspace` removal.** This ancestor-pointer key
+/// requests that the package be a member of the named workspace. It
+/// contradicts the `[workspace]` self-declaration we just made, so we
+/// strip it. The compat driver does not need the upstream's
+/// workspace-membership relationship preserved in the overlay — the
+/// overlay's sole purpose is to compile the dylib_crate as a `dylib`,
+/// not to faithfully reproduce the upstream workspace topology.
+///
+/// **Why this runs LAST.** The earlier `absolutize_path_bearing_keys`
+/// pass had already rewritten `[workspace] members`/`exclude`/
+/// `default-members`/`dependencies.<X>.path` against the upstream dir.
+/// Clobbering at the end discards that work, but it was not load-bearing
+/// for the staged overlay's build — cargo resolves the overlay's deps
+/// from `[dependencies.<X>] path` (already absolutized), not from
+/// `[workspace.dependencies]`. The post-absolutize clobber is the
+/// cleanest layering: the earlier pass keeps its existing tests green
+/// at the unit level, and the higher-level override is the new
+/// workspace-identity contract.
+///
+/// Idempotent: a second call on already-overridden output is a no-op.
+fn override_workspace_inheritance(top: &mut toml::map::Map<String, toml::Value>) {
+    // 1. Replace any existing `[workspace]` (or absent key) with an
+    //    empty table. Cargo accepts an empty workspace table as the
+    //    canonical "this manifest is its own workspace root" declaration
+    //    (https://doc.rust-lang.org/cargo/reference/workspaces.html).
+    top.insert(
+        "workspace".to_string(),
+        toml::Value::Table(toml::map::Map::new()),
+    );
+
+    // 2. Strip `[package].workspace` if present. The overlay always
+    //    elects the workspace-root role (step 1); a simultaneous
+    //    `[package] workspace = "..."` declaration would point at an
+    //    ancestor workspace, contradicting the self-declaration and
+    //    triggering a cargo error.
+    if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
+        pkg.remove("workspace");
+    }
 }
 
 /// Splice the synthetic `[package.metadata.lihaaf]` table into `top`.
