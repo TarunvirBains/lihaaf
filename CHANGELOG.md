@@ -78,6 +78,19 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   `compat_root` prefix via `Path::strip_prefix` before serialization,
   producing the canonical repo-relative form `target/lihaaf-overlay/Cargo.toml`
   on every runner (R3 FIX class III).
+- **`errors[].detail` envelope field no longer leaks absolute paths**
+  (`src/compat/report.rs` `normalize_error_detail_paths`): infrastructure
+  errors — in particular `DylibBuildFailed` — embed the cargo invocation
+  in their `Display` output, which includes absolute `--manifest-path`
+  and `--target-dir` values (cargo requires both to be absolute).
+  Without normalization, a failure envelope from any stage-2 pilot run
+  contained runner-specific paths (e.g.
+  `/home/runner/work/lihaaf/lihaaf/target/lihaaf-build`) in
+  `errors[0].detail`, violating §3.3 determinism. Fix: a new
+  `normalize_error_detail_paths` step strips the `compat_root` prefix
+  from every `errors[].detail` string at the envelope write boundary,
+  mirroring the `commands.lihaaf` normalization pattern. Local terminal
+  output is unaffected — the `Display` impl is unchanged (R5 FIX class V).
 
 ### Changed
 - **`docs/compatibility-plan.md` §3.2.3** rewritten to describe the

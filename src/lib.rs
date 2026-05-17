@@ -228,6 +228,8 @@ pub use compat::report::canonicalize as compat_canonicalize_envelope;
 #[doc(hidden)]
 pub use compat::report::generated_path_from_cleanup as compat_envelope_generated_path_from_cleanup;
 #[doc(hidden)]
+pub use compat::report::normalize_error_detail_paths as compat_normalize_error_detail_paths;
+#[doc(hidden)]
 pub use compat::report::write_envelope as compat_write_envelope;
 
 // Compat-mode §5 pilot gate. Re-exported for the gate_smoke integration

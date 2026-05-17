@@ -67,6 +67,7 @@ use lihaaf::{
     CompatGeneratedPathClass as CleanupGeneratedPathClass, CompatLihaafCounts as LihaafCounts,
     CompatMismatchExample as MismatchExample, CompatOverlayMetadata as OverlayMetadata,
     CompatResults as Results, compat_envelope_generated_path_from_cleanup as from_cleanup,
+    compat_normalize_error_detail_paths as normalize_error_detail_paths,
     compat_write_envelope as write_envelope,
 };
 
@@ -719,4 +720,167 @@ fn generated_path_from_cleanup_round_trip() {
         envelope_entry.path
     );
     assert_eq!(envelope_entry.path, "target/lihaaf-compat-converted");
+}
+
+/// Test 14 — `errors[].detail` has absolute `compat_root` paths stripped
+/// before envelope serialization. Mirrors the production failure in
+/// Actions run 25994537438, where `errors[0].detail` contained
+/// `/home/runner/work/lihaaf/lihaaf/./Cargo.lihaaf.toml` from the cargo
+/// invocation embedded in `DylibBuildFailed::Display`.
+///
+/// This test is the regression gate for FIX class V. It would FAIL
+/// without the `normalize_error_detail_paths` call in `compat::run`
+/// (or, equivalently, without calling `normalize_error_detail_paths`
+/// before `write_envelope` here in the test).
+///
+/// Verification that the test actually bites: remove the
+/// `normalize_error_detail_paths` call below and confirm the
+/// `assert!(!text.contains(abs_root_str))` fires.
+#[test]
+fn error_detail_paths_stripped_before_write() {
+    let abs_root = PathBuf::from("/home/runner/work/my-crate/my-crate");
+    let abs_root_str = abs_root.to_string_lossy();
+
+    // Simulate the `DylibBuildFailed` display string: cargo uses `{:?}`
+    // for PathBuf, which wraps the path in double-quotes. Two absolute
+    // paths appear in one detail string — exactly the shape from the
+    // production failing run.
+    let raw_detail = format!(
+        "lihaaf: dylib build failed.\n  invocation: RUSTFLAGS=\"-C prefer-dynamic\" \
+         cargo rustc -p anyhow --lib --release --crate-type=dylib \
+         --message-format=json-render-diagnostics \
+         --manifest-path \"{root}/target/lihaaf-overlay/Cargo.toml\" \
+         --target-dir \"{root}/target/lihaaf-build\"\n  cargo stderr:\nerror[E0]: ...",
+        root = abs_root_str
+    );
+
+    // Confirm the raw detail DOES contain the absolute root (test-setup
+    // invariant: the assertion below is not vacuously true).
+    assert!(
+        raw_detail.contains(abs_root_str.as_ref()),
+        "test setup: raw_detail must contain the absolute root before normalization"
+    );
+
+    let mut env = empty_envelope();
+    env.errors = vec![EnvelopeError {
+        error_type: "lihaaf_session_failed".into(),
+        fixture: None,
+        file: String::new(),
+        line: 0,
+        detail: raw_detail,
+    }];
+
+    // Apply normalization at the envelope boundary — this is what
+    // `compat::run` does before calling `write_envelope`.
+    normalize_error_detail_paths(&mut env, &abs_root);
+
+    let (_tmp, _path, bytes) = write_to_tmp(&mut env);
+    let text = std::str::from_utf8(&bytes).expect("envelope must be valid UTF-8");
+
+    // The absolute root MUST NOT appear anywhere in the serialized
+    // envelope — not in `detail`, not in any other field.
+    assert!(
+        !text.contains(abs_root_str.as_ref()),
+        "errors[].detail must not contain the absolute compat_root after normalization; \
+         got envelope:\n{text}"
+    );
+
+    // The repo-relative sub-paths MUST still appear — normalization
+    // strips the prefix but not the rest of the path.
+    assert!(
+        text.contains("target/lihaaf-overlay/Cargo.toml"),
+        "repo-relative manifest path must survive normalization; got:\n{text}"
+    );
+    assert!(
+        text.contains("target/lihaaf-build"),
+        "repo-relative target-dir path must survive normalization; got:\n{text}"
+    );
+}
+
+/// Test 15 — cross-root byte determinism for `errors[].detail`. Two
+/// envelopes built with the same logical error content but different
+/// absolute `compat_root` values must produce byte-identical serialized
+/// output after `normalize_error_detail_paths` and `dur_ms` stripping.
+///
+/// This is the §3.3 determinism property for error entries: different
+/// CI runners (at different checkout roots) that both encounter the
+/// same `DylibBuildFailed` error must produce identical envelope bytes.
+///
+/// The test would fail without the normalization step — the two
+/// `abs_root_*` strings differ, so two raw detail strings differ, so
+/// two unstripped envelopes differ outside `dur_ms` lines.
+#[test]
+fn error_detail_paths_cross_root_byte_determinism() {
+    // Two hypothetical checkout roots — one for a GitHub Actions runner,
+    // one for a local developer machine. Same relative layout, different
+    // absolute prefix.
+    let abs_root_a = PathBuf::from("/home/runner/work/my-crate/my-crate");
+    let abs_root_b = PathBuf::from("/home/tarunvir/projects/my-crate");
+
+    let make_detail = |root: &str| {
+        format!(
+            "lihaaf: dylib build failed.\n  invocation: RUSTFLAGS=\"-C prefer-dynamic\" \
+             cargo rustc -p anyhow --lib --release --crate-type=dylib \
+             --message-format=json-render-diagnostics \
+             --manifest-path \"{root}/target/lihaaf-overlay/Cargo.toml\" \
+             --target-dir \"{root}/target/lihaaf-build\"\n  cargo stderr:\nerror[E0]: ...",
+        )
+    };
+
+    let mut env_a = empty_envelope();
+    env_a.errors = vec![EnvelopeError {
+        error_type: "lihaaf_session_failed".into(),
+        fixture: None,
+        file: String::new(),
+        line: 0,
+        detail: make_detail(&abs_root_a.to_string_lossy()),
+    }];
+    normalize_error_detail_paths(&mut env_a, &abs_root_a);
+
+    let mut env_b = empty_envelope();
+    env_b.errors = vec![EnvelopeError {
+        error_type: "lihaaf_session_failed".into(),
+        fixture: None,
+        file: String::new(),
+        line: 0,
+        detail: make_detail(&abs_root_b.to_string_lossy()),
+    }];
+    normalize_error_detail_paths(&mut env_b, &abs_root_b);
+
+    let (_tmp_a, _path_a, bytes_a) = write_to_tmp(&mut env_a);
+    let (_tmp_b, _path_b, bytes_b) = write_to_tmp(&mut env_b);
+
+    let text_a = std::str::from_utf8(&bytes_a).expect("envelope A must be valid UTF-8");
+    let text_b = std::str::from_utf8(&bytes_b).expect("envelope B must be valid UTF-8");
+
+    // Before strip: the two envelopes must be byte-equal even WITHOUT
+    // dur_ms stripping, because neither root appears in the detail after
+    // normalization and both `dur_ms` values are 0 (empty_envelope default).
+    // We still use the strip helper for robustness against future timing
+    // fields, but the pre-strip equality is the stronger property to assert.
+    assert_eq!(
+        text_a, text_b,
+        "two runners with different compat_root values must produce byte-identical \
+         envelopes after normalize_error_detail_paths; \
+         runner A:\n{text_a}\nrunner B:\n{text_b}"
+    );
+
+    // Belt-and-braces via strip: the stripped form is also equal
+    // (covers future cases where dur_ms is non-zero).
+    let stripped_a = strip_dur_ms_lines(text_a);
+    let stripped_b = strip_dur_ms_lines(text_b);
+    assert_eq!(
+        stripped_a, stripped_b,
+        "stripped envelopes must be byte-equal; runner A:\n{stripped_a}\nrunner B:\n{stripped_b}"
+    );
+
+    // Neither absolute root must appear anywhere in the output.
+    assert!(
+        !text_a.contains("/home/runner/work/my-crate"),
+        "runner-A root must not appear in serialized envelope; got:\n{text_a}"
+    );
+    assert!(
+        !text_b.contains("/home/tarunvir/projects/my-crate"),
+        "runner-B root must not appear in serialized envelope; got:\n{text_b}"
+    );
 }

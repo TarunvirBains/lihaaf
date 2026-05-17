@@ -239,6 +239,7 @@ Write one deterministic JSON envelope:
 - `schema_version` is the integer envelope schema version (currently `1`). A breaking change to the envelope shape increments this; additive fields do not.
 - `mismatch_examples` is sorted by `fixture` (repo-relative, forward-slash, ASCII byte order). `errors` is sorted by `file` then `line`. `excluded_fixtures` is sorted by `fixture`.
 - All `fixture` and `file` paths are repo-relative, forward-slash, never absolute. The target crate's repo root is the relative root.
+- `errors[].detail` free-text strings are normalized: the absolute `compat_root` prefix is stripped from any embedded path before serialization. Infrastructure errors (e.g. `DylibBuildFailed`) embed the cargo invocation, which uses absolute `--manifest-path` and `--target-dir` values. The normalization is applied at the envelope write boundary via the same prefix-stripping mechanism as `commands.lihaaf` (R3 FIX class III / R5 FIX class V). Local terminal output from `cargo lihaaf --compat` still shows absolute paths; only the §3.3 envelope artifact is normalized.
 - `dur_ms` fields are non-deterministic and explicitly excluded from determinism checks (per §2 item 4, Determinism). Every other field is part of the determinism guarantee.
 
 **Fields the §5 gate reads.**

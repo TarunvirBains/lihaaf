@@ -306,6 +306,17 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
         toolchain,
     };
 
+    // Normalize absolute `compat_root` prefixes in `errors[].detail`
+    // before writing the envelope. Infrastructure errors (e.g.
+    // `DylibBuildFailed`) embed the cargo invocation, which contains
+    // runner-specific absolute paths. Without this step, two CI runners
+    // at different checkout roots produce non-identical envelope bytes
+    // on failure, violating the §3.3 determinism rule. The `Display`
+    // impl is intentionally left unchanged — absolute paths remain
+    // useful for local terminal output; this is the single
+    // normalization boundary.
+    report::normalize_error_detail_paths(&mut envelope, &compat_root);
+
     report::write_envelope(&mut envelope, &compat_report)?;
     let _ = started;
     Ok(())
