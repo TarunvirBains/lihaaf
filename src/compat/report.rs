@@ -305,8 +305,8 @@ pub struct OverlayMetadata {
 /// [`GeneratedPath`] (repo-relative forward-slash string).
 ///
 /// `compat_root` is the adopter's `--compat-root` directory. The path
-/// is stripped of the prefix and rendered forward-slash via
-/// [`util::relative_to`]. If the path is not under `compat_root`
+/// is stripped of the prefix and rendered forward-slash via the
+/// crate-internal `util::relative_to` helper. If the path is not under `compat_root`
 /// (which would indicate a driver bug — every tracked path is supposed
 /// to live under the adopter's checkout), the caller explicitly records
 /// a deterministic non-absolute diagnostic path instead of reviving the
