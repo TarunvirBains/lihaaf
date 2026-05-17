@@ -108,7 +108,8 @@ pub fn collect(
                 .and_then(|s| s.to_str())
                 .unwrap_or("")
                 .to_string();
-            let rel = util::relative_to(&p, crate_root);
+            let rel =
+                util::relative_to(&p, crate_root).unwrap_or_else(|err| err.non_absolute_path());
             fixtures.push(Fixture {
                 path: p,
                 relative_path: rel,

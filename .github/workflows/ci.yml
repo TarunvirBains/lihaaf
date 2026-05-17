@@ -46,6 +46,14 @@ jobs:
         run: cargo build --release
 
       - name: Test
+        env:
+          # Opt into the gated `cargo rustc` integration test that
+          # codifies the PR #34 overlay-staging-path fix
+          # (`cargo_accepts_staged_overlay_for_dylib_build` in
+          # `tests/compat/overlay_determinism.rs`). The gate exists so
+          # RAM-limited local boxes can skip the test by default; CI
+          # explicitly opts in to make the test authoritative.
+          LIHAAF_RUN_CARGO_BUILD_TESTS: "1"
         run: cargo test
 
       - name: Self-test corpus end-to-end

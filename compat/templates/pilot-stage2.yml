@@ -284,16 +284,16 @@ jobs:
 
       - name: Upload §3.3 envelope artifact
         if: always()
-        # SHA `ea165f8d65b6e75b540449e92b4886f43607fa02` resolves to
-        # actions/upload-artifact v4.6.2 (2025-03-19), NOT v7.0.1 as a
-        # prior comment misstated. Staying on v4.x for v0.1: v7
-        # introduced a breaking compression-default change
-        # (zstd-vs-gzip) plus altered concurrency semantics, and the
-        # v0.1 envelope artifact is small JSON — no v7-specific
-        # capability is required. Rotation to v7.x is a v0.2 task and
-        # gated on a re-pinning audit. SHA→tag mapping verified
-        # 2026-05-16 via `gh api repos/actions/upload-artifact/git/refs/tags/v4.6.2`.
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 as of 2025-03-19
+        # SHA `043fb46d1a93c77aae656e7c1c64a875d1fc6a0a` resolves to
+        # actions/upload-artifact v7.0.1 (2026-04-10, node24). Bumped
+        # from v4.6.2 (node20) ahead of the GitHub Actions forced
+        # Node.js 24 migration on 2026-06-02. All four inputs used here
+        # (name, path, retention-days, if-no-files-found) are present
+        # and API-stable in v7; the new `archive` input defaults to
+        # `true` (zip), matching v4 behaviour for this small JSON
+        # artifact. SHA→tag mapping verified 2026-05-17 via
+        # `gh api repos/actions/upload-artifact/git/refs/tags/v7.0.1`.
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1 as of 2026-04-10
         with:
           name: ${{ steps.artifact-name.outputs.name }}
           path: target/lihaaf-compat/compat-report.json

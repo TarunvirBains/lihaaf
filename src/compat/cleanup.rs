@@ -2,10 +2,11 @@
 //! output policy.
 //!
 //! The compat driver materializes a small set of artifacts inside the
-//! adopter's target-crate checkout: the sibling overlay
-//! (`Cargo.lihaaf.toml`, Phase 2), the §3.3 envelope (Phase 8), and —
-//! once Phase 6 fixture-conversion lands — a transient directory of
-//! converted fixtures under `target/lihaaf-compat-converted/`. Per
+//! adopter's target-crate checkout: the staged overlay
+//! (`target/lihaaf-overlay/Cargo.toml`, Phase 2), the §3.3 envelope
+//! (Phase 8), and — once Phase 6 fixture-conversion lands — a
+//! transient directory of converted fixtures under
+//! `target/lihaaf-compat-converted/`. Per
 //! `docs/compatibility-plan.md` §3.2.3:
 //!
 //! > Generated overlays, copied fixture trees, and generated Lihaaf

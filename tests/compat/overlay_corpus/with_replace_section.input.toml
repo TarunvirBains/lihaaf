@@ -1,0 +1,7 @@
+[package]
+name = "demo"
+version = "0.1.0"
+
+[replace]
+"old-dep:0.2.0" = { path = "vendor/old-dep" }
+"serde:1.0.0" = { git = "https://example.com/serde", rev = "abc123" }

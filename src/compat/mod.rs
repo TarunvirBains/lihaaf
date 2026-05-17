@@ -4,13 +4,14 @@
 //! wires the supporting modules (`overlay`, `baseline`, `discovery`,
 //! `fixture_convert`, `cleanup`, `report`, `rustup`, `gate`) into a
 //! single end-to-end run: read upstream `Cargo.toml`, synthesize a
-//! sibling `Cargo.lihaaf.toml` with an in-memory `[package.metadata.
-//! lihaaf]` block, run the argv-only baseline (§3.4), discover
-//! trybuild fixtures via syn AST walk (§3.2.1), convert each fixture
-//! to the lihaaf-compatible directory tree, invoke `lihaaf::run`
-//! in-process for the inner session, capture the active toolchain
-//! (§3.4), and write the §3.3 envelope. The cleanup guard catches
-//! panic / early-return paths and removes registered transient paths.
+//! staged overlay at `<compat_root>/target/lihaaf-overlay/Cargo.toml`
+//! with an in-memory `[package.metadata.lihaaf]` block, run the
+//! argv-only baseline (§3.4), discover trybuild fixtures via syn AST
+//! walk (§3.2.1), convert each fixture to the lihaaf-compatible
+//! directory tree, invoke `lihaaf::run` in-process for the inner
+//! session, capture the active toolchain (§3.4), and write the §3.3
+//! envelope. The cleanup guard catches panic / early-return paths and
+//! removes registered transient paths.
 //!
 //! Adopters opt in via `cargo lihaaf --compat --compat-root <DIR>
 //! --compat-report <PATH>`. The Rust API is not part of the v0.1
@@ -39,7 +40,8 @@ use crate::error::Error;
 /// 1. Install the panic hook + construct the cleanup guard.
 /// 2. Resolve the upstream `Cargo.toml` path (`--compat-manifest`
 ///    overrides `--compat-root/Cargo.toml`).
-/// 3. Materialize the sibling overlay with a synthetic
+/// 3. Materialize the staged overlay at
+///    `<compat_root>/target/lihaaf-overlay/Cargo.toml` with a synthetic
 ///    `[package.metadata.lihaaf]` table; the builder closure reads
 ///    `[package].name` from the parsed manifest in a single pass.
 ///    Track the overlay path with the cleanup classifier.
@@ -100,10 +102,46 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // `is_file()` children only. If `fixture_dirs` pointed at the
     // parent, discovery would skip the `.rs` files that sit under
     // `compile_pass/` / `compile_fail/` and the inner session would see
-    // zero fixtures. Paths are repo-relative (resolved against the
-    // overlay manifest dir, which is `<compat_root>`) with forward
-    // slashes — §3.2.3's byte-determinism requirement bars absolute
-    // platform-dependent paths from the envelope/manifest.
+    // zero fixtures.
+    //
+    // **Why ABSOLUTE paths here (approach A from the PR #34 redesign).**
+    // The overlay now lives at `<compat_root>/target/lihaaf-overlay/Cargo.toml`,
+    // two dirs deeper than the upstream `Cargo.toml`. lihaaf's
+    // [`crate::discovery::collect`] resolves relative `fixture_dirs`
+    // against the manifest's parent dir (the `[lib]` crate's root). A
+    // repo-relative `./target/lihaaf-compat-converted/...` string would
+    // therefore resolve to
+    // `<compat_root>/target/lihaaf-overlay/target/lihaaf-compat-converted/...`
+    // — a double-`target/` path that does not exist (fixture-conversion
+    // writes to `<compat_root>/target/lihaaf-compat-converted/...`).
+    //
+    // Approach A absolutizes the two paths against `compat_root` here,
+    // so the inner session sees the real on-disk locations regardless
+    // of where the overlay manifest is staged. The cross-platform
+    // §3.2.3 byte-determinism requirement (no platform-dependent
+    // absolute paths in the §3.3 envelope) is preserved because these
+    // paths flow into the OVERLAY MANIFEST, not the envelope —
+    // `render_inner_command` shows the overlay manifest path itself but
+    // never the synthesized `fixture_dirs`, and the envelope's
+    // `crate_name` / `commit` / `commands.lihaaf` fields contain no
+    // absolute paths. Approach B (carry upstream root through the
+    // inner-session struct) would be semantically cleaner but
+    // significantly more invasive — every call site of
+    // `discovery::collect` would need a second path argument, and the
+    // existing v0.1 surface only exposes one root. Approach A keeps
+    // the §3.2.3 invariants while landing the GA fix in the smallest
+    // possible change.
+    let converted_fixtures_root = compat_root.join("target").join("lihaaf-compat-converted");
+    let abs_compile_pass = crate::util::to_forward_slash(
+        &converted_fixtures_root
+            .join("compile_pass")
+            .to_string_lossy(),
+    );
+    let abs_compile_fail = crate::util::to_forward_slash(
+        &converted_fixtures_root
+            .join("compile_fail")
+            .to_string_lossy(),
+    );
     let overlay_plan = overlay::materialize_overlay_with_synthetic_metadata_builder(
         &upstream_manifest,
         |upstream_name| {
@@ -113,10 +151,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             overlay::SyntheticMetadata {
                 dylib_crate: name.clone(),
                 extern_crates: vec![name],
-                fixture_dirs: vec![
-                    "./target/lihaaf-compat-converted/compile_pass".to_string(),
-                    "./target/lihaaf-compat-converted/compile_fail".to_string(),
-                ],
+                fixture_dirs: vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
             }
         },
     )?;
@@ -240,7 +275,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
         commit: args.compat_commit.clone().unwrap_or_default(),
         commands: report::Commands {
             baseline: render_argv(&baseline_result.argv),
-            lihaaf: render_inner_command(&args, &overlay_plan.sibling_manifest),
+            lihaaf: render_inner_command(&args, &overlay_plan.sibling_manifest, &compat_root),
         },
         results: report::Results {
             baseline: report::BaselineCounts {
@@ -270,6 +305,17 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
         },
         toolchain,
     };
+
+    // Normalize absolute `compat_root` prefixes in `errors[].detail`
+    // before writing the envelope. Infrastructure errors (e.g.
+    // `DylibBuildFailed`) embed the cargo invocation, which contains
+    // runner-specific absolute paths. Without this step, two CI runners
+    // at different checkout roots produce non-identical envelope bytes
+    // on failure, violating the §3.3 determinism rule. The `Display`
+    // impl is intentionally left unchanged — absolute paths remain
+    // useful for local terminal output; this is the single
+    // normalization boundary.
+    report::normalize_error_detail_paths(&mut envelope, &compat_root);
 
     report::write_envelope(&mut envelope, &compat_report)?;
     let _ = started;
@@ -342,12 +388,46 @@ fn build_inner_cli(args: &cli::CompatArgs, overlay_manifest: &Path) -> crate::cl
 /// shell-style string for the §3.3 envelope's `commands.lihaaf` field.
 /// Per §3.1 this is for human inspection only — the spec forbids
 /// constructing a shell command line in compat mode itself.
-fn render_inner_command(args: &cli::CompatArgs, overlay_manifest: &Path) -> String {
+///
+/// `overlay_manifest` is always under `compat_root` (it is staged at
+/// `<compat_root>/target/lihaaf-overlay/Cargo.toml`); the manifest
+/// path is relativized against `compat_root` before serialization so
+/// the envelope's `commands.lihaaf` field never contains runner-specific
+/// absolute paths. This satisfies the §3.3 determinism rule
+/// (`docs/compatibility-plan.md §3.3`): different CI runners produce
+/// byte-identical envelopes from the same crate checkout.
+///
+/// # Panics
+///
+/// Panics if `overlay_manifest` cannot be made relative to `compat_root`.
+/// This is a driver invariant: the overlay is always staged under
+/// `compat_root`; if it is not, the compat driver has a bug.
+fn render_inner_command(
+    args: &cli::CompatArgs,
+    overlay_manifest: &Path,
+    compat_root: &Path,
+) -> String {
+    // Strip the compat_root prefix and convert to forward-slash form so the
+    // envelope field is the same on every runner regardless of its absolute
+    // checkout path (e.g. `/home/runner/work/...` vs `/home/tarunvir/...`).
+    let rel_manifest = overlay_manifest
+        .strip_prefix(compat_root)
+        .unwrap_or_else(|_| {
+            panic!(
+                "render_inner_command: overlay_manifest `{}` is not under compat_root `{}`; \
+                 this is a compat-driver bug — the overlay must always be staged under \
+                 compat_root",
+                overlay_manifest.display(),
+                compat_root.display()
+            )
+        });
+    let rel_manifest_str = crate::util::to_forward_slash(&rel_manifest.to_string_lossy());
+
     let mut parts: Vec<String> = vec![
         "cargo".into(),
         "lihaaf".into(),
         "--manifest-path".into(),
-        overlay_manifest.to_string_lossy().into_owned(),
+        rel_manifest_str,
     ];
     if args.inner_cli.bless {
         parts.push("--bless".into());
@@ -480,7 +560,8 @@ fn assemble_diagnostic_errors(
         errors.push(report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),
             fixture: None,
-            file: crate::util::relative_to(&unrecog.file, compat_root),
+            file: crate::util::relative_to(&unrecog.file, compat_root)
+                .unwrap_or_else(|err| err.non_absolute_path()),
             line: u32::try_from(unrecog.line).unwrap_or(u32::MAX),
             detail: unrecog.detail.clone(),
         });
@@ -554,7 +635,8 @@ mod tests {
         // `$CARGO/<crate>-<ver>/...` will mismatch as
         // `$CARGO/registry/...` strings without any other diagnostic.
         let args = neutral_compat_args();
-        let overlay_manifest = PathBuf::from("/tmp/lihaaf-build-inner-cli-test/Cargo.lihaaf.toml");
+        let overlay_manifest =
+            PathBuf::from("/tmp/lihaaf-build-inner-cli-test/target/lihaaf-overlay/Cargo.toml");
         let inner = build_inner_cli(&args, &overlay_manifest);
         assert!(
             inner.inner_compat_normalize,
@@ -629,6 +711,62 @@ mod tests {
             !errors.iter().any(|e| e.error_type == "baseline_unknown"),
             "no `baseline_unknown` entry may appear in errors[]; the field \
              lives in results.baseline.unknown_count as a diagnostic counter"
+        );
+    }
+
+    /// **`render_inner_command` produces a repo-relative `--manifest-path`.**
+    ///
+    /// This pins the §3.3 determinism rule: the envelope's `commands.lihaaf`
+    /// field must not contain runner-specific absolute paths.  Two calls with
+    /// the same repo layout but different `compat_root` absolute prefixes must
+    /// produce byte-identical `--manifest-path` values.
+    ///
+    /// Without the relativization fix, `overlay_manifest.to_string_lossy()` is
+    /// used directly — producing `/home/runner/work/.../target/lihaaf-overlay/Cargo.toml`
+    /// on one runner and `/home/tarunvir/.../target/lihaaf-overlay/Cargo.toml` on
+    /// another. This test would fail before the fix.
+    #[test]
+    fn render_inner_command_manifest_path_is_repo_relative() {
+        // Two hypothetical compat_root values with the same repo layout but
+        // different absolute prefixes — simulates two different CI runners
+        // that checked out at different absolute paths.
+        let compat_root_a = PathBuf::from("/home/runner/work/my-crate");
+        let compat_root_b = PathBuf::from("/home/tarunvir/projects/my-crate");
+
+        // The overlay is staged at `<compat_root>/target/lihaaf-overlay/Cargo.toml`
+        // on both runners.
+        let overlay_a = compat_root_a
+            .join("target")
+            .join("lihaaf-overlay")
+            .join("Cargo.toml");
+        let overlay_b = compat_root_b
+            .join("target")
+            .join("lihaaf-overlay")
+            .join("Cargo.toml");
+
+        let args = neutral_compat_args();
+
+        let cmd_a = render_inner_command(&args, &overlay_a, &compat_root_a);
+        let cmd_b = render_inner_command(&args, &overlay_b, &compat_root_b);
+
+        // The two strings must be identical (byte-for-byte) — no runner-specific
+        // prefix leaks into the envelope.
+        assert_eq!(
+            cmd_a, cmd_b,
+            "commands.lihaaf must be runner-independent; \
+             runner A: `{cmd_a}`\nrunner B: `{cmd_b}`"
+        );
+
+        // The `--manifest-path` value must not be an absolute path.
+        assert!(
+            !cmd_a.contains("/home/"),
+            "commands.lihaaf must not contain an absolute path; got `{cmd_a}`"
+        );
+
+        // The `--manifest-path` value must be the canonical repo-relative form.
+        assert!(
+            cmd_a.contains("target/lihaaf-overlay/Cargo.toml"),
+            "commands.lihaaf must contain the repo-relative manifest path; got `{cmd_a}`"
         );
     }
 

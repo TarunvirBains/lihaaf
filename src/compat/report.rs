@@ -34,6 +34,15 @@
 //!   [`std::path::Path::strip_prefix`]). The writer asserts no path
 //!   conversion of its own; the input must already be in canonical
 //!   form.
+//! - Normalization of absolute paths embedded in `errors[].detail`
+//!   free-text strings. [`normalize_error_detail_paths`] is a separate
+//!   pre-write step the driver calls between envelope construction and
+//!   [`write_envelope`]. The `Display` form of infrastructure errors
+//!   (e.g. `DylibBuildFailed`) embeds absolute paths (cargo requires
+//!   `--manifest-path` to be absolute); normalizing at the write
+//!   boundary — rather than at error construction — keeps the `Display`
+//!   impl useful for local terminal output while satisfying §3.3
+//!   determinism for the envelope artifact.
 //!
 //! ## Locked decisions
 //!
@@ -297,11 +306,11 @@ pub struct OverlayMetadata {
 ///
 /// `compat_root` is the adopter's `--compat-root` directory. The path
 /// is stripped of the prefix and rendered forward-slash via the
-/// crate-internal `util::to_forward_slash` helper. If the path is not
-/// under `compat_root` (which would indicate a driver bug — every
-/// tracked path is supposed to live under the adopter's checkout),
-/// the result preserves the full path verbatim, again in forward-
-/// slash form, so the envelope is still readable.
+/// crate-internal `util::relative_to` helper. If the path is not under `compat_root`
+/// (which would indicate a driver bug — every tracked path is supposed
+/// to live under the adopter's checkout), the caller explicitly records
+/// a deterministic non-absolute diagnostic path instead of reviving the
+/// old absolute fallback.
 ///
 /// The cleanup-side classification enum is stringified to its
 /// lower-case discriminant name for v0.2-additive evolution. See the
@@ -311,7 +320,8 @@ pub fn generated_path_from_cleanup(
     cleanup_entry: &crate::compat::cleanup::GeneratedPath,
     compat_root: &Path,
 ) -> GeneratedPath {
-    let rel = util::relative_to(&cleanup_entry.path, compat_root);
+    let rel = util::relative_to(&cleanup_entry.path, compat_root)
+        .unwrap_or_else(|err| err.non_absolute_path());
     let class = match cleanup_entry.class {
         crate::compat::cleanup::GeneratedPathClass::Committed => "committed",
         crate::compat::cleanup::GeneratedPathClass::Ignored => "ignored",
@@ -321,6 +331,83 @@ pub fn generated_path_from_cleanup(
     GeneratedPath {
         path: rel,
         class: class.to_string(),
+    }
+}
+
+/// Strip the absolute `compat_root` prefix from every
+/// `errors[].detail` string in `envelope`.
+///
+/// ## Why
+///
+/// Infrastructure errors — especially `DylibBuildFailed` — include the
+/// cargo invocation in their `Display` output. Cargo requires
+/// `--manifest-path` and `--target-dir` to be absolute, so the
+/// invocation string inevitably contains the runner-specific checkout
+/// path (e.g. `/home/runner/work/my-crate/my-crate/target/...`). Two
+/// CI runners that check out the same commit at different absolute paths
+/// would otherwise produce non-identical `errors[].detail` bytes,
+/// violating the §3.3 determinism rule for the envelope artifact.
+///
+/// The `Display` impl on error types is intentionally left unchanged —
+/// absolute paths remain useful for local terminal output. This function
+/// is the single normalization boundary between "useful for the
+/// operator" and "deterministic for the envelope".
+///
+/// ## What is replaced
+///
+/// Every occurrence of the `compat_root` string is replaced with the
+/// empty string. The replacement is applied twice per entry:
+///
+/// 1. **`<root>/`** (root + path separator) — turns
+///    `/abs/root/target/foo` into `target/foo`. Covers paths that
+///    appear as prefixes inside cargo command lines and cargo stderr.
+/// 2. **`<root>`** (bare, no trailing slash) — turns a bare occurrence
+///    of the root itself (e.g. the last component in a Debug-quoted
+///    path `"/abs/root"`) into the empty string. Covers the edge case
+///    where `compat_root` is the leaf path referenced.
+///
+/// The cargo invocation uses `{:?}` formatting for `PathBuf`, which
+/// wraps the path in double-quotes. Those surrounding quotes are NOT
+/// part of the path and are NOT touched. After step 1, a Debug-quoted
+/// path `"/abs/root/target/foo"` becomes `"target/foo"` — the leading
+/// `"` and trailing `"` remain in place, producing a valid repo-relative
+/// display string.
+///
+/// Paths outside `compat_root` (e.g. `/tmp/...`) do not match and are
+/// left verbatim.
+///
+/// ## Idempotency
+///
+/// Calling this function twice on the same envelope with the same
+/// `compat_root` is a no-op on the second call: after the first call
+/// the absolute prefix is absent, so neither replacement matches.
+///
+/// ## Relationship to other path normalizations
+///
+/// This mirrors the `commands.lihaaf` normalization in
+/// `render_inner_command` (R3 FIX class III), which used
+/// `Path::strip_prefix` on a structured path value. `detail` is a
+/// free-text display string, so structured stripping is not available;
+/// substring replacement is the equivalent mechanism.
+pub fn normalize_error_detail_paths(envelope: &mut CompatEnvelope, compat_root: &Path) {
+    let root_str = compat_root.to_string_lossy();
+    // Pre-compute both replacement targets so we allocate the strings
+    // once, not once per error entry.
+    let with_sep = format!("{root_str}/");
+    let bare = root_str.as_ref().to_owned();
+
+    for error in &mut envelope.errors {
+        // Step 1: replace every `<root>/` occurrence first so child
+        // paths lose both the prefix AND the separator in one pass.
+        if error.detail.contains(with_sep.as_str()) {
+            error.detail = error.detail.replace(with_sep.as_str(), "");
+        }
+        // Step 2: replace any remaining bare `<root>` occurrence (covers
+        // the case where the path IS compat_root, e.g. `"/abs/root"`
+        // becomes `""`).
+        if error.detail.contains(bare.as_str()) {
+            error.detail = error.detail.replace(bare.as_str(), "");
+        }
     }
 }
 

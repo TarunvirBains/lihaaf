@@ -425,11 +425,13 @@ pub fn discover(crate_root: &Path, custom_macros: &[String]) -> Result<Discovery
     })
 }
 
-/// Repo-relative forward-slash form. Falls back to the absolute path
-/// stringified verbatim when the fixture lives outside the crate root
-/// (the user passed an absolute literal pointing elsewhere — rare).
+/// Repo-relative forward-slash form. If the fixture lives outside the
+/// crate root (the user passed an absolute literal pointing elsewhere
+/// — rare), render an explicit non-absolute diagnostic path instead of
+/// leaking the old `util::relative_to` absolute fallback into
+/// `mismatch_examples[].fixture`.
 fn relative_repo_path(crate_root: &Path, absolute: &Path) -> String {
-    util::relative_to(absolute, crate_root)
+    util::relative_to(absolute, crate_root).unwrap_or_else(|err| err.non_absolute_path())
 }
 
 /// Outcome of the tests-directory listing helper. `DoesNotExist` is
@@ -1691,6 +1693,8 @@ fn glob_segment_matches(pattern: &[u8], name: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compat::report;
+    use std::path::Path;
 
     #[test]
     fn glob_segment_matches_star() {
@@ -1771,5 +1775,95 @@ mod tests {
     fn is_test_attribute_rejects_other() {
         let attr: syn::Attribute = syn::parse_quote!(#[cfg(test)]);
         assert!(!is_test_attribute(&[attr]));
+    }
+
+    fn envelope_with_mismatch_fixture(fixture: String) -> report::CompatEnvelope {
+        report::CompatEnvelope {
+            schema_version: 1,
+            mode: "compat".into(),
+            crate_name: "demo".into(),
+            commit: String::new(),
+            commands: report::Commands {
+                baseline: "cargo test".into(),
+                lihaaf: "cargo lihaaf --compat --compat-root .".into(),
+            },
+            results: report::Results {
+                baseline: report::BaselineCounts {
+                    pass: 0,
+                    fail: 1,
+                    unknown_count: 0,
+                    exit_code: 0,
+                    dur_ms: 0,
+                },
+                lihaaf: report::LihaafCounts {
+                    pass: 0,
+                    fail: 0,
+                    exit_code: 0,
+                    dur_ms: 0,
+                    toolchain: "rustc 1.95.0 (abc 2026-01-01)".into(),
+                },
+                mismatch_count: 1,
+            },
+            mismatch_examples: vec![report::MismatchExample {
+                fixture,
+                mismatch_type: "baseline_only_fail".into(),
+                notes: String::new(),
+            }],
+            errors: Vec::new(),
+            excluded_fixtures: Vec::new(),
+            generated_paths: Vec::new(),
+            overlay: report::OverlayMetadata {
+                generated: true,
+                dropped_comments: Vec::new(),
+                upstream_already_has_dylib: false,
+            },
+            toolchain: "rustc 1.95.0 (abc 2026-01-01)".into(),
+        }
+    }
+
+    #[test]
+    fn outside_root_absolute_fixture_does_not_serialize_as_absolute_mismatch_fixture() {
+        let crate_root = tempfile::tempdir().unwrap();
+        let outside_root = tempfile::tempdir().unwrap();
+        let tests_dir = crate_root.path().join("tests");
+        std::fs::create_dir(&tests_dir).unwrap();
+
+        let outside_fixture = outside_root.path().join("external.rs");
+        std::fs::write(&outside_fixture, "fn main() {}\n").unwrap();
+        std::fs::write(
+            tests_dir.join("trybuild.rs"),
+            format!(
+                r#"
+#[test]
+fn ui() {{
+    trybuild::TestCases::new().compile_fail("{}");
+}}
+"#,
+                outside_fixture.display()
+            ),
+        )
+        .unwrap();
+
+        let output = discover(crate_root.path(), &[]).unwrap();
+        assert_eq!(output.fixtures.len(), 1);
+        let fixture = output.fixtures[0].relative_path.clone();
+        assert!(
+            !Path::new(&fixture).is_absolute(),
+            "discovery must not hand an absolute fixture path to the envelope; got `{fixture}`"
+        );
+
+        let mut envelope = envelope_with_mismatch_fixture(fixture);
+        let report_path = crate_root.path().join("compat-report.json");
+        report::write_envelope(&mut envelope, &report_path).unwrap();
+        let text = std::fs::read_to_string(report_path).unwrap();
+
+        assert!(
+            !text.contains(r#""fixture": "/"#),
+            "mismatch_examples[].fixture must not serialize as an absolute POSIX path; got:\n{text}"
+        );
+        assert!(
+            text.contains(r#""fixture": "outside-base/"#),
+            "out-of-root absolute fixtures must use the explicit non-absolute fallback; got:\n{text}"
+        );
     }
 }

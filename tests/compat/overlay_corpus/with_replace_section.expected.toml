@@ -10,5 +10,9 @@ version = "0.1.0"
 crate-type = ["dylib", "rlib"]
 path = "__UPSTREAM_DIR__/src/lib.rs"
 
-[dependencies]
-serde = "1"
+[replace."old-dep:0.2.0"]
+path = "__UPSTREAM_DIR__/vendor/old-dep"
+
+[replace."serde:1.0.0"]
+git = "https://example.com/serde"
+rev = "abc123"
