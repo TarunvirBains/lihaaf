@@ -560,7 +560,8 @@ fn assemble_diagnostic_errors(
         errors.push(report::EnvelopeError {
             error_type: "discovery_unrecognized".into(),
             fixture: None,
-            file: crate::util::relative_to(&unrecog.file, compat_root),
+            file: crate::util::relative_to(&unrecog.file, compat_root)
+                .unwrap_or_else(|err| err.non_absolute_path()),
             line: u32::try_from(unrecog.line).unwrap_or(u32::MAX),
             detail: unrecog.detail.clone(),
         });

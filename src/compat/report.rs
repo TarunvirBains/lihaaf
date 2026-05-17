@@ -305,12 +305,12 @@ pub struct OverlayMetadata {
 /// [`GeneratedPath`] (repo-relative forward-slash string).
 ///
 /// `compat_root` is the adopter's `--compat-root` directory. The path
-/// is stripped of the prefix and rendered forward-slash via the
-/// crate-internal `util::to_forward_slash` helper. If the path is not
-/// under `compat_root` (which would indicate a driver bug — every
-/// tracked path is supposed to live under the adopter's checkout),
-/// the result preserves the full path verbatim, again in forward-
-/// slash form, so the envelope is still readable.
+/// is stripped of the prefix and rendered forward-slash via
+/// [`util::relative_to`]. If the path is not under `compat_root`
+/// (which would indicate a driver bug — every tracked path is supposed
+/// to live under the adopter's checkout), the caller explicitly records
+/// a deterministic non-absolute diagnostic path instead of reviving the
+/// old absolute fallback.
 ///
 /// The cleanup-side classification enum is stringified to its
 /// lower-case discriminant name for v0.2-additive evolution. See the
@@ -320,7 +320,8 @@ pub fn generated_path_from_cleanup(
     cleanup_entry: &crate::compat::cleanup::GeneratedPath,
     compat_root: &Path,
 ) -> GeneratedPath {
-    let rel = util::relative_to(&cleanup_entry.path, compat_root);
+    let rel = util::relative_to(&cleanup_entry.path, compat_root)
+        .unwrap_or_else(|err| err.non_absolute_path());
     let class = match cleanup_entry.class {
         crate::compat::cleanup::GeneratedPathClass::Committed => "committed",
         crate::compat::cleanup::GeneratedPathClass::Ignored => "ignored",

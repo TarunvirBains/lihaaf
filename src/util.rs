@@ -1,6 +1,7 @@
 //! Small cross-module helpers: atomic file writes, SHA-256, and path
 //! normalization helpers used by snapshot comparisons.
 
+use std::fmt;
 use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -100,15 +101,58 @@ pub fn to_forward_slash(s: &str) -> String {
     s.chars().map(|c| if c == '\\' { '/' } else { c }).collect()
 }
 
-/// Compute a path relative to `base`, returning the path verbatim if
-/// it cannot be made relative. Used for fixture display paths.
+/// Error returned when a path cannot be rendered relative to a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelativePathError {
+    path: PathBuf,
+    base: PathBuf,
+}
+
+impl RelativePathError {
+    /// Deterministic non-absolute rendering for callers that must keep
+    /// reporting an out-of-base diagnostic path without leaking the
+    /// runner-specific absolute prefix.
+    pub fn non_absolute_path(&self) -> String {
+        non_absolute_outside_base_path(&self.path)
+    }
+}
+
+impl fmt::Display for RelativePathError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "path `{}` is not under base `{}`",
+            self.path.display(),
+            self.base.display()
+        )
+    }
+}
+
+/// Render an out-of-base path without an absolute prefix.
+///
+/// v0.1 compat envelopes are Linux-only, but this still routes through
+/// [`to_forward_slash`] so the fallback is stable if a backslash-bearing
+/// diagnostic path reaches this boundary.
+pub fn non_absolute_outside_base_path(path: &Path) -> String {
+    let rendered = to_forward_slash(&path.to_string_lossy());
+    let trimmed = rendered.trim_start_matches('/');
+    if trimmed.is_empty() {
+        "outside-base".to_string()
+    } else {
+        format!("outside-base/{trimmed}")
+    }
+}
+
+/// Compute a path relative to `base`.
 ///
 /// The result is always forward-slash form for stable report output.
-pub fn relative_to(path: &Path, base: &Path) -> String {
-    match path.strip_prefix(base) {
-        Ok(rel) => to_forward_slash(&rel.to_string_lossy()),
-        Err(_) => to_forward_slash(&path.to_string_lossy()),
-    }
+pub fn relative_to(path: &Path, base: &Path) -> Result<String, RelativePathError> {
+    path.strip_prefix(base)
+        .map(|rel| to_forward_slash(&rel.to_string_lossy()))
+        .map_err(|_| RelativePathError {
+            path: path.to_path_buf(),
+            base: base.to_path_buf(),
+        })
 }
 
 /// Remove `path` from the filesystem without relying on a prior
@@ -334,14 +378,22 @@ mod tests {
     fn relative_to_strips_common_prefix() {
         let base = std::path::PathBuf::from("/a/b");
         let p = std::path::PathBuf::from("/a/b/c/d.rs");
-        assert_eq!(relative_to(&p, &base), "c/d.rs");
+        assert_eq!(relative_to(&p, &base).unwrap(), "c/d.rs");
     }
 
     #[test]
-    fn relative_to_returns_input_when_no_common_prefix() {
+    fn relative_to_errors_when_no_common_prefix() {
         let base = std::path::PathBuf::from("/x");
         let p = std::path::PathBuf::from("/y/z.rs");
-        // Forward-slash form preserved.
-        assert_eq!(relative_to(&p, &base), "/y/z.rs");
+        let err = relative_to(&p, &base).unwrap_err();
+        assert_eq!(err.to_string(), "path `/y/z.rs` is not under base `/x`");
+    }
+
+    #[test]
+    fn relative_to_error_fallback_is_not_absolute() {
+        let base = std::path::PathBuf::from("/x");
+        let p = std::path::PathBuf::from("/y/z.rs");
+        let err = relative_to(&p, &base).unwrap_err();
+        assert_eq!(err.non_absolute_path(), "outside-base/y/z.rs");
     }
 }

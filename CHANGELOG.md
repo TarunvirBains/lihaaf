@@ -91,6 +91,15 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   from every `errors[].detail` string at the envelope write boundary,
   mirroring the `commands.lihaaf` normalization pattern. Local terminal
   output is unaffected — the `Display` impl is unchanged (R5 FIX class V).
+- **`mismatch_examples[].fixture` envelope field no longer leaks an
+  absolute fallback path** (`src/util.rs` `relative_to`): structured
+  path relativization now returns an error when the input is outside
+  the expected base, forcing compat callers to choose an explicit
+  non-absolute diagnostic rendering (`outside-base/...`) instead of
+  silently serializing a runner-specific absolute path (R5 FIX class VI).
+
+### Known limitations
+- Windows path portability in `errors[].detail` and `mismatch_examples[].fixture` normalization is v0.2 work. v0.1 stage-2 runs ubuntu-24.04 only.
 
 ### Changed
 - **`docs/compatibility-plan.md` §3.2.3** rewritten to describe the
