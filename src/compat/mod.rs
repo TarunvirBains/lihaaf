@@ -4,13 +4,14 @@
 //! wires the supporting modules (`overlay`, `baseline`, `discovery`,
 //! `fixture_convert`, `cleanup`, `report`, `rustup`, `gate`) into a
 //! single end-to-end run: read upstream `Cargo.toml`, synthesize a
-//! sibling `Cargo.lihaaf.toml` with an in-memory `[package.metadata.
-//! lihaaf]` block, run the argv-only baseline (§3.4), discover
-//! trybuild fixtures via syn AST walk (§3.2.1), convert each fixture
-//! to the lihaaf-compatible directory tree, invoke `lihaaf::run`
-//! in-process for the inner session, capture the active toolchain
-//! (§3.4), and write the §3.3 envelope. The cleanup guard catches
-//! panic / early-return paths and removes registered transient paths.
+//! staged overlay at `<compat_root>/target/lihaaf-overlay/Cargo.toml`
+//! with an in-memory `[package.metadata.lihaaf]` block, run the
+//! argv-only baseline (§3.4), discover trybuild fixtures via syn AST
+//! walk (§3.2.1), convert each fixture to the lihaaf-compatible
+//! directory tree, invoke `lihaaf::run` in-process for the inner
+//! session, capture the active toolchain (§3.4), and write the §3.3
+//! envelope. The cleanup guard catches panic / early-return paths and
+//! removes registered transient paths.
 //!
 //! Adopters opt in via `cargo lihaaf --compat --compat-root <DIR>
 //! --compat-report <PATH>`. The Rust API is not part of the v0.1
@@ -39,7 +40,8 @@ use crate::error::Error;
 /// 1. Install the panic hook + construct the cleanup guard.
 /// 2. Resolve the upstream `Cargo.toml` path (`--compat-manifest`
 ///    overrides `--compat-root/Cargo.toml`).
-/// 3. Materialize the sibling overlay with a synthetic
+/// 3. Materialize the staged overlay at
+///    `<compat_root>/target/lihaaf-overlay/Cargo.toml` with a synthetic
 ///    `[package.metadata.lihaaf]` table; the builder closure reads
 ///    `[package].name` from the parsed manifest in a single pass.
 ///    Track the overlay path with the cleanup classifier.
@@ -100,10 +102,46 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // `is_file()` children only. If `fixture_dirs` pointed at the
     // parent, discovery would skip the `.rs` files that sit under
     // `compile_pass/` / `compile_fail/` and the inner session would see
-    // zero fixtures. Paths are repo-relative (resolved against the
-    // overlay manifest dir, which is `<compat_root>`) with forward
-    // slashes — §3.2.3's byte-determinism requirement bars absolute
-    // platform-dependent paths from the envelope/manifest.
+    // zero fixtures.
+    //
+    // **Why ABSOLUTE paths here (approach A from the PR #34 redesign).**
+    // The overlay now lives at `<compat_root>/target/lihaaf-overlay/Cargo.toml`,
+    // two dirs deeper than the upstream `Cargo.toml`. lihaaf's
+    // [`crate::discovery::collect`] resolves relative `fixture_dirs`
+    // against the manifest's parent dir (the `[lib]` crate's root). A
+    // repo-relative `./target/lihaaf-compat-converted/...` string would
+    // therefore resolve to
+    // `<compat_root>/target/lihaaf-overlay/target/lihaaf-compat-converted/...`
+    // — a double-`target/` path that does not exist (fixture-conversion
+    // writes to `<compat_root>/target/lihaaf-compat-converted/...`).
+    //
+    // Approach A absolutizes the two paths against `compat_root` here,
+    // so the inner session sees the real on-disk locations regardless
+    // of where the overlay manifest is staged. The cross-platform
+    // §3.2.3 byte-determinism requirement (no platform-dependent
+    // absolute paths in the §3.3 envelope) is preserved because these
+    // paths flow into the OVERLAY MANIFEST, not the envelope —
+    // `render_inner_command` shows the overlay manifest path itself but
+    // never the synthesized `fixture_dirs`, and the envelope's
+    // `crate_name` / `commit` / `commands.lihaaf` fields contain no
+    // absolute paths. Approach B (carry upstream root through the
+    // inner-session struct) would be semantically cleaner but
+    // significantly more invasive — every call site of
+    // `discovery::collect` would need a second path argument, and the
+    // existing v0.1 surface only exposes one root. Approach A keeps
+    // the §3.2.3 invariants while landing the GA fix in the smallest
+    // possible change.
+    let converted_fixtures_root = compat_root.join("target").join("lihaaf-compat-converted");
+    let abs_compile_pass = crate::util::to_forward_slash(
+        &converted_fixtures_root
+            .join("compile_pass")
+            .to_string_lossy(),
+    );
+    let abs_compile_fail = crate::util::to_forward_slash(
+        &converted_fixtures_root
+            .join("compile_fail")
+            .to_string_lossy(),
+    );
     let overlay_plan = overlay::materialize_overlay_with_synthetic_metadata_builder(
         &upstream_manifest,
         |upstream_name| {
@@ -113,10 +151,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             overlay::SyntheticMetadata {
                 dylib_crate: name.clone(),
                 extern_crates: vec![name],
-                fixture_dirs: vec![
-                    "./target/lihaaf-compat-converted/compile_pass".to_string(),
-                    "./target/lihaaf-compat-converted/compile_fail".to_string(),
-                ],
+                fixture_dirs: vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
             }
         },
     )?;
@@ -554,7 +589,8 @@ mod tests {
         // `$CARGO/<crate>-<ver>/...` will mismatch as
         // `$CARGO/registry/...` strings without any other diagnostic.
         let args = neutral_compat_args();
-        let overlay_manifest = PathBuf::from("/tmp/lihaaf-build-inner-cli-test/Cargo.lihaaf.toml");
+        let overlay_manifest =
+            PathBuf::from("/tmp/lihaaf-build-inner-cli-test/target/lihaaf-overlay/Cargo.toml");
         let inner = build_inner_cli(&args, &overlay_manifest);
         assert!(
             inner.inner_compat_normalize,
