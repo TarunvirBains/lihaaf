@@ -54,6 +54,18 @@
 //!    - `staged_overlay_rejects_workspace_member_manifest` pins the
 //!      Option-C decision: `[package].workspace = "<path>"` manifests
 //!      are REJECTED (out-of-scope for v0.1.0-beta.6).
+//!    - `staged_overlay_rejects_implicit_workspace_member_manifest`
+//!      is the R3 extension (PR #37 Codex BLOCK fixup): manifests
+//!      that lack a local `[workspace]` but carry any
+//!      `{ workspace = true }` inheritance reference are ALSO
+//!      rejected — they would otherwise produce a manifest with
+//!      stranded inheritance refs that cargo fails to parse with
+//!      "workspace inheritance was specified but `[workspace.X]`
+//!      was not defined".
+//!    - `staged_overlay_allows_root_with_local_workspace_and_inheritance_refs`
+//!      is the negative-case companion: a workspace ROOT carrying
+//!      both `[workspace]` and `{ workspace = true }` refs MUST
+//!      succeed, since the refs resolve LOCALLY.
 //!    - `cargo_accepts_workspace_style_overlay_for_dylib_build` is
 //!      the cargo-level proof for the membership-stripping case.
 //!    - `cargo_accepts_workspace_inheritance_reference_in_overlay`
@@ -1282,6 +1294,15 @@ serde = "1"
 /// present in the upstream manifest, `materialize_overlay` returns an
 /// `Error::Cli` with a directed diagnostic — NOT a silently-stripped
 /// pointer (R1's behavior) or a silently-overlayed manifest.
+///
+/// **R3 tightening (PR #37, strict-swe Finding 1):** the rejection
+/// MUST surface as `Error::Cli { clap_exit_code: 2, message }`, not
+/// as a different `Error` variant that happens to have a Debug repr
+/// containing "workspace member". The earlier `format!("{err:?}")`
+/// + `.contains(...)` shape was loose family-completeness with the
+/// adjacent `workspace_root_manifest_is_rejected_with_directed_diagnostic`
+/// test pattern; a future refactor could replace `Error::Cli` with
+/// (say) `Error::TomlParse` and the loose test would still pass.
 #[test]
 fn staged_overlay_rejects_workspace_member_manifest() {
     let tmp = tempfile::tempdir().expect("tempdir for workspace-member rejection test");
@@ -1316,14 +1337,199 @@ serde = "1"
          is out-of-scope for v0.1.0-beta.6",
     );
 
-    let s = format!("{err:?}");
-    assert!(
-        s.contains("workspace member"),
-        "rejection diagnostic must name the failure category; got: {s}"
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(
+                clap_exit_code, 2,
+                "exit code must be the clap usage code (2)"
+            );
+            assert!(
+                message.contains("workspace member"),
+                "rejection diagnostic must name the failure category; got: {message}"
+            );
+            assert!(
+                message.contains("[package].workspace"),
+                "rejection diagnostic must name the offending key; got: {message}"
+            );
+            // Distinguish from the implicit-member rejection: the
+            // explicit case must NOT use the word "implicit".
+            assert!(
+                !message.contains("implicit"),
+                "explicit rejection must not use the implicit-case wording; got: {message}"
+            );
+        }
+        other => panic!("expected Error::Cli for workspace-member rejection, got {other:?}"),
+    }
+}
+
+/// **R3 invariant: IMPLICIT workspace-member case is REJECTED.**
+///
+/// In real cargo workspaces, members commonly OMIT
+/// `[package].workspace` from their own manifests. Cargo discovers
+/// membership by walking UP the filesystem from the member's
+/// `Cargo.toml`, finding the nearest ancestor manifest containing
+/// `[workspace]`, and reading that ancestor's `members = [...]`
+/// array. Example: `cxx`'s root `Cargo.toml` carries
+/// `[workspace] members = ["demo", "macro", "gen/build", ...]` and
+/// each sub-crate (e.g. `macro/Cargo.toml`) has NO
+/// `[package].workspace` line — its membership is implicit via the
+/// parent's `members`.
+///
+/// **What this test pins:** when the upstream manifest has NO local
+/// `[workspace]` table but DOES carry any `{ workspace = true }`
+/// inheritance reference (here, a single `[dependencies] foo =
+/// { workspace = true }`), `materialize_overlay` rejects with an
+/// `Error::Cli { clap_exit_code: 2, ... }` whose message names the
+/// implicit-member category, the missing local `[workspace]` table,
+/// and the offending inheritance shape. Without R3 this case
+/// produced a manifest with stranded `{ workspace = true }`
+/// references that cargo rejected with the cryptic "workspace
+/// inheritance was specified but `[workspace.X]` was not defined"
+/// parse error — opaque to users.
+///
+/// This case doesn't currently exercise in production for the four
+/// Round-1 pilots (all are invoked from upstream ROOT per
+/// `compat/templates/pilot-stage2.yml`), but it is required for
+/// completeness — any future user invoking lihaaf from a workspace
+/// sub-crate hits the cryptic cargo error instead of a clean
+/// rejection.
+#[test]
+fn staged_overlay_rejects_implicit_workspace_member_manifest() {
+    let tmp = tempfile::tempdir().expect("tempdir for implicit workspace-member rejection test");
+    let upstream_dir = tmp.path();
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Implicit workspace-member shape:
+    //  - `[package]` present (it IS a buildable crate)
+    //  - NO `[package].workspace` line (membership is implicit)
+    //  - NO local `[workspace]` table (the ancestor is the
+    //    workspace root)
+    //  - ONE `{ workspace = true }` inheritance reference — enough
+    //    to trigger the rejection.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "implicit-member"
+version = "0.1.0"
+
+[dependencies]
+foo = { workspace = true }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let result = materialize_overlay(&upstream_manifest);
+    let err = result.expect_err(
+        "implicit workspace-member manifest (no local `[workspace]` but `{ workspace = true }` \
+         reference present) MUST be rejected under R3 — injecting `[workspace] = {}` here \
+         would strand the inheritance reference at cargo parse time with `\"workspace \
+         inheritance was specified but [workspace.X] was not defined\"`",
     );
+
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(
+                clap_exit_code, 2,
+                "exit code must match the explicit-rejection contract (clap usage code 2)"
+            );
+            assert!(
+                message.contains("implicit workspace member"),
+                "diagnostic must name the implicit-member category; got: {message}"
+            );
+            assert!(
+                message.contains("no local `[workspace]`"),
+                "diagnostic must name the structural signal that triggered the rejection; got: {message}"
+            );
+            assert!(
+                message.contains("workspace = true"),
+                "diagnostic must point at the inheritance-reference shape; got: {message}"
+            );
+            assert!(
+                message.contains("workspace-ROOT"),
+                "diagnostic must direct the user at the workspace root; got: {message}"
+            );
+        }
+        other => {
+            panic!("expected Error::Cli for implicit workspace-member rejection, got {other:?}")
+        }
+    }
+}
+
+/// **R3 invariant: workspace-root case (local `[workspace]` + own
+/// inheritance refs) is NOT rejected.**
+///
+/// A manifest with BOTH a local `[workspace]` table AND
+/// `{ workspace = true }` references is the standard workspace-root
+/// shape: the root crate hosts `[workspace.dependencies]` /
+/// `[workspace.package]` / `[workspace.lints]` and also has its OWN
+/// `[package]` whose inheritance refs resolve against those local
+/// tables. The R3 implicit-member check must NOT fire — the
+/// inheritance refs resolve LOCALLY, within the same manifest, which
+/// the overlay preserves verbatim.
+///
+/// **What this test pins:** an upstream Cargo.toml carrying both
+/// `[package].version = { workspace = true }` AND a local
+/// `[workspace.package] version = "..."` produces a staged overlay
+/// WITHOUT error and preserves both the inheritance reference and
+/// the local `[workspace.package]` table.
+#[test]
+fn staged_overlay_allows_root_with_local_workspace_and_inheritance_refs() {
+    let input = r#"[package]
+name = "root-with-inheritance"
+version.workspace = true
+
+[lib]
+crate-type = ["dylib", "rlib"]
+
+[workspace]
+members = ["nested"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+
+[workspace.dependencies]
+shared = "1.0"
+"#;
+    let (_tmp, upstream) = write_upstream(input);
+    let plan = materialize_overlay(&upstream)
+        .expect("workspace-root case with own inheritance refs must NOT be rejected");
+
+    let bytes = read_overlay(&plan.sibling_manifest);
+
+    // The `version.workspace = true` reference must survive verbatim.
     assert!(
-        s.contains("[package].workspace"),
-        "rejection diagnostic must name the offending key; got: {s}"
+        bytes.contains("workspace = true"),
+        "the local-inheritance reference must pass through unchanged; got:\n{bytes}"
+    );
+    // The `[workspace.package]` table must survive (preserves R2
+    // inheritance-table contract).
+    assert!(
+        bytes.contains("[workspace.package]"),
+        "the local `[workspace.package]` table must pass through; got:\n{bytes}"
+    );
+    // The `[workspace.dependencies]` table must survive.
+    assert!(
+        bytes.contains("[workspace.dependencies]"),
+        "the local `[workspace.dependencies]` table must pass through; got:\n{bytes}"
+    );
+    // The membership key must be stripped (R2 selective-rewrite
+    // contract).
+    assert!(
+        !bytes.contains("members = ["),
+        "the `members` membership key must be stripped; got:\n{bytes}"
     );
 }
 
