@@ -518,3 +518,62 @@ serde = { git = "https://example.com/serde", branch = "main" }
         "[patch] must follow [dependencies] in canonical order; got:\n{out}"
     );
 }
+
+/// `sibling_manifest` filename must be `Cargo.toml` — not
+/// `Cargo.lihaaf.toml` or any other variant — so that
+/// `cargo rustc --manifest-path <path>` accepts it without error.
+///
+/// Cargo validates the `--manifest-path` filename at startup and rejects
+/// any path whose last component is not literally `Cargo.toml` (exit
+/// code 1, ~43 ms, before any compilation work). This test pins the
+/// contract at the overlay level so a future rename of the staged path
+/// breaks here rather than silently causing every compat pilot to fail
+/// with an opaque cargo error.
+///
+/// Regression: before this fix the overlay was staged as
+/// `Cargo.lihaaf.toml` (a sibling of the upstream `Cargo.toml`), which
+/// caused all four stage-2 pilot forks (cxx, serde-json, anyhow,
+/// thiserror) to fail with `error_type: lihaaf_session_failed` / detail
+/// "the manifest-path must be a path to a Cargo.toml file" on every CI
+/// run — run https://github.com/TarunvirBains/lihaaf/actions/runs/25994537438.
+#[test]
+fn sibling_manifest_filename_is_cargo_toml_for_cargo_compat() {
+    let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+    let (_tmp, upstream) = write_upstream(input);
+    let plan = materialize_overlay(&upstream).expect("overlay must succeed");
+
+    let filename = plan
+        .sibling_manifest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .expect("sibling_manifest must have a filename component");
+
+    assert_eq!(
+        filename, "Cargo.toml",
+        "`sibling_manifest` filename must be `Cargo.toml` so cargo accepts \
+         `--manifest-path`; got `{filename}`. Cargo rejects any manifest-path \
+         whose last component is not literally `Cargo.toml`."
+    );
+
+    // Belt-and-suspenders: the staged overlay must live under
+    // `target/lihaaf-overlay/` so it is implicitly cargo-ignored and
+    // never pollutes the fork's worktree.
+    let path_str = plan.sibling_manifest.to_string_lossy();
+    assert!(
+        path_str.contains("lihaaf-overlay"),
+        "`sibling_manifest` must be staged under `target/lihaaf-overlay/`; \
+         got `{path_str}`"
+    );
+
+    // The overlay content must be readable and contain the expected
+    // crate-type canonicalization — verifies the staged file is well-formed.
+    let content = std::fs::read_to_string(&plan.sibling_manifest)
+        .expect("staged overlay must exist and be readable");
+    assert!(
+        content.contains(r#"crate-type = ["dylib", "rlib"]"#),
+        "staged overlay must contain canonical crate-type; got:\n{content}"
+    );
+}

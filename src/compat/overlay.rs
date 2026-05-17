@@ -1,8 +1,20 @@
-//! Phase 2 of compat mode (issue #11) — sibling-manifest overlay generator.
+//! Phase 2 of compat mode (issue #11) — staged overlay manifest generator.
 //!
 //! Reads the upstream `Cargo.toml`, canonicalizes `[lib] crate-type` so the
 //! lihaaf stage-3 dylib build can succeed without mutating the upstream
-//! file, and writes the result to `Cargo.lihaaf.toml` next to it.
+//! file, and writes the result to
+//! `<upstream_dir>/target/lihaaf-overlay/Cargo.toml`.
+//!
+//! ## Why `target/lihaaf-overlay/Cargo.toml` and not `Cargo.lihaaf.toml`
+//!
+//! `cargo rustc --manifest-path` requires the target filename to be
+//! literally `Cargo.toml`; any other filename is rejected with exit code 1
+//! before cargo does any work. Staging the overlay under
+//! `target/lihaaf-overlay/` satisfies that constraint while keeping the
+//! file isolated from the upstream `Cargo.toml`. The `target/` subtree is
+//! treated as implicitly ignored by the cleanup classifier
+//! ([`crate::compat::cleanup::CleanupGuard`]), so the overlay never
+//! pollutes the fork's worktree regardless of `.gitignore` state.
 //!
 //! Per `docs/compatibility-plan.md` §3.2.3, the overlay is:
 //!
@@ -22,9 +34,9 @@
 //!    when the existing sibling matches.
 //!
 //! The atomic write reuses [`crate::util::write_file_atomic`] so the
-//! sibling is either fully written or absent — a SIGKILL mid-write
-//! cannot leave a half-formed `Cargo.lihaaf.toml` for the stage-3
-//! `cargo rustc` to choke on.
+//! staged overlay is either fully written or absent — a SIGKILL mid-write
+//! cannot leave a half-formed file for the stage-3 `cargo rustc` to choke
+//! on.
 //!
 //! ## Crate-type canonicalization
 //!
@@ -71,8 +83,11 @@ use crate::util;
 pub struct OverlayPlan {
     /// Path to the upstream `Cargo.toml` the overlay was derived from.
     pub upstream_manifest: PathBuf,
-    /// Path to the generated `Cargo.lihaaf.toml`. Always the
-    /// sibling of `upstream_manifest`; never inside `target/`.
+    /// Path to the staged overlay manifest. Always
+    /// `<upstream_manifest_dir>/target/lihaaf-overlay/Cargo.toml` so that
+    /// `cargo rustc --manifest-path` accepts the filename (cargo rejects
+    /// any `--manifest-path` whose last component is not literally
+    /// `Cargo.toml`).
     pub sibling_manifest: PathBuf,
     /// `true` when the upstream manifest already declared
     /// `[lib] crate-type = ["dylib", ...]`. The sibling is still
@@ -280,7 +295,23 @@ where
     }
 
     let serialized = serialize_canonical(&value)?;
-    let sibling_path = upstream_manifest_path.with_file_name("Cargo.lihaaf.toml");
+
+    // Stage the overlay at `<upstream_dir>/target/lihaaf-overlay/Cargo.toml`.
+    //
+    // The filename MUST be `Cargo.toml`: `cargo rustc --manifest-path`
+    // rejects any path whose last component is not literally `Cargo.toml`
+    // (exit code 1, "the manifest-path must be a path to a Cargo.toml
+    // file"). Staging under `target/lihaaf-overlay/` isolates the overlay
+    // from the upstream `Cargo.toml` while satisfying that constraint.
+    // `write_file_atomic` calls `create_dir_all` on the parent, so the
+    // subdirectory is created on first use without a separate call here.
+    let crate_dir = upstream_manifest_path
+        .parent()
+        .unwrap_or(upstream_manifest_path);
+    let sibling_path = crate_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
 
     // Idempotent rerun guard — skip the write when bytes match. This
     // preserves mtime so a clean-state second invocation does not
@@ -291,7 +322,7 @@ where
         Err(e) => {
             return Err(Error::io(
                 e,
-                "checking existing Cargo.lihaaf.toml for idempotent rerun",
+                "checking existing staged overlay for idempotent rerun",
                 Some(sibling_path.clone()),
             ));
         }
