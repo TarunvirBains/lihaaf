@@ -4,6 +4,8 @@ version = "0.1.0"
 
 [dependencies]
 serde = "1"
+inner = { path = "inner" }
 
 [patch.crates-io]
 serde = { git = "https://example.com/serde", branch = "main" }
+demo-patched = { path = "." }

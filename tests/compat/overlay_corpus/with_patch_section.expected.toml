@@ -13,6 +13,12 @@ path = "__UPSTREAM_DIR__/src/lib.rs"
 [dependencies]
 serde = "1"
 
+[dependencies.inner]
+path = "__UPSTREAM_DIR__/inner"
+
+[patch.crates-io.demo-patched]
+path = "__UPSTREAM_DIR__/."
+
 [patch.crates-io.serde]
 branch = "main"
 git = "https://example.com/serde"

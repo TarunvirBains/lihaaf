@@ -35,11 +35,25 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   `[[example]] path`, `[[test]] path`, `[[bench]] path`,
   `[dependencies.X] path`, `[dev-dependencies.X] path`,
   `[build-dependencies.X] path`, `[target.*.<deps>] path`,
-  `[workspace] members`, `[workspace] exclude`, and `[package] build`.
+  `[workspace] members`, `[workspace] exclude`,
+  `[workspace] default-members`, `[workspace.dependencies.X] path`,
+  `[package].workspace`, `[package] build`, and
+  `[patch.<registry>.X] path` (the `git`/`branch`/`tag`/`rev` fields
+  in `[patch]` pass through verbatim; only `path`-form overrides are
+  rewritten — fixing the cxx pilot pattern `cxx = { path = "." }`).
   Auto-discovery for `[[bin]]` / `[[example]]` / `[[test]]` /
   `[[bench]]` is explicitly disabled (`autobins = false`, etc.) so a
   future cargo version that hardens the empty-discovery case does not
   break the overlay.
+- **`compat_root` absolutized at CLI entry boundary**: the production
+  shape `--compat-root .` (used in `compat/templates/pilot-stage2.yml`)
+  now receives a single-point absolutization in `CompatArgs::from_cli`
+  via `current_dir().join()` before reaching any downstream consumer.
+  Previously a relative `compat_root` caused every downstream `join`
+  (converted-fixtures dir, overlay staging path, manifest path) to
+  produce relative strings that cargo resolved against the staged
+  manifest dir instead of the crate root, yielding a double-`target/`
+  nonexistent-path failure on every real pilot run.
 - **`fixture_dirs` resolution under the new staging path**
   (`src/compat/mod.rs`): the synthetic `[package.metadata.lihaaf]`
   block previously wrote `fixture_dirs` as repo-relative strings
@@ -77,13 +91,38 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   path-absolutization contract at the byte level so every CI lane
   (without the cargo-build env-var gate) bites a regression that
   drops or downgrades the rewrite.
+- `tests/compat/overlay_determinism.rs`:
+  `absolutizes_patch_path_entries` (FIX class C) pins that
+  `[patch.crates-io.X].path` entries are absolutized; regression for
+  the cxx pilot `cxx = { path = "." }` / `cxx-build = { path =
+  "gen/build" }` pattern that the Round-2 strict-swe Opus BLOCK found.
+- `tests/compat/overlay_determinism.rs`:
+  `staged_overlay_absolutizes_workspace_key_classes` (FIX class B) pins
+  `[package].workspace`, `[workspace].default-members`, and
+  `[workspace.dependencies.X].path` absolutization.
+- `tests/compat/overlay_determinism.rs`:
+  `cargo_accepts_rich_overlay_for_dylib_build` (FIX class D, gated
+  behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`) exercises path-dep +
+  `[patch.crates-io]` path entry in a single `cargo rustc` run — the
+  richer production-failure shape the Round-2 panel surfaced that the
+  minimal existing test would not have caught.
+- `tests/compat/overlay_corpus/with_patch_section.{input,expected}.toml`
+  updated to include a path-form patch entry (`demo-patched = { path =
+  "." }`) alongside the existing `git`/`branch` entry, so the
+  cross-binary determinism corpus bites any regression to `[patch.*.X]
+  path` absolutization.
 - `src/compat/overlay.rs` unit tests cover the explicit / implicit
   `[lib] path` injection, the `[target.*.dependencies.X] path`
   rewrite, the `[workspace] members` / `[workspace] exclude` rewrite,
   the `[package] build` injection rule (only when
   `<upstream>/build.rs` exists), the `autoX = false` disabling for
   non-lib targets, and the `[[bin]]` / `[[example]]` / `[[test]]` /
-  `[[bench]]` `path =` rewrite.
+  `[[bench]]` `path =` rewrite.  Round-3 adds unit tests for all three
+  FIX class B key classes (`absolutizes_package_workspace_pointer`,
+  `absolutizes_workspace_default_members`,
+  `absolutizes_workspace_dependencies_path`) and two unit tests for
+  FIX class C (`absolutizes_patch_registry_path`,
+  `absolutize_leaves_absolute_patch_path_unchanged`).
 
 ## [0.1.0-beta.4] — 2026-05-16
 
