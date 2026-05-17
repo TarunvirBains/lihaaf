@@ -3029,6 +3029,20 @@ version = "0.1.0"
     /// surface (all four `[package]` / dep / target / lints
     /// families) is exercised by
     /// `manifest_has_inheritance_reference_*` below.
+    ///
+    /// **Test environment caveat**: like the R4 standalone-allows
+    /// test, this assertion depends on no `Cargo.toml` existing
+    /// along the filesystem walk-up from
+    /// `/tmp/lihaaf-test-upstream/Cargo.toml` (i.e., no
+    /// `/tmp/Cargo.toml` or `/Cargo.toml` declaring `[workspace]`
+    /// on the runner). If such a file exists, R4's ancestor-walk
+    /// branch (`detect_implicit_ancestor_workspace`) fires before
+    /// this rejection branch and produces a diagnostic naming the
+    /// ancestor path instead of the "implicit workspace member"
+    /// category — the inner `message.contains("no local
+    /// \`[workspace]\`")` assertion would then fail. The
+    /// constraint holds on standard CI runners and developer
+    /// machines.
     #[test]
     fn override_workspace_rejects_implicit_workspace_member_manifest() {
         let mut top = toml::map::Map::new();
