@@ -33,11 +33,9 @@ name: refresh pilots (stage-2 cross-repo)
 # - The four pilot jobs are HARDCODED here. Adding a new pilot
 #   requires a PR to this file; this is intentional — pilot
 #   enrollment is a review-gated event, not a config-file dynamic.
-# - Each `uses:` line is pinned to `@main` as a v0.1 placeholder. As
-#   each fork commits its `pilot-stage2.yml`, the user pins the
-#   `@main` to the fork commit's SHA via a follow-up PR (see
-#   `compat/PILOTS.md` "SHA-rotation workflow"). Matrix expressions
-#   are documented as forbidden in `jobs.<job_id>.uses` per
+# - Each `uses:` line is SHA-pinned per the SHA-rotation workflow in
+#   `compat/PILOTS.md`. Matrix expressions are documented as forbidden
+#   in `jobs.<job_id>.uses` per
 #   https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_iduses,
 #   hence the four duplicated job blocks.
 #
@@ -70,56 +68,44 @@ permissions:
 jobs:
   refresh-cxx:
     name: refresh cxx
-    # TODO(post-fork-setup): replace @main with pinned SHA after this
-    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
-    # SHA-rotation workflow.
-    uses: TarunvirBains/cxx-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    uses: TarunvirBains/cxx-lihaaf-pilot/.github/workflows/pilot-stage2.yml@fa1fabee8d8cdb5ff5e2bea671f3161753826ffc
     with:
       fork_repo: TarunvirBains/cxx-lihaaf-pilot
       pilot_name: cxx
-      fork_ref: main
+      fork_ref: master
       lihaaf_version: ${{ inputs.lihaaf_version }}
     permissions:
       contents: read
 
   refresh-serde-json:
     name: refresh serde-json
-    # TODO(post-fork-setup): replace @main with pinned SHA after this
-    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
-    # SHA-rotation workflow.
-    uses: TarunvirBains/serde-json-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    uses: TarunvirBains/serde-json-lihaaf-pilot/.github/workflows/pilot-stage2.yml@9fac43bc674b856edf91e2a0d24aafc744b9eae8
     with:
       fork_repo: TarunvirBains/serde-json-lihaaf-pilot
       pilot_name: serde-json
-      fork_ref: main
+      fork_ref: master
       lihaaf_version: ${{ inputs.lihaaf_version }}
     permissions:
       contents: read
 
   refresh-anyhow:
     name: refresh anyhow
-    # TODO(post-fork-setup): replace @main with pinned SHA after this
-    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
-    # SHA-rotation workflow.
-    uses: TarunvirBains/anyhow-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    uses: TarunvirBains/anyhow-lihaaf-pilot/.github/workflows/pilot-stage2.yml@24b93a59831edf0a843942cfddc73498ce83682e
     with:
       fork_repo: TarunvirBains/anyhow-lihaaf-pilot
       pilot_name: anyhow
-      fork_ref: main
+      fork_ref: master
       lihaaf_version: ${{ inputs.lihaaf_version }}
     permissions:
       contents: read
 
   refresh-thiserror:
     name: refresh thiserror
-    # TODO(post-fork-setup): replace @main with pinned SHA after this
-    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
-    # SHA-rotation workflow.
-    uses: TarunvirBains/thiserror-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    uses: TarunvirBains/thiserror-lihaaf-pilot/.github/workflows/pilot-stage2.yml@9666a9c16146cf0740fcd73eba643110df7936a3
     with:
       fork_repo: TarunvirBains/thiserror-lihaaf-pilot
       pilot_name: thiserror
-      fork_ref: main
+      fork_ref: master
       lihaaf_version: ${{ inputs.lihaaf_version }}
     permissions:
       contents: read
