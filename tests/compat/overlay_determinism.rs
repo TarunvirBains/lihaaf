@@ -62,6 +62,18 @@
 //!      stranded inheritance refs that cargo fails to parse with
 //!      "workspace inheritance was specified but `[workspace.X]`
 //!      was not defined".
+//!    - `staged_overlay_rejects_manifest_with_ancestor_workspace`
+//!      is the R4 extension (PR #37 R3 Codex BLOCK fixup):
+//!      manifests with no local `[workspace]` AND no
+//!      `{ workspace = true }` references are ALSO rejected when
+//!      an ancestor `Cargo.toml` on the filesystem walk-up carries
+//!      `[workspace]` — the ancestor may carry `[patch]` /
+//!      `[replace]` / `[profile]` / `resolver` /
+//!      `[workspace.dependencies]` tables that produce a divergent
+//!      cargo dependency graph between baseline (walks up, sees the
+//!      ancestor) and overlay (terminates the walk-up at the staged
+//!      manifest, skips the ancestor entirely) — and therefore
+//!      false compat verdicts.
 //!    - `staged_overlay_allows_root_with_local_workspace_and_inheritance_refs`
 //!      is the negative-case companion: a workspace ROOT carrying
 //!      both `[workspace]` and `{ workspace = true }` refs MUST
@@ -1463,6 +1475,126 @@ foo = { workspace = true }
         }
         other => {
             panic!("expected Error::Cli for implicit workspace-member rejection, got {other:?}")
+        }
+    }
+}
+
+/// **R4 invariant: ancestor-workspace implicit-member case is REJECTED.**
+///
+/// The Codex R3 review (PR #37) surfaced a high-severity correctness
+/// gap: a manifest can be an IMPLICIT workspace member even without
+/// any `{ workspace = true }` inheritance references. Cargo's
+/// dependency resolution walks up the filesystem from the manifest
+/// and applies state from the first ancestor `Cargo.toml` carrying
+/// `[workspace]` — including `[patch.crates-io]`, `[replace]`,
+/// `[profile]`, `resolver`, and `[workspace.dependencies]`. The
+/// lihaaf overlay declares its own `[workspace]` and terminates
+/// cargo's walk-up at the staged manifest, skipping the ancestor
+/// entirely. Result: baseline cargo (which sees the ancestor) and
+/// the lihaaf overlay (which does not) build against different
+/// dependency graphs — producing false-positive or false-negative
+/// compat verdicts that mislead users.
+///
+/// **What this test pins:** when the upstream Cargo.toml has neither
+/// a local `[workspace]` table nor any `{ workspace = true }`
+/// references, but its parent directory's `Cargo.toml` carries
+/// `[workspace] members = ["<dir>"]` plus `[patch.crates-io]`,
+/// `materialize_overlay` rejects with `Error::Cli { clap_exit_code:
+/// 2, ... }` whose message names the implicit-member-via-ancestor
+/// category AND the ancestor manifest path. Without R4 the overlay
+/// would silently produce a manifest with a divergent resolved
+/// dependency graph — the worst possible failure mode (no error
+/// surfaced, just a wrong compat verdict).
+///
+/// This integration test mirrors the unit test
+/// `override_workspace_rejects_manifest_with_ancestor_workspace` at
+/// the full pipeline level, so a regression in the R4 logic is
+/// caught at both layers.
+#[test]
+fn staged_overlay_rejects_manifest_with_ancestor_workspace() {
+    let tmp = tempfile::tempdir().expect("tempdir for ancestor-workspace rejection test");
+
+    // Parent: workspace root with [patch.crates-io]. This mirrors
+    // the Codex repro pattern exactly: an ancestor workspace whose
+    // [patch] / [replace] / [profile] state would affect baseline
+    // cargo's resolution.
+    let parent_manifest = tmp.path().join("Cargo.toml");
+    std::fs::write(
+        &parent_manifest,
+        r#"[workspace]
+members = ["sub"]
+
+[patch.crates-io]
+serde = { path = "../my-serde-fork" }
+"#,
+    )
+    .expect("writing parent Cargo.toml");
+
+    // Sub-crate: no local [workspace], no inheritance refs. The
+    // implicit-member-via-ancestor shape — R4's exact target.
+    let sub_dir = tmp.path().join("sub");
+    std::fs::create_dir_all(&sub_dir).expect("creating sub/");
+    let sub_manifest = sub_dir.join("Cargo.toml");
+    std::fs::write(
+        &sub_manifest,
+        r#"[package]
+name = "sub"
+version = "0.1.0"
+
+[dependencies]
+serde = "1"
+"#,
+    )
+    .expect("writing sub/Cargo.toml");
+    std::fs::create_dir_all(sub_dir.join("src")).expect("creating sub/src/");
+    std::fs::write(sub_dir.join("src").join("lib.rs"), "pub fn _stub() {}\n")
+        .expect("writing sub/src/lib.rs");
+
+    let result = materialize_overlay(&sub_manifest);
+    let err = result.expect_err(
+        "manifest with ancestor `[workspace]` MUST be rejected under R4 — \
+         injecting `[workspace] = {}` would silently skip the ancestor's \
+         `[patch]` / `[replace]` / `[profile]` state during cargo resolution, \
+         producing a divergent dependency graph between baseline and overlay \
+         and therefore false compat verdicts (the worst failure mode)",
+    );
+
+    match err {
+        lihaaf::Error::Cli {
+            clap_exit_code,
+            message,
+        } => {
+            assert_eq!(
+                clap_exit_code, 2,
+                "exit code must match the rejection contract (clap usage code 2)"
+            );
+            assert!(
+                message.contains("implicit workspace member"),
+                "diagnostic must name the implicit-member category; got: {message}"
+            );
+            assert!(
+                message.contains("ancestor manifest"),
+                "diagnostic must name the ancestor-detection signal; got: {message}"
+            );
+            // The diagnostic must include the offending ancestor
+            // manifest path so the user can locate the source of the
+            // rejection without spelunking.
+            let parent_str = parent_manifest.display().to_string();
+            assert!(
+                message.contains(&parent_str),
+                "diagnostic must include the ancestor manifest path `{parent_str}`; got: {message}"
+            );
+            // Distinguish from the R3 inheritance-refs rejection:
+            // this case has no `{ workspace = true }` references, and
+            // surfacing that wording would mislead users about which
+            // signal triggered the rejection.
+            assert!(
+                !message.contains("workspace = true"),
+                "ancestor-workspace rejection must not mention inheritance refs (this case has none); got: {message}"
+            );
+        }
+        other => {
+            panic!("expected Error::Cli for ancestor-workspace rejection, got {other:?}")
         }
     }
 }

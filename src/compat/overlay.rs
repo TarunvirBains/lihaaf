@@ -130,53 +130,108 @@
 //! preserves anything that is NOT one of the three membership keys, so
 //! the overlay stays forward-compatible with future cargo additions.
 //!
-//! **`[package].workspace` is REJECTED (explicit workspace member).**
-//! A package cannot simultaneously declare itself as a workspace root
-//! (`[workspace]`) AND as a member of an ancestor workspace
-//! (`[package] workspace = "..."`). The overlay always elects the
-//! workspace-root role. The R1 implementation silently stripped the
-//! ancestor-pointer, which is wrong when the upstream manifest IS
-//! itself a workspace member pointing at an ancestor workspace root:
-//! that ancestor is where the actual `[workspace.dependencies]` /
-//! `[workspace.package]` / `[workspace.lints]` tables live, and
-//! stripping the pointer strands every `{ workspace = true }`
-//! reference in the overlay. Preserving the pointer would require
-//! READING the ancestor manifest to copy the inheritance tables down
-//! into the overlay — out-of-scope for v0.1.0-beta.6. So the
-//! workspace-member case (`[package].workspace` present) is REJECTED
-//! with a directed diagnostic, the same way
-//! `is_workspace_root_manifest` rejects a virtual workspace root.
+//! **Five branches of the override decision tree.** The
+//! [`override_workspace_inheritance`] function classifies the upstream
+//! manifest into one of five mutually-exclusive cases:
 //!
-//! **Implicit workspace member case is ALSO REJECTED (R3 fixup).**
-//! In real cargo workspaces, members commonly OMIT `[package].workspace`
-//! from their own manifests — cargo discovers membership by walking UP
-//! the filesystem from the member's `Cargo.toml`, finding the nearest
-//! ancestor manifest containing `[workspace]`, and reading that
-//! ancestor's `members = [...]` declaration. Example: `cxx`'s
-//! root `Cargo.toml` carries `[workspace] members = ["demo", "macro",
-//! "gen/build", ...]`, and each sub-crate (e.g. `macro/Cargo.toml`)
-//! has NO `[package].workspace` line — its membership is implicit via
-//! the parent's `members`. The explicit-member rejection above does
-//! not catch this; the overlay used to silently produce a manifest
-//! with stranded `{ workspace = true }` references that cargo would
-//! reject with the cryptic "workspace inheritance was specified but
-//! `[workspace.X]` was not defined" parse error. R3 (PR #37) extends
-//! the rejection: if the upstream manifest has NO local `[workspace]`
-//! table AND contains ANY `{ workspace = true }` inheritance
-//! reference, REJECT with the same `Error::Cli { clap_exit_code: 2 }`
-//! variant — the user must invoke `cargo lihaaf --compat` from the
-//! workspace ROOT, not from an implicit member. The detection covers
-//! `[package].<key>` inheritance, `[dependencies.X]` /
-//! `[dev-dependencies.X]` / `[build-dependencies.X]`,
-//! `[target.<cfg>.<deps>]`, and top-level `[lints] workspace = true`.
+//! 1. **Explicit workspace member** (`[package].workspace = "<path>"`):
+//!    REJECTED with a directed diagnostic. The ancestor pointer
+//!    declares the manifest as a member of an ancestor workspace; the
+//!    overlay cannot self-declare as a workspace root and a member
+//!    simultaneously. R1 silently stripped the pointer, which strands
+//!    every surviving `{ workspace = true }` reference (the actual
+//!    inheritance tables live in the ancestor). Copying the
+//!    ancestor's tables down is out-of-scope for v0.1.0-beta.6 — see
+//!    "Workspace-member cases are out-of-scope" in the function-level
+//!    docs.
+//!
+//! 2. **Implicit workspace member via ancestor `Cargo.toml`**
+//!    (no `[package].workspace`, no local `[workspace]`, AND any
+//!    ancestor `Cargo.toml` on the filesystem walk-up carries
+//!    `[workspace]`): REJECTED with a directed diagnostic naming the
+//!    offending ancestor manifest path. This catches the case Codex
+//!    flagged in PR #37 R3 review: an ancestor workspace carrying
+//!    `[patch.crates-io]` / `[replace]` / `[profile]` / `resolver` /
+//!    `[workspace.dependencies]` would change cargo's baseline
+//!    resolution but the lihaaf overlay (which terminates cargo's
+//!    walk-up at the staged manifest) would resolve against the
+//!    REGISTRY versions of those deps — producing a divergent baseline
+//!    vs. overlay graph and false compat verdicts. The R4 rejection
+//!    runs even when the manifest has NO `{ workspace = true }`
+//!    inheritance references; the ancestor-state divergence applies
+//!    regardless of inheritance usage.
+//!
+//! 3. **Implicit workspace member via inheritance refs only**
+//!    (no `[package].workspace`, no local `[workspace]`, no ancestor
+//!    workspace detected, BUT one or more `{ workspace = true }`
+//!    inheritance references present in `[package]` / `[dependencies]`
+//!    / `[dev-dependencies]` / `[build-dependencies]` /
+//!    `[target.<cfg>.<deps>]` / `[lints]`): REJECTED. R3 (PR #37
+//!    R3) added this branch — the only way a manifest can carry
+//!    `{ workspace = true }` references is if its workspace root
+//!    lives elsewhere (either an ancestor we DIDN'T detect because
+//!    it has no `Cargo.toml`, or a path-via-non-filesystem-walk that
+//!    cargo somehow resolves). Without rejection the overlay would
+//!    strand these refs at cargo parse time with the cryptic
+//!    "workspace inheritance was specified but `[workspace.X]` was
+//!    not defined" error.
+//!
+//! 4. **Workspace-root** (local `[workspace]` table present): the
+//!    overlay CLONES the upstream's `[workspace]` table and strips
+//!    only the MEMBERSHIP keys (`members`, `exclude`,
+//!    `default-members`). Every inheritance table
+//!    (`workspace.dependencies`, `workspace.package`, `workspace.lints`,
+//!    `workspace.metadata`, `workspace.resolver`, plus any unknown
+//!    `[workspace.X]` cargo may add in future releases) is preserved
+//!    verbatim. This is the case the four Round-1 pilots (cxx,
+//!    serde-json, anyhow, thiserror) all hit: each invokes lihaaf
+//!    from the upstream ROOT, which carries both `[package]` and
+//!    `[workspace]`.
+//!
+//! 5. **Standalone single-crate** (no local `[workspace]`, no
+//!    inheritance refs, no ancestor workspace): the overlay INJECTS
+//!    an empty `[workspace] = {}` so cargo terminates its walk-up at
+//!    the staged manifest. This is the case for forks whose upstream
+//!    `Cargo.toml` is a single-crate manifest with no workspace
+//!    relationships.
+//!
+//! **R4 ancestor-walk: how it works.** When a manifest has no local
+//! `[workspace]` and no `[package].workspace`, the override walks UP
+//! the filesystem from the manifest's parent directory, checking each
+//! ancestor directory for a `Cargo.toml`. If any ancestor `Cargo.toml`
+//! parses as TOML AND contains a `[workspace]` table, branch 2 fires.
+//! Unparseable ancestor manifests log a non-fatal warning and the walk
+//! continues — we should not abort on a malformed ancestor manifest
+//! the user does not control. I/O errors other than NotFound propagate
+//! as `Error::Io`. The walk terminates at the filesystem root.
+//!
+//! **Why a CONSERVATIVE ancestor-rejection (any ancestor `[workspace]`,
+//! not just one whose `members` claims the manifest).** Even when the
+//! ancestor `[workspace]` does not name the descendant explicitly,
+//! it can still carry `[patch.crates-io]`, `[replace]`, `[profile]`,
+//! `resolver`, or `[workspace.dependencies]` tables that cargo applies
+//! during dependency resolution from the descendant. The lihaaf overlay
+//! at `<descendant>/target/lihaaf-overlay/Cargo.toml` declares
+//! `[workspace]` so cargo stops the walk-up there, skipping the
+//! ancestor's state entirely. The result: baseline `cargo test`
+//! (from the descendant, walks up, applies the ancestor state) and
+//! lihaaf overlay (terminates the walk-up at the overlay manifest,
+//! does NOT apply the ancestor state) build against DIFFERENT
+//! dependency graphs — producing false-positive and false-negative
+//! compat results. Rejecting any ancestor workspace is the only
+//! correct conservative behavior; a finer-grained check would require
+//! reasoning about cargo's full resolution algorithm against the
+//! ancestor's specific configuration, which is far more complex than
+//! the value it adds for v0.1.0-beta.6.
 //!
 //! All four Round-1 pilots (cxx, serde-json, anyhow, thiserror) invoke
 //! lihaaf from the upstream ROOT, which carries `[package]` +
-//! `[workspace]` (workspace-root case) — NOT from a sub-crate — so
-//! neither the explicit nor the implicit rejection affects any
-//! currently-enrolled pilot. The R3 rejection is defense-in-depth for
-//! any future user invoking lihaaf from a workspace-member sub-crate:
-//! they get a clean diagnostic instead of a cryptic cargo parse error.
+//! `[workspace]` (case 4, workspace-root) — NOT from a sub-crate — so
+//! none of cases 1, 2, or 3 affects any currently-enrolled pilot. The
+//! ancestor-walk rejection is defense-in-depth for any future user
+//! invoking lihaaf from a workspace-member sub-crate or a crate inside
+//! a parent workspace tree: they get a clean diagnostic instead of a
+//! cryptic cargo parse error OR a silent false compat verdict.
 
 use std::path::{Path, PathBuf};
 
@@ -441,12 +496,12 @@ where
         // carried through, while the absolutization of the stripped
         // `members` / `exclude` / `default-members` is harmlessly discarded.
         //
-        // REJECTS the workspace-member case (`[package].workspace =
-        // "<path>"`) — the overlay cannot self-declare as a workspace
-        // root and a workspace member simultaneously, and copying the
-        // ancestor workspace's inheritance tables down into the overlay
-        // is out-of-scope for v0.1.0-beta.6. See module-level docs and
-        // issue #38 / PR #37 R2 BLOCK fixup for the full rationale.
+        // REJECTS workspace-member cases (EXPLICIT `[package].workspace
+        // = "<path>"`, IMPLICIT no-`[workspace]` + ancestor `[workspace]`,
+        // and IMPLICIT no-`[workspace]` + `{ workspace = true }` references).
+        // See module-level docs (lines 130-238) and function-level docs
+        // for the cargo-walk-up discovery rationale and the five-branch
+        // decision tree.
         override_workspace_inheritance(top, upstream_manifest_path)?;
     }
 
@@ -526,25 +581,40 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// as its own workspace root, but PRESERVE the upstream's workspace
 /// inheritance tables.
 ///
-/// **What this does (in order):**
+/// **What this does (in order — five mutually-exclusive branches):**
 ///
-/// 1. If the upstream has `[package].workspace = "<ancestor>"` (the
-///    EXPLICIT workspace-member case), REJECT with a directed
-///    diagnostic. See "Workspace-member cases are out of scope" below.
-/// 2. If the upstream has NO local `[workspace]` table AND any
-///    `{ workspace = true }` inheritance reference is present (the
-///    IMPLICIT workspace-member case), REJECT with a directed
-///    diagnostic. See same.
-/// 3. If the upstream had `[workspace]`, CLONE it and strip only the
-///    membership keys (`members`, `exclude`, `default-members`).
-///    Every other key — `dependencies`, `package`, `lints`, `metadata`,
-///    `resolver`, plus any unknown `[workspace.X]` cargo may add in
-///    future releases — is preserved verbatim.
-/// 4. Otherwise (no `[workspace]`, no inheritance references), inject
-///    an empty `[workspace] = {}` so cargo treats the overlay as its
-///    own workspace root. (For workspace-style pilots this case is
-///    rare, but it covers single-crate forks whose upstream is the
-///    workspace root and whose path-deps reach back up.)
+/// 1. **Explicit member.** If the upstream has `[package].workspace =
+///    "<ancestor>"`, REJECT with a directed diagnostic. The overlay
+///    cannot self-declare as a workspace root and an explicit member
+///    of another workspace simultaneously.
+/// 2. **Implicit member via ancestor workspace (R4).** If the
+///    upstream has NO local `[workspace]` and an ancestor `Cargo.toml`
+///    on the filesystem walk-up carries `[workspace]`, REJECT with a
+///    directed diagnostic naming the offending ancestor manifest path.
+///    The ancestor workspace may carry `[patch.crates-io]`, `[replace]`,
+///    `[profile]`, `resolver`, or `[workspace.dependencies]` tables
+///    that affect baseline cargo's dependency resolution; the lihaaf
+///    overlay terminates cargo's walk-up at the staged manifest and
+///    skips the ancestor entirely, producing a divergent dependency
+///    graph and false compat verdicts. See module-level docs for the
+///    "conservative reject any ancestor workspace" rationale.
+/// 3. **Implicit member via inheritance refs only (R3).** If the
+///    upstream has NO local `[workspace]`, NO ancestor workspace
+///    detected on the walk-up, BUT any `{ workspace = true }`
+///    inheritance reference is present, REJECT with a directed
+///    diagnostic. This catches manifests whose ancestor workspace
+///    exists outside the filesystem walk-up's reach (or in a
+///    Cargo.toml we cannot parse).
+/// 4. **Workspace-root.** If the upstream had `[workspace]`, CLONE
+///    it and strip only the membership keys (`members`, `exclude`,
+///    `default-members`). Every other key — `dependencies`, `package`,
+///    `lints`, `metadata`, `resolver`, plus any unknown
+///    `[workspace.X]` cargo may add in future releases — is preserved
+///    verbatim.
+/// 5. **Standalone.** Otherwise (no `[workspace]`, no inheritance
+///    references, no ancestor workspace), inject an empty
+///    `[workspace] = {}` so cargo treats the overlay as its own
+///    workspace root.
 ///
 /// **Why this is necessary (cargo walk-up).** When cargo resolves the
 /// staged overlay at `<upstream>/target/lihaaf-overlay/Cargo.toml`, it
@@ -575,22 +645,21 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// When the overlay manifest itself carries `[package].workspace =
 /// "<path>"`, that declares the manifest as an EXPLICIT MEMBER of an
 /// ANCESTOR workspace. When the manifest has NO local `[workspace]`
-/// table but DOES carry any `{ workspace = true }` inheritance
-/// reference, it is an IMPLICIT MEMBER — cargo discovers the ancestor
-/// by walking up the filesystem from the manifest's parent until it
-/// finds another `Cargo.toml` with `[workspace]`. In both cases, the
-/// actual `[workspace.dependencies]` / `[workspace.package]` /
+/// table AND an ancestor `Cargo.toml` carries `[workspace]`, OR has
+/// at least one `{ workspace = true }` inheritance reference, it is
+/// an IMPLICIT MEMBER. In all of these cases, the actual
+/// `[workspace.dependencies]` / `[workspace.package]` /
 /// `[workspace.lints]` tables live in the ancestor — to preserve the
 /// inheritance references we would need to read that ancestor and
 /// copy the tables down into the overlay. That cross-manifest read is
-/// out-of-scope for v0.1.0-beta.6; we reject both cases with directed
-/// diagnostics instead. None of the four Round-1 pilots (cxx,
-/// serde-json, anyhow, thiserror) invokes lihaaf from a workspace
-/// member — they all invoke from upstream ROOT (which carries both
-/// `[package]` and `[workspace]`, the workspace-root case) — so
-/// neither rejection breaks any currently-enrolled pilot. The R3
-/// implicit-member rejection is defense-in-depth for any future
-/// invocation from a sub-crate. The follow-up to enable
+/// out-of-scope for v0.1.0-beta.6; we reject all three cases with
+/// directed diagnostics instead. None of the four Round-1 pilots
+/// (cxx, serde-json, anyhow, thiserror) invokes lihaaf from a
+/// workspace member — they all invoke from upstream ROOT (which
+/// carries both `[package]` and `[workspace]`, the workspace-root
+/// case) — so none of the rejections affect any currently-enrolled
+/// pilot. The R3 + R4 rejections are defense-in-depth for any future
+/// invocation from a workspace sub-crate. The follow-up to enable
 /// workspace-member overlays (copying ancestor inheritance tables
 /// down) will land separately.
 ///
@@ -606,13 +675,19 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 ///
 /// Idempotent: a second call on already-overridden output is a no-op
 /// (the membership keys are already absent and `[package].workspace`
-/// is absent).
+/// is absent). The R4 ancestor walk re-reads the filesystem on each
+/// call but never mutates it; the walk's result is the same on a
+/// second invocation.
 ///
 /// **Errors.** Returns `Error::Cli` with `clap_exit_code = 2` when the
-/// upstream manifest is a workspace member — either explicit
-/// (`[package].workspace = "<path>"`) or implicit (no local
-/// `[workspace]` table but at least one `{ workspace = true }`
-/// inheritance reference). All other shapes succeed.
+/// upstream manifest is a workspace member — explicit
+/// (`[package].workspace = "<path>"`), implicit-via-ancestor (no local
+/// `[workspace]` but ancestor `Cargo.toml` carries `[workspace]`), or
+/// implicit-via-inheritance-refs (no local `[workspace]` but at least
+/// one `{ workspace = true }` reference). May also return `Error::Io`
+/// when an ancestor `Cargo.toml` exists but cannot be read due to a
+/// non-NotFound I/O error (permissions, etc.). All other shapes
+/// succeed.
 fn override_workspace_inheritance(
     top: &mut toml::map::Map<String, toml::Value>,
     upstream_manifest_path: &Path,
@@ -646,19 +721,67 @@ fn override_workspace_inheritance(
         });
     }
 
-    // 2. Reject the IMPLICIT workspace-member case (R3 fixup). If
-    //    the manifest has no local `[workspace]` table but contains
-    //    any `{ workspace = true }` inheritance reference, it is a
-    //    workspace member whose membership is declared in an
-    //    ancestor `Cargo.toml`'s `members = [...]` array. Injecting
+    let has_local_workspace = top.get("workspace").is_some_and(|v| v.is_table());
+
+    // 2. Reject the IMPLICIT workspace-member case via ancestor
+    //    `Cargo.toml` walk-up (R4 — Codex BLOCK fixup in PR #37 R3
+    //    review). If the manifest has no local `[workspace]` table
+    //    AND any ancestor `Cargo.toml` on the filesystem walk-up
+    //    carries `[workspace]`, REJECT. The ancestor workspace may
+    //    carry `[patch.crates-io]`, `[replace]`, `[profile]`,
+    //    `resolver`, or `[workspace.dependencies]` tables that
+    //    affect baseline cargo's dependency resolution; the lihaaf
+    //    overlay terminates cargo's walk-up at the staged manifest
+    //    and skips the ancestor's state entirely, producing a
+    //    divergent dependency graph between baseline and overlay and
+    //    therefore false compat verdicts. The check is CONSERVATIVE:
+    //    any ancestor workspace triggers rejection regardless of
+    //    whether its `members` array explicitly names this manifest
+    //    (see module-level docs for the rationale).
+    if !has_local_workspace
+        && let Some(ancestor_manifest) = detect_implicit_ancestor_workspace(upstream_manifest_path)?
+    {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--compat-root` `{}` is an implicit workspace member: \
+                 it has no local `[workspace]` table but an ancestor manifest \
+                 at `{}` carries `[workspace]`. Cargo's baseline build walks \
+                 up the filesystem and would apply the ancestor's `[patch]` / \
+                 `[replace]` / `[profile]` / `resolver` / \
+                 `[workspace.dependencies]` tables during dependency \
+                 resolution, but the lihaaf overlay declares its own \
+                 `[workspace]` and terminates cargo's walk-up at the staged \
+                 manifest — producing a divergent dependency graph and \
+                 false compat verdicts. Compat mode currently cannot copy \
+                 the ancestor workspace state down into the overlay. \
+                 Either invoke `cargo lihaaf --compat` from the workspace \
+                 ROOT (`{}` or its containing directory), or restructure \
+                 the fork so the crate-under-test has no ancestor workspace.",
+                upstream_manifest_path.display(),
+                ancestor_manifest.display(),
+                ancestor_manifest.display(),
+            ),
+        });
+    }
+
+    // 3. Reject the IMPLICIT workspace-member case via inheritance
+    //    references only (R3 fixup). If the manifest has no local
+    //    `[workspace]` table but contains any `{ workspace = true }`
+    //    inheritance reference, it is a workspace member whose
+    //    membership is declared in an ancestor `Cargo.toml`'s
+    //    `members = [...]` array. The R4 ancestor-walk above
+    //    catches the common case where the ancestor exists as a
+    //    parseable `Cargo.toml`; this branch catches the residual
+    //    case where the ancestor is unreachable on the walk-up
+    //    (e.g., outside the working tree, behind a symlink we did
+    //    not follow, or a Cargo.toml we could not parse). Injecting
     //    an empty `[workspace]` here would strand every such
     //    reference at cargo parse time with the cryptic "workspace
     //    inheritance was specified but `[workspace.X]` was not
     //    defined" error. Reject with the same directed diagnostic
-    //    family as the explicit case so the user gets actionable
-    //    output. See module-level docs for the cargo-walk-up
-    //    discovery details.
-    let has_local_workspace = top.get("workspace").is_some_and(|v| v.is_table());
+    //    family as branches 1 and 2 so the user gets actionable
+    //    output.
     if !has_local_workspace && manifest_has_inheritance_reference(top) {
         return Err(Error::Cli {
             clap_exit_code: 2,
@@ -682,7 +805,7 @@ fn override_workspace_inheritance(
         });
     }
 
-    // 3. Build the overlay's `[workspace]` table. If the upstream
+    // 4. Build the overlay's `[workspace]` table. If the upstream
     //    had one, clone it and strip ONLY the membership keys.
     //    Otherwise inject an empty table so cargo treats the overlay
     //    as its own workspace root (terminating the walk-up).
@@ -696,7 +819,7 @@ fn override_workspace_inheritance(
         toml::map::Map::new()
     };
 
-    // 4. Idempotency / belt-and-braces: if a future pass re-introduces
+    // 5. Idempotency / belt-and-braces: if a future pass re-introduces
     //    one of the membership keys, this re-strips. Cheap; preserves
     //    the documented idempotency contract.
     for key in WORKSPACE_MEMBERSHIP_KEYS {
@@ -705,6 +828,99 @@ fn override_workspace_inheritance(
 
     top.insert("workspace".to_string(), toml::Value::Table(new_workspace));
     Ok(())
+}
+
+/// Walk UP the filesystem from `upstream_manifest_path`'s parent
+/// directory, looking for an ancestor `Cargo.toml` that declares a
+/// `[workspace]` table. Returns `Some(ancestor_manifest_path)` on the
+/// first such ancestor found; returns `None` if the walk reaches the
+/// filesystem root without finding any ancestor workspace.
+///
+/// Used by [`override_workspace_inheritance`] (branch 2) to detect the
+/// implicit-workspace-member case where the descendant manifest has no
+/// local `[workspace]` table but is contained within an ancestor
+/// workspace that affects baseline cargo's dependency resolution.
+///
+/// **Walk-up semantics.** Starts at `parent_of(parent_of(upstream))`,
+/// i.e., one level above the directory containing the manifest. This
+/// avoids re-checking the upstream manifest itself (which we already
+/// have parsed in [`override_workspace_inheritance`]) and is what
+/// cargo's own walk-up does. Each iteration:
+///
+/// - If `<dir>/Cargo.toml` does not exist (`NotFound`), continue
+///   walking up. This is the common case — most directories on a
+///   typical Linux filesystem do not contain a `Cargo.toml`.
+/// - If `<dir>/Cargo.toml` exists but fails to parse as TOML, emit a
+///   non-fatal warning on stderr and continue walking. The user does
+///   not control ancestor manifests they did not author; we should
+///   not abort compat-mode entirely because a third-party Cargo.toml
+///   somewhere above is malformed.
+/// - If `<dir>/Cargo.toml` exists, parses, and contains
+///   `[workspace]`, return the ancestor manifest path immediately.
+/// - If `<dir>/Cargo.toml` exists, parses, but does NOT contain
+///   `[workspace]`, continue walking. Cargo's own walk-up does the
+///   same — it does not stop at the first Cargo.toml but at the first
+///   `[workspace]`.
+/// - Other I/O errors (permission denied, etc.) propagate as
+///   [`Error::Io`]. These are not silent skip cases — a permissions
+///   problem reading an ancestor is something the user should see.
+///
+/// The walk terminates at the filesystem root (`Path::parent` returns
+/// `None`). The `Path::canonicalize` call is intentionally NOT made:
+/// the upstream manifest path is already absolutized at the CLI layer
+/// ([`crate::compat::args::CompatArgs::from_cli`]), and re-canonicalizing
+/// would require the path to exist on disk (which fails for test
+/// dummies and for legitimate non-existent ancestor manifests).
+fn detect_implicit_ancestor_workspace(
+    upstream_manifest_path: &Path,
+) -> Result<Option<PathBuf>, Error> {
+    let Some(manifest_dir) = upstream_manifest_path.parent() else {
+        // No parent — e.g. root-level manifest. Nothing to walk.
+        return Ok(None);
+    };
+    let mut current = manifest_dir.parent();
+    while let Some(dir) = current {
+        let candidate = dir.join("Cargo.toml");
+        match std::fs::read_to_string(&candidate) {
+            Ok(text) => {
+                match toml::from_str::<toml::Value>(&text) {
+                    Ok(value) => {
+                        if value.get("workspace").is_some_and(|v| v.is_table()) {
+                            return Ok(Some(candidate));
+                        }
+                        // Ancestor manifest exists and parses but has
+                        // no `[workspace]`. Cargo's walk-up does not
+                        // stop here; we don't either. Continue.
+                    }
+                    Err(e) => {
+                        // Malformed ancestor manifest. Log and
+                        // continue — we should not abort compat mode
+                        // entirely because of a third-party manifest
+                        // the user did not author.
+                        eprintln!(
+                            "lihaaf: warning: skipping ancestor Cargo.toml `{}` during \
+                             workspace detection: TOML parse error: {}",
+                            candidate.display(),
+                            e
+                        );
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Most directories on the walk-up have no Cargo.toml.
+                // Continue silently.
+            }
+            Err(e) => {
+                return Err(Error::io(
+                    e,
+                    "reading ancestor Cargo.toml during workspace detection",
+                    Some(candidate),
+                ));
+            }
+        }
+        current = dir.parent();
+    }
+    Ok(None)
 }
 
 /// Return `true` when `top` contains any `{ workspace = true }`
@@ -2868,6 +3084,265 @@ version = "0.1.0"
                 panic!("expected Error::Cli for implicit workspace-member rejection, got {other:?}")
             }
         }
+    }
+
+    /// **R4 invariant: IMPLICIT workspace-member case via ancestor
+    /// `Cargo.toml` is REJECTED.**
+    ///
+    /// The Codex R3 review flagged a correctness gap: a manifest with
+    /// NO local `[workspace]` AND NO `{ workspace = true }`
+    /// inheritance references could still be contained within an
+    /// ancestor workspace that carries `[patch.crates-io]`,
+    /// `[replace]`, `[profile]`, `resolver`, or
+    /// `[workspace.dependencies]` tables. Baseline cargo walks up the
+    /// filesystem from the descendant and applies the ancestor state;
+    /// the lihaaf overlay declares its own `[workspace]` and
+    /// terminates the walk-up at the staged manifest, skipping the
+    /// ancestor state entirely. Result: divergent dependency graphs
+    /// and false compat verdicts. R4 (PR #37 R3 BLOCK fixup) walks
+    /// up the filesystem from the manifest's parent and rejects on
+    /// any ancestor `Cargo.toml` carrying `[workspace]`.
+    ///
+    /// **What this test pins:** when the upstream Cargo.toml has
+    /// neither a local `[workspace]` table nor any inheritance
+    /// references, but lives inside a directory whose parent
+    /// `Cargo.toml` carries `[workspace] members = ["<dir>"]`,
+    /// `override_workspace_inheritance` rejects with `Error::Cli {
+    /// clap_exit_code: 2, ... }` whose message names the implicit-
+    /// member category AND the ancestor manifest path.
+    ///
+    /// **Defense-in-depth:** this is the case the R3 implicit-
+    /// inheritance-refs rejection does NOT catch (no `{ workspace =
+    /// true }` is required to trigger the failure mode), so without
+    /// R4 the overlay silently produced a manifest with a divergent
+    /// resolved graph relative to baseline — the worst failure mode
+    /// (false compat verdict, no error surfaced).
+    #[test]
+    fn override_workspace_rejects_manifest_with_ancestor_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir for ancestor-workspace rejection test");
+
+        // Parent dir: workspace ROOT carrying `[workspace]` +
+        // `[patch.crates-io]`. The Codex repro shape exactly.
+        let parent_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &parent_manifest,
+            r#"[workspace]
+members = ["sub"]
+
+[patch.crates-io]
+foo = { path = "../my-foo-fork" }
+"#,
+        )
+        .expect("writing parent Cargo.toml");
+
+        // Sub-crate: no local `[workspace]`, no inheritance refs.
+        // This is the implicit-member-via-ancestor shape.
+        let sub_dir = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub_dir).expect("creating sub/ dir");
+        let sub_manifest = sub_dir.join("Cargo.toml");
+        std::fs::write(
+            &sub_manifest,
+            r#"[package]
+name = "sub"
+version = "0.1.0"
+"#,
+        )
+        .expect("writing sub/Cargo.toml");
+
+        // Now exercise `override_workspace_inheritance` on a parsed
+        // top representing the sub manifest. We build the top
+        // directly (rather than going through `materialize_overlay`)
+        // because this is the structural unit test; the integration
+        // test below exercises the full pipeline.
+        let mut top = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("sub".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        let err = override_workspace_inheritance(&mut top, &sub_manifest)
+            .expect_err("manifest with ancestor workspace must be rejected");
+
+        match err {
+            Error::Cli {
+                clap_exit_code,
+                message,
+            } => {
+                assert_eq!(
+                    clap_exit_code, 2,
+                    "exit code must match the rejection contract (clap usage code 2)"
+                );
+                assert!(
+                    message.contains("implicit workspace member"),
+                    "diagnostic must name the implicit-member category; got: {message}"
+                );
+                assert!(
+                    message.contains("ancestor manifest"),
+                    "diagnostic must name the ancestor-detection signal; got: {message}"
+                );
+                let parent_str = parent_manifest.display().to_string();
+                assert!(
+                    message.contains(&parent_str),
+                    "diagnostic must include the ancestor manifest path `{parent_str}`; got: {message}"
+                );
+                // The diagnostic must NOT use the inheritance-refs
+                // wording: this case has no `{ workspace = true }`
+                // references, and conflating the two would mislead
+                // users about which signal triggered the rejection.
+                assert!(
+                    !message.contains("workspace = true"),
+                    "ancestor-workspace rejection must not mention inheritance refs (this case has none); got: {message}"
+                );
+                // No half-mutated workspace key on failure.
+                assert!(
+                    !top.contains_key("workspace"),
+                    "rejection must not leave a half-mutated `[workspace]` entry in place"
+                );
+            }
+            other => {
+                panic!("expected Error::Cli for ancestor-workspace rejection, got {other:?}")
+            }
+        }
+    }
+
+    /// **R4 invariant: STANDALONE single-crate manifest (no ancestor
+    /// workspace) is ALLOWED — branch 5 still works.**
+    ///
+    /// The R4 ancestor-walk must NOT produce false-positive rejections
+    /// for the standard standalone single-crate case: a fork whose
+    /// `Cargo.toml` has no local `[workspace]`, no inheritance refs,
+    /// AND lives in a directory tree whose ancestors have no
+    /// `Cargo.toml` at all. This is the most common compat-mode shape
+    /// for adopters who haven't enrolled in a workspace pattern
+    /// (single-crate libraries like `anyhow`, `thiserror`).
+    ///
+    /// **What this test pins:** a tempdir with ONLY a single
+    /// `Cargo.toml` in its root (no ancestor Cargo.toml on the walk-
+    /// up; tempdirs live under `/tmp/...` on Linux and `~/Library/
+    /// Caches/.../` on macOS — neither path typically has a `Cargo.
+    /// toml` along the way to the filesystem root) produces a
+    /// successful `override_workspace_inheritance` call with an
+    /// injected empty `[workspace]`.
+    ///
+    /// **Defense-in-depth:** without R4 this test would still pass
+    /// (the standalone case has always worked); with R4 it confirms
+    /// that the ancestor-walk does not regress the standalone case.
+    /// The test asserts the SPECIFIC absence of the ancestor-walk
+    /// rejection AND the presence of the injected empty `[workspace]`
+    /// — a regression where the ancestor-walk spuriously triggered
+    /// rejection on a path with no real ancestor workspace would
+    /// fail this test by producing `Err(Error::Cli)` instead of
+    /// `Ok(())`.
+    ///
+    /// **Test-environment caveat:** this test relies on no
+    /// `Cargo.toml` existing at any ancestor of the OS temp dir
+    /// (typically `/tmp/Cargo.toml`, `/Cargo.toml`, etc.). On any
+    /// reasonable CI runner or developer machine this holds; on a
+    /// weirdly-configured box that happens to have such a file, this
+    /// test would surface the issue cleanly (the rejection diagnostic
+    /// would name the offending path).
+    #[test]
+    fn override_workspace_allows_standalone_with_no_ancestor_workspace() {
+        let tmp = tempfile::tempdir().expect("tempdir for standalone-allows negative-case test");
+
+        // Single standalone Cargo.toml at the tempdir root. NO
+        // local `[workspace]`, NO inheritance refs, NO sibling or
+        // ancestor Cargo.toml.
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            r#"[package]
+name = "standalone"
+version = "0.1.0"
+"#,
+        )
+        .expect("writing standalone Cargo.toml");
+
+        let mut top = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("standalone".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        // No `[workspace]` in input.
+        assert!(!top.contains_key("workspace"));
+
+        // The override MUST succeed — no ancestor workspace on the
+        // walk-up, no inheritance refs, no local workspace. Branch 5
+        // (standalone injection) fires.
+        override_workspace_inheritance(&mut top, &manifest).unwrap_or_else(|err| {
+            panic!(
+                "standalone manifest with no ancestor workspace must NOT be rejected; \
+                 got: {err:?} (this would indicate an R4 regression — the ancestor walk \
+                 spuriously detected a workspace where there is none, OR the test \
+                 environment has an unexpected `Cargo.toml` somewhere above the temp dir)"
+            )
+        });
+
+        // Branch 5 outcome: empty `[workspace]` table injected.
+        let ws_out = top.get("workspace").and_then(|v| v.as_table()).unwrap();
+        assert!(
+            ws_out.is_empty(),
+            "branch 5 (standalone) must inject an empty `[workspace]`; got keys: {:?}",
+            ws_out.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// **R4 helper: `detect_implicit_ancestor_workspace` returns
+    /// `None` when no ancestor Cargo.toml exists on the walk-up.**
+    ///
+    /// Direct unit test on the helper function — the negative case
+    /// for the simplest possible filesystem layout. The integration
+    /// behavior is verified by
+    /// `override_workspace_allows_standalone_with_no_ancestor_workspace`
+    /// above; this is the unit-level confirmation that the helper
+    /// itself does the right thing.
+    #[test]
+    fn detect_implicit_ancestor_workspace_returns_none_for_standalone() {
+        let tmp = tempfile::tempdir().expect("tempdir for ancestor-walk None negative case");
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&manifest, "[package]\nname = \"standalone\"\n")
+            .expect("writing standalone Cargo.toml");
+
+        let result = detect_implicit_ancestor_workspace(&manifest)
+            .expect("ancestor walk on a clean tempdir must not return Err");
+        assert!(
+            result.is_none(),
+            "ancestor walk from a standalone tempdir manifest must return None; got: {result:?}"
+        );
+    }
+
+    /// **R4 helper: `detect_implicit_ancestor_workspace` returns
+    /// `Some(path)` when an ancestor Cargo.toml carries
+    /// `[workspace]`.**
+    ///
+    /// Direct unit test on the helper — confirms the walk finds the
+    /// nearest ancestor with `[workspace]` AND returns that
+    /// manifest's path (not the descendant's, not the grandparent's).
+    #[test]
+    fn detect_implicit_ancestor_workspace_finds_nearest_ancestor() {
+        let tmp = tempfile::tempdir().expect("tempdir for ancestor-walk Some positive case");
+
+        // Parent: workspace root.
+        let parent_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&parent_manifest, "[workspace]\nmembers = [\"sub\"]\n")
+            .expect("writing parent Cargo.toml");
+
+        // Sub: implicit member.
+        let sub_dir = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub_dir).expect("creating sub/");
+        let sub_manifest = sub_dir.join("Cargo.toml");
+        std::fs::write(
+            &sub_manifest,
+            "[package]\nname = \"sub\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing sub/Cargo.toml");
+
+        let result =
+            detect_implicit_ancestor_workspace(&sub_manifest).expect("ancestor walk must succeed");
+        let found = result.expect("ancestor walk must find the parent workspace");
+        assert_eq!(
+            found, parent_manifest,
+            "ancestor walk must return the parent manifest path verbatim"
+        );
     }
 
     /// Verify `manifest_has_inheritance_reference` returns `false`
