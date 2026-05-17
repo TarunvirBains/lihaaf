@@ -722,9 +722,8 @@ fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstrea
                             .get("path")
                             .and_then(|v| v.as_str())
                             .expect("needs_rewrite implies path exists");
-                        let abs = crate::util::to_forward_slash(
-                            &upstream_dir.join(s).to_string_lossy(),
-                        );
+                        let abs =
+                            crate::util::to_forward_slash(&upstream_dir.join(s).to_string_lossy());
                         krate_table.insert("path".to_string(), toml::Value::String(abs));
                     }
                 }
