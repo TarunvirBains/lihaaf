@@ -1,7 +1,12 @@
 [package]
+autobenches = false
+autobins = false
+autoexamples = false
+autotests = false
 edition = "2021"
 name = "demo"
 version = "0.1.0"
 
 [lib]
 crate-type = ["dylib", "rlib"]
+path = "__UPSTREAM_DIR__/src/lib.rs"

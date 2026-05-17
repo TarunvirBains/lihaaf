@@ -1,9 +1,14 @@
 [package]
+autobenches = false
+autobins = false
+autoexamples = false
+autotests = false
 name = "demo"
 version = "0.1.0"
 
 [lib]
 crate-type = ["dylib", "rlib"]
+path = "__UPSTREAM_DIR__/src/lib.rs"
 
 [dependencies]
 serde = "1"
