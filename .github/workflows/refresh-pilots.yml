@@ -1,0 +1,125 @@
+name: refresh pilots (stage-2 cross-repo)
+
+# v0.1 pilot-refresh orchestrator. Invokes the reusable
+# `pilot-stage2.yml` workflow over every enrolled pilot fork
+# synchronously via cross-repo `workflow_call`. See
+# `compat/PILOTS.md` for the full operational flow and the v0.2
+# refresh strategy.
+#
+# Execution-context (corrected from round-1):
+# Per GitHub Actions docs
+# (https://docs.github.com/en/actions/concepts/workflows-and-actions/reusing-workflow-configurations),
+# a called reusable workflow runs as part of the CALLER's workflow
+# run. That means:
+# - `github.repository` inside the called workflow is `TarunvirBains/lihaaf`
+#   (this orchestrator), NOT the fork — so `actions/checkout` must be
+#   told explicitly which repo to check out (we pass `fork_repo`).
+# - The artifacts produced by the called workflow appear in THIS
+#   workflow run's Actions tab, not in each fork's Actions tab.
+# - The GITHUB_TOKEN available to the called workflow is the
+#   orchestrator's, scoped by the orchestrator's `permissions:` block
+#   (`contents: read`).
+#
+# Security:
+# - `workflow_dispatch` ONLY. NO `pull_request` / `pull_request_target`
+#   trigger. Reason: cross-repo `workflow_call` from a PR-triggered
+#   workflow would expose orchestrator inputs to PR authors, and
+#   manual `workflow_dispatch` requires `repo` write scope which PR
+#   authors don't have. Manual-only invocation matches the v0.1
+#   manual drift-detection cadence and keeps the dispatch surface
+#   gated to maintainers.
+# - `permissions: contents: read` at workflow level. No issue / PR /
+#   checks-API writes.
+# - The four pilot jobs are HARDCODED here. Adding a new pilot
+#   requires a PR to this file; this is intentional — pilot
+#   enrollment is a review-gated event, not a config-file dynamic.
+# - Each `uses:` line is pinned to `@main` as a v0.1 placeholder. As
+#   each fork commits its `pilot-stage2.yml`, the user pins the
+#   `@main` to the fork commit's SHA via a follow-up PR (see
+#   `compat/PILOTS.md` "SHA-rotation workflow"). Matrix expressions
+#   are documented as forbidden in `jobs.<job_id>.uses` per
+#   https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_iduses,
+#   hence the four duplicated job blocks.
+#
+# v0.2 may add a scheduled trigger:
+#   schedule:
+#     - cron: '0 6 * * 1'  # Mondays 06:00 UTC
+# Intentionally NOT enabled for v0.1: scheduled refreshes blur the
+# stage-3 enrollment audit trail (a baseline.toml ceiling drift caused
+# by a midnight refresh is harder to attribute than one tied to an
+# explicit `Run workflow` click).
+
+on:
+  workflow_dispatch:
+    inputs:
+      lihaaf_version:
+        description: 'lihaaf version each pilot installs via `cargo install` (published crates.io version)'
+        required: false
+        type: string
+        default: '0.1.0-beta.4'
+
+permissions:
+  contents: read
+
+# Four explicit jobs — one per enrolled pilot fork — because contexts
+# and expressions (including matrix expressions) are forbidden in
+# `jobs.<job_id>.uses` per GitHub Actions workflow syntax. The jobs
+# run in parallel (no `needs:`); a fork failure does not cancel the
+# other three (the `fail-fast: false` matrix idiom is satisfied here
+# by independent jobs).
+jobs:
+  refresh-cxx:
+    name: refresh cxx
+    # TODO(post-fork-setup): replace @main with pinned SHA after this
+    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
+    # SHA-rotation workflow.
+    uses: TarunvirBains/cxx-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    with:
+      fork_repo: TarunvirBains/cxx-lihaaf-pilot
+      pilot_name: cxx
+      fork_ref: main
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
+
+  refresh-serde-json:
+    name: refresh serde-json
+    # TODO(post-fork-setup): replace @main with pinned SHA after this
+    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
+    # SHA-rotation workflow.
+    uses: TarunvirBains/serde-json-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    with:
+      fork_repo: TarunvirBains/serde-json-lihaaf-pilot
+      pilot_name: serde-json
+      fork_ref: main
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
+
+  refresh-anyhow:
+    name: refresh anyhow
+    # TODO(post-fork-setup): replace @main with pinned SHA after this
+    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
+    # SHA-rotation workflow.
+    uses: TarunvirBains/anyhow-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    with:
+      fork_repo: TarunvirBains/anyhow-lihaaf-pilot
+      pilot_name: anyhow
+      fork_ref: main
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
+
+  refresh-thiserror:
+    name: refresh thiserror
+    # TODO(post-fork-setup): replace @main with pinned SHA after this
+    # fork commits pilot-stage2.yml. See compat/PILOTS.md for the
+    # SHA-rotation workflow.
+    uses: TarunvirBains/thiserror-lihaaf-pilot/.github/workflows/pilot-stage2.yml@main
+    with:
+      fork_repo: TarunvirBains/thiserror-lihaaf-pilot
+      pilot_name: thiserror
+      fork_ref: main
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read

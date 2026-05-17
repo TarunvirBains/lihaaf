@@ -1,0 +1,365 @@
+name: lihaaf compat stage-2 (pilot)
+
+# Reusable workflow for a lihaaf compat-mode pilot fork.
+#
+# This file is a TEMPLATE distributed from the lihaaf repo at
+# `compat/templates/pilot-stage2.yml`. To enroll a fork as a pilot:
+#
+#   1. Copy this file verbatim into the fork at
+#      `.github/workflows/pilot-stage2.yml`.
+#   2. Ensure cross-repo `workflow_call` access is permitted from
+#      `TarunvirBains/lihaaf` (see compat/PILOTS.md "One-time fork
+#      setup"). This applies to BOTH public and private forks — the
+#      "Allow access" gate is independent of fork visibility for the
+#      cross-repo reusable-workflow surface.
+#   3. Ensure the fork's `Cargo.toml` has `[package].name` set to the
+#      upstream crate name (this is how lihaaf records `crate_name` in
+#      the §3.3 envelope and how the §5 baseline.toml key is keyed).
+#
+# This template does NOT execute from lihaaf's repo. The lihaaf-side
+# orchestrator at `.github/workflows/refresh-pilots.yml` invokes this
+# workflow over each enrolled fork via cross-repo `workflow_call`.
+#
+# Execution-context note (BLOCK-1 fix):
+# Per GitHub Actions docs, a CALLED reusable workflow runs as part of
+# the CALLER's workflow run, NOT the called repo's. `github.repository`
+# evaluates to `TarunvirBains/lihaaf` (the orchestrator) — NOT the fork.
+# Therefore `actions/checkout` MUST receive an explicit `repository:`
+# input pointing at the fork, otherwise it will check out lihaaf.
+# The orchestrator passes `fork_repo` / `fork_ref` for that purpose.
+#
+# Pilot ladder (compatibility-plan.md §4):
+#   stage 1 — fork exists
+#   stage 2 — this workflow produces a §3.3 envelope (THIS FILE)
+#   stage 3 — PR to lihaaf adds a `compat/baseline.toml` row
+#
+# Security:
+# - `permissions: contents: read` only; no token write scopes.
+# - `actions/checkout` runs with `persist-credentials: false` so the
+#   workflow's GITHUB_TOKEN does not leak into subsequent steps.
+# - All third-party-action `uses:` lines are SHA-pinned per
+#   https://docs.github.com/en/actions/security-guides/security-hardening-for-github-actions.
+# - This workflow is callable via `workflow_call` only — there is no
+#   `pull_request` / `pull_request_target` trigger and the orchestrator
+#   that invokes it runs only on `workflow_dispatch`.
+# - `lihaaf_version` is passed through a step `env:` block and quoted in
+#   shell to defeat injection; a strict semver regex rejects any
+#   non-conforming input before `cargo install` runs.
+
+on:
+  workflow_call:
+    inputs:
+      fork_repo:
+        description: 'The pilot fork repo to check out, e.g. `TarunvirBains/cxx-lihaaf-pilot`. Required because the called workflow runs in the CALLER context — `actions/checkout` would otherwise pull lihaaf.'
+        required: true
+        type: string
+      pilot_name:
+        description: 'Short pilot identifier used in artifact name and log labels, e.g. `cxx`, `serde-json`. Distinct per fork to avoid artifact-name collisions inside one orchestrator run.'
+        required: true
+        type: string
+      fork_ref:
+        description: 'Branch or commit SHA to check out in the fork. Defaults to `main`.'
+        required: false
+        type: string
+        default: 'main'
+      lihaaf_version:
+        description: 'lihaaf version to `cargo install` (must be a published crates.io version)'
+        required: false
+        type: string
+        default: '0.1.0-beta.4'
+    outputs:
+      crate_name:
+        description: 'Crate name parsed from the envelope (upstream `[package].name`)'
+        value: ${{ jobs.compat-run.outputs.crate_name }}
+      mismatch_count:
+        description: 'results.mismatch_count from the §3.3 envelope (string-formatted integer)'
+        value: ${{ jobs.compat-run.outputs.mismatch_count }}
+      baseline_exit_code:
+        description: 'results.baseline.exit_code from the §3.3 envelope (string-formatted integer)'
+        value: ${{ jobs.compat-run.outputs.baseline_exit_code }}
+      lihaaf_exit_code:
+        description: 'results.lihaaf.exit_code from the §3.3 envelope (string-formatted integer)'
+        value: ${{ jobs.compat-run.outputs.lihaaf_exit_code }}
+      envelope_artifact_name:
+        description: 'Name of the uploaded envelope artifact (download via `gh run download`)'
+        value: ${{ jobs.compat-run.outputs.envelope_artifact_name }}
+      fork_sha:
+        description: 'Resolved fork HEAD SHA (native `commit` output from actions/checkout). Recorded in the §3.3 envelope `commit` field via `--compat-commit`.'
+        value: ${{ jobs.compat-run.outputs.fork_sha }}
+
+permissions:
+  contents: read
+
+jobs:
+  compat-run:
+    name: stage-2 compat run (${{ inputs.pilot_name }})
+    # v0.1 ships ubuntu-24.04 only. The KNOWN_DIFFS Windows-cleanup
+    # divergence is v0.2 work; macOS is not on the v0.1 matrix.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    outputs:
+      crate_name: ${{ steps.parse.outputs.crate_name }}
+      mismatch_count: ${{ steps.parse.outputs.mismatch_count }}
+      baseline_exit_code: ${{ steps.parse.outputs.baseline_exit_code }}
+      lihaaf_exit_code: ${{ steps.parse.outputs.lihaaf_exit_code }}
+      envelope_artifact_name: ${{ steps.artifact-name.outputs.name }}
+      # Native `commit` output from actions/checkout (pinned SHA above
+      # is v6.0.2; the action exposes the resolved HEAD SHA as
+      # `steps.<id>.outputs.commit`). No separate `git rev-parse` step
+      # needed — the action already does it.
+      fork_sha: ${{ steps.checkout.outputs.commit }}
+
+    steps:
+      - name: Checkout fork
+        id: checkout
+        # CRITICAL: the called workflow runs in the CALLER context
+        # (lihaaf), not the fork. Without `repository:`, this step
+        # would check out lihaaf and the compat run would have nothing
+        # to test. `fork_repo` is supplied by the orchestrator.
+        # `persist-credentials: false` prevents the (read-only)
+        # GITHUB_TOKEN from leaking into later steps; `cargo install`
+        # and the compat run never need it.
+        #
+        # `id: checkout` is load-bearing: the action's `commit` output
+        # is consumed by the `--compat-commit` flag (writes the SHA
+        # into the §3.3 envelope's `commit` field) and by the
+        # workflow-level `fork_sha` output (surfaced to the
+        # orchestrator for cross-fork audit). Prior to round-3 a
+        # separate `git rev-parse HEAD` step recomputed this — that
+        # step is removed because actions/checkout already exposes
+        # the value natively.
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2 as of 2026-05-16
+        with:
+          repository: ${{ inputs.fork_repo }}
+          ref: ${{ inputs.fork_ref }}
+          persist-credentials: false
+
+      - name: Install Rust toolchain (MSRV-pinned)
+        # MSRV-pinned per lihaaf's published Cargo.toml `rust-version =
+        # "1.95"`. The toolchain is supplied via the `toolchain:` input
+        # (dtolnay/rust-toolchain's documented idiom); the action ref
+        # is SHA-pinned to master and the version comes from input —
+        # this is the recommended pattern from the action's README.
+        # Crates needing C/C++ toolchain (e.g., cxx) work out-of-the-box
+        # on ubuntu-24.04 — `build-essential` is preinstalled. If a
+        # future pilot needs a non-default compiler version, add a
+        # `CC` / `CXX` override step here.
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # master as of 2026-05-16
+        with:
+          toolchain: '1.95.0'
+
+      - name: Install lihaaf from crates.io
+        # `--locked` honors lihaaf's published Cargo.lock so transitive
+        # deps are deterministic across pilot runs.
+        #
+        # Injection-defense (round-4 hardening, Codex FIX-1):
+        # - `lihaaf_version` is read via env: (not direct ${{ }}
+        #   interpolation into the script body), so GitHub never
+        #   expands operator input into the shell command line.
+        # - A strict SemVer regex rejects any value containing shell
+        #   metacharacters BEFORE `cargo install` is invoked.
+        # - The match uses bash's `[[ =~ ]]` (whole-string match), not
+        #   `grep -qE` (per-line match). `grep -qE` would accept
+        #   `0.1.0\nmalicious` because the first line satisfies the
+        #   anchored regex; `[[ =~ ]]` anchors against the entire
+        #   value, so any embedded newline is rejected.
+        # - Full SemVer 2.0 grammar: numeric identifiers reject leading
+        #   zeros; prerelease/build identifiers reject empty segments.
+        #   Tested against 16 cases including injection vectors.
+        env:
+          LIHAAF_VERSION: ${{ inputs.lihaaf_version }}
+        run: |
+          set -euo pipefail
+          SEMVER_RE='^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*)(\.(0|[1-9][0-9]*|[0-9]*[a-zA-Z-][0-9a-zA-Z-]*))*))?(\+([0-9a-zA-Z-]+(\.[0-9a-zA-Z-]+)*))?$'
+          if [[ ! "$LIHAAF_VERSION" =~ $SEMVER_RE ]]; then
+            echo "::error::Invalid lihaaf_version (must be semver, optionally with prerelease and/or build metadata): $LIHAAF_VERSION"
+            exit 1
+          fi
+          cargo install lihaaf --version "$LIHAAF_VERSION" --locked
+
+      - name: Run cargo lihaaf --compat
+        id: compat
+        # `--compat-report <PATH>` is REQUIRED — no default exists.
+        # `continue-on-error: true` is intentional: some pilots
+        # legitimately exit non-zero (see `expected_exit_code` in
+        # lihaaf's compat/baseline.toml). Envelope-write semantics
+        # (`src/compat/mod.rs:78-274`): envelope is written iff the
+        # overlay, discovery, baseline, and conversion stages all
+        # succeed; early-stage errors in those phases short-circuit
+        # before write. The parse step's `if [ ! -f ENVELOPE ]` branch
+        # handles that case.
+        #
+        # `--compat-commit "$FORK_SHA"` writes the fork's resolved HEAD
+        # SHA into the envelope's `commit` field; stage-3 PR reviewers
+        # need that to reproduce.
+        #
+        # We intentionally OMIT `set -e` in the run block: the
+        # `continue-on-error: true` directive above is the
+        # error-handling primitive, and we want any non-zero cargo
+        # exit to reach the next `if: always()` step. `set -uo
+        # pipefail` retains the safety-belts that do not abort on
+        # non-zero exit.
+        continue-on-error: true
+        env:
+          FORK_SHA: ${{ steps.checkout.outputs.commit }}
+        run: |
+          set -uo pipefail
+          mkdir -p target/lihaaf-compat
+          cargo lihaaf --compat \
+            --compat-root . \
+            --compat-report target/lihaaf-compat/compat-report.json \
+            --compat-commit "$FORK_SHA"
+
+      - name: Parse §3.3 envelope
+        id: parse
+        # Run even if the previous step exited non-zero — the envelope
+        # is written before lihaaf returns its exit code, and the
+        # parse-side fields (`results.mismatch_count`,
+        # `results.baseline.exit_code`, `results.lihaaf.exit_code`,
+        # `crate_name`) are exactly the fields a §5 gate consumer needs.
+        # Python 3.11+ stdlib `json` only — no `jq` dep — to keep parse
+        # behavior deterministic across runner image upgrades.
+        if: always()
+        run: |
+          set -euo pipefail
+
+          ENVELOPE=target/lihaaf-compat/compat-report.json
+          if [ ! -f "$ENVELOPE" ]; then
+            echo "::error::§3.3 envelope not produced at $ENVELOPE"
+            echo "crate_name=" >> "$GITHUB_OUTPUT"
+            echo "mismatch_count=" >> "$GITHUB_OUTPUT"
+            echo "baseline_exit_code=" >> "$GITHUB_OUTPUT"
+            echo "lihaaf_exit_code=" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import sys
+
+          with open("target/lihaaf-compat/compat-report.json", "rb") as f:
+              env = json.load(f)
+
+          # Defensive field reads — if the envelope is malformed (e.g.
+          # an old lihaaf version writing a stale schema), surface the
+          # missing keys directly rather than crashing with a KeyError.
+          try:
+              crate_name = env["crate_name"]
+              results = env["results"]
+              mismatch_count = results["mismatch_count"]
+              baseline_exit_code = results["baseline"]["exit_code"]
+              lihaaf_exit_code = results["lihaaf"]["exit_code"]
+          except KeyError as exc:
+              print(f"missing_field={exc!s}", file=sys.stderr)
+              sys.exit(1)
+
+          print(f"crate_name={crate_name}")
+          print(f"mismatch_count={mismatch_count}")
+          print(f"baseline_exit_code={baseline_exit_code}")
+          print(f"lihaaf_exit_code={lihaaf_exit_code}")
+          PY
+
+      - name: Compute envelope artifact name
+        id: artifact-name
+        if: always()
+        # Artifact name MUST include `pilot_name` because all four
+        # pilot fork shards within a single orchestrator run share the
+        # same `github.run_id` (the orchestrator's). Without the
+        # pilot-name discriminator, `upload-artifact@v4` would reject
+        # the second uploader with a duplicate-name error.
+        #
+        # Injection-defense (round-3): `pilot_name` reaches the shell
+        # via env: rather than direct ${{ }} interpolation. Even though
+        # pilot_name is set by the orchestrator (not an untrusted
+        # external party), the consistent env-only rule for every
+        # run: body removes the audit burden of identifying which
+        # individual inputs are operator-controlled vs lihaaf-controlled.
+        # `github.run_id` is integer-valued and safe but is routed the
+        # same way for the same audit-uniformity reason.
+        env:
+          PILOT_NAME: ${{ inputs.pilot_name }}
+          RUN_ID: ${{ github.run_id }}
+        run: echo "name=compat-envelope-$PILOT_NAME-$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Upload §3.3 envelope artifact
+        if: always()
+        # SHA `ea165f8d65b6e75b540449e92b4886f43607fa02` resolves to
+        # actions/upload-artifact v4.6.2 (2025-03-19), NOT v7.0.1 as a
+        # prior comment misstated. Staying on v4.x for v0.1: v7
+        # introduced a breaking compression-default change
+        # (zstd-vs-gzip) plus altered concurrency semantics, and the
+        # v0.1 envelope artifact is small JSON — no v7-specific
+        # capability is required. Rotation to v7.x is a v0.2 task and
+        # gated on a re-pinning audit. SHA→tag mapping verified
+        # 2026-05-16 via `gh api repos/actions/upload-artifact/git/refs/tags/v4.6.2`.
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2 as of 2025-03-19
+        with:
+          name: ${{ steps.artifact-name.outputs.name }}
+          path: target/lihaaf-compat/compat-report.json
+          # 30-day retention matches the §5 gate's drift-window heuristic
+          # (a baseline.toml row older than ~a month merits a fresh run
+          # before stage-3 enrollment).
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Write step summary
+        if: always()
+        # Injection-defense (round-3 hardening):
+        # Same pattern as the install step above — every `${{ ... }}`
+        # expression that would otherwise be expanded INTO the shell
+        # script body is lifted into an env: block and referenced as
+        # a quoted "$VAR". Reason: under `if: always()`, this step
+        # runs even when the install step's regex check rejected and
+        # exited 1. If `inputs.lihaaf_version` were spliced directly
+        # into `echo "${{ inputs.lihaaf_version }}"`, an attacker who
+        # dispatched the orchestrator with `0.1.0$(id)` could still
+        # cause `$(id)` to execute here — the regex guard above only
+        # protects `cargo install`, not subsequent step bodies. The
+        # env: block defeats that vector for the whole step.
+        #
+        # The TOML-row gate moves INSIDE the run body as a shell-side
+        # `if [ -n "$CRATE_NAME" ]` test rather than a step-level
+        # `if:` predicate, so the diagnostic table is still rendered
+        # even when crate_name is empty (envelope missing/malformed)
+        # — operators get the exit codes and artifact name even on
+        # the failure path.
+        env:
+          PILOT_NAME: ${{ inputs.pilot_name }}
+          FORK_REPO: ${{ inputs.fork_repo }}
+          FORK_REF: ${{ inputs.fork_ref }}
+          FORK_SHA: ${{ steps.checkout.outputs.commit }}
+          LIHAAF_VERSION: ${{ inputs.lihaaf_version }}
+          CRATE_NAME: ${{ steps.parse.outputs.crate_name }}
+          MISMATCH_COUNT: ${{ steps.parse.outputs.mismatch_count }}
+          BASELINE_EXIT: ${{ steps.parse.outputs.baseline_exit_code }}
+          LIHAAF_EXIT: ${{ steps.parse.outputs.lihaaf_exit_code }}
+          ARTIFACT_NAME: ${{ steps.artifact-name.outputs.name }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## lihaaf compat stage-2 — \`$PILOT_NAME\`"
+            echo
+            echo "| field | value |"
+            echo "| --- | --- |"
+            echo "| fork repo | \`$FORK_REPO\` |"
+            echo "| fork ref | \`$FORK_REF\` |"
+            echo "| fork SHA | \`$FORK_SHA\` |"
+            echo "| lihaaf version | \`$LIHAAF_VERSION\` |"
+            echo "| crate_name | \`$CRATE_NAME\` |"
+            echo "| mismatch_count | \`$MISMATCH_COUNT\` |"
+            echo "| baseline.exit_code | \`$BASELINE_EXIT\` |"
+            echo "| lihaaf.exit_code | \`$LIHAAF_EXIT\` |"
+            echo "| envelope artifact | \`$ARTIFACT_NAME\` |"
+            echo
+            if [ -n "$CRATE_NAME" ]; then
+              echo "Stage-3 enrollment: open a PR to \`TarunvirBains/lihaaf\` adding a row to \`compat/baseline.toml\`:"
+              echo
+              echo "\`\`\`toml"
+              echo "[$CRATE_NAME]"
+              echo "n_max = $MISMATCH_COUNT"
+              echo "\`\`\`"
+            else
+              echo "Stage-3 enrollment row NOT generated: the parse step did not produce a crate_name (envelope missing or malformed). Inspect the previous step's logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
