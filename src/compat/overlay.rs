@@ -57,11 +57,17 @@
 //! (`cdylib`, `staticlib`, etc.) are preserved verbatim AFTER the
 //! `dylib`/`rlib` pair, in their original order.
 //!
-//! ## What the overlay does NOT touch
+//! ## What the overlay does and does NOT touch in `[patch]`
 //!
-//! - `[patch.crates-io]` — must pass through verbatim. The spec
-//!   (§3.2.3 risks section) is explicit that `[patch]` cannot add
-//!   crate-type and the overlay code must not rewrite it.
+//! - `[patch.<registry>.X]` `git`, `branch`, `tag`, `rev` keys — these
+//!   identify a remote source and must pass through verbatim.  The spec
+//!   (§3.2.3 risks section) is explicit that `[patch]` cannot add crate-type
+//!   and the overlay code must not rewrite those fields.
+//! - The `path` sub-key inside a `[patch.<registry>.X]` entry IS rewritten
+//!   with the same absolutization semantics as `[dependencies.X].path`.
+//!   Without this, a fork that carries `cxx = { path = "." }` in
+//!   `[patch.crates-io]` would point cargo at the staged manifest dir after
+//!   overlay materialization — either a self-reference or a nonexistent path.
 //! - Every other top-level table (`dependencies`, `dev-dependencies`,
 //!   `features`, `[[bin]]`, `[workspace]`, …) is preserved as parsed.
 
@@ -639,6 +645,87 @@ fn absolutize_path_bearing_keys(
                             );
                             *entry = toml::Value::String(abs);
                         }
+                    }
+                }
+            }
+        }
+
+        // 7b. `[workspace].default-members` — another string array, same
+        //     absolutization semantics as `members`.
+        if let Some(toml::Value::Array(arr)) = ws.get_mut("default-members") {
+            for entry in arr.iter_mut() {
+                if let toml::Value::String(s) = entry {
+                    let p = Path::new(s.as_str());
+                    if !p.is_absolute() {
+                        let abs =
+                            crate::util::to_forward_slash(&upstream_dir.join(p).to_string_lossy());
+                        *entry = toml::Value::String(abs);
+                    }
+                }
+            }
+        }
+
+        // 7c. `[workspace.dependencies.<name>].path` — workspace-inherited
+        //     dependency paths.  These have the same shape as the top-level
+        //     `[dependencies.X] path` entries handled by `absolutize_deps_paths`,
+        //     but live one table level deeper inside `[workspace]`.
+        absolutize_deps_paths(ws, "dependencies", upstream_dir);
+    }
+
+    // 8. `[package].workspace` — explicit workspace root pointer.  A single
+    //    path string; the member crate declares `[package] workspace = "../"` to
+    //    point at its containing workspace.  Absolutize so cargo can resolve the
+    //    workspace root from the staged manifest dir.
+    if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
+        absolutize_string_at(pkg, "workspace", upstream_dir);
+    }
+
+    // 9. `[patch.<registry>.X].path` — path-form patch overrides.  For
+    //    example, cxx carries `cxx = { path = "." }` and
+    //    `cxx-build = { path = "gen/build" }` in `[patch.crates-io]`.
+    //    After staging the overlay two dirs deeper, those relative paths
+    //    would resolve against the staged manifest dir and either form a
+    //    self-reference (`path = "."`) or point at a nonexistent dir.
+    //    Only the `path` sub-key is rewritten; `git`, `branch`, `tag`, and
+    //    `rev` pass through verbatim per spec §3.2.3.
+    absolutize_patch_paths(top, upstream_dir);
+}
+
+/// Absolutize `[patch.<registry>.X].path` entries in the top-level manifest
+/// table.
+///
+/// `[patch]` is a table-of-registries: each registry key (e.g. `crates-io`)
+/// maps to a table of crate overrides, and each override may carry a `path`
+/// sub-key.  This function walks all registries and all overrides, absolutizing
+/// only the `path` key.  All other sub-keys (`git`, `branch`, `tag`, `rev`, …)
+/// are passed through verbatim — this is intentional and matches the spec
+/// §3.2.3 promise that `[patch]` remote-source fields are never rewritten.
+///
+/// Registry-agnostic: the same walk covers `[patch.crates-io]`,
+/// `[patch.https://my-registry.example.com/]`, or any other registry key.
+fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstream_dir: &Path) {
+    let Some(toml::Value::Table(patch)) = top.get_mut("patch") else {
+        return;
+    };
+    for (_registry, registry_value) in patch.iter_mut() {
+        if let toml::Value::Table(registry_table) = registry_value {
+            for (_krate, krate_value) in registry_table.iter_mut() {
+                if let toml::Value::Table(krate_table) = krate_value {
+                    // Only rewrite `path`; leave `git`, `branch`, `tag`, `rev`
+                    // untouched per spec §3.2.3.
+                    let needs_rewrite = krate_table
+                        .get("path")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|s| !Path::new(s).is_absolute());
+                    if needs_rewrite {
+                        let s = krate_table
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .expect("needs_rewrite implies path exists");
+                        let abs = crate::util::to_forward_slash(
+                            &upstream_dir.join(s).to_string_lossy(),
+                        );
+                        krate_table.insert("path".to_string(), toml::Value::String(abs));
                     }
                 }
             }
@@ -1596,5 +1683,282 @@ version = "0.1.0"
                 "[[{section}]] path must be absolutized to `{expected}`; got `{path}`"
             );
         }
+    }
+
+    // ── FIX class B unit tests ──────────────────────────────────────────────
+
+    /// **`[package].workspace` explicit pointer is absolutized.**
+    ///
+    /// A member crate may declare `[package] workspace = "../"` to name its
+    /// containing workspace root explicitly.  Without absolutization the
+    /// staged overlay would carry a relative pointer that cargo resolves
+    /// against the staged manifest dir — two dirs deeper than the crate root.
+    #[test]
+    fn absolutizes_package_workspace_pointer() {
+        let upstream_dir = Path::new("/work/cxx");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("cxx".into()));
+        // Relative workspace pointer — the production shape.
+        pkg.insert("workspace".to_string(), toml::Value::String("../".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let pkg = top.get("package").and_then(|v| v.as_table()).unwrap();
+        let ws_ptr = pkg.get("workspace").and_then(|v| v.as_str()).unwrap();
+        // `upstream_dir.join("../")` collapses to `/work` on POSIX.
+        assert!(
+            Path::new(ws_ptr).is_absolute(),
+            "[package].workspace must be absolutized; got `{ws_ptr}`"
+        );
+        assert!(
+            !ws_ptr.contains(".."),
+            "[package].workspace must not contain `..` after absolutization; got `{ws_ptr}`"
+        );
+    }
+
+    /// **`[workspace].default-members` array entries are absolutized.**
+    ///
+    /// `default-members` is an array of paths (strings), parallel to
+    /// `members` and `exclude`.  The existing `members`/`exclude` rewrite
+    /// was already tested; this test pins the extension to `default-members`.
+    #[test]
+    fn absolutizes_workspace_default_members() {
+        let upstream_dir = Path::new("/work/repo");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("repo".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut ws = toml::map::Map::new();
+        ws.insert(
+            "default-members".to_string(),
+            toml::Value::Array(vec![
+                toml::Value::String("crate-a".into()),
+                toml::Value::String("crate-b".into()),
+            ]),
+        );
+        top.insert("workspace".to_string(), toml::Value::Table(ws));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let ws = top.get("workspace").and_then(|v| v.as_table()).unwrap();
+        let dm = ws
+            .get("default-members")
+            .and_then(|v| v.as_array())
+            .unwrap();
+        let dm_strs: Vec<&str> = dm.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            dm_strs,
+            vec!["/work/repo/crate-a", "/work/repo/crate-b"],
+            "[workspace].default-members must be absolutized; got {dm_strs:?}"
+        );
+    }
+
+    /// **`[workspace.dependencies.<name>].path` entries are absolutized.**
+    ///
+    /// Workspace-inherited dependency paths (e.g. `[workspace.dependencies]
+    /// my-dep = { path = "impl" }`) have the same shape as top-level dep
+    /// entries and require the same absolutization so cargo can locate
+    /// them from the staged manifest dir.
+    #[test]
+    fn absolutizes_workspace_dependencies_path() {
+        let upstream_dir = Path::new("/work/monorepo");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("monorepo".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut ws = toml::map::Map::new();
+        let mut ws_deps = toml::map::Map::new();
+        let mut impl_dep = toml::map::Map::new();
+        impl_dep.insert("path".to_string(), toml::Value::String("impl".into()));
+        ws_deps.insert("my-impl".to_string(), toml::Value::Table(impl_dep));
+        let mut proc_macro_dep = toml::map::Map::new();
+        proc_macro_dep.insert("path".to_string(), toml::Value::String("proc-macro".into()));
+        ws_deps.insert(
+            "my-proc-macro".to_string(),
+            toml::Value::Table(proc_macro_dep),
+        );
+        ws.insert("dependencies".to_string(), toml::Value::Table(ws_deps));
+        top.insert("workspace".to_string(), toml::Value::Table(ws));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let ws = top.get("workspace").and_then(|v| v.as_table()).unwrap();
+        let ws_deps = ws.get("dependencies").and_then(|v| v.as_table()).unwrap();
+        let impl_path = ws_deps
+            .get("my-impl")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            impl_path, "/work/monorepo/impl",
+            "[workspace.dependencies.my-impl].path must be absolutized; got `{impl_path}`"
+        );
+        let pm_path = ws_deps
+            .get("my-proc-macro")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            pm_path, "/work/monorepo/proc-macro",
+            "[workspace.dependencies.my-proc-macro].path must be absolutized; got `{pm_path}`"
+        );
+    }
+
+    // ── FIX class C unit tests ──────────────────────────────────────────────
+
+    /// **`[patch.<registry>.X].path` entries are absolutized.**
+    ///
+    /// Mirrors the cxx pilot shape: `[patch.crates-io] cxx = { path = "." }`
+    /// and `cxx-build = { path = "gen/build" }`.  After staging the overlay
+    /// two dirs deeper, those relative paths would resolve against the staged
+    /// manifest dir and fail.  The absolutizer must rewrite `path` but leave
+    /// `git`, `branch`, `tag`, and `rev` untouched.
+    #[test]
+    fn absolutizes_patch_registry_path() {
+        let upstream_dir = Path::new("/work/cxx");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("cxx".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        // Build [patch.crates-io] with two path-form entries (mirrors cxx).
+        let mut cxx_entry = toml::map::Map::new();
+        cxx_entry.insert("path".to_string(), toml::Value::String(".".into()));
+        let mut cxx_build_entry = toml::map::Map::new();
+        cxx_build_entry.insert("path".to_string(), toml::Value::String("gen/build".into()));
+        // Also include a git-form entry to verify it is NOT touched.
+        let mut serde_entry = toml::map::Map::new();
+        serde_entry.insert(
+            "git".to_string(),
+            toml::Value::String("https://github.com/serde-rs/serde".into()),
+        );
+        serde_entry.insert("branch".to_string(), toml::Value::String("master".into()));
+
+        let mut crates_io = toml::map::Map::new();
+        crates_io.insert("cxx".to_string(), toml::Value::Table(cxx_entry));
+        crates_io.insert("cxx-build".to_string(), toml::Value::Table(cxx_build_entry));
+        crates_io.insert("serde".to_string(), toml::Value::Table(serde_entry));
+
+        let mut patch = toml::map::Map::new();
+        patch.insert("crates-io".to_string(), toml::Value::Table(crates_io));
+        top.insert("patch".to_string(), toml::Value::Table(patch));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let patch = top.get("patch").and_then(|v| v.as_table()).unwrap();
+        let crates_io = patch.get("crates-io").and_then(|v| v.as_table()).unwrap();
+
+        // cxx path = "." → "/work/cxx"
+        let cxx_path = crates_io
+            .get("cxx")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            cxx_path, "/work/cxx",
+            "[patch.crates-io.cxx].path must be absolutized; got `{cxx_path}`"
+        );
+
+        // cxx-build path = "gen/build" → "/work/cxx/gen/build"
+        let cxx_build_path = crates_io
+            .get("cxx-build")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            cxx_build_path, "/work/cxx/gen/build",
+            "[patch.crates-io.cxx-build].path must be absolutized; got `{cxx_build_path}`"
+        );
+
+        // serde entry has no `path` key — must be unchanged.
+        let serde = crates_io.get("serde").and_then(|v| v.as_table()).unwrap();
+        assert!(
+            !serde.contains_key("path"),
+            "git-form patch entry must not gain a path key"
+        );
+        assert_eq!(
+            serde.get("git").and_then(|v| v.as_str()),
+            Some("https://github.com/serde-rs/serde"),
+            "git URL in git-form patch entry must be unchanged"
+        );
+        assert_eq!(
+            serde.get("branch").and_then(|v| v.as_str()),
+            Some("master"),
+            "branch in git-form patch entry must be unchanged"
+        );
+    }
+
+    /// **An already-absolute `[patch.<registry>.X].path` is left unchanged.**
+    #[test]
+    fn absolutize_leaves_absolute_patch_path_unchanged() {
+        let upstream_dir = Path::new("/work/cxx");
+        let mut top = toml::map::Map::new();
+        let mut lib = toml::map::Map::new();
+        lib.insert(
+            "crate-type".to_string(),
+            toml::Value::Array(vec![toml::Value::String("rlib".into())]),
+        );
+        top.insert("lib".to_string(), toml::Value::Table(lib));
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("cxx".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        let mut abs_entry = toml::map::Map::new();
+        abs_entry.insert(
+            "path".to_string(),
+            toml::Value::String("/absolute/path/to/cxx".into()),
+        );
+        let mut crates_io = toml::map::Map::new();
+        crates_io.insert("cxx".to_string(), toml::Value::Table(abs_entry));
+        let mut patch = toml::map::Map::new();
+        patch.insert("crates-io".to_string(), toml::Value::Table(crates_io));
+        top.insert("patch".to_string(), toml::Value::Table(patch));
+
+        absolutize_path_bearing_keys(&mut top, upstream_dir);
+
+        let path = top
+            .get("patch")
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("crates-io"))
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("cxx"))
+            .and_then(|v| v.as_table())
+            .and_then(|t| t.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert_eq!(
+            path, "/absolute/path/to/cxx",
+            "an absolute [patch.*.*].path must be left unchanged; got `{path}`"
+        );
     }
 }
