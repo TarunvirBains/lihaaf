@@ -11,7 +11,7 @@ This is a **pre-implementer-dispatch design plan**, NOT durable repository docum
 
 # Plan: lihaaf #40 + #47 — overlay self-`[patch.crates-io]` injection
 
-Revision: R7 (2026-05-18, post-Codex-R6-BLOCK)
+Revision: R8 (2026-05-18, post-Codex-post-implementation-diagnosis)
 
 Issue: https://github.com/TarunvirBains/lihaaf/issues/40 (compat: serde_json "ambiguous specification" resolution-time failure)
 Issue: https://github.com/TarunvirBains/lihaaf/issues/47 (compat: cxx pilot fails with "links = cxxbridge1" collision in beta.6 overlay)
@@ -809,17 +809,28 @@ Each test must FAIL without the fix and PASS with the fix (defense-in-depth crit
 
 ### 5.2 Integration tests in `tests/compat/overlay_determinism.rs`
 
-#### 5.2.0 Cargo acceptance of patched dependency graphs (R3 SEC-6 / R4 SEC-8 closure)
+#### 5.2.0 Cargo acceptance of patched dependency graphs (R3 SEC-6 / R4 SEC-8 / R8 narrowing)
 
-Codex R2 raised that the §5.2 synthetic-repro shape "foo → test-suite → foo" looks like a normal-dep cycle, which cargo's resolver rejects. Codex R3 SEC-8 further surfaced that R3's claim "cargo accepts the patched topology" was relying on a misleading cited test — the existing `cargo_accepts_rich_overlay_for_dylib_build` test exercises `rich-demo = { path = "." }` at a DIFFERENT topology than `foo → test-suite → foo`. R4 closes both issues with a load-bearing dedicated test:
+Codex R2 raised that the §5.2 synthetic-repro shape "foo → test-suite → foo" looks like a normal-dep cycle, which cargo's resolver rejects. Codex R3 SEC-8 further surfaced that R3's claim "cargo accepts the patched topology" was relying on a misleading cited test — the existing `cargo_accepts_rich_overlay_for_dylib_build` test exercises `rich-demo = { path = "." }` at a DIFFERENT topology than `foo → test-suite → foo`. R4 added a dedicated load-bearing test. **R8 (post-CI failure diagnosis, Codex rollout 019e3cc3) narrowed the claim further:**
 
-**The post-patch graph is NOT a cycle, because the two references resolve to the same source.** Cargo's resolver, when evaluating `foo` (root, source `path+file://<staged-overlay>`) → `test-suite` (path-dep) → `foo` (registry-name reference `foo = "1.0"`), under the influence of `[patch.crates-io.foo] = { path = "<staged-overlay-dir>" }` (Rule 1 INJECT case) OR `[patch.crates-io.foo] = { path = "<staged-overlay-dir>" }` (Rule 2 REMAP case from cxx-shape upstream `path = "."`):
+**R8 narrowed claim: cargo's self-patch collapses registry-name references only when they do not create an active package self-dependency cycle.** It is valid for cxx's cargo-build path because cxx lacks the synthetic active root-to-test-suite dependency. Prior revisions stated that "cargo collapses these to a single Package in the resolved graph rather than treating them as a cycle" for ANY `root → member → root` topology. That is overbroad. Empirical verification (CI failure, PR #56, Codex rollout 019e3cc3) shows:
+
+- cargo collapses sources (resolves two `path` references with the same absolute path to one source-id);
+- cargo DOES still reject active dep cycles — if the root carries `[dependencies] test-suite = { path = "test-suite" }` AND test-suite carries `bar = "1.0"` (redirected to staged-overlay root via INJECT/REMAP), cargo fires `cyclic package dependency: package bar v1.0.0 (...) depends on itself`. The cycle check runs AFTER source-id resolution.
+
+The correct characterization of when self-patching succeeds: **the root must NOT declare an active `[dependencies]` edge to the workspace member that carries the back-reference**. Real upstreams like cxx satisfy this — cxx's `Cargo.toml` carries `[workspace] members = ["test-suite"]` but no `[dependencies] test-suite = { path = "test-suite" }` at the root. The §5.2.6 and §5.2.9 synthetic fixtures are updated in R8 to match this faithful shape.
+
+Cargo's resolver, when evaluating the faithful shape — root `foo` (source `path+file://<staged-overlay>`) with workspace member `test-suite` (workspace only, NOT a root dep) → `test-suite` carrying `foo = "1.0"` — under the influence of `[patch.crates-io.foo] = { path = "<staged-overlay-dir>" }` (Rule 1 INJECT or Rule 2 REMAP):
 
 1. cargo resolves `test-suite`'s `foo = "1.0"` registry-name reference;
 2. the `[patch.crates-io.foo]` mapping fires; the resolved source is `path+file://<staged-overlay-dir>`;
-3. cargo's resolver examines the resulting Package — and because the patched source matches the root's intent (same crate, same version, same source-id as the overlay's `[package]`), cargo collapses these to a single Package in the resolved graph rather than treating them as a cycle. This is the standard "self-patch" idiom cargo's `[patch.crates-io]` was designed for (cargo book § "The [patch] section").
+3. cargo's resolver sees the root and the member's `foo` dep resolve to the same source-id → no ambiguity, no active-dep cycle (root doesn't dep on member) → resolution clean.
 
-**R5 load-bearing test: `cargo_accepts_root_to_test_suite_to_root_topology`** (SEC-8 closure). This is a fresh cargo-build-gated test (gates on `LIHAAF_RUN_CARGO_BUILD_TESTS=1`) that constructs the synthetic `foo → test-suite → foo` shape WITHOUT relying on the existing `cargo_accepts_rich_overlay_for_dylib_build` test as proof. The new test is specified in §5.2.9 below (replaces R3's §5.2.4 / §5.2.5 / §5.2.8 in their proof-purpose; the synthetic-repro tests still exist for the cxx-shape and serde-json-shape failure-shape coverage but the topology-acceptance proof is delegated to the new dedicated test).
+This is the standard "self-patch" idiom cargo's `[patch.crates-io]` was designed for (cargo book § "The [patch] section"), valid specifically when the root lacks an active dep edge to the redirecting member.
+
+**R8 load-bearing tests:**
+- **`cargo_accepts_remap_when_upstream_self_patch_cxx_shape`** (§5.2.6): Rule 2 REMAP proof for the cxx failure shape. Fixture is faithful to cxx's actual `Cargo.toml` (workspace declaration only, no root dep on member). R8 removes the `[dependencies] test-suite = { path = "test-suite" }` that was causing the CI cycle.
+- **`cargo_accepts_workspace_member_registry_dep_via_self_patch`** (§5.2.9): Rule 1 INJECT proof, rescoped from the empirically-false `root → member → root` active-dep topology to the faithful workspace-member-registry-dep-via-self-patch topology. R8 renames the test and removes the root dep on member.
 
 **Real cargo error strings the synthetic repros must reproduce (R3 BLOCK-3 finish, unchanged in R4).** The synthetic test descriptions reference real cargo error strings even though the synthetic fixtures use synthetic crate names (`foo` / `bar` instead of `cxx` / `serde_json`) to avoid name-collision with real registry entries during CI:
 
@@ -863,7 +874,7 @@ Both assertions verify pre-fix FAIL (with the synthetic error strings) and post-
 
 6. **Cargo-build-gated test: `cargo_accepts_remap_when_upstream_self_patch_cxx_shape`** — Rule 2 REMAP cargo-graph proof AND staged-mirror strategy validation (M.4 closure). Constructs the cxx-shape repro with a real file-reading `build.rs`:
 
-   - Upstream Cargo.toml at `<tmp>/Cargo.toml`:
+   - Upstream Cargo.toml at `<tmp>/Cargo.toml` (R8: faithful to cxx's actual `Cargo.toml` — workspace declaration only, NO root dep on member; verified by Codex rollout 019e3cc3):
      ```toml
      [package]
      name = "foo"
@@ -878,11 +889,13 @@ Both assertions verify pre-fix FAIL (with the synthetic error strings) and post-
      [workspace]
      members = ["test-suite"]
 
-     [dependencies]
-     test-suite = { path = "test-suite" }
-
      # Mirrors cxx's upstream Cargo.toml: pre-existing self-patch to "." per
      # overlay.rs:1349-1351 + tests/compat/overlay_determinism.rs:938-940.
+     # R8: cxx does NOT carry [dependencies] test-suite = { path = "test-suite" }
+     # at the root. The prior fixture had this edge; it caused a `cyclic package
+     # dependency: foo v1.0.0 depends on itself` CI failure (PR #56). Removed in
+     # R8 to match the real cxx shape. cargo rustc runs `-p foo`; test-suite is
+     # in the workspace but not a build dep of the root.
      [patch.crates-io]
      foo = { path = "." }
      ```
@@ -963,13 +976,17 @@ Both assertions verify pre-fix FAIL (with the synthetic error strings) and post-
    - Minimal `<tmp>/src/lib.rs`: `pub fn _stub() {}`.
    - Invoke `materialize_overlay(<tmp>/Cargo.toml)`. **Assertion:** returns `Err(_)` with the structured error variant. NO `cargo rustc` invocation — the test stops at the materializer's REJECT. The error message must reference the v0.2/v1.1 escape hatch.
 
-9. **`cargo_accepts_root_to_test_suite_to_root_topology`** — **R4 SEC-8 closure test (LIHAAF_RUN_CARGO_BUILD_TESTS=1).** This is the dedicated load-bearing proof that cargo accepts the patched `root → member → root` topology when the patch redirects both references to the same source-id. Distinct from §5.2.6 (Rule 2 cxx-shape) because:
+9. **`cargo_accepts_workspace_member_registry_dep_via_self_patch`** — **R8 rescope of R4 SEC-8 closure test (LIHAAF_RUN_CARGO_BUILD_TESTS=1).** Rule 1 INJECT proof: workspace member's registry dep gets correctly remapped to the staged overlay, even when the root carries no direct dep on the member.
 
-   - §5.2.6 proves Rule 2 + cargo accepts the resulting topology FOR THE CXX FAILURE SHAPE (with `links`).
-   - §5.2.9 (this test) proves cargo accepts the resulting topology AS A GENERAL CARGO-RESOLVER PROPERTY, independent of `links` collision. The test uses the simpler serde-json-shape topology (no `links`, no `build.rs`) so that any cargo failure surfaces as the resolver-level ambiguity (`specification \`bar\` is ambiguous`) rather than the build-script-level `links` collision.
-   - The test is written so that pre-fix it FAILS with the resolver-level ambiguity; post-fix it PASSES because the patch resolves the ambiguity.
+   **R8 rescope rationale (Codex rollout 019e3cc3):** The prior `cargo_accepts_root_to_test_suite_to_root_topology` fixture had `[dependencies] test-suite = { path = "test-suite" }` in the root, creating a `bar → test-suite → bar` active-dep cycle. Empirical CI failure (PR #56) confirmed cargo rejects that topology unconditionally — `cyclic package dependency: package bar v1.0.0 (...) depends on itself`. The "root → member → root active-dep topology proof" is therefore empirically impossible. The faithful shape (matching real upstreams like cxx/serde_json) is: workspace declaration only, no root dep on member. The rescoped test proves the same Rule 1 INJECT property without the unfaithful dep edge.
 
-   - Upstream Cargo.toml at `<tmp>/Cargo.toml`:
+   Distinct from §5.2.6 (Rule 2 cxx-shape) because:
+
+   - §5.2.6 proves Rule 2 REMAP + cargo accepts the resulting topology FOR THE CXX FAILURE SHAPE (with `links`, `build.rs`, and the pre-existing self-patch `path = "."`).
+   - §5.2.9 (this test) proves Rule 1 INJECT + cargo accepts the workspace-member-registry-dep topology AS A GENERAL CARGO-RESOLVER PROPERTY, independent of `links` collision. Uses the simpler serde-json-shape (no `links`, no `build.rs`) so cargo failures surface at the resolver level (`specification \`bar\` is ambiguous`) not the build-script level.
+   - Both tests now use the faithful shape: workspace declaration only, no root dep on member.
+
+   - Upstream Cargo.toml at `<tmp>/Cargo.toml` (R8: workspace declaration only, no root dep on member):
      ```toml
      [package]
      name = "bar"
@@ -981,12 +998,6 @@ Both assertions verify pre-fix FAIL (with the synthetic error strings) and post-
 
      [workspace]
      members = ["test-suite"]
-
-     # CRITICAL: root path-dep to test-suite is the edge that brings test-suite
-     # into the overlay's resolved graph after `members` is stripped per
-     # overlay.rs:812-829.
-     [dependencies]
-     test-suite = { path = "test-suite" }
      ```
    - Workspace member at `<tmp>/test-suite/Cargo.toml`:
      ```toml
@@ -1001,7 +1012,7 @@ Both assertions verify pre-fix FAIL (with the synthetic error strings) and post-
    - Workspace member source at `<tmp>/test-suite/src/lib.rs`: `pub fn _stub() {}`.
    - Root source at `<tmp>/src/lib.rs`: `pub fn _stub() {}`.
    - Invoke `materialize_overlay(<tmp>/Cargo.toml)`. Rule 1 fires (no upstream patch). The overlay carries `[patch.crates-io.bar] = { path = "<staged-overlay-dir>" }`.
-   - Invoke `cargo rustc --manifest-path <staged>`. Assert exit 0. This is the dedicated SEC-8 proof: cargo accepts `bar → test-suite → bar` topology when the patch redirects `bar = "1.0"` to the same source-id as the root `bar`'s `[package]`.
+   - Invoke `cargo rustc -p bar --manifest-path <staged>`. Assert exit 0. Root doesn't dep on member so no active-dep cycle. The injected patch redirects `bar = "1.0"` in the member to the staged-overlay path → both `bar` references (root `[package]` and member registry dep) resolve to the same source-id → resolution clean.
 
 10. **Cargo-build-gated test: `cargo_build_anyhow_shape_probe_file_resolves_via_mirror`** — **M.5 closure: staged-mirror fixes anyhow-shape silent-false probe.** Constructs the anyhow-shape build-script probe repro:
 
@@ -1127,7 +1138,7 @@ R4 replaces R3's per-key PRESERVE with **Option H: intent-aware self-patch polic
 | **Rule 4 (REJECT)** | `[patch.crates-io.<self>]` exists but the target is external: (a) `path` resolves to a non-root dir (vendored fork), OR (b) has `git`/`branch`/`tag`/`rev` keys (git source / registry override), OR (c) both `path` and `git`/etc | Return `Err(Error::CompatPatchOverrideConflict { .. })` with structured error referencing the v0.2/v1.1 escape hatch | Adopter has explicitly overridden the registry-name with a non-root, non-staged-overlay source. lihaaf v0.1.0 / v1.0.0 must NOT silently overwrite this. Conservative path is REJECT; escape hatch (`--compat-allow-patch-override`) deferred to v0.2/v1.1. |
 
 **Cases covered by tests:**
-- Rule 1 (INJECT): tests 5.1.1, 5.1.3, 5.1.10 (orthogonal-key variant), 5.1.11-13, 5.2.1, 5.2.3-4, 5.2.5, 5.2.9 (SEC-8 cargo-graph proof)
+- Rule 1 (INJECT): tests 5.1.1, 5.1.3, 5.1.10 (orthogonal-key variant), 5.1.11-13, 5.2.1, 5.2.3-4, 5.2.5, 5.2.9 (R8 rescope: workspace-member-registry-dep-via-self-patch cargo-graph proof)
 - Rule 2 (REMAP): tests 5.1.5, 5.1.6 (`path = "./"` variant), 5.2.2 (corpus fixture), 5.2.3 (`with_patch_section` fixture update), 5.2.6 (cxx-shape cargo-build proof)
 - Rule 3 (CONTINUE-ABSOLUTIZE): test 5.2.7 (cxx-build-shape cargo-build proof)
 - Rule 4 (REJECT): tests 5.1.7-9, 5.2.8 (cargo-build-gated REJECT proof)
@@ -1420,7 +1431,7 @@ Every test in §5 must run in CI. R4 confirms the following CI surface (verified
 |---|---|---|---|
 | Unit tests (§5.1, all 15) | `src/compat/overlay.rs::tests` | ✅ Yes | `cargo test --lib` standard path; no env gate. Covers Rules 1-4 detection + lexical normalizer corner cases + R6 mirror idempotency reconciliation (§5.1.4 extended, §5.1.14, §5.1.15). |
 | Corpus determinism (§5.2.1-4, §5.3.4) | `tests/compat/overlay_determinism.rs` | ✅ Yes | `cargo test --test compat::overlay_determinism::byte_identical_across_two_lihaaf_binaries_on_corpus` standard path; no env gate. R5 includes BOTH new fixtures: `with_self_patch_injected` (Rule 1) and `with_self_patch_remapped` (Rule 2). Count bumped from 6 to 8. |
-| Cargo-build-gated rule proofs (§5.2.5 INJECT, §5.2.6 REMAP+mirror-cxx, §5.2.7 CONTINUE-ABSOLUTIZE, §5.2.8 REJECT, §5.2.9 SEC-8 graph proof) | `tests/compat/overlay_determinism.rs` | ✅ Yes | `LIHAAF_RUN_CARGO_BUILD_TESTS=1` set in `.github/workflows/ci.yml:56`. Local runs skip these per `[[lihaaf-no-local-binary-builds]]`. |
+| Cargo-build-gated rule proofs (§5.2.5 INJECT, §5.2.6 REMAP+mirror-cxx, §5.2.7 CONTINUE-ABSOLUTIZE, §5.2.8 REJECT, §5.2.9 R8 workspace-member-registry-dep Rule 1 proof) | `tests/compat/overlay_determinism.rs` | ✅ Yes | `LIHAAF_RUN_CARGO_BUILD_TESTS=1` set in `.github/workflows/ci.yml:56`. Local runs skip these per `[[lihaaf-no-local-binary-builds]]`. |
 | Probe-file silent-false mirror tests (§5.2.10 anyhow-shape, §5.2.11 thiserror-shape) | `tests/compat/overlay_determinism.rs` | ✅ Yes | `LIHAAF_RUN_CARGO_BUILD_TESTS=1`. M.5 + M.6 closure. |
 | Backward-compat re-verification (§5.3.1-4) | `tests/compat/overlay_determinism.rs` | ✅ Yes | `LIHAAF_RUN_CARGO_BUILD_TESTS=1` for the cargo-rustc tests; standard path for the structural tests. |
 | Patch absolute-path pin (§5.2.12) | `tests/compat/overlay_determinism.rs` | ✅ Yes | No env gate. |
@@ -1447,7 +1458,7 @@ Every test in §5 must run in CI. R4 confirms the following CI surface (verified
 9. `cargo_accepts_remap_when_upstream_self_patch_cxx_shape` (§5.2.6 — upgraded in R5 to exercise `src/cxx_stub.cc` and `include/stub.h` file reads via staged-mirror, M.4 closure)
 10. `cargo_accepts_continue_absolutize_when_non_root_patch` (§5.2.7)
 11. `materialize_rejects_when_upstream_patch_targets_external_source_rule4` (§5.2.8)
-12. `cargo_accepts_root_to_test_suite_to_root_topology` (§5.2.9 — SEC-8 closure)
+12. `cargo_accepts_workspace_member_registry_dep_via_self_patch` (§5.2.9 — R8 rescope: Rule 1 INJECT closure; workspace-member-registry-dep-via-self-patch; faithful upstream shape)
 13. `cargo_build_anyhow_shape_probe_file_resolves_via_mirror` (§5.2.10 — M.5 closure, anyhow silent-false probe)
 14. `cargo_build_thiserror_shape_probe_file_resolves_via_mirror` (§5.2.11 — M.6 closure, thiserror silent-false probe)
 15. `byte_identical_across_two_lihaaf_binaries_on_corpus` (§5.3.4 — corpus count bumped to 8)
@@ -1514,3 +1525,4 @@ All other decisions in this plan are pre-committed and the implementer follows t
 - **R5 (2026-05-18, post-Codex-R4-BLOCK + sweep-after-review):** Staged package-root mirror with symlinks + copy fallback (§4.5 new section) — covers cxx M.2-M.4, anyhow M.5, thiserror M.6. §5.2.6 build.rs upgraded from stub to real file-read test. New §5.2.10-11 probe-file silent-false tests. Pilot inventory precision: 4 build-script classes (§3.2 AC.2). v0.1.0 framing throughout (AC.1). Three counter-signal fixes from R4 review: §2.6 citation (C.1), overlay.rs:1393+:1402 production citation (C.2), "step 6" ordering phrase + §5.2.9 numbering (C.3). Verified non-drivers (serde_json, derive_more, axum-macros) now explicit in §3.2. Per sweep-after-review discipline applied to R4 BLOCK-1.
 - **R6 (2026-05-18, post-Codex-R5-BLOCK + sweep):** Mirror idempotency contract (Option B — Idempotent skip + reconcile-by-replacement). New §4.5.6 "Idempotency / rerun-state reconciliation" with 15-case rerun-state table (CASEs 1–15, grouped A/B) and 7-item idempotency-contract decisions (skip-on-canonical / reconcile-by-replacement / desired-root-state / discrepancies=replace-or-error / copy-exact-sync / no-preservation / failure-modes). §4.5.2 pseudocode replaced bare "create symlink" loop with the full per-case decision tree (CASEs 1–9 forward pass + stale-cleanup pass + CASE 15 post-condition assertion). Existing §4.5.6 (apply_self_patch_policy interaction) renumbered §4.5.7; existing §4.5.7 (known limitations) renumbered §4.5.8; §4.3 doc reference updated. §5.1.4 extended with Option B second-call assertions (Ok, identical state, no AlreadyExists, CASE 2 inode-identity preservation; superseding earlier mtime-based wording per R7 BLOCK-1 cleanup). New §5.1.14 `mirror_upstream_rerun_reconciles_stale_entries` (CASE 3/5/6/7/12 representative reconciliation sub-cases). New §5.1.15 `mirror_copy_fallback_exact_sync_removes_destination_only_files` (CASE 6 exact-sync removes destination-only files). §11 dispatch-required test list extended to 19 items. Per sweep-after-review applied to R5 BLOCK staged-mirror-lifecycle class.
 - **R7 (2026-05-18, post-Codex-R6-BLOCK):** Idempotency propagation cleanup (BLOCK-1: mtime→inode-identity in §11 item 17 and ID.4 delta summary). CASE 14 split (BLOCK-2: §4.5.6 table CASE 14 split into CASE 14a disposable `target/` and CASE 14b must-be-absent-or-removed `.git/`+`Cargo.lock`; §4.5.2 stale-cleanup pass extended with explicit CASE 14b removal loop; §4.5.4 exclusion table extended with Disposable/Must-be-absent-or-removed category column; §4.5.6 decision 3 updated to note cleanup pass backs the "exactly" claim; §4.5.6 opening para updated). CASE 15 narrowed claim (BLOCK-3: Option B-15a — §4.5.6 table CASE 15 narrowed to type-only structural check; §4.5.2 post-condition comment updated with B-15a rationale; `write_file_atomic` cited as content-correctness owner). §11 item 18 + R6 revision history CASE 6 inclusion (FIX_BEFORE_MERGE: CASE 3/5/7/12 → CASE 3/5/6/7/12 in both sites). §4.5.6 CASE 4 table aligned with §4.5.2 pseudocode wording (MINOR: "no further action needed" replaces stale CASE-9 back-reference). §5.1.X placeholder concrete-numbering (MINOR: §5.1.X → §5.1.12 and §5.1.13 at two bullet sites).
+- **R8 (2026-05-18, post-Codex-post-implementation-diagnosis):** Surgical fix per Codex rollout 019e3cc3 — CI cycle in §5.2.6/§5.2.9 cargo-build-gated fixtures; plan §5.2.0 claim narrowed. §5.2.0: prior "cargo collapses to a single Package rather than treating them as a cycle" was overbroad — cargo collapses sources but DOES reject active dep cycles (cycle check fires after source-id resolution). Narrowed claim: self-patch collapses registry-name references only when they do not create an active package self-dependency cycle; valid for cxx because cxx lacks a root dep on its test-suite member. §5.2.6 fixture: remove `[dependencies] test-suite = { path = "test-suite" }` from root — faithful to cxx's actual `Cargo.toml` (workspace declaration only; verified at github.com/dtolnay/cxx). §5.2.9: rescope from empirically-false `root → member → root` active-dep topology to `cargo_accepts_workspace_member_registry_dep_via_self_patch` — proves Rule 1 INJECT correctly remaps workspace member's registry dep via staged-overlay patch even when root carries no dep on member (the faithful upstream shape). §11 item 12 + Rule 1 coverage note + §12 table updated to match renamed test.
