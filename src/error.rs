@@ -83,6 +83,67 @@ pub enum Error {
         /// The error message clap already printed (kept for tests).
         message: String,
     },
+
+    /// The upstream `Cargo.toml` declared a `[patch.crates-io.<self>]`
+    /// entry that compat-mode's Option H self-patch policy cannot
+    /// safely overwrite — the entry targets a vendored fork (`path`
+    /// resolves to a non-root directory), a git source, or both.
+    ///
+    /// Surfaced by the compat overlay materializer's Rule 4 (REJECT)
+    /// branch. The §3.3 envelope renders this as an overlay-stage
+    /// error; the operator sees the structured message verbatim so
+    /// they can resolve by either reshaping their upstream's
+    /// `[patch.crates-io]` table or waiting for the v0.2/v1.1
+    /// `--compat-allow-patch-override` escape hatch.
+    ///
+    /// See `src/compat/overlay.rs::apply_self_patch_policy` for the
+    /// 4-rule decision tree and issues #40 / #47 for the failure
+    /// shapes this policy resolves.
+    CompatPatchOverrideConflict {
+        /// The crate name (the upstream's `[package].name`) keying the
+        /// rejected `[patch.crates-io.<crate_name>]` entry.
+        crate_name: String,
+        /// A `Debug` rendering of the upstream's existing entry, so the
+        /// operator can see exactly what compat-mode refused to
+        /// overwrite.
+        upstream_entry: String,
+        /// Human-readable explanation of what compat-mode would have
+        /// done (Rule 1 INJECT / Rule 2 REMAP) and why the upstream's
+        /// existing entry blocks it. References the v0.2/v1.1 escape
+        /// hatch.
+        expected_resolution: String,
+    },
+
+    /// Staged package-root mirror step failed.
+    ///
+    /// After the overlay manifest is written to
+    /// `<upstream>/target/lihaaf-overlay/Cargo.toml`, the materializer
+    /// creates symlinks (or copies on platforms where symlinks are
+    /// unavailable) for each top-level entry in the upstream package
+    /// directory so build scripts can read package-root files via
+    /// `CARGO_MANIFEST_DIR` / cwd. This variant surfaces when an
+    /// individual symlink, copy, or stale-state reconcile step fails
+    /// during that pass.
+    ///
+    /// See `src/compat/overlay.rs::mirror_upstream_into_overlay` and
+    /// issues #40 / #47 for the build-script file-access failure shapes
+    /// the mirror resolves.
+    OverlayMirrorFailed {
+        /// The upstream entry path that was being mirrored (e.g.
+        /// `/work/cxx/src` for `<upstream>/src`).
+        upstream_entry: PathBuf,
+        /// The destination path inside the staged overlay (e.g.
+        /// `/work/cxx/target/lihaaf-overlay/src`).
+        staged_target: PathBuf,
+        /// Human-readable description of which stage failed (symlink
+        /// creation, copy fallback, stale-state removal, post-condition
+        /// assertion).
+        stage: String,
+        /// The OS-level I/O error, when one is in scope. `None` for
+        /// post-condition assertion failures that report a structural
+        /// mismatch rather than an `io::Error`.
+        source: Option<io::Error>,
+    },
 }
 
 /// Session outcomes reported before fixture verdicts can run.
@@ -235,6 +296,35 @@ impl fmt::Display for Error {
                 write!(f, "failed to spawn `{program}`: {source}")
             }
             Self::Cli { message, .. } => write!(f, "{message}"),
+            Self::CompatPatchOverrideConflict {
+                crate_name,
+                upstream_entry,
+                expected_resolution,
+            } => {
+                write!(
+                    f,
+                    "compat overlay: upstream [patch.crates-io.{crate_name}] entry {upstream_entry} cannot be safely overwritten.\n  {expected_resolution}"
+                )
+            }
+            Self::OverlayMirrorFailed {
+                upstream_entry,
+                staged_target,
+                stage,
+                source,
+            } => match source {
+                Some(e) => write!(
+                    f,
+                    "compat overlay mirror failed in stage `{stage}` mirroring `{}` → `{}` ({e})",
+                    upstream_entry.display(),
+                    staged_target.display()
+                ),
+                None => write!(
+                    f,
+                    "compat overlay mirror failed in stage `{stage}` mirroring `{}` → `{}`",
+                    upstream_entry.display(),
+                    staged_target.display()
+                ),
+            },
         }
     }
 }
@@ -244,6 +334,9 @@ impl std::error::Error for Error {
         match self {
             Self::Io { source, .. } => Some(source),
             Self::SubprocessSpawn { source, .. } => Some(source),
+            Self::OverlayMirrorFailed {
+                source: Some(s), ..
+            } => Some(s),
             _ => None,
         }
     }
@@ -256,6 +349,27 @@ impl Error {
             source,
             context: context.into(),
             path,
+        }
+    }
+
+    /// Convenience constructor for [`Error::OverlayMirrorFailed`].
+    ///
+    /// `stage` is a short human-readable label naming which step failed
+    /// (e.g. `"symlink"`, `"copy-fallback"`, `"stale-removal"`,
+    /// `"post-condition-assertion"`); see
+    /// `src/compat/overlay.rs::mirror_upstream_into_overlay` for the
+    /// enumerated stages.
+    pub fn overlay_mirror_failed(
+        upstream_entry: PathBuf,
+        staged_target: PathBuf,
+        stage: impl Into<String>,
+        source: Option<io::Error>,
+    ) -> Self {
+        Self::OverlayMirrorFailed {
+            upstream_entry,
+            staged_target,
+            stage: stage.into(),
+            source,
         }
     }
 }
