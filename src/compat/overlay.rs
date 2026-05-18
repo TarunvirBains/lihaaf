@@ -4632,4 +4632,749 @@ version = "0.1.0"
             "inject_synthetic_metadata must REPLACE upstream allow_lints, not merge or preserve it"
         );
     }
+
+    // ───────────────────────────────────────────────────────────────
+    // §5.1 Option H self-patch policy + staged-mirror tests
+    // (issues #40 + #47).
+    // ───────────────────────────────────────────────────────────────
+
+    /// Helper: drop an input manifest in a tempdir, run the
+    /// materializer, return the staged-overlay parsed bytes.
+    fn materialize_for_patch_test(input: &str) -> (tempfile::TempDir, PathBuf, String) {
+        let tmp = tempfile::tempdir().expect("tempdir for self-patch test");
+        let upstream_dir = tmp.path();
+        let upstream_manifest = upstream_dir.join("Cargo.toml");
+        std::fs::write(&upstream_manifest, input).expect("writing upstream Cargo.toml");
+        // Ensure the conventional `src/lib.rs` exists so the
+        // `absolutize_path_bearing_keys` lib-path injection does not
+        // need to invent a missing file (the materializer itself does
+        // not check for existence, but downstream tests that exercise
+        // the staged-mirror are stricter).
+        std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+        std::fs::write(
+            upstream_dir.join("src").join("lib.rs"),
+            "pub fn _stub() {}\n",
+        )
+        .expect("writing src/lib.rs");
+        let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+        let bytes = std::fs::read(&plan.sibling_manifest).expect("read overlay manifest");
+        let out = String::from_utf8(bytes).expect("overlay UTF-8");
+        (tmp, plan.sibling_manifest, out)
+    }
+
+    /// §5.1.1: Rule 1 (INJECT) happy path. Bare upstream with
+    /// `[package].name = "demo"` and no `[patch]` table → overlay
+    /// carries `[patch.crates-io.demo]` pointing at the staged-
+    /// overlay-dir.
+    #[test]
+    fn apply_self_patch_writes_entry_for_named_package_rule1_inject() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+edition = "2021"
+"#;
+        let (tmp, _staged, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let patch = parsed
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.get("demo"))
+            .expect("Rule 1 INJECT must add [patch.crates-io.demo]");
+        let path = patch
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("[patch.crates-io.demo].path must be present");
+        let expected_tail = "target/lihaaf-overlay";
+        assert!(
+            path.ends_with(expected_tail),
+            "Rule 1 INJECT path must point at the staged-overlay-dir; got `{path}`"
+        );
+        assert!(
+            Path::new(path).is_absolute(),
+            "Rule 1 INJECT path must be absolute; got `{path}`"
+        );
+        // Sanity: the tempdir stays alive until end-of-test.
+        drop(tmp);
+    }
+
+    /// §5.1.2: defense-in-depth. Input where `[package]` exists but
+    /// `name` is missing (or empty) — the policy returns `Ok(_)` and
+    /// no `[patch.crates-io]` entry is injected.
+    #[test]
+    fn apply_self_patch_no_entry_when_package_name_absent() {
+        // A manifest with no `[package].name` at all. `[lib]` is
+        // injected to satisfy `canonicalize_crate_type` which expects
+        // a `[lib]` table to exist; the materializer itself ensures
+        // this so the absence of `name` is the only deliberate gap.
+        let input = r#"[package]
+version = "0.1.0"
+"#;
+        let (tmp, _staged, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let patch = parsed.get("patch").and_then(|p| p.get("crates-io"));
+        // Either no `[patch.crates-io]` table at all OR the table
+        // exists but does NOT contain a self-keyed entry. Both are
+        // acceptable since the absent crate-name short-circuits Step 1
+        // of the policy before any `crates-io` table mutation.
+        if let Some(c) = patch {
+            assert!(
+                c.as_table().is_none_or(|t| t.is_empty()),
+                "no [patch.crates-io.<X>] should be injected when [package].name is missing; got: {c}"
+            );
+        }
+        drop(tmp);
+    }
+
+    /// §5.1.3: Rule 1 + BLOCK-1 self-loop avoidance pin. The emitted
+    /// `path` must be the absolutized staged-overlay-dir (ends with
+    /// `/target/lihaaf-overlay`), NOT the upstream dir. A regression
+    /// pointing at the upstream dir would reintroduce the self-loop
+    /// bug R1 carried.
+    #[test]
+    fn apply_self_patch_path_form_is_staged_overlay_dir_not_upstream_rule1() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+        let (tmp, staged_manifest, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let path = parsed
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.get("demo"))
+            .and_then(|d| d.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("[patch.crates-io.demo].path must exist");
+        assert!(
+            path.ends_with("/target/lihaaf-overlay"),
+            "Rule 1 emission must target the STAGED-OVERLAY-DIR \
+             (`<upstream>/target/lihaaf-overlay`), NOT the upstream dir. \
+             Got `{path}`. A regression to the upstream-dir target would \
+             reintroduce the R1 self-loop bug (issue #40 plan §2.1)."
+        );
+
+        // Double-pin: the staged manifest's parent dir is exactly the
+        // policy target.
+        let staged_parent = staged_manifest
+            .parent()
+            .expect("staged manifest has a parent dir")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(
+            path, staged_parent,
+            "[patch.crates-io.demo].path must equal the staged-overlay parent"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.4 (R6 extended): Option B idempotency contract — second
+    /// `materialize_overlay` call returns Ok, the staged state is
+    /// byte-identical, and the canonical mirror symlinks preserve
+    /// their inodes (CASE 2 idempotent skip — no re-creation).
+    ///
+    /// Inode identity is checked via `MetadataExt::ino()` (Unix). A
+    /// re-created symlink gets a new inode even within the same
+    /// second, whereas a skipped (CASE 2) symlink retains its
+    /// original inode — strictly stronger than an mtime check (ext4's
+    /// 1-second granularity can mask a broken implementation on fast
+    /// hardware).
+    #[cfg(unix)]
+    #[test]
+    fn apply_self_patch_idempotent_second_materialize() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir for idempotency test");
+        let upstream_dir = tmp.path();
+        let upstream_manifest = upstream_dir.join("Cargo.toml");
+        std::fs::write(
+            &upstream_manifest,
+            r#"[package]
+name = "demo"
+version = "0.1.0"
+"#,
+        )
+        .expect("writing upstream Cargo.toml");
+        std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+        std::fs::write(
+            upstream_dir.join("src").join("lib.rs"),
+            "pub fn _stub() {}\n",
+        )
+        .expect("writing src/lib.rs");
+        std::fs::create_dir_all(upstream_dir.join("include")).expect("creating include/");
+        std::fs::write(
+            upstream_dir.join("include").join("stub.h"),
+            "// stub header\n",
+        )
+        .expect("writing include/stub.h");
+
+        // First materialize.
+        let plan1 = materialize_overlay(&upstream_manifest).expect("first overlay must succeed");
+        let bytes1 = std::fs::read(&plan1.sibling_manifest).expect("read overlay 1");
+
+        // Capture inodes of the canonical mirror symlinks.
+        let staged_overlay_dir = plan1
+            .sibling_manifest
+            .parent()
+            .expect("staged manifest has a parent")
+            .to_path_buf();
+        let src_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
+            .expect("staged src symlink must exist after first run")
+            .ino();
+        let include_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
+            .expect("staged include symlink must exist after first run")
+            .ino();
+
+        // Second materialize — must be Ok and idempotent.
+        let plan2 = materialize_overlay(&upstream_manifest)
+            .expect("second materialize must return Ok (Option B contract)");
+        let bytes2 = std::fs::read(&plan2.sibling_manifest).expect("read overlay 2");
+        assert_eq!(
+            bytes1, bytes2,
+            "second materialize must produce byte-identical overlay manifest"
+        );
+
+        // Inode-identity check (CASE 2 idempotent skip): the same
+        // symlink inode → not re-created.
+        let src_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
+            .expect("staged src symlink must still exist after second run")
+            .ino();
+        let include_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
+            .expect("staged include symlink must still exist after second run")
+            .ino();
+        assert_eq!(
+            src_ino_before, src_ino_after,
+            "CASE 2 idempotent skip: src/ symlink must not be re-created (inode identity preserved)"
+        );
+        assert_eq!(
+            include_ino_before, include_ino_after,
+            "CASE 2 idempotent skip: include/ symlink must not be re-created"
+        );
+
+        // CASE 15 post-condition: the manifest itself remains a
+        // regular file, not a symlink.
+        let manifest_meta = std::fs::symlink_metadata(&plan2.sibling_manifest)
+            .expect("staged manifest must exist after second run");
+        assert!(
+            manifest_meta.file_type().is_file(),
+            "CASE 15: staged Cargo.toml must be a regular file after second materialize"
+        );
+        assert!(
+            !manifest_meta.file_type().is_symlink(),
+            "CASE 15: staged Cargo.toml must not be a symlink"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.5: Rule 2 (REMAP) cxx-shape pin. Upstream carries
+    /// `[patch.crates-io.demo] = { path = "." }`. The policy must
+    /// REMAP to the staged-overlay-dir.
+    #[test]
+    fn apply_self_patch_remap_when_upstream_self_patch_cxx_shape_rule2() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { path = "." }
+"#;
+        let (tmp, staged_manifest, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let demo_patch = parsed
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.get("demo"))
+            .expect("Rule 2 must keep the [patch.crates-io.demo] entry present");
+        let path = demo_patch
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("Rule 2 REMAP must emit a path string");
+        let staged_parent = staged_manifest
+            .parent()
+            .expect("staged has parent")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(
+            path, staged_parent,
+            "Rule 2 REMAP must REWRITE the upstream's `path = \".\"` to point at \
+             the absolutized staged-overlay-dir; got `{path}` vs expected `{staged_parent}`"
+        );
+        // The REMAP must not leave any git/branch/tag/rev fields
+        // behind — Rule 2 fires only when those are absent in the
+        // source, but the test asserts they are also absent in the
+        // output as a defensive check.
+        assert!(
+            demo_patch.get("git").is_none(),
+            "Rule 2 REMAP must not surface any git source in the output"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.6: Rule 2 variant pin. Upstream `path = "./"` (trailing
+    /// slash) — the lexical normalizer treats this as upstream-root
+    /// equivalent, so Rule 2 fires.
+    #[test]
+    fn apply_self_patch_remap_path_dot_slash_form_rule2() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { path = "./" }
+"#;
+        let (tmp, staged_manifest, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let path = parsed
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.get("demo"))
+            .and_then(|d| d.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("Rule 2 must emit a path under the `./` variant");
+        let staged_parent = staged_manifest
+            .parent()
+            .expect("staged has parent")
+            .to_string_lossy()
+            .replace('\\', "/");
+        assert_eq!(
+            path, staged_parent,
+            "Rule 2 REMAP must fire for the trailing-slash variant `path = \"./\"`"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.7: Rule 4 (REJECT) — vendored fork (`path = "../forked"`)
+    /// resolves to a sibling dir, NOT upstream root. The
+    /// materializer must return `Error::CompatPatchOverrideConflict`
+    /// referencing the v0.2/v1.1 escape hatch.
+    #[test]
+    fn apply_self_patch_rejects_when_upstream_path_targets_external_source_rule4_path() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { path = "../forked-demo" }
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for Rule 4 path test");
+        let upstream_dir = tmp.path();
+        let upstream_manifest = upstream_dir.join("Cargo.toml");
+        std::fs::write(&upstream_manifest, input).expect("writing upstream Cargo.toml");
+        std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+        std::fs::write(
+            upstream_dir.join("src").join("lib.rs"),
+            "pub fn _stub() {}\n",
+        )
+        .expect("writing src/lib.rs");
+
+        let err = materialize_overlay(&upstream_manifest)
+            .expect_err("Rule 4 REJECT must surface as Err(_)");
+        match err {
+            Error::CompatPatchOverrideConflict {
+                crate_name,
+                upstream_entry: _,
+                expected_resolution,
+            } => {
+                assert_eq!(crate_name, "demo");
+                assert!(
+                    expected_resolution.contains("compat-allow-patch-override"),
+                    "Rule 4 error must reference the v0.2/v1.1 escape hatch flag; got: {expected_resolution}"
+                );
+            }
+            other => panic!("Rule 4 must return CompatPatchOverrideConflict; got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// §5.1.8: Rule 4 (REJECT) — git source (`git = "..."`). Rule 4
+    /// fires regardless of whether `.path` is also present.
+    #[test]
+    fn apply_self_patch_rejects_when_upstream_git_form_rule4_git() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { git = "https://example.com/demo" }
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for Rule 4 git test");
+        let upstream_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&upstream_manifest, input).expect("writing upstream Cargo.toml");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("creating src/");
+        std::fs::write(tmp.path().join("src").join("lib.rs"), "pub fn _stub() {}\n")
+            .expect("writing src/lib.rs");
+
+        let err = materialize_overlay(&upstream_manifest)
+            .expect_err("Rule 4 git-source must surface as Err(_)");
+        assert!(
+            matches!(err, Error::CompatPatchOverrideConflict { .. }),
+            "Rule 4 git-source must return CompatPatchOverrideConflict; got {err:?}"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.9: Rule 4 (REJECT) — mixed shape (`path = "."` AND
+    /// `git = "..."`). Both keys present → Rule 4 fires because the
+    /// git key disqualifies Rule 2 detection.
+    #[test]
+    fn apply_self_patch_rejects_when_upstream_mixed_rule4_mixed() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { path = ".", git = "https://example.com/demo" }
+"#;
+        let tmp = tempfile::tempdir().expect("tempdir for Rule 4 mixed test");
+        let upstream_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&upstream_manifest, input).expect("writing upstream Cargo.toml");
+        std::fs::create_dir_all(tmp.path().join("src")).expect("creating src/");
+        std::fs::write(tmp.path().join("src").join("lib.rs"), "pub fn _stub() {}\n")
+            .expect("writing src/lib.rs");
+
+        let err = materialize_overlay(&upstream_manifest)
+            .expect_err("Rule 4 mixed must surface as Err(_)");
+        assert!(
+            matches!(err, Error::CompatPatchOverrideConflict { .. }),
+            "Rule 4 mixed must return CompatPatchOverrideConflict; got {err:?}"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.10: orthogonal-key preservation. Two upstream patch
+    /// entries: `serde` (an unrelated crate; git source — Rule 3
+    /// CONTINUE-ABSOLUTIZE no-op) and `demo` (the self-key; Rule 2
+    /// REMAP fires). Both must end up in the overlay; `serde` must
+    /// be preserved verbatim, `demo` must be REMAPPED.
+    #[test]
+    fn apply_self_patch_preserves_other_crate_patches_when_remap_or_inject() {
+        let input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+serde = { git = "https://example.com/serde", branch = "main" }
+demo = { path = "." }
+"#;
+        let (tmp, staged_manifest, out) = materialize_for_patch_test(input);
+        let parsed: toml::Value = toml::from_str(&out).expect("overlay must parse");
+        let crates_io = parsed
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .expect("[patch.crates-io] must survive");
+
+        // demo: REMAPPED.
+        let staged_parent = staged_manifest
+            .parent()
+            .expect("staged has parent")
+            .to_string_lossy()
+            .replace('\\', "/");
+        let demo_path = crates_io
+            .get("demo")
+            .and_then(|d| d.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("Rule 2 must emit demo.path");
+        assert_eq!(
+            demo_path, staged_parent,
+            "Rule 2 REMAP must emit staged-overlay-dir"
+        );
+
+        // serde: orthogonal Rule 3 — git/branch preserved verbatim,
+        // no path key.
+        let serde_entry = crates_io
+            .get("serde")
+            .expect("serde patch entry must be preserved (Rule 3 no-op)");
+        assert_eq!(
+            serde_entry.get("git").and_then(|v| v.as_str()),
+            Some("https://example.com/serde")
+        );
+        assert_eq!(
+            serde_entry.get("branch").and_then(|v| v.as_str()),
+            Some("main")
+        );
+        assert!(
+            serde_entry.get("path").is_none(),
+            "serde patch entry has no path (git-form), must not gain one through the policy"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.11: lexical normalizer — `.` and trailing-slash
+    /// equivalences. `/work/cxx`, `/work/cxx/.`, `/work/cxx/` all
+    /// lexically-normalize to the same component vector; `..` is
+    /// preserved; nested dirs do not equate.
+    #[test]
+    fn lexical_path_normalize_handles_dot_and_trailing_slash() {
+        let a = lexical_path_normalize_path(Path::new("/work/cxx"));
+        let b = lexical_path_normalize_path(Path::new("/work/cxx/."));
+        let c = lexical_path_normalize_path(Path::new("/work/cxx/"));
+        assert_eq!(a, b, "`/work/cxx` and `/work/cxx/.` must normalize equally");
+        assert_eq!(a, c, "`/work/cxx` and `/work/cxx/` must normalize equally");
+
+        let d = lexical_path_normalize_path(Path::new("/work/cxx/.."));
+        assert_ne!(
+            a, d,
+            "`..` (ParentDir) must be PRESERVED, not collapsed; `/work/cxx/..` must not equal `/work/cxx`"
+        );
+
+        let e = lexical_path_normalize_path(Path::new("/work/cxx/target/lihaaf-overlay"));
+        assert_ne!(
+            a, e,
+            "nested-deeper paths must not equate at the lexical layer"
+        );
+    }
+
+    /// §5.1.12: lexical normalizer — repeated separators (R3 BLOCK-2
+    /// finish). `Path::components()` collapses `//` and `///` on
+    /// Unix; the normalizer naturally handles this case.
+    #[cfg(unix)]
+    #[test]
+    fn lexical_path_normalize_handles_repeated_separators() {
+        let a = lexical_path_normalize_path(Path::new("/work/cxx"));
+        let b = lexical_path_normalize_path(Path::new("/work//cxx"));
+        let c = lexical_path_normalize_path(Path::new("/work///cxx"));
+        assert_eq!(
+            a, b,
+            "`//` must collapse to `/` for lexical-normalize equality (cargo path-source resolution semantics)"
+        );
+        assert_eq!(a, c, "multiple separators must also collapse");
+    }
+
+    /// §5.1.13: lexical normalizer — does NOT resolve symlinks
+    /// (R3 BLOCK-2 finish; known limitation documented in
+    /// `apply_self_patch_policy` rustdoc and plan §6.11). Two paths
+    /// that point to the same canonical filesystem location via
+    /// symlinks compare UNEQUAL at the lexical layer.
+    #[cfg(unix)]
+    #[test]
+    fn lexical_path_normalize_does_not_resolve_symlinks() {
+        let tmp = tempfile::tempdir().expect("tempdir for symlink-normalize test");
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).expect("creating real/");
+        let symlink_path = tmp.path().join("alias");
+        std::os::unix::fs::symlink(&real_dir, &symlink_path).expect("creating symlink");
+
+        // Sanity: canonicalize would equate them.
+        let real_canon = std::fs::canonicalize(&real_dir).expect("canonicalize real");
+        let alias_canon = std::fs::canonicalize(&symlink_path).expect("canonicalize alias");
+        assert_eq!(
+            real_canon, alias_canon,
+            "canonicalize SHOULD equate the symlinked paths (sanity check)"
+        );
+
+        // The lexical normalizer must NOT equate them.
+        let real_norm = lexical_path_normalize_path(&real_dir);
+        let alias_norm = lexical_path_normalize_path(&symlink_path);
+        assert_ne!(
+            real_norm, alias_norm,
+            "lexical normalize must NOT resolve symlinks; \
+             this is a documented known limitation (plan §6.11): \
+             symlinked-equivalent paths fall to Rule 4 REJECT"
+        );
+    }
+
+    /// §5.1.14: Option B reconcile-by-replacement for representative
+    /// CASEs 3 / 5 / 6 / 7 / 12 (mixed partial state). Pre-seeds the
+    /// staged overlay dir with stale entries, runs
+    /// `mirror_upstream_into_overlay`, and asserts the stale state is
+    /// replaced with the canonical mirror.
+    #[cfg(unix)]
+    #[test]
+    fn mirror_upstream_rerun_reconciles_stale_entries() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir for stale-mirror reconcile test");
+        let upstream_dir = tmp.path().join("upstream");
+        std::fs::create_dir(&upstream_dir).expect("creating upstream/");
+        // Upstream tree: src/ (dir), include/ (dir), build/ (dir),
+        // example.txt (file). Each is a non-excluded top-level entry.
+        for sub in ["src", "include", "build"] {
+            std::fs::create_dir(upstream_dir.join(sub)).expect("creating upstream subdir");
+            std::fs::write(
+                upstream_dir.join(sub).join("marker"),
+                format!("real upstream {sub} marker\n"),
+            )
+            .expect("writing marker");
+        }
+        std::fs::write(upstream_dir.join("example.txt"), "real upstream bytes\n")
+            .expect("writing example.txt");
+
+        // Staged overlay dir: pre-populate with a stale tree.
+        let staged_overlay_dir = tmp.path().join("staged-overlay");
+        std::fs::create_dir(&staged_overlay_dir).expect("creating staged-overlay/");
+        // Required for CASE 15 post-condition assertion.
+        std::fs::write(
+            staged_overlay_dir.join("Cargo.toml"),
+            "[package]\nname = \"stub\"\n",
+        )
+        .expect("seed staged Cargo.toml");
+
+        // CASE 3: wrong-target symlink for `src/`. Point it at an
+        // unrelated tmpdir.
+        let unrelated_tmp = tempfile::tempdir().expect("tempdir for wrong-target symlink");
+        std::os::unix::fs::symlink(unrelated_tmp.path(), staged_overlay_dir.join("src"))
+            .expect("seed wrong-target src symlink");
+        // CASE 5: real file in staged where upstream has a dir? No —
+        // CASE 5 is real file in staged AND upstream is also file.
+        // Use example.txt for that.
+        std::fs::write(
+            staged_overlay_dir.join("example.txt"),
+            "stale dummy bytes\n",
+        )
+        .expect("seed stale example.txt file");
+        // CASE 6: real directory in staged where upstream has dir.
+        std::fs::create_dir(staged_overlay_dir.join("build")).expect("seed stale build/ dir");
+        std::fs::write(
+            staged_overlay_dir.join("build").join("stale.rs"),
+            "// stale\n",
+        )
+        .expect("seed stale build/stale.rs");
+        // CASE 7: type mismatch. Staged regular file where upstream
+        // has a directory (`include/`).
+        std::fs::write(
+            staged_overlay_dir.join("include"),
+            "stale file at include path\n",
+        )
+        .expect("seed stale include as file");
+
+        // Run mirror.
+        mirror_upstream_into_overlay(&upstream_dir, &staged_overlay_dir)
+            .expect("mirror must reconcile stale state");
+
+        // CASE 3: `src` must now be a symlink → upstream/src.
+        let src_meta = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
+            .expect("staged src must exist");
+        assert!(
+            src_meta.file_type().is_symlink(),
+            "CASE 3: stale wrong-target symlink must be replaced with a fresh canonical symlink"
+        );
+        let src_target = std::fs::read_link(staged_overlay_dir.join("src")).expect("readlink src");
+        assert_eq!(
+            src_target,
+            upstream_dir.join("src"),
+            "CASE 3: new symlink must target upstream/src"
+        );
+
+        // CASE 5: `example.txt` must now be a symlink → upstream/example.txt.
+        let ex_meta = std::fs::symlink_metadata(staged_overlay_dir.join("example.txt"))
+            .expect("staged example.txt must exist");
+        assert!(
+            ex_meta.file_type().is_symlink(),
+            "CASE 5: stale real file must be replaced with canonical symlink"
+        );
+        let ex_content = std::fs::read_to_string(staged_overlay_dir.join("example.txt"))
+            .expect("read example.txt via symlink");
+        assert_eq!(
+            ex_content, "real upstream bytes\n",
+            "CASE 5: reading through new symlink must yield upstream content, not stale dummy"
+        );
+
+        // CASE 6: `build/` must now be a symlink → upstream/build.
+        let build_meta = std::fs::symlink_metadata(staged_overlay_dir.join("build"))
+            .expect("staged build must exist");
+        assert!(
+            build_meta.file_type().is_symlink(),
+            "CASE 6: stale real directory must be replaced with canonical symlink"
+        );
+        let build_target =
+            std::fs::read_link(staged_overlay_dir.join("build")).expect("readlink build");
+        assert_eq!(
+            build_target,
+            upstream_dir.join("build"),
+            "CASE 6: new symlink must target upstream/build"
+        );
+
+        // CASE 7: `include/` (was a file) must now be a symlink to the
+        // upstream directory.
+        let inc_meta = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
+            .expect("staged include must exist");
+        assert!(
+            inc_meta.file_type().is_symlink(),
+            "CASE 7: stale type-mismatch must be replaced with canonical symlink"
+        );
+
+        // CASE 12: mixed partial state. Run mirror once more; the
+        // newly-canonical symlinks for src/include/build must skip
+        // (CASE 2). Capture inode identity to prove no recreation.
+        let src_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
+            .unwrap()
+            .ino();
+        let inc_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
+            .unwrap()
+            .ino();
+        let build_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("build"))
+            .unwrap()
+            .ino();
+
+        // Re-introduce ONE stale entry: replace src/ with a wrong-
+        // target symlink. The mirror must reconcile src/ (CASE 3)
+        // while leaving include/ and build/ untouched (CASE 2 skip
+        // → inode-identity preserved).
+        std::fs::remove_file(staged_overlay_dir.join("src")).expect("remove canonical src");
+        let unrelated2 = tempfile::tempdir().expect("tempdir for second wrong-target");
+        std::os::unix::fs::symlink(unrelated2.path(), staged_overlay_dir.join("src"))
+            .expect("seed second wrong-target src");
+
+        mirror_upstream_into_overlay(&upstream_dir, &staged_overlay_dir)
+            .expect("second mirror must succeed");
+
+        let inc_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
+            .unwrap()
+            .ino();
+        let build_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("build"))
+            .unwrap()
+            .ino();
+        assert_eq!(
+            inc_ino_before, inc_ino_after,
+            "CASE 12: canonical include/ symlink must be skipped (inode preserved) under mixed-state rerun"
+        );
+        assert_eq!(
+            build_ino_before, build_ino_after,
+            "CASE 12: canonical build/ symlink must be skipped under mixed-state rerun"
+        );
+        let src_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
+            .unwrap()
+            .ino();
+        assert_ne!(
+            src_ino_before, src_ino_after,
+            "CASE 12: reintroduced wrong-target src/ must be re-created (CASE 3 reconcile)"
+        );
+        drop(tmp);
+    }
+
+    /// §5.1.15: copy-fallback exact-sync — removed-upstream files
+    /// MUST be purged from staged on rerun (decision 5 of the
+    /// idempotency contract).
+    #[test]
+    fn mirror_copy_fallback_exact_sync_removes_destination_only_files() {
+        // Direct test of `copy_fallback`'s exact-sync semantics. The
+        // mirror's public surface dispatches to copy-fallback only on
+        // platform / permission failures; testing the helper directly
+        // gives us deterministic coverage of decision 5 (no merge).
+        let tmp = tempfile::tempdir().expect("tempdir for copy-fallback test");
+        let upstream_src = tmp.path().join("upstream-src");
+        std::fs::create_dir(&upstream_src).expect("creating upstream-src/");
+        std::fs::write(upstream_src.join("a.rs"), "// upstream a.rs\n").expect("write a.rs");
+        std::fs::write(upstream_src.join("b.rs"), "// upstream b.rs\n").expect("write b.rs");
+
+        let staged_src = tmp.path().join("staged-src");
+        // First copy: both files land in staged.
+        copy_fallback(&upstream_src, &staged_src).expect("first copy must succeed");
+        assert!(staged_src.join("a.rs").exists());
+        assert!(staged_src.join("b.rs").exists());
+
+        // Simulate upstream removing b.rs between runs.
+        std::fs::remove_file(upstream_src.join("b.rs")).expect("remove upstream b.rs");
+
+        // Second copy: exact-sync must purge b.rs from staged.
+        copy_fallback(&upstream_src, &staged_src).expect("second copy must succeed");
+        assert!(
+            staged_src.join("a.rs").exists(),
+            "CASE 6 copy-fallback exact-sync: surviving upstream file must remain"
+        );
+        assert!(
+            !staged_src.join("b.rs").exists(),
+            "CASE 6 copy-fallback exact-sync: destination-only b.rs MUST be removed (decision 5)"
+        );
+        drop(tmp);
+    }
 }
