@@ -338,6 +338,41 @@ pub struct SyntheticMetadata {
     pub allow_lints: Vec<String>,
 }
 
+/// Construct the `SyntheticMetadata` that the compat driver embeds in
+/// the staged overlay for the named crate.
+///
+/// This is the **single authoritative source** for the driver's default
+/// `allow_lints` list. The compat driver (`src/compat/mod.rs`) calls
+/// this function instead of inlining the struct literal so that:
+///
+/// 1. A future change to the `allow_lints` default is a one-line edit
+///    in one place.
+/// 2. Test #17 (`synthetic_metadata_default_in_compat_driver`) can call
+///    this same function and assert against an independently written
+///    literal — any drift between the function and the expected default
+///    is caught immediately.
+///
+/// `fixture_dirs` carries the two absolute converted-fixture directories
+/// (`compile_pass` / `compile_fail`); callers compute these before
+/// constructing the metadata.
+pub(crate) fn compat_default_synthetic_metadata(
+    name: &str,
+    fixture_dirs: Vec<String>,
+) -> SyntheticMetadata {
+    SyntheticMetadata {
+        dylib_crate: name.to_string(),
+        extern_crates: vec![name.to_string()],
+        fixture_dirs,
+        // Forward-only insurance: suppresses `unexpected_cfgs` noise for
+        // compat-mode pilots once `--check-cfg` becomes active (either via
+        // lihaaf or a future rustc default). Under v0.1.0 today this is a
+        // no-op — the lint is `--check-cfg`-gated and lihaaf does not pass
+        // that flag (verified worker.rs:916-919, 929-972). See
+        // `SyntheticMetadata.allow_lints` rustdoc for the full rationale.
+        allow_lints: vec!["unexpected_cfgs".to_string()],
+    }
+}
+
 /// Read the upstream `Cargo.toml`, materialize the sibling overlay, and
 /// return the plan.
 ///
@@ -3722,21 +3757,20 @@ version = "0.1.0"
 
     #[test]
     fn synthetic_metadata_default_in_compat_driver() {
-        // Pin the compat-driver default: the SyntheticMetadata literal at
-        // src/compat/mod.rs must set allow_lints = ["unexpected_cfgs"].
-        // This test exercises the same construction path as the driver
-        // (building the struct directly) and asserts the default value.
-        let name = "demo".to_string();
-        let meta = SyntheticMetadata {
-            dylib_crate: name.clone(),
-            extern_crates: vec![name],
-            fixture_dirs: vec![],
-            allow_lints: vec!["unexpected_cfgs".to_string()],
-        };
+        // Pin the compat-driver default via the SAME helper the driver calls
+        // (`compat_default_synthetic_metadata`). The assertion is against an
+        // independently written literal so that a future change to the helper
+        // (e.g. `allow_lints: vec![]`) fails this test — the helper return
+        // and the expected value are decoupled.
+        //
+        // If you change the helper's `allow_lints` default you MUST also
+        // update spec §3.2/C.4, CHANGELOG, and this assertion.
+        let meta = compat_default_synthetic_metadata("demo", vec![]);
         assert_eq!(
             meta.allow_lints,
             vec!["unexpected_cfgs".to_string()],
-            "compat-driver SyntheticMetadata must default allow_lints to [\"unexpected_cfgs\"]"
+            "compat-driver default allow_lints must be [\"unexpected_cfgs\"]; \
+             changes also require spec §3.2/C.4 + CHANGELOG updates",
         );
     }
 

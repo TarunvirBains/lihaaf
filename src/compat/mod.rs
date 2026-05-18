@@ -148,19 +148,10 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             let name = upstream_name
                 .map(str::to_string)
                 .unwrap_or_else(|| basename_fallback(&compat_root));
-            overlay::SyntheticMetadata {
-                dylib_crate: name.clone(),
-                extern_crates: vec![name],
-                fixture_dirs: vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
-                // Forward-only insurance: suppresses `unexpected_cfgs` noise
-                // for compat-mode pilots once `--check-cfg` becomes active
-                // (either via lihaaf or a future rustc default). Under v0.1.0
-                // today this is a no-op — the lint is `--check-cfg`-gated and
-                // lihaaf does not pass that flag (verified worker.rs:916-919,
-                // 929-972). See overlay.rs `SyntheticMetadata.allow_lints`
-                // rustdoc for the full rationale.
-                allow_lints: vec!["unexpected_cfgs".to_string()],
-            }
+            overlay::compat_default_synthetic_metadata(
+                &name,
+                vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
+            )
         },
     )?;
     let crate_name = overlay_plan
