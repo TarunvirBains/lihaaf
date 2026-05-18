@@ -1269,12 +1269,12 @@ fn inject_synthetic_metadata(
 ///
 /// **Why we disable auto-discovery for non-lib targets.** Cargo also
 /// auto-discovers `src/bin/`, `examples/`, `tests/`, `benches/` under
-/// the manifest's parent dir. The staged dir contains only `Cargo.toml`,
-/// so auto-discovery would silently produce no targets — but a future
-/// cargo version could surface a warning or error. Setting
-/// `autobins = false`, `autoexamples = false`, `autotests = false`,
-/// `autobenches = false` makes the overlay's "lib-only" intent explicit
-/// and forward-compatible.
+/// the manifest's parent dir. The staged dir now contains symlinks to
+/// upstream top-level entries (§4.5 staged-mirror), so auto-discovery
+/// WOULD surface upstream targets — which would produce duplicate or
+/// spurious build artifacts. Setting `autobins = false`,
+/// `autoexamples = false`, `autotests = false`, `autobenches = false`
+/// makes the overlay's "lib-only" intent explicit and forward-compatible.
 ///
 /// **Why `[package] build` is injected when `<upstream>/build.rs` exists.**
 /// Cargo auto-discovers `<manifest_dir>/build.rs` when `[package] build`
@@ -1393,11 +1393,12 @@ fn absolutize_path_bearing_keys(
     absolutize_array_table_paths(top, "test", upstream_dir);
     absolutize_array_table_paths(top, "bench", upstream_dir);
 
-    // 4. Disable auto-discovery for non-lib targets. The staged
-    //    overlay's parent dir contains only `Cargo.toml`; auto-discovery
-    //    would silently produce no targets, but making the overlay's
-    //    "lib-only" intent explicit guards against future cargo
-    //    versions that might warn or error on the empty case.
+    // 4. Disable auto-discovery for non-lib targets. The staged overlay's
+    //    parent dir now contains symlinks to upstream top-level entries
+    //    (§4.5 staged-mirror), so auto-discovery would surface upstream
+    //    targets and produce spurious build artifacts. Making the overlay's
+    //    "lib-only" intent explicit also guards against future cargo
+    //    versions that might change auto-discovery semantics.
     //
     //    We unconditionally write `false` regardless of any pre-existing
     //    value — the overlay's target surface is the lib only, by

@@ -1002,7 +1002,9 @@ serde = { git = "https://example.com/serde", branch = "main" }
         .and_then(|v| v.get("crates-io"))
         .expect("[patch.crates-io] must survive overlay");
 
-    // cxx-demo path = "." → absolute upstream dir.
+    // cxx-demo path = "." → absolute staged overlay dir (Rule 2 REMAP, Option H §4.2).
+    // The self-patch entry is remapped to the staged dir so cargo resolves the
+    // overlay manifest, not the upstream root directly.
     let cxx_path = crates_io
         .get("cxx-demo")
         .and_then(|v| v.get("path"))
@@ -1723,8 +1725,9 @@ fn cargo_accepts_rich_overlay_for_dylib_build() {
     //   - a [patch.crates-io] entry with path = "." (mirrors cxx pattern)
     //
     // The path-dep crate is a stub with its own Cargo.toml + src/lib.rs.
-    // The patch entry references the same crate; cargo will resolve the
-    // patch to the real upstream dir after absolutization.
+    // The patch entry references the same crate (self-patch); per Option H
+    // Rule 2 REMAP it is absolutized to the staged overlay dir, not the
+    // upstream root, so cargo resolves the overlay manifest directly.
     let tmp = tempfile::tempdir().expect("creating tempdir for rich cargo build test");
     let upstream_dir = tmp.path();
 
