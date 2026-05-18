@@ -1,11 +1,14 @@
-//! # lihaaf — fast, parallel compile-fail/compile-pass harness
+//! Fast compile-fail and compile-pass testing for Rust proc macros.
 //!
-//! `lihaaf` ("quilt", Urdu) is a practical Rust test harness for
-//! running compile-fail and compile-pass fixtures with less friction.
-//! It compiles the consumer crate once as a dynamic library, then runs each
-//! fixture as a standalone `rustc` invocation that links the prebuilt
-//! dylib via `--extern`. In many real projects this is the difference
-//! between waiting forever and getting quick feedback.
+//! `lihaaf` is a `trybuild`-style test harness optimized for quick iteration.
+//! It is designed for proc-macro crates that need many compile-pass and
+//! compile-fail fixtures without paying unnecessary rebuild overhead.
+//!
+//! `lihaaf` ("quilt"; Urdu and Punjabi, also written ਲਿਹਾਫ਼ in Gurmukhi)
+//! compiles the consumer crate once as a dynamic
+//! library, then runs each fixture as a standalone `rustc` invocation that
+//! links the prebuilt dylib via `--extern`. In many real projects this is the
+//! difference between waiting forever and getting quick feedback.
 //!
 //! ## Public surface
 //!
