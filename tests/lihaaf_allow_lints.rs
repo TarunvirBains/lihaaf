@@ -99,12 +99,28 @@ allow_lints = ["unused_imports"]
     // Derived by running the probe under lihaaf's actual argv shape and
     // inspecting the normalized rendered output. The lihaaf normalizer
     // replaces the absolute source directory with $DIR (§6.2).
+    //
+    // The rendered field from rustc 1.95.0 for the fixture
+    //   fn main() { let _x: u8 = "not a number"; }
+    // has column 26 (the `"` of the string literal) and includes the full
+    // span annotation block. The blank lines between the span block,
+    // "aborting" summary, and "For more information" footer are preserved
+    // (normalize::normalize collapses runs-of-blank to a single blank line
+    // but does not strip single blank lines).
     std::fs::write(
         fixture_dir.join("unused_import_and_type_error.stderr"),
-        "error[E0308]: mismatched types\n \
-         --> $DIR/unused_import_and_type_error.rs:2:25\n\
-         \nerror: aborting due to 1 previous error\n\
-         \nFor more information about this error, try `rustc --explain E0308`.\n",
+        r#"error[E0308]: mismatched types
+ --> $DIR/unused_import_and_type_error.rs:2:26
+  |
+2 | fn main() { let _x: u8 = "not a number"; }
+  |                     --   ^^^^^^^^^^^^^^ expected `u8`, found `&str`
+  |                     |
+  |                     expected due to this
+
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0308`.
+"#,
     )
     .expect("writing fixture snapshot");
 
@@ -114,9 +130,13 @@ allow_lints = ["unused_imports"]
     // is a `#[arg(skip)]` field and defaults to `false` (correct for non-compat
     // sessions). This avoids the `pub(crate)` visibility gap for that field.
     let manifest_path = crate_root.join("Cargo.toml");
+    // `parse_from` receives argv AFTER the cargo subcommand prefix is
+    // stripped (the real binary strips "lihaaf" at argv[1] before calling
+    // `parse_from`; see src/bin/cargo-lihaaf.rs:33-35). Do not include
+    // the "lihaaf" positional here — clap would reject it as an
+    // unexpected argument.
     let cli = lihaaf::cli::parse_from(vec![
         "cargo-lihaaf".to_string(),
-        "lihaaf".to_string(),
         "--manifest-path".to_string(),
         manifest_path.to_string_lossy().to_string(),
         "--jobs".to_string(),
