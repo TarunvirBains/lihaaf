@@ -13,3 +13,5 @@ path = "__UPSTREAM_DIR__/src/lib.rs"
 
 [dependencies]
 serde = "1"
+
+[workspace]
