@@ -6,6 +6,16 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.7] — 2026-05-18
+
+Bundles the `allow_lints` feature (issue #43) plus a class-sweep fix for
+NUL-byte rejection across argv-bound config string fields. The `allow_lints`
+feature landed via PR #54 across two adversarial-review rounds; Codex round-1
+flagged a single NUL gap in `validate_allow_lints`, and the subsequent
+class-enumeration sweep surfaced three additional sibling instances of the
+same gap (features, dylib_crate, test corpus). All four were closed in one
+atomic follow-up commit before merge.
+
 ### Added
 - **`allow_lints` config key** (#43, mirrors trybuild #302): new optional
   `Vec<String>` key in `[package.metadata.lihaaf]` and per-suite tables.
@@ -21,6 +31,19 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   lihaaf or rustc enables check-cfg-driven diagnostics. Adopters who want
   the opposite (i.e. surfacing `unexpected_cfgs` once enabled) must drop
   out of compat mode and use the v0.1 TOML-driven path.
+
+### Fixed
+- **NUL-byte rejection in argv-bound config strings** (`src/config.rs`):
+  four config fields that flow to subprocess argv tokens (`allow_lints`,
+  `features`, `dylib_crate`, plus their test corpus) now reject interior
+  NUL bytes at config-parse time, surfacing as `CONFIG_INVALID` with a
+  directed diagnostic. Previously these fields had no NUL check, so a
+  NUL would pass validation and the spawn failure would surface as
+  `WORKER_CRASHED` / `SubprocessSpawn` — actionable but misrouted.
+  New `validate_features` and `validate_dylib_crate` private functions
+  enforce the same structural rule. The `allow_lints` validator gains
+  a NUL check ahead of its existing whitespace / quote / backslash
+  rejection.
 
 ## [0.1.0-beta.6] — 2026-05-17
 
