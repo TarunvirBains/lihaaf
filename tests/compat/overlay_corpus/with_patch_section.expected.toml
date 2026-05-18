@@ -16,6 +16,9 @@ serde = "1"
 [dependencies.inner]
 path = "__UPSTREAM_DIR__/inner"
 
+[patch.crates-io.demo]
+path = "__UPSTREAM_DIR__/target/lihaaf-overlay"
+
 [patch.crates-io.demo-patched]
 path = "__UPSTREAM_DIR__/."
 

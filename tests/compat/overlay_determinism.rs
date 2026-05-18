@@ -23,7 +23,7 @@
 //!    (`idempotent_rerun_no_byte_change` — second run does not touch
 //!    mtime).
 //! 5. The cross-binary determinism corpus
-//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — five
+//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — eight
 //!    representative `Cargo.toml` shapes under
 //!    `tests/compat/overlay_corpus/`, each checked against a
 //!    pre-committed `*.expected.toml`).
@@ -254,7 +254,11 @@ version = "0.1.0"
 
     let headers: Vec<&str> = out.lines().filter(|l| l.starts_with('[')).collect();
     // Per `canonical_key_order()` the expected order is:
-    // package, lib (newly inserted), dependencies, features, workspace.
+    // package, lib (newly inserted), dependencies, features,
+    // patch.crates-io.<self> (newly INJECTED by the Option H Rule 1
+    // self-patch policy — issues #40 / #47 — because `[package].name`
+    // is set and no upstream `[patch.crates-io.demo]` exists),
+    // workspace.
     assert_eq!(
         headers,
         vec![
@@ -262,6 +266,7 @@ version = "0.1.0"
             "[lib]",
             "[dependencies]",
             "[features]",
+            "[patch.crates-io.demo]",
             "[workspace]"
         ],
         "canonical order violated; output:\n{out}"
@@ -457,6 +462,15 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         "with_patch_section",
         "with_comments",
         "with_replace_section",
+        // Two new fixtures pin the issue #40/#47 Option H self-patch
+        // policy emission: Rule 1 INJECT for clean upstreams (the
+        // anyhow / thiserror / serde_json shape) and Rule 2 REMAP
+        // for upstreams that already carry `[patch.crates-io.<self>]
+        // = { path = "." }` (the cxx shape). Both rules emit the
+        // same byte form (absolutized staged-overlay-dir); the
+        // distinction is in the INPUT.
+        "with_self_patch_injected",
+        "with_self_patch_remapped",
     ];
     let mut checked = 0usize;
     for name in &names {
@@ -493,8 +507,10 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         checked += 1;
     }
     assert_eq!(
-        checked, 6,
-        "corpus must include all 6 representative fixtures"
+        checked, 8,
+        "corpus must include all 8 representative fixtures \
+         (6 existing + 2 new for the issue #40/#47 Option H \
+         Rule 1 INJECT and Rule 2 REMAP policy)"
     );
 }
 

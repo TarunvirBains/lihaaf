@@ -10,6 +10,9 @@ version = "0.1.0"
 crate-type = ["dylib", "rlib"]
 path = "__UPSTREAM_DIR__/src/lib.rs"
 
+[patch.crates-io.demo]
+path = "__UPSTREAM_DIR__/target/lihaaf-overlay"
+
 [replace."old-dep:0.2.0"]
 path = "__UPSTREAM_DIR__/vendor/old-dep"
 
