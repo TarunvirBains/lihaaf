@@ -1310,11 +1310,13 @@ serde = "1"
 /// **R3 tightening (PR #37, strict-swe Finding 1):** the rejection
 /// MUST surface as `Error::Cli { clap_exit_code: 2, message }`, not
 /// as a different `Error` variant that happens to have a Debug repr
-/// containing "workspace member". The earlier `format!("{err:?}")`
-/// + `.contains(...)` shape was loose family-completeness with the
-/// adjacent `workspace_root_manifest_is_rejected_with_directed_diagnostic`
-/// test pattern; a future refactor could replace `Error::Cli` with
-/// (say) `Error::TomlParse` and the loose test would still pass.
+/// containing "workspace member". The earlier
+/// `format!("{err:?}") + .contains(...)` shape was loose
+/// family-completeness with the adjacent
+/// `workspace_root_manifest_is_rejected_with_directed_diagnostic`
+/// test pattern; a future refactor could replace `Error::Cli`
+/// with (say) `Error::TomlParse` and the loose test would still
+/// pass.
 #[test]
 fn staged_overlay_rejects_workspace_member_manifest() {
     let tmp = tempfile::tempdir().expect("tempdir for workspace-member rejection test");
