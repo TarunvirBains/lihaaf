@@ -911,7 +911,7 @@ The baseline `cargo test` invocation runs at the workspace root (where the lockf
 
 **Pre-committed:** this is an adopter-facing knob, NOT an automatic override. The compat driver does NOT inject `-p <pkg>` into the baseline argv. Rationale: adopters may want a workspace-wide baseline (compare the OVERALL workspace pass/fail rate) or a member-specific one — the choice is theirs. Documented in §8 spec amendment.
 
-**Audit:** the existing byte-determinism corpus at `tests/compat/overlay_corpus/<name>.input.toml` + `<name>.expected.toml` assumes single-crate pilots. The new corpus fixture pair for the workspace-member case must include the `-p`-bearing baseline argv shape so the test can pin the convention. Out of scope: `compat/baseline.toml` does not exist (this is a §5 pilot-gate baseline table, not the byte-determinism corpus).
+**Audit:** the existing byte-determinism corpus at `tests/compat/overlay_corpus/<name>.input.toml` + `<name>.expected.toml` assumes single-crate pilots. The new corpus fixture pair for the workspace-member case must include the `-p`-bearing baseline argv shape so the test can pin the convention. Out of scope: `compat/baseline.toml` is not the byte-determinism corpus (it is the §5 pilot-gate baseline table — a separate artifact).
 
 ### 6.14 Glob expansion bug class (Codex check-target)
 
