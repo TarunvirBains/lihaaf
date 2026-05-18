@@ -830,6 +830,7 @@ mod tests {
             extern_crates: vec!["x".into()],
             fixture_dirs: vec![],
             features: vec![],
+            allow_lints: vec![],
             edition: "2021".into(),
             dev_deps: vec![],
             compile_fail_marker: "compile_fail".into(),

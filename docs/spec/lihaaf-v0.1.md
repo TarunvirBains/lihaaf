@@ -344,6 +344,14 @@ fixture_timeout_secs = 90
 # DEFAULT: platform-derived (Section 5.4). Max RSS in MB any single
 # rustc worker may consume before being killed.
 per_fixture_memory_mb = 1024
+
+# DEFAULT: []. rustc lints to forward as `-A <lint>` on every per-
+# fixture invocation. Each entry becomes one `-A` argv flag.
+# Validation rejects empty strings, leading-dash entries (caller
+# should not supply `-A` prefix), and entries containing whitespace,
+# quotes, or backslashes. Unknown lint names are NOT pre-validated —
+# rustc surfaces `warning: unknown lint: X` on the per-fixture stderr.
+allow_lints = ["unexpected_cfgs", "dead_code"]
 ```
 
 ### 3.3 Worked example
@@ -395,6 +403,14 @@ doing any work. Any of these conditions hard-error with a non-zero exit:
 - `edition` not in the allowed set.
 - `fixture_timeout_secs` not a positive integer.
 - `per_fixture_memory_mb` (if set) not a positive integer.
+- An entry in `allow_lints` is an empty string.
+- An entry in `allow_lints` starts with `-` (caller must not supply the
+  `-A` prefix; lihaaf supplies it).
+- An entry in `allow_lints` contains whitespace, double quotes, single
+  quotes, or backslashes (would break argv tokenization).
+
+Unknown lint names are NOT pre-validated — rustc surfaces
+`warning: unknown lint: X` on the per-fixture stderr.
 
 Validation messages name the offending key, the allowed shape, and a
 one-line "Why this matters" hint.
@@ -444,8 +460,8 @@ name = "spatial"
 features = ["spatial"]
 fixture_dirs = ["tests/lihaaf/compile_pass_spatial"]
 # extern_crates, dev_deps, edition, compile_fail_marker,
-# fixture_timeout_secs, per_fixture_memory_mb all inherit from the
-# top-level table when omitted on a named suite.
+# fixture_timeout_secs, per_fixture_memory_mb, allow_lints all
+# inherit from the top-level table when omitted on a named suite.
 ```
 
 **Per-suite resources.** The default suite uses the legacy paths
@@ -474,11 +490,25 @@ at session startup with the list of valid names.
   rule keeps a "spatial only" suite from accidentally pulling in a
   sibling `testing` feature.
 - `extern_crates`, `dev_deps`, `edition`, `compile_fail_marker`,
-  `fixture_timeout_secs`, and `per_fixture_memory_mb` DO inherit from
-  the default suite when omitted.
+  `fixture_timeout_secs`, `per_fixture_memory_mb`, and `allow_lints`
+  DO inherit from the default suite when omitted.
 - The reserved name `default` cannot be claimed by a `[[suite]]` entry.
 - Suite names must contain only `[A-Za-z0-9_-]` (used in filesystem
   paths and on the CLI).
+
+**Compat-mode default `allow_lints = ["unexpected_cfgs"]`.** In
+compat mode (`cargo lihaaf --compat`), the compat driver synthesizes
+the `[package.metadata.lihaaf]` block entirely; adopter TOML does not
+survive into the inner session. The synthesized block sets
+`allow_lints = ["unexpected_cfgs"]` as **forward-only insurance**: the
+`unexpected_cfgs` lint is `--check-cfg`-gated and lihaaf does not
+currently pass `--check-cfg` (verified at `src/worker.rs:916-919,
+929-972`), so this default is a no-op under v0.1.0 today. It will
+start suppressing noise on the day lihaaf or rustc enables
+check-cfg-driven diagnostics. Adopters who want to surface
+`unexpected_cfgs` (e.g. to test diagnostic output of macros that emit
+`#[cfg]`) must drop out of compat mode and use the v0.1 TOML-driven
+path with `allow_lints = []`.
 
 **Cross-suite invariants.** Fixture directories must be **disjoint**
 across suites — validated at config parse time. Two suites sharing a
@@ -796,6 +826,8 @@ rustc
     --extern <crate2>=<rlib_or_dylib_path>
     [--cfg feature="<feat1>"]
     [--cfg feature="<feat2>"]
+    [-A <lint1>]
+    [-A <lint2>]
     <fixture.rs>
 ```
 
@@ -822,6 +854,9 @@ Where:
   output captured during stage 3 — for each crate name in
   `extern_crates ++ dev_deps`, find the matching `Resolve` node, read
   its compiled artifact path (`.rlib` or `.so`).
+- `-A <lint>`: one flag pair per entry in the suite's `allow_lints`;
+  omitted when the list is empty; forwarded verbatim to rustc with no
+  shell expansion (lihaaf uses `Command::arg`, not a shell string).
 - `--error-format=json` is non-negotiable. It gives lihaaf structured
   diagnostics with stable spans, allowing normalization without text
   parsing. The plain-text rendering (which is what the snapshot stores)

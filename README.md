@@ -45,6 +45,12 @@ extern_crates = ["consumer", "consumer-macros"]
 features = ["testing"]
 dev_deps = ["serde", "serde_json"]
 edition = "2021"
+# Suppress rustc lints on each per-fixture invocation (forwarded as `-A <lint>`).
+# Common entries under v0.1: unused_imports and dead_code, which fire under
+# lihaaf's bare-rustc invocation when fixtures share scaffolding with the
+# main crate. Other entries (e.g. unexpected_cfgs) become active when
+# rustc is invoked with --check-cfg; today lihaaf does not pass --check-cfg.
+allow_lints = ["unused_imports", "dead_code"]
 ```
 
 Layout:
@@ -131,8 +137,8 @@ Constraints (validated at config parse time):
   gets `[]`, not the default suite's features).
 - Other keys (`extern_crates`, `dev_deps`, `edition`,
   `compile_fail_marker`, `fixture_timeout_secs`,
-  `per_fixture_memory_mb`) inherit from the top-level table when
-  omitted on a named suite.
+  `per_fixture_memory_mb`, `allow_lints`) inherit from the top-level
+  table when omitted on a named suite.
 
 See `docs/spec/lihaaf-v0.1.md` §3.6 for the full design.
 
