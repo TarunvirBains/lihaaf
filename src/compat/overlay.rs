@@ -1737,8 +1737,7 @@ fn apply_self_patch_policy(
     // Step 2: compute the absolutized staged-overlay path string,
     // matching the absolutization shape used by every other
     // path-bearing key (forward-slash form via `to_forward_slash`).
-    let staged_overlay_abs =
-        crate::util::to_forward_slash(&staged_overlay_dir.to_string_lossy());
+    let staged_overlay_abs = crate::util::to_forward_slash(&staged_overlay_dir.to_string_lossy());
 
     // Step 3-4: ensure `top["patch"]` and `top["patch"]["crates-io"]`
     // exist as tables.
@@ -1770,10 +1769,7 @@ fn apply_self_patch_policy(
         // Rule 1: INJECT. No upstream entry; create a fresh one.
         None => {
             let mut entry = toml::map::Map::new();
-            entry.insert(
-                "path".to_string(),
-                toml::Value::String(staged_overlay_abs),
-            );
+            entry.insert("path".to_string(), toml::Value::String(staged_overlay_abs));
             crates_io.insert(self_name.to_string(), toml::Value::Table(entry));
             Ok(())
         }
@@ -1806,10 +1802,7 @@ fn apply_self_patch_policy(
                     // would otherwise survive untouched. We want a
                     // clean overlay byte shape.
                     let mut entry = toml::map::Map::new();
-                    entry.insert(
-                        "path".to_string(),
-                        toml::Value::String(staged_overlay_abs),
-                    );
+                    entry.insert("path".to_string(), toml::Value::String(staged_overlay_abs));
                     crates_io.insert(self_name.to_string(), toml::Value::Table(entry));
                     return Ok(());
                 }
@@ -1872,8 +1865,7 @@ fn apply_self_patch_policy(
 ///
 /// See [`crate::compat::overlay::mirror_upstream_into_overlay`] for
 /// the full rule table.
-const MIRROR_EXCLUDED_TOP_LEVEL: &[&str] =
-    &["target", ".git", "Cargo.toml", "Cargo.lock"];
+const MIRROR_EXCLUDED_TOP_LEVEL: &[&str] = &["target", ".git", "Cargo.toml", "Cargo.lock"];
 
 /// Top-level upstream entries that, if found in the staged overlay
 /// dir, the stale-cleanup pass MUST remove (CASE 14b in the §4.5.6
@@ -1987,8 +1979,7 @@ fn mirror_upstream_into_overlay(
         )
     })?;
 
-    let mut upstream_names: std::collections::BTreeSet<String> =
-        std::collections::BTreeSet::new();
+    let mut upstream_names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
     for entry_res in upstream_entries {
         let entry = entry_res.map_err(|e| {
@@ -2200,10 +2191,7 @@ fn reconcile_one_entry(upstream_path: &Path, staged_path: &Path) -> Result<(), E
 /// platform check, because symlink availability is a runtime property
 /// (Windows Developer Mode, `nosymlink` mounts, filesystem
 /// configuration, container restrictions).
-fn create_canonical_mirror(
-    upstream_path: &Path,
-    staged_path: &Path,
-) -> Result<(), Error> {
+fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(), Error> {
     let mirror_err = |stage: &str, e: std::io::Error| {
         Error::overlay_mirror_failed(
             upstream_path.to_path_buf(),
