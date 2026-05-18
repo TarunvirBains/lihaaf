@@ -2410,12 +2410,26 @@ fn cargo_accepts_remap_when_upstream_self_patch_cxx_shape() {
 
     let upstream_manifest = upstream_dir.join("Cargo.toml");
 
-    // Upstream package-root layout mirrors the cxx pilot:
+    // Upstream package-root layout faithfully mirrors the cxx upstream
+    // Cargo.toml (github.com/dtolnay/cxx, verified Codex rollout 019e3cc3):
     //   - root manifest with `[package]` + `links` + `build.rs`
+    //   - `[workspace] members = ["test-suite"]` — workspace declaration ONLY;
+    //     cxx does NOT carry a root `[dependencies]` edge to the member
     //   - workspace member `test-suite` with `foo = "1.0"` registry dep
     //   - `[patch.crates-io.foo] = { path = "." }` (the cxx self-patch)
     //   - build.rs reads `src/cxx_stub.cc` via CARGO_MANIFEST_DIR
     //   - include/stub.h is referenced via `Path::exists()`
+    //
+    // The absence of `[dependencies] test-suite = { path = "test-suite" }` in
+    // the root is load-bearing: adding it creates a `foo → test-suite → foo`
+    // active-dep cycle that cargo rejects even when both `foo` references
+    // resolve to the same source-id (Codex diagnosis, rollout 019e3cc3).
+    // The real cxx avoids this because it never declares test-suite as a
+    // root build dependency.
+    //
+    // cargo rustc below runs `-p foo` against the staged overlay; the member
+    // is in the workspace but is NOT a build dep of the root, mirroring real
+    // cxx's build topology.
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -2430,9 +2444,6 @@ path = "src/lib.rs"
 
 [workspace]
 members = ["test-suite"]
-
-[dependencies]
-test-suite = { path = "test-suite" }
 
 [patch.crates-io]
 foo = { path = "." }
@@ -2810,38 +2821,51 @@ foo = { path = "../my-fork" }
     }
 }
 
-/// §5.2.9 — SEC-8 cargo-graph acceptance dedicated proof.
+/// §5.2.9 — SEC-8 Rule 1 INJECT cargo-graph proof: workspace member registry
+/// dep remapped via injected self-patch (R8 rescope).
 ///
-/// Constructs the synthetic `bar → test-suite → bar` topology with
-/// NO `links` collision (so any cargo failure surfaces at the
-/// resolver level as `specification \`bar\` is ambiguous`, not at the
-/// build-script level). Rule 1 INJECT fires (no upstream
-/// `[patch.crates-io.bar]` entry). The patched topology resolves
-/// cleanly because both references collapse to the same source-id
-/// (staged-overlay path). This is the dedicated load-bearing proof
-/// that cargo accepts the patched-self-patch topology AS A GENERAL
-/// CARGO-RESOLVER PROPERTY (distinct from §5.2.6 which validates
-/// the cxx failure shape with `links`).
+/// **R8 rescope (Codex rollout 019e3cc3, 2026-05-18):** The prior fixture
+/// carried `[dependencies] test-suite = { path = "test-suite" }` in the
+/// root, creating a `bar → test-suite → bar` active-dep cycle that cargo
+/// rejects even when both `bar` references resolve to the same source-id.
+/// The `root → member → root` topology proof is empirically impossible:
+/// cargo rejects it unconditionally at the dep-cycle check.
 ///
-/// **What this test bites.** A regression that fails to absolutize
-/// the injected `[patch.crates-io.bar].path` (or emits a form that
-/// cargo doesn't recognize as a path source) would leave
-/// `bar = "1.0"` resolving to crates.io while the root resolves to
-/// the staged-overlay path → cargo's resolver sees two source-ids
-/// for `bar` and reports the ambiguity error.
+/// This test is rescoped to prove what cargo ACTUALLY accepts: a workspace
+/// whose root does NOT depend on the member, but whose member carries
+/// `bar = "1.0"` (registry-name dep). Rule 1 INJECT fires (no upstream
+/// `[patch.crates-io.bar]` entry) and adds the patch. The member's
+/// `bar = "1.0"` reference is redirected via the injected patch to the
+/// staged-overlay path source-id, which is the same source-id as the root
+/// `bar`'s `[package]` → cargo resolves without ambiguity.
+///
+/// **What this test bites.** A regression that fails to absolutize the
+/// injected `[patch.crates-io.bar].path` (or emits a form that cargo
+/// doesn't recognize as a path source) would leave `bar = "1.0"` resolving
+/// to crates.io while the root resolves to the staged-overlay path → cargo's
+/// resolver sees two source-ids for `bar` and reports the ambiguity error
+/// (`specification \`bar\` is ambiguous`).
+///
+/// **What this test does NOT prove.** The `root → member → root` active-dep
+/// cycle (root declares test-suite as a `[dependencies]` entry that also
+/// dep-on-root-by-registry-name) is rejected by cargo regardless of patch
+/// state. That topology is unfaithful to real upstreams (cxx does not carry
+/// a root dep on its test-suite workspace member). Tests §5.2.6 and this
+/// §5.2.9 both mirror faithful upstream shapes.
 ///
 /// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.9.
 #[test]
-fn cargo_accepts_root_to_test_suite_to_root_topology() {
+fn cargo_accepts_workspace_member_registry_dep_via_self_patch() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
-            "skipping cargo_accepts_root_to_test_suite_to_root_topology: \
+            "skipping cargo_accepts_workspace_member_registry_dep_via_self_patch: \
              set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
 
-    let tmp = tempfile::tempdir().expect("creating tempdir for SEC-8 cargo-graph test");
+    let tmp =
+        tempfile::tempdir().expect("creating tempdir for SEC-8 Rule 1 INJECT cargo-graph test");
     let upstream_dir = tmp.path();
 
     assert!(
@@ -2850,6 +2874,14 @@ fn cargo_accepts_root_to_test_suite_to_root_topology() {
     );
 
     let upstream_manifest = upstream_dir.join("Cargo.toml");
+    // Root manifest: workspace declaration ONLY — no root dep on member.
+    // cxx-faithful shape: root is in the workspace with its test-suite member,
+    // but root does NOT carry `[dependencies] test-suite = { path = "test-suite" }`.
+    // Adding that edge creates a `bar → test-suite → bar` active-dep cycle
+    // that cargo rejects; omitting it is the correct faithful shape.
+    //
+    // cargo rustc below runs `-p bar` against the staged overlay; the member
+    // is in the workspace but not a build dep of the root.
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -2862,9 +2894,6 @@ path = "src/lib.rs"
 
 [workspace]
 members = ["test-suite"]
-
-[dependencies]
-test-suite = { path = "test-suite" }
 "#,
     )
     .expect("writing upstream Cargo.toml");
@@ -2875,7 +2904,8 @@ test-suite = { path = "test-suite" }
     )
     .expect("writing src/lib.rs");
 
-    // Workspace member referencing `bar` by registry name.
+    // Workspace member referencing `bar` by registry name — the dep Rule 1
+    // INJECT must redirect to the staged-overlay path.
     let member_dir = upstream_dir.join("test-suite");
     std::fs::create_dir_all(member_dir.join("src")).expect("creating test-suite/src/");
     std::fs::write(
@@ -2911,13 +2941,13 @@ bar = "1.0"
         "Rule 1 INJECT path must target the staged-overlay-dir; got `{bar_path}`"
     );
 
-    // The acid test: cargo rustc against the staged overlay. Pre-fix
-    // (without Rule 1 INJECT), cargo's resolver sees `bar` referenced
-    // BOTH as the workspace root (path source) AND via `test-suite`'s
-    // `bar = "1.0"` registry-name dep → `specification \`bar\` is
-    // ambiguous`. Post-fix, the injected patch redirects the
-    // registry-name reference to the staged-overlay path → both
-    // references collapse to the same source-id → resolution clean.
+    // The acid test: cargo rustc -p bar against the staged overlay. Pre-fix
+    // (without Rule 1 INJECT), cargo's resolver sees `bar` referenced BOTH as
+    // the workspace root (path source) AND via `test-suite`'s `bar = "1.0"`
+    // registry-name dep → `specification \`bar\` is ambiguous`. Post-fix,
+    // the injected patch redirects the registry-name reference to the
+    // staged-overlay path → both references collapse to the same source-id →
+    // resolution clean. Root doesn't dep on member so no active-dep cycle.
     let target_dir = upstream_dir.join("target").join("lihaaf-build");
     let output = std::process::Command::new("cargo")
         .arg("rustc")
@@ -2936,8 +2966,8 @@ bar = "1.0"
 
     assert!(
         output.status.success(),
-        "cargo rustc must accept the patched `bar → test-suite → bar` \
-         topology (SEC-8 closure); got exit {:?}\n\
+        "cargo rustc must accept the workspace-member-registry-dep-via-self-patch \
+         topology (SEC-8 Rule 1 INJECT closure); got exit {:?}\n\
          stdout:\n{}\n\
          stderr:\n{}",
         output.status.code(),
