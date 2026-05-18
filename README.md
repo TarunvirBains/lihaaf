@@ -1,24 +1,34 @@
 # lihaaf
 
-**lihaaf** ("quilt", Urdu) was inspired by
+`lihaaf` is a fast compile-fail and compile-pass test harness for Rust proc
+macros — a faster `trybuild`-style workflow for proc-macro crates with many
+compile-fail / compile-pass fixtures.
+
+## Why lihaaf?
+
+`lihaaf` ("quilt", Urdu) was inspired by
 [Trybuild](https://github.com/dtolnay/trybuild) but driven by a need for
-quick iteration: the compile-fail/compile-pass fixture style Trybuild made
+quick iteration: the compile-fail/compile-pass fixture style `trybuild` made
 practical, combined with a build model that keeps adding fixtures cheap.
 
 `lihaaf` is a CLI proc-macro test harness for Rust. It builds the consumer
-crate as a dynamic library once per session, then dispatches each fixture
-to `rustc` individually, linking the prebuilt dylib via `--extern`. For
-larger fixture suites this usually means seconds instead of minutes,
-because fixtures share that one build.
+crate as a dynamic library once per session, then dispatches each fixture to
+`rustc` individually, linking the prebuilt dylib via `--extern`. For larger
+fixture suites this usually means seconds instead of minutes, because fixtures
+share that one build.
 
-There’s a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
+There's a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
 Most of the code aims to stay readable first, not process-centric.
 
-## Measured adopter result
+## lihaaf vs trybuild
 
-`djogi-macros` is the canonical adopter that drove the v0.1 design. In
-the Phase 8.5 integration work, the same 237 proc-macro fixtures ran
-through lihaaf successfully:
+`trybuild` is the mature default for compile-fail / compile-pass testing in
+Rust. `lihaaf` is for proc-macro authors who want faster iteration when their
+fixture corpus grows — it builds the macro crate into a dylib once and
+dispatches per-fixture rustc invocations against it, so adding the N+1th
+fixture stays cheap.
+
+**Measured adopter result** (`djogi-macros`, 237 fixtures):
 
 - `cargo lihaaf --list`: 237 fixtures discovered.
 - `cargo lihaaf --filter compile_pass`: 99 OK in 27.5 seconds.
@@ -31,8 +41,33 @@ The existing trybuild fallback still passed on the same source corpus
 trybuild suite took 1942.56 seconds in the same validation pass. Exact
 timings depend on hardware, target-dir state, and fixture shape; the
 important result is that lihaaf preserves the compile-fail/compile-pass
-workflow while making local iteration practical on large proc-macro
-suites.
+workflow while making local iteration practical on large proc-macro suites.
+
+## Compile-fail tests
+
+Place fixtures in `tests/lihaaf/compile_fail/`. Each `.rs` file is a
+standalone Rust snippet expected to fail compilation. lihaaf compares the
+normalized stderr output against a `.stderr` snapshot file with the same
+stem. Run `cargo lihaaf --bless` the first time to write the snapshots.
+
+## Compile-pass tests
+
+Place fixtures in `tests/lihaaf/compile_pass/`. Each `.rs` file must compile
+successfully when linked against the consumer crate's dylib. lihaaf reports
+`OK` for each one that does and `EXPECTED_PASS_BUT_FAILED` for any that does
+not.
+
+## Proc macro test harness
+
+lihaaf is purpose-built for proc-macro crates. The consumer crate is compiled
+once as a `dylib` (`cargo rustc --crate-type=dylib`); every fixture
+invocation then links that prebuilt dylib via `--extern`. This means:
+
+- Proc-macro expansion runs against the real compiled macro implementation —
+  no mocking, no simulation.
+- Adding a new fixture does not re-invoke the macro-crate build.
+- Multi-suite support lets you test the same macro with different Cargo
+  feature subsets in a single session.
 
 ## Quick start
 
@@ -189,7 +224,7 @@ felt easiest to keep stable and debuggable in day-to-day use:
   `cargo build` cache, since `RUSTFLAGS` is part of cargo's
   fingerprint.
 
-- **File copy primitive**: `std::fs::copy`. It’s plain and predictable:
+- **File copy primitive**: `std::fs::copy`. It's plain and predictable:
   POSIX semantics on Linux/macOS, `CopyFileW` on Windows. Reflink is
   still deferred for v0.2.
 
