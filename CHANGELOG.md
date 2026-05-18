@@ -6,6 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Compat-mode now applies an intent-aware self-patch policy to `[patch.crates-io.<overlay-package-name>]` in the staged overlay (Option H, 4 rules):
+  - Rule 1 (INJECT): if your upstream Cargo.toml does not self-patch the package-under-test, lihaaf injects `[patch.crates-io.<overlay-package-name>] = { path = "<staged-overlay-dir>" }`. Resolves the previously-failing serde-json case (`ambiguous specification`) and the family-completeness equivalents on anyhow-shape pilots.
+  - Rule 2 (REMAP): if your upstream self-patches the package-under-test to a path that resolves to the upstream root crate (cxx-style `path = "."`), lihaaf rewrites the entry to point at the staged overlay directory. Resolves the previously-failing cxx case (`links = "cxxbridge1"` collision).
+  - Rule 3: non-target `[patch.crates-io.<X>]` entries are preserved untouched.
+  - Rule 4 (REJECT): if your upstream self-patches the package-under-test to a non-root path (vendored fork) or to a git source, lihaaf rejects with a clear error. The escape hatch (`--compat-allow-patch-override`) is deferred to v0.2/v1.1; if you hit this case, file an issue.
+
+  See `docs/compatibility-plan.md` §3.2.3 for the adopter-facing rule table.
+
+- Compat-mode now creates a staged package-root mirror in the overlay directory. After writing the overlay `Cargo.toml`, lihaaf creates symlinks (or copies on platforms where symlinks are unavailable) for each top-level entry in the upstream package directory into the staged overlay dir. This ensures that `build.rs` scripts which read package-root-relative files via `CARGO_MANIFEST_DIR` (cxx: `src/cxx.cc`, `include/cxx.h`) or via cwd probes (anyhow: `src/nightly.rs`; thiserror: `build/probe.rs`) find the correct files during the overlay build. Upstream entries excluded from the mirror: `target/`, `.git/`, `Cargo.toml` (overlay-generated), `Cargo.lock`. Without this fix, cxx builds fail with a hard I/O error; anyhow and thiserror builds silently use incorrect cfg flags (silent-false probe pattern).
+
+  Issues #40 and #47.
+
 ## [0.1.0-beta.7] — 2026-05-18
 
 Bundles the `allow_lints` feature (issue #43) plus a class-sweep fix for
