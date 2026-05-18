@@ -510,6 +510,15 @@ where
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
+    // Staged overlay dir, shared by `apply_self_patch_policy` (which
+    // needs the absolutized path string for its INJECT / REMAP
+    // emission) and the staged-mirror writer (which needs the same
+    // dir to create symlinks into). Sharing the construction with
+    // `sibling_path` below keeps the single source-of-truth shape:
+    // `<upstream>/target/lihaaf-overlay/`. Shape A per
+    // `docs/plans/issue-40-47-overlay-vs-registry.md` §4.2.
+    let staged_overlay_dir: PathBuf = upstream_dir.join("target").join("lihaaf-overlay");
+
     if let toml::Value::Table(top) = &mut value {
         // Insert/extend [lib] crate-type. The canonicalization is
         // idempotent: a second run on the output is a no-op.
@@ -536,6 +545,52 @@ where
         // `absolutize_path_bearing_keys` for the full key inventory and
         // the workspace-members handling rationale.
         absolutize_path_bearing_keys(top, &upstream_dir);
+
+        // Option H intent-aware self-patch policy for
+        // `[patch.crates-io.<upstream-package-name>]` (issues #40 + #47).
+        //
+        // - cxx (#47) fails with `package cxx links to the native library
+        //   cxxbridge1, but it conflicts with a previous package which
+        //   links to cxxbridge1 as well` because cxx-test-suite declares
+        //   `cxx = "1.0"` from crates.io while the overlay declares
+        //   `[package] name = "cxx"` from `target/lihaaf-overlay/`: two
+        //   distinct source-ids for the same `links` claim.
+        // - serde_json (#40) fails with `specification serde_json is
+        //   ambiguous` for the same root cause without the `links`
+        //   collision detail.
+        //
+        // Rule 1 INJECT (clean upstream — anyhow / thiserror / serde_json
+        // / clean Round-2 candidates) emits a `{ path =
+        // "<staged-overlay-dir>" }` entry pointing at the overlay's own
+        // package; cargo collapses both registry-name references to the
+        // staged-overlay path-source-id and the conflict / ambiguity is
+        // gone.
+        //
+        // Rule 2 REMAP (cxx upstream's `[patch.crates-io.cxx] = { path =
+        // "." }`) replaces the upstream's self-patch entry with the same
+        // staged-overlay-dir target — preserving the upstream's "patch
+        // to root" intent in the overlay's manifest context.
+        //
+        // Rule 3 CONTINUE-ABSOLUTIZE leaves non-`<self>` `[patch.crates-
+        // io.<X>]` entries alone — `absolutize_patch_paths` (above) has
+        // already absolutized them against `upstream_dir`.
+        //
+        // Rule 4 REJECT (vendored fork / git source / non-root path)
+        // surfaces `Error::CompatPatchOverrideConflict`; the
+        // `--compat-allow-patch-override` escape hatch is deferred to
+        // v0.2 / v1.1.
+        //
+        // Targets the STAGED OVERLAY DIR (not the upstream dir) to
+        // avoid the R1 self-loop bug: pointing the patch at the upstream
+        // dir IS the source-id cargo already aliases to crates.io. See
+        // `apply_self_patch_policy` rustdoc and §2.1 / §2.6 of the
+        // implementation plan for the cargo-anchoring reasoning.
+        apply_self_patch_policy(
+            top,
+            upstream_crate_name.as_deref(),
+            &upstream_dir,
+            &staged_overlay_dir,
+        )?;
 
         if let Some(meta) = synthetic.as_ref() {
             inject_synthetic_metadata(top, meta);
@@ -575,13 +630,7 @@ where
     // from the upstream `Cargo.toml` while satisfying that constraint.
     // `write_file_atomic` calls `create_dir_all` on the parent, so the
     // subdirectory is created on first use without a separate call here.
-    let crate_dir = upstream_manifest_path
-        .parent()
-        .unwrap_or(upstream_manifest_path);
-    let sibling_path = crate_dir
-        .join("target")
-        .join("lihaaf-overlay")
-        .join("Cargo.toml");
+    let sibling_path = staged_overlay_dir.join("Cargo.toml");
 
     // Idempotent rerun guard — skip the write when bytes match. This
     // preserves mtime so a clean-state second invocation does not
@@ -601,6 +650,28 @@ where
     if need_write {
         util::write_file_atomic(&sibling_path, &serialized)?;
     }
+
+    // Staged package-root mirror (issues #40 + #47, §4.5). After the
+    // overlay manifest is written, populate the staged-overlay dir with
+    // a structural mirror of the upstream package root so build scripts
+    // can read package-root files via `CARGO_MANIFEST_DIR` / cwd:
+    //
+    // - cxx `build.rs:143-148` reads `src/cxx.cc` via
+    //   `manifest_dir.join(...)` (hard error without the mirror).
+    // - cxx `build.rs:154-159` references `include/cxx.h`.
+    // - anyhow `build.rs:255-257,323-367` probes
+    //   `Path::new("src").join("nightly.rs")` from cwd (silent-false
+    //   without the mirror — wrong cfg flags).
+    // - thiserror `build.rs:261-263,328-371` probes
+    //   `Path::new("build").join("probe.rs")` from cwd (same silent-
+    //   false hazard).
+    //
+    // Exclusions: `target/` (disposable), `.git/` (must-be-absent),
+    // `Cargo.toml` (overlay-generated, post-condition assertion),
+    // `Cargo.lock` (must-be-absent). Idempotency contract Option B
+    // (§4.5.6): skip-on-canonical-symlink, reconcile-by-replacement
+    // for all other states, exact-sync copy fallback.
+    mirror_upstream_into_overlay(&upstream_dir, &staged_overlay_dir)?;
 
     Ok(OverlayPlan {
         upstream_manifest: upstream_manifest_path.to_path_buf(),
@@ -1516,6 +1587,760 @@ fn absolutize_replace_paths(top: &mut toml::map::Map<String, toml::Value>, upstr
                 entry_table.insert("path".to_string(), toml::Value::String(abs));
             }
         }
+    }
+}
+
+/// Lexically normalize a path: drop `Component::CurDir` (`.`) entries
+/// and preserve every other component (`Normal`, `ParentDir`,
+/// `RootDir`, `Prefix`).
+///
+/// This is the helper Rule 2 (REMAP) detection uses to decide whether
+/// the upstream's `[patch.crates-io.<self>].path` entry, when joined
+/// against the upstream manifest dir, resolves to the upstream root
+/// crate. Two paths are lexically equal iff their component vectors
+/// (after `.`-filtering) are equal.
+///
+/// **Scope:** lexical only. `..` (`Component::ParentDir`) is preserved,
+/// not collapsed — collapsing `..` would change semantics on a
+/// filesystem with symlinks, and lihaaf is explicit about NOT calling
+/// `canonicalize()` here (see [`crate::compat::overlay`] module docs
+/// and issue #40/#47 plan §6.11). Symlinked-equivalent paths compare
+/// lexically unequal.
+///
+/// Tests in this module pin the supported equivalences:
+/// - `<dir>` == `<dir>/.` (one CurDir filtered)
+/// - `<dir>` == `<dir>/` (trailing slash handled by `Path::components`)
+/// - `<dir>//<sub>` == `<dir>/<sub>` (repeated separators collapse)
+/// - `<dir>/..` != `<dir>` (ParentDir preserved)
+/// - real path != symlinked path (no `canonicalize()`)
+fn lexical_path_normalize_path(p: &Path) -> Vec<std::path::Component<'_>> {
+    p.components()
+        .filter(|c| !matches!(c, std::path::Component::CurDir))
+        .collect()
+}
+
+/// Apply the Option H intent-aware self-patch policy to
+/// `[patch.crates-io.<self>]` in the overlay's parsed manifest table.
+///
+/// `self` is the upstream's `[package].name`, captured by
+/// [`read_upstream_crate_name`] before this function runs.
+///
+/// **Why this exists (issue #40 / #47).** The staged overlay manifest
+/// at `<upstream>/target/lihaaf-overlay/Cargo.toml` declares
+/// `[package].name = "<self>"` with the upstream's version. From
+/// cargo's POV the staged-overlay package lives at a path-source-id
+/// distinct from the upstream's path-source-id; without a self-patch
+/// redirect, downstream resolution sees two competing sources for the
+/// same crate-name+version pair and fails with either:
+///
+/// - `package <X> links to the native library <L>, but it conflicts
+///   with a previous package which links to <L> as well` (cxx-shape,
+///   issue #47; fires when any path-dep / workspace member references
+///   `<self>` by registry-name AND `<self>` declares `links = "<L>"`),
+///   OR
+/// - `error: specification <X> is ambiguous` (serde-json-shape, issue
+///   #40; fires when any in-graph entity references `<self>` by
+///   registry-name).
+///
+/// The fix injects (or remaps) a `[patch.crates-io.<self>] = { path =
+/// "<absolutized staged-overlay-dir>" }` entry so cargo's resolver
+/// redirects every "registry <self>" reference to the staged-overlay
+/// path-source — the same source-id as the overlay's own `[package]`.
+/// The two references then collapse to one Package in the resolved
+/// graph; both failure shapes disappear.
+///
+/// # The Option H 4-rule decision tree
+///
+/// Rules are mutually exclusive and exhaustive; the first matching
+/// rule fires.
+///
+/// **Rule 1 (INJECT)** — `[patch.crates-io.<self>]` is absent. Insert
+/// `{ path = "<absolutized staged-overlay-dir>" }`. Pilots:
+/// anyhow / thiserror / serde-json / clean Round-2 candidates.
+///
+/// **Rule 2 (REMAP)** — `[patch.crates-io.<self>]` is present with a
+/// `.path` key and NO `git`/`branch`/`tag`/`rev`, AND the resolved
+/// target (path lexically-normalized after joining against the
+/// upstream manifest dir) IS the upstream root crate. Replace the
+/// entire entry with a clean `{ path = "<absolutized
+/// staged-overlay-dir>" }` (matching the §6.1 Rule 2 normative
+/// emission). The upstream's "self-patch to root" intent is preserved
+/// — translated to the overlay's manifest context, the equivalent
+/// root is the staged-overlay-dir. Pilots: cxx (`path = "."`).
+///
+/// **Rule 3 (CONTINUE-ABSOLUTIZE)** — no-op fallthrough for the
+/// `<self>` key. Non-target `[patch.crates-io.<X>]` entries where
+/// `<X> != <self>` are NOT touched by this function. The pre-existing
+/// [`absolutize_patch_paths`] pass (run before this function) already
+/// absolutized those entries against the upstream dir. Documented
+/// here so the test surface pins the orthogonality contract.
+///
+/// **Rule 4 (REJECT)** — `[patch.crates-io.<self>]` is present but the
+/// target is external: (a) `.path` resolves to a non-root dir
+/// (vendored fork), (b) `git`/`branch`/`tag`/`rev` keys present
+/// (registry-name aliased to git source), or (c) both `.path` and
+/// `git`/etc. Return [`Error::CompatPatchOverrideConflict`]; the
+/// overlay materialization fails fast. The
+/// `--compat-allow-patch-override` escape hatch is deferred to v0.2 /
+/// v1.1.
+///
+/// # Why REMAP over PRESERVE-AS-IS
+///
+/// Cargo anchors `[patch.crates-io.X].path` relative to the manifest
+/// declaring the patch (= the staged overlay manifest in our case).
+/// Verbatim-preserving `path = "."` from the upstream into the
+/// overlay would let cargo re-anchor `.` to the staged-overlay-dir at
+/// READ time, which happens to give the correct source-id for the
+/// cxx case (`path = "."` resolves to upstream root). But the
+/// general case (`path = "../my-fork"` resolves to a sibling dir)
+/// would silently misroute under PRESERVE-AS-IS: cargo would
+/// re-anchor `..` against `<staged-overlay>/`, NOT `<upstream>/`,
+/// producing `<staged-overlay>/../my-fork = <upstream>/target/my-fork`
+/// — a dir the adopter never intended. REMAP unifies the emission
+/// form across all path-bearing self-patches: every emitted byte
+/// shape is the absolutized staged-overlay-dir, robust to cargo /
+/// `absolutize_patch_paths` future changes.
+///
+/// # Ordering
+///
+/// This function runs AFTER [`absolutize_patch_paths`] and BEFORE
+/// [`inject_synthetic_metadata`] / [`override_workspace_inheritance`].
+/// Running after `absolutize_patch_paths` means non-self `[patch]`
+/// entries (Rule 3 fallthrough) are already absolutized. Rule 2
+/// detection re-joins the upstream's `.path` value against
+/// `upstream_dir`; `upstream_dir.join("/abs/path")` returns
+/// `/abs/path` on Unix (the prefix wins) so the join is correct
+/// regardless of whether the value is pre-absolutized.
+///
+/// # Errors
+///
+/// Returns [`Error::CompatPatchOverrideConflict`] on Rule 4. Returns
+/// `Ok(())` on Rule 1 (INJECT), Rule 2 (REMAP), Rule 3 (no-op for
+/// `<self>` key), or when `upstream_crate_name` is `None`.
+fn apply_self_patch_policy(
+    top: &mut toml::map::Map<String, toml::Value>,
+    upstream_crate_name: Option<&str>,
+    upstream_dir: &Path,
+    staged_overlay_dir: &Path,
+) -> Result<(), Error> {
+    // Step 1: bail when the upstream has no crate name. Workspace-root
+    // manifests are already rejected by `is_workspace_root_manifest`
+    // at the materializer's top; this is defense-in-depth for partial
+    // / malformed manifests.
+    let Some(self_name) = upstream_crate_name else {
+        return Ok(());
+    };
+    if self_name.is_empty() {
+        return Ok(());
+    }
+
+    // Step 2: compute the absolutized staged-overlay path string,
+    // matching the absolutization shape used by every other
+    // path-bearing key (forward-slash form via `to_forward_slash`).
+    let staged_overlay_abs =
+        crate::util::to_forward_slash(&staged_overlay_dir.to_string_lossy());
+
+    // Step 3-4: ensure `top["patch"]` and `top["patch"]["crates-io"]`
+    // exist as tables.
+    let patch_entry = top
+        .entry("patch".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(patch) = patch_entry else {
+        // Defensive: `[patch]` was declared as a non-table value in
+        // the upstream. Surface as a TOML parse error; cargo would
+        // also reject this.
+        return Err(Error::TomlParse {
+            path: PathBuf::from("<overlay>"),
+            message: "`[patch]` must be a table".to_string(),
+        });
+    };
+    let crates_io_entry = patch
+        .entry("crates-io".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(crates_io) = crates_io_entry else {
+        return Err(Error::TomlParse {
+            path: PathBuf::from("<overlay>"),
+            message: "`[patch.crates-io]` must be a table".to_string(),
+        });
+    };
+
+    // Step 5: Option H 4-rule dispatch on
+    // `top["patch"]["crates-io"][<self>]`.
+    match crates_io.get(self_name).cloned() {
+        // Rule 1: INJECT. No upstream entry; create a fresh one.
+        None => {
+            let mut entry = toml::map::Map::new();
+            entry.insert(
+                "path".to_string(),
+                toml::Value::String(staged_overlay_abs),
+            );
+            crates_io.insert(self_name.to_string(), toml::Value::Table(entry));
+            Ok(())
+        }
+        // Entry present — Rules 2 / 4 dispatch.
+        Some(toml::Value::Table(existing_entry)) => {
+            let has_git = existing_entry.contains_key("git");
+            let has_branch = existing_entry.contains_key("branch");
+            let has_tag = existing_entry.contains_key("tag");
+            let has_rev = existing_entry.contains_key("rev");
+            let any_git_keys = has_git || has_branch || has_tag || has_rev;
+            let path_raw = existing_entry.get("path").and_then(|v| v.as_str());
+
+            // Rule 2 fires only when (a) the entry has `.path`,
+            // (b) NO git-source keys, AND (c) the joined-and-
+            // lexical-normalized path equals the upstream manifest
+            // dir.
+            if let Some(path_raw) = path_raw
+                && !any_git_keys
+            {
+                let joined = upstream_dir.join(path_raw);
+                let joined_normalized = lexical_path_normalize_path(&joined);
+                let upstream_normalized = lexical_path_normalize_path(upstream_dir);
+                if joined_normalized == upstream_normalized {
+                    // Rule 2 REMAP: replace the entire entry with a
+                    // clean `{ path = "<staged-overlay-dir>" }`.
+                    // Clearing (vs. upsert-path) is intentional per
+                    // §6.1 "Overwrite the entry": Rule 2's entry
+                    // condition guarantees no git/branch/tag/rev
+                    // keys today, but a future cargo manifest key
+                    // would otherwise survive untouched. We want a
+                    // clean overlay byte shape.
+                    let mut entry = toml::map::Map::new();
+                    entry.insert(
+                        "path".to_string(),
+                        toml::Value::String(staged_overlay_abs),
+                    );
+                    crates_io.insert(self_name.to_string(), toml::Value::Table(entry));
+                    return Ok(());
+                }
+            }
+
+            // Rule 4: REJECT. Falls here on (a) git-source keys
+            // present, (b) `.path` resolves to a non-root dir, OR
+            // (c) the entry has neither `.path` nor git keys
+            // (malformed / empty entry — we are conservative).
+            Err(Error::CompatPatchOverrideConflict {
+                crate_name: self_name.to_string(),
+                upstream_entry: format!("{:?}", toml::Value::Table(existing_entry)),
+                expected_resolution: format!(
+                    "lihaaf would inject [patch.crates-io.{self_name}] = \
+                     {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT) \
+                     or remap an upstream self-patch to that path (Rule 2 \
+                     REMAP), but the upstream's existing entry declares an \
+                     external target (vendored fork, git source, or non-root \
+                     path). To opt into overwriting, use \
+                     --compat-allow-patch-override (deferred to v0.2 / v1.1; \
+                     see issues #40 + #47 for tracking)."
+                ),
+            })
+        }
+        // Entry present but not a table (e.g. inline string — invalid
+        // for `[patch.crates-io.<X>]`). Reject with the same Rule-4
+        // shape so the operator sees the same actionable message.
+        Some(other) => Err(Error::CompatPatchOverrideConflict {
+            crate_name: self_name.to_string(),
+            upstream_entry: format!("{other:?}"),
+            expected_resolution: format!(
+                "lihaaf would inject [patch.crates-io.{self_name}] = \
+                 {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT), \
+                 but the upstream's existing entry is not a table — cargo \
+                 requires `[patch.crates-io.<X>] = {{ ... }}`."
+            ),
+        }),
+    }
+}
+
+/// Top-level upstream entries that the staged package-root mirror MUST
+/// NOT touch.
+///
+/// Each entry falls into one of two categories. The mirror loop reads
+/// this list to decide whether an upstream top-level entry should be
+/// mirrored; the stale-cleanup pass uses it to decide whether a name
+/// it sees in the staged overlay dir is a known excluded entry.
+///
+/// - **Disposable** (`target`): may or may not be present in the
+///   staged overlay; the mirror leaves it alone. `target/` belongs to
+///   cargo; mirroring it would either create circular artifact paths
+///   or thrash I/O on large projects.
+/// - **Must-be-absent-or-removed** (`Cargo.toml`, `Cargo.lock`,
+///   `.git`): never mirrored, and if present in the staged overlay
+///   from a prior buggy run or manual placement, must be removed by
+///   the stale-cleanup pass. `Cargo.toml` is the overlay's own
+///   generated manifest (the post-condition assertion guards type);
+///   `Cargo.lock` would interfere with cargo's fresh-resolve
+///   semantics; `.git` is irrelevant to build-script execution.
+///
+/// See [`crate::compat::overlay::mirror_upstream_into_overlay`] for
+/// the full rule table.
+const MIRROR_EXCLUDED_TOP_LEVEL: &[&str] =
+    &["target", ".git", "Cargo.toml", "Cargo.lock"];
+
+/// Top-level upstream entries that, if found in the staged overlay
+/// dir, the stale-cleanup pass MUST remove (CASE 14b in the §4.5.6
+/// rerun-state table).
+///
+/// `target/` is NOT in this list — it is "disposable" (CASE 14a):
+/// neither mirrored nor removed. Only `Cargo.toml` is checked
+/// separately by the [`mirror_upstream_into_overlay`] post-condition
+/// assertion (it must remain a regular file written by
+/// `write_file_atomic`).
+const MIRROR_MUST_REMOVE_IF_PRESENT: &[&str] = &[".git", "Cargo.lock"];
+
+/// Populate the staged overlay dir with a structural mirror of the
+/// upstream package root: for each non-excluded top-level entry in
+/// `<upstream>/`, create a symlink (or copy under fallback) at the
+/// matching path under `<staged-overlay>/`.
+///
+/// # Why this exists (issue #40 / #47, §4.5)
+///
+/// When cargo builds the overlay package via `cargo rustc
+/// --manifest-path <staged-overlay>/Cargo.toml`, it sets
+/// `CARGO_MANIFEST_DIR` and the build-script cwd to the staged
+/// overlay dir. Build scripts in real upstream pilots access
+/// package-root-relative files through that dir:
+///
+/// - `cxx build.rs`: reads `src/cxx.cc` via `manifest_dir.join(...)`
+///   and references `include/cxx.h` — hard error (`No such file or
+///   directory`) if the staged dir is empty.
+/// - `anyhow build.rs`: probes `Path::new("src").join("nightly.rs")`
+///   from cwd — silent-false (returns `false` and disables nightly
+///   cfg) if missing.
+/// - `thiserror build.rs`: probes `Path::new("build").join("probe.rs")`
+///   from cwd — same silent-false hazard.
+///
+/// The fix is structural: after the overlay manifest is written, this
+/// function creates symlinks at each `<staged-overlay>/<entry>` →
+/// `<upstream>/<entry>` for every non-excluded `<entry>`. A build
+/// script reading `manifest_dir.join("src/cxx.cc")` then follows the
+/// symlink and finds the real upstream file.
+///
+/// # Excluded entries (§4.5.4)
+///
+/// - `target/` — disposable (CASE 14a); left alone in either direction.
+/// - `.git/` — must be absent (CASE 14b); removed if present.
+/// - `Cargo.toml` — must remain the overlay's generated regular file
+///   (post-condition assertion).
+/// - `Cargo.lock` — must be absent (CASE 14b); removed if present.
+///
+/// # Idempotency contract (Option B, §4.5.6)
+///
+/// Skip an entry only when the current state is the canonical symlink
+/// to the correct `<upstream>/<entry>` (CASE 2). For all other states,
+/// reconcile by replacing the stale state with the canonical mirror.
+/// 15-case rerun-state table:
+///
+/// - CASEs 1, 10: absent at destination → create canonical symlink.
+/// - CASE 2: canonical symlink already present → skip (idempotent
+///   inode-identity guard).
+/// - CASE 3: wrong-target symlink → unlink + create canonical.
+/// - CASE 4: broken symlink → unlink (and recreate if upstream still
+///   present).
+/// - CASE 5: real file in staged vs file in upstream → remove + create
+///   canonical symlink (symlink mode) or byte-check (copy mode).
+/// - CASE 6: real directory in staged vs dir in upstream → remove tree
+///   + create canonical symlink (symlink mode) or exact-sync copy
+///     (copy mode — MUST remove destination-only files).
+/// - CASE 7: type mismatch (file ↔ dir) → remove + create canonical
+///   with current type.
+/// - CASE 8: manual placement at a mirror-eligible path → replace
+///   with canonical (no preservation semantics).
+/// - CASE 9: stale entry in staged with no upstream counterpart →
+///   remove (forward stale-cleanup).
+/// - CASE 11: upstream content changed since prior run → symlink mode
+///   passes through; copy mode byte-checks.
+/// - CASE 12: mixed partial state → per-entry reconciliation.
+/// - CASE 13: entire overlay stale from different upstream →
+///   reconcile every entry (per-entry, not per-manifest).
+/// - CASE 14a (`target/`): never touched.
+/// - CASE 14b (`.git/`, `Cargo.lock`): removed by stale-cleanup if
+///   present.
+/// - CASE 15: post-condition — `<staged-overlay>/Cargo.toml` must be a
+///   regular file, not a symlink. Type-only structural check;
+///   manifest content correctness is `write_file_atomic`'s contract.
+///
+/// # Copy fallback (§4.5.3)
+///
+/// On platforms / configurations where symlink creation fails
+/// (`PermissionDenied`, `Unsupported`, Windows without symlink
+/// privilege), each entry falls back to a recursive copy. Copies
+/// follow exact-sync semantics for directories (removed-upstream
+/// files MUST NOT persist in the staged overlay — see decision 5 of
+/// §4.5.6).
+///
+/// # Errors
+///
+/// Returns [`Error::OverlayMirrorFailed`] on any I/O failure during
+/// symlink creation, copy fallback, stale-state removal, or the
+/// CASE 15 post-condition assertion.
+fn mirror_upstream_into_overlay(
+    upstream_dir: &Path,
+    staged_overlay_dir: &Path,
+) -> Result<(), Error> {
+    // Per-entry forward pass: reconcile every non-excluded top-level
+    // upstream entry into the staged overlay dir.
+    let upstream_entries = std::fs::read_dir(upstream_dir).map_err(|e| {
+        Error::overlay_mirror_failed(
+            upstream_dir.to_path_buf(),
+            staged_overlay_dir.to_path_buf(),
+            "read-upstream-dir",
+            Some(e),
+        )
+    })?;
+
+    let mut upstream_names: std::collections::BTreeSet<String> =
+        std::collections::BTreeSet::new();
+
+    for entry_res in upstream_entries {
+        let entry = entry_res.map_err(|e| {
+            Error::overlay_mirror_failed(
+                upstream_dir.to_path_buf(),
+                staged_overlay_dir.to_path_buf(),
+                "iter-upstream-dir",
+                Some(e),
+            )
+        })?;
+        let name_os = entry.file_name();
+        let Some(name) = name_os.to_str() else {
+            // Skip non-UTF-8 names. The overlay corpus is Linux /
+            // macOS; a non-UTF-8 entry is a fork-side anomaly the
+            // mirror does not try to reproduce. Document explicitly:
+            // such entries are intentionally not mirrored.
+            continue;
+        };
+        upstream_names.insert(name.to_string());
+
+        if MIRROR_EXCLUDED_TOP_LEVEL.contains(&name) {
+            // CASE 14a (target/) and the Cargo.toml / Cargo.lock /
+            // .git exclusions: do not mirror. The
+            // CASE 14b stale-cleanup pass (below) handles the must-
+            // be-absent case for `.git` and `Cargo.lock` if they
+            // already exist in the staged overlay.
+            continue;
+        }
+
+        let upstream_path = upstream_dir.join(name);
+        let staged_path = staged_overlay_dir.join(name);
+        reconcile_one_entry(&upstream_path, &staged_path)?;
+    }
+
+    // Stale-cleanup pass (CASE 9 + CASE 14b): remove staged entries
+    // that have no upstream counterpart, plus the must-be-absent
+    // entries even if they have an upstream counterpart.
+    if staged_overlay_dir.is_dir() {
+        let staged_iter = std::fs::read_dir(staged_overlay_dir).map_err(|e| {
+            Error::overlay_mirror_failed(
+                staged_overlay_dir.to_path_buf(),
+                staged_overlay_dir.to_path_buf(),
+                "read-staged-dir",
+                Some(e),
+            )
+        })?;
+        for entry_res in staged_iter {
+            let entry = entry_res.map_err(|e| {
+                Error::overlay_mirror_failed(
+                    staged_overlay_dir.to_path_buf(),
+                    staged_overlay_dir.to_path_buf(),
+                    "iter-staged-dir",
+                    Some(e),
+                )
+            })?;
+            let name_os = entry.file_name();
+            let Some(name) = name_os.to_str() else {
+                continue;
+            };
+
+            // Keep the overlay's generated Cargo.toml (post-condition
+            // CASE 15 below asserts type) and the disposable target/.
+            if name == "Cargo.toml" || name == "target" {
+                continue;
+            }
+
+            // CASE 14b: explicit must-be-absent removal even if the
+            // upstream carries one.
+            if MIRROR_MUST_REMOVE_IF_PRESENT.contains(&name) {
+                let stale = staged_overlay_dir.join(name);
+                remove_path_any(&stale).map_err(|e| {
+                    Error::overlay_mirror_failed(
+                        upstream_dir.join(name),
+                        stale.clone(),
+                        "stale-cleanup-must-absent",
+                        Some(e),
+                    )
+                })?;
+                continue;
+            }
+
+            // CASE 9: staged entry without an upstream counterpart.
+            if !upstream_names.contains(name) {
+                let stale = staged_overlay_dir.join(name);
+                remove_path_any(&stale).map_err(|e| {
+                    Error::overlay_mirror_failed(
+                        upstream_dir.join(name),
+                        stale.clone(),
+                        "stale-cleanup-orphan",
+                        Some(e),
+                    )
+                })?;
+            }
+        }
+    }
+
+    // CASE 15 post-condition: `<staged-overlay>/Cargo.toml` MUST be a
+    // regular file, not a symlink. Type-only structural check; content
+    // correctness is `write_file_atomic`'s contract (overlay.rs:527-543
+    // bytes-match skip path).
+    let manifest = staged_overlay_dir.join("Cargo.toml");
+    let meta = std::fs::symlink_metadata(&manifest).map_err(|e| {
+        Error::overlay_mirror_failed(
+            upstream_dir.join("Cargo.toml"),
+            manifest.clone(),
+            "post-condition-stat",
+            Some(e),
+        )
+    })?;
+    if meta.file_type().is_symlink() {
+        return Err(Error::overlay_mirror_failed(
+            upstream_dir.join("Cargo.toml"),
+            manifest.clone(),
+            "post-condition-cargo-toml-is-symlink",
+            None,
+        ));
+    }
+    if !meta.file_type().is_file() {
+        return Err(Error::overlay_mirror_failed(
+            upstream_dir.join("Cargo.toml"),
+            manifest.clone(),
+            "post-condition-cargo-toml-not-regular-file",
+            None,
+        ));
+    }
+
+    Ok(())
+}
+
+/// Reconcile a single staged-overlay mirror entry against its upstream
+/// counterpart, applying the §4.5.6 Option B per-case decision tree.
+///
+/// Used by [`mirror_upstream_into_overlay`] for each non-excluded
+/// upstream top-level entry; the case classification is per the
+/// 15-case rerun-state table (CASEs 1 / 2 / 3 / 4 / 5 / 6 / 7 / 8 in
+/// this function; CASE 9 + CASE 14b in the parent function's stale-
+/// cleanup pass).
+fn reconcile_one_entry(upstream_path: &Path, staged_path: &Path) -> Result<(), Error> {
+    // Helper: structured error wrapper for I/O calls below.
+    let mirror_err = |stage: &str, e: std::io::Error| {
+        Error::overlay_mirror_failed(
+            upstream_path.to_path_buf(),
+            staged_path.to_path_buf(),
+            stage.to_string(),
+            Some(e),
+        )
+    };
+
+    let staged_meta = std::fs::symlink_metadata(staged_path);
+    match staged_meta {
+        // CASE 1 / CASE 10: staged path absent → create canonical
+        // mirror.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            create_canonical_mirror(upstream_path, staged_path)
+        }
+        Err(e) => Err(mirror_err("stat-staged", e)),
+        Ok(meta) => {
+            let ftype = meta.file_type();
+            if ftype.is_symlink() {
+                // Symlink already exists; decide whether it is
+                // canonical (CASE 2 skip) or needs reconciliation
+                // (CASE 3 wrong-target, CASE 4 broken).
+                let link_target = std::fs::read_link(staged_path)
+                    .map_err(|e| mirror_err("readlink-staged", e))?;
+                // Canonical state: the symlink target matches the
+                // upstream path exactly. We compare against the
+                // absolute upstream path because `create_canonical_
+                // mirror` always emits an absolute target.
+                if link_target == upstream_path {
+                    // CASE 2: idempotent skip.
+                    return Ok(());
+                }
+                // CASE 3 or CASE 4: stale symlink (wrong target or
+                // broken). Unlink and recreate.
+                std::fs::remove_file(staged_path)
+                    .map_err(|e| mirror_err("stale-symlink-unlink", e))?;
+                create_canonical_mirror(upstream_path, staged_path)
+            } else if ftype.is_file() {
+                // CASE 5 or CASE 7: real file in staged path. If
+                // upstream is also a file, this is CASE 5; otherwise
+                // CASE 7 (type mismatch). Either way we remove and
+                // recreate canonically.
+                std::fs::remove_file(staged_path)
+                    .map_err(|e| mirror_err("stale-file-remove", e))?;
+                create_canonical_mirror(upstream_path, staged_path)
+            } else if ftype.is_dir() {
+                // CASE 6 or CASE 7: real directory in staged path.
+                // Remove and recreate canonically.
+                std::fs::remove_dir_all(staged_path)
+                    .map_err(|e| mirror_err("stale-dir-remove", e))?;
+                create_canonical_mirror(upstream_path, staged_path)
+            } else {
+                // CASE 8: unrecognised file type (block device, fifo,
+                // etc. — extremely unusual at a Cargo package root).
+                // Treat as stale and remove.
+                std::fs::remove_file(staged_path)
+                    .map_err(|e| mirror_err("stale-other-remove", e))?;
+                create_canonical_mirror(upstream_path, staged_path)
+            }
+        }
+    }
+}
+
+/// Create the canonical mirror entry for one upstream path: a symlink
+/// from `staged_path` → `upstream_path`, with copy fallback on
+/// platforms / configurations where symlink creation fails.
+///
+/// The fallback is selected at I/O time per-entry, not by an upfront
+/// platform check, because symlink availability is a runtime property
+/// (Windows Developer Mode, `nosymlink` mounts, filesystem
+/// configuration, container restrictions).
+fn create_canonical_mirror(
+    upstream_path: &Path,
+    staged_path: &Path,
+) -> Result<(), Error> {
+    let mirror_err = |stage: &str, e: std::io::Error| {
+        Error::overlay_mirror_failed(
+            upstream_path.to_path_buf(),
+            staged_path.to_path_buf(),
+            stage.to_string(),
+            Some(e),
+        )
+    };
+
+    // Try symlink first; on failure fall back to a recursive copy.
+    match symlink_platform(upstream_path, staged_path) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::PermissionDenied
+                    | std::io::ErrorKind::Unsupported
+                    | std::io::ErrorKind::AlreadyExists
+            ) =>
+        {
+            // PermissionDenied / Unsupported: copy fallback.
+            // AlreadyExists is treated as a race window — we
+            // unlink and retry once via copy fallback to keep the
+            // operation idempotent (`reconcile_one_entry` should
+            // have cleared the staged path, but a concurrent
+            // process might have rewritten it).
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                let _ = std::fs::remove_file(staged_path);
+            }
+            copy_fallback(upstream_path, staged_path).map_err(|e| mirror_err("copy-fallback", e))
+        }
+        Err(e) => Err(mirror_err("symlink", e)),
+    }
+}
+
+/// Recursive copy fallback used when symlink creation is unavailable
+/// (§4.5.3).
+///
+/// Copies one upstream entry (file or directory tree) into the staged
+/// overlay. Directory copies are exact-sync: any pre-existing staged
+/// subdirectory is removed before the copy to honour decision 5 of
+/// the idempotency contract (no merge — destination-only files must
+/// not persist).
+fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(src)?;
+    let ftype = meta.file_type();
+    if ftype.is_file() {
+        // Ensure parent dir exists; on the staged-overlay top level
+        // the parent is the staged-overlay-dir itself, but the helper
+        // is also used recursively for nested entries below.
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(src, dst)?;
+        Ok(())
+    } else if ftype.is_dir() {
+        // Exact-sync: if `dst` already exists (e.g. from a partial
+        // prior run), remove it before re-copying. Decision 5 of
+        // §4.5.6: NO MERGE — destination-only files must not
+        // persist.
+        if dst.exists() {
+            std::fs::remove_dir_all(dst)?;
+        }
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let child_src = entry.path();
+            let child_dst = dst.join(entry.file_name());
+            copy_fallback(&child_src, &child_dst)?;
+        }
+        Ok(())
+    } else if ftype.is_symlink() {
+        // Resolve the symlink target and copy the dereferenced
+        // content. Build scripts that read package-root files don't
+        // care whether the underlying file came from a symlink; the
+        // dereferenced contents are what they read.
+        let target_meta = std::fs::metadata(src)?;
+        if target_meta.is_file() {
+            std::fs::copy(src, dst)?;
+        } else {
+            // Target is a dir; recurse.
+            std::fs::create_dir_all(dst)?;
+            for entry in std::fs::read_dir(src)? {
+                let entry = entry?;
+                let child_src = entry.path();
+                let child_dst = dst.join(entry.file_name());
+                copy_fallback(&child_src, &child_dst)?;
+            }
+        }
+        Ok(())
+    } else {
+        // Other (block device, fifo, socket): unrecognised at the
+        // Cargo-package level. Surface as an I/O error.
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "copy-fallback: unsupported file type at upstream path",
+        ))
+    }
+}
+
+/// Platform-dispatched symlink creation.
+///
+/// Unix: always `std::os::unix::fs::symlink` (single-call API).
+///
+/// Windows: `symlink_dir` for directories, `symlink_file` for files —
+/// Windows distinguishes the two at the kernel level. Both may fail
+/// with `ERROR_PRIVILEGE_NOT_HELD` (`PermissionDenied` in Rust terms)
+/// on machines without Developer Mode; the caller falls back to copy.
+#[cfg(unix)]
+fn symlink_platform(target: &Path, link: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, link)
+}
+
+/// Windows variant of [`symlink_platform`].
+#[cfg(windows)]
+fn symlink_platform(target: &Path, link: &Path) -> std::io::Result<()> {
+    let meta = std::fs::metadata(target)?;
+    if meta.is_dir() {
+        std::os::windows::fs::symlink_dir(target, link)
+    } else {
+        std::os::windows::fs::symlink_file(target, link)
+    }
+}
+
+/// Remove a filesystem entry regardless of its type (file / dir /
+/// symlink). Used by the stale-cleanup pass which may encounter any
+/// of these types at a single name.
+fn remove_path_any(path: &Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    let ftype = meta.file_type();
+    if ftype.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        // Files and symlinks both go through `remove_file` — the file-
+        // type check above ensured we are not asked to remove a dir
+        // through this path.
+        std::fs::remove_file(path)
     }
 }
 
