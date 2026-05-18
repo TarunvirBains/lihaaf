@@ -6,6 +6,22 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`allow_lints` config key** (#43, mirrors trybuild #302): new optional
+  `Vec<String>` key in `[package.metadata.lihaaf]` and per-suite tables.
+  Each entry is forwarded as `-A <lint>` to per-fixture rustc invocations,
+  letting adopters suppress noisy lints (e.g. `unused_imports`, `dead_code`
+  from bare rustc invocation paths) without per-fixture `#![allow(...)]`
+  annotations. Inherits from the default suite when omitted on a named
+  suite, mirroring the `dev_deps` precedent.
+- **Compat-mode default `allow_lints = ["unexpected_cfgs"]`** in synthetic
+  metadata as forward-only insurance: `unexpected_cfgs` is `--check-cfg`-
+  gated and lihaaf does not currently pass `--check-cfg`, so the default
+  is a no-op under v0.1.0 today. It will start mattering on the day
+  lihaaf or rustc enables check-cfg-driven diagnostics. Adopters who want
+  the opposite (i.e. surfacing `unexpected_cfgs` once enabled) must drop
+  out of compat mode and use the v0.1 TOML-driven path.
+
 ## [0.1.0-beta.6] — 2026-05-17
 
 Targeted GA-blocker fix for compat-mode workspace identity. v0.1.0-beta.5

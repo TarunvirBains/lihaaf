@@ -312,6 +312,65 @@ pub struct SyntheticMetadata {
     /// under `<compat_root>/target/lihaaf-compat-converted/`. Paths
     /// are written verbatim into the TOML.
     pub fixture_dirs: Vec<String>,
+    /// `allow_lints` — rustc lints forwarded as `-A <lint>` on every
+    /// per-fixture invocation. Defaults to `["unexpected_cfgs"]` in
+    /// compat mode as **forward-only insurance**. Today, with rustc
+    /// 1.95 not passing `--check-cfg` automatically and lihaaf not
+    /// setting it (verified `src/worker.rs:916-919, 929-972`), this
+    /// default is a no-op — the `unexpected_cfgs` lint is
+    /// `--check-cfg`-gated and does not fire. Once `--check-cfg` is
+    /// active in rustc (either by default or by lihaaf passing it
+    /// explicitly in a future release), compat pilots would otherwise
+    /// produce unavoidable `unexpected_cfgs` noise from their
+    /// proc-macro-emitted `#[cfg(feature = "...")]` annotations. This
+    /// default suppresses that noise preemptively so the toolchain
+    /// shift is uneventful.
+    ///
+    /// This default does NOT address the v0.1-active default-on lints
+    /// (`unused_imports`, `dead_code`, etc.) that fire under bare
+    /// rustc today. Round-2 compat pilots that hit those add the
+    /// relevant entries to their own fork's
+    /// `[package.metadata.lihaaf].allow_lints` via the v0.1 TOML path.
+    ///
+    /// To override (e.g. add more lints, or empty for diagnostic
+    /// debugging), the compat-driver caller passes a custom list when
+    /// constructing `SyntheticMetadata`.
+    pub allow_lints: Vec<String>,
+}
+
+/// Construct the `SyntheticMetadata` that the compat driver embeds in
+/// the staged overlay for the named crate.
+///
+/// This is the **single authoritative source** for the driver's default
+/// `allow_lints` list. The compat driver (`src/compat/mod.rs`) calls
+/// this function instead of inlining the struct literal so that:
+///
+/// 1. A future change to the `allow_lints` default is a one-line edit
+///    in one place.
+/// 2. Test #17 (`synthetic_metadata_default_in_compat_driver`) can call
+///    this same function and assert against an independently written
+///    literal — any drift between the function and the expected default
+///    is caught immediately.
+///
+/// `fixture_dirs` carries the two absolute converted-fixture directories
+/// (`compile_pass` / `compile_fail`); callers compute these before
+/// constructing the metadata.
+pub(crate) fn compat_default_synthetic_metadata(
+    name: &str,
+    fixture_dirs: Vec<String>,
+) -> SyntheticMetadata {
+    SyntheticMetadata {
+        dylib_crate: name.to_string(),
+        extern_crates: vec![name.to_string()],
+        fixture_dirs,
+        // Forward-only insurance: suppresses `unexpected_cfgs` noise for
+        // compat-mode pilots once `--check-cfg` becomes active (either via
+        // lihaaf or a future rustc default). Under v0.1.0 today this is a
+        // no-op — the lint is `--check-cfg`-gated and lihaaf does not pass
+        // that flag (verified worker.rs:916-919, 929-972). See
+        // `SyntheticMetadata.allow_lints` rustdoc for the full rationale.
+        allow_lints: vec!["unexpected_cfgs".to_string()],
+    }
 }
 
 /// Read the upstream `Cargo.toml`, materialize the sibling overlay, and
@@ -1096,6 +1155,16 @@ fn inject_synthetic_metadata(
         "fixture_dirs".to_string(),
         toml::Value::Array(
             meta.fixture_dirs
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    lihaaf_table.insert(
+        "allow_lints".to_string(),
+        toml::Value::Array(
+            meta.allow_lints
                 .iter()
                 .cloned()
                 .map(toml::Value::String)
@@ -3644,6 +3713,110 @@ version = "0.1.0"
         assert_eq!(
             top, after_first,
             "second call must be a no-op on already-overridden output"
+        );
+    }
+
+    // ---- inject_synthetic_metadata tests ----
+
+    /// Helper: extract the `[package.metadata.lihaaf]` sub-table from a
+    /// post-`inject_synthetic_metadata` map.
+    fn extract_lihaaf_table(
+        top: &toml::map::Map<String, toml::Value>,
+    ) -> &toml::map::Map<String, toml::Value> {
+        top["package"].as_table().unwrap()["metadata"]
+            .as_table()
+            .unwrap()["lihaaf"]
+            .as_table()
+            .unwrap()
+    }
+
+    #[test]
+    fn synthetic_metadata_injects_allow_lints() {
+        // Given an empty TOML map, inject_synthetic_metadata must write the
+        // allow_lints array into [package.metadata.lihaaf].
+        let mut top = toml::map::Map::new();
+        let meta = SyntheticMetadata {
+            dylib_crate: "demo".into(),
+            extern_crates: vec!["demo".into()],
+            fixture_dirs: vec!["/abs/pass".into(), "/abs/fail".into()],
+            allow_lints: vec!["unexpected_cfgs".to_string()],
+        };
+        inject_synthetic_metadata(&mut top, &meta);
+
+        let lihaaf = extract_lihaaf_table(&top);
+        let lints = lihaaf["allow_lints"]
+            .as_array()
+            .expect("allow_lints must be an array");
+        let lint_strs: Vec<&str> = lints.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            lint_strs,
+            vec!["unexpected_cfgs"],
+            "inject_synthetic_metadata must write the allow_lints array verbatim"
+        );
+    }
+
+    #[test]
+    fn synthetic_metadata_default_in_compat_driver() {
+        // Pin the compat-driver default via the SAME helper the driver calls
+        // (`compat_default_synthetic_metadata`). The assertion is against an
+        // independently written literal so that a future change to the helper
+        // (e.g. `allow_lints: vec![]`) fails this test — the helper return
+        // and the expected value are decoupled.
+        //
+        // If you change the helper's `allow_lints` default you MUST also
+        // update spec §3.2/C.4, CHANGELOG, and this assertion.
+        let meta = compat_default_synthetic_metadata("demo", vec![]);
+        assert_eq!(
+            meta.allow_lints,
+            vec!["unexpected_cfgs".to_string()],
+            "compat-driver default allow_lints must be [\"unexpected_cfgs\"]; \
+             changes also require spec §3.2/C.4 + CHANGELOG updates",
+        );
+    }
+
+    #[test]
+    fn synthetic_metadata_replaces_upstream_allow_lints() {
+        // The "compat owns inner config" invariant: inject_synthetic_metadata
+        // must REPLACE any pre-existing [package.metadata.lihaaf] block —
+        // including a pre-existing allow_lints key — with the synthetic values.
+        // Verified at overlay.rs:1051-1058 in comment; this test makes it
+        // executable so a future partial-merge regression is caught.
+        let mut top = toml::map::Map::new();
+
+        // Build the upstream lihaaf table with a conflicting allow_lints.
+        let mut upstream_lihaaf = toml::map::Map::new();
+        upstream_lihaaf.insert(
+            "allow_lints".to_string(),
+            toml::Value::Array(vec![toml::Value::String("some_other_lint".to_string())]),
+        );
+        // Nest: top["package"]["metadata"]["lihaaf"] = upstream_lihaaf
+        let mut upstream_metadata = toml::map::Map::new();
+        upstream_metadata.insert("lihaaf".to_string(), toml::Value::Table(upstream_lihaaf));
+        let mut upstream_pkg = toml::map::Map::new();
+        upstream_pkg.insert(
+            "metadata".to_string(),
+            toml::Value::Table(upstream_metadata),
+        );
+        top.insert("package".to_string(), toml::Value::Table(upstream_pkg));
+
+        // Inject synthetic metadata with allow_lints = ["unexpected_cfgs"].
+        let meta = SyntheticMetadata {
+            dylib_crate: "demo".into(),
+            extern_crates: vec!["demo".into()],
+            fixture_dirs: vec!["/abs/pass".into()],
+            allow_lints: vec!["unexpected_cfgs".to_string()],
+        };
+        inject_synthetic_metadata(&mut top, &meta);
+
+        let lihaaf = extract_lihaaf_table(&top);
+        let lints = lihaaf["allow_lints"]
+            .as_array()
+            .expect("allow_lints must be an array after injection");
+        let lint_strs: Vec<&str> = lints.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(
+            lint_strs,
+            vec!["unexpected_cfgs"],
+            "inject_synthetic_metadata must REPLACE upstream allow_lints, not merge or preserve it"
         );
     }
 }

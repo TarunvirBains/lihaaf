@@ -1,8 +1,12 @@
 //! `[package.metadata.lihaaf]` parsing + validation.
 //!
 //! This module is the single point where raw TOML becomes the typed [`Config`]
-//! used by the rest of the harness. If you add a new key, add it here and in
-//! `manifest.rs` so snapshot behavior stays aligned.
+//! used by the rest of the harness. If you add a new TOP-LEVEL key (one that
+//! lives directly in `[package.metadata.lihaaf]`, such as `dylib_crate`,
+//! `extern_crates`, or `features`), also add it in `manifest.rs` so snapshot
+//! behavior stays aligned. Per-suite keys (those in `Suite` / `RawSuite`,
+//! such as `dev_deps`, `edition`, and `allow_lints`) are preserved verbatim
+//! via the `raw_metadata` round-trip and do NOT require a `manifest.rs` change.
 //!
 //! ## Why only TOML
 //!
@@ -14,7 +18,7 @@
 //!
 //! A *suite* is a named bundle of (features, fixture_dirs, edition,
 //! dev_deps, extern_crates, compile_fail_marker, fixture_timeout_secs,
-//! per_fixture_memory_mb). The top-level `[package.metadata.lihaaf]`
+//! per_fixture_memory_mb, allow_lints). The top-level `[package.metadata.lihaaf]`
 //! table is always the implicit default suite; each
 //! `[[package.metadata.lihaaf.suite]]` array entry contributes one
 //! additional named suite. Each suite triggers an independent dylib
@@ -145,6 +149,21 @@ pub struct Suite {
     /// killed. Inherits from the default suite if omitted on a named
     /// suite.
     pub per_fixture_memory_mb: u32,
+
+    /// rustc lints forwarded as `-A <lint>` on every per-fixture
+    /// invocation. Empty by default. Inherits from the default suite
+    /// if omitted on a named suite (same precedent as `dev_deps`).
+    ///
+    /// Each entry is passed verbatim as a single argv token via
+    /// `std::process::Command::arg` — no shell expansion occurs.
+    /// Unknown lint names are NOT pre-validated; rustc surfaces
+    /// `warning: unknown lint: X` on the per-fixture stderr.
+    ///
+    /// Validation rejects: empty strings, entries starting with `-`
+    /// (caller must not supply the `-A` prefix; lihaaf supplies it),
+    /// and entries containing whitespace, double quotes, single quotes,
+    /// or backslashes (would break argv tokenization).
+    pub allow_lints: Vec<String>,
 }
 
 impl Suite {
@@ -175,6 +194,7 @@ struct RawMetadata {
     compile_fail_marker: Option<String>,
     fixture_timeout_secs: Option<u32>,
     per_fixture_memory_mb: Option<u32>,
+    allow_lints: Option<Vec<String>>,
     /// `[[package.metadata.lihaaf.suite]]` array entries.
     #[serde(default)]
     suite: Vec<RawSuite>,
@@ -194,6 +214,7 @@ struct RawSuite {
     compile_fail_marker: Option<String>,
     fixture_timeout_secs: Option<u32>,
     per_fixture_memory_mb: Option<u32>,
+    allow_lints: Option<Vec<String>>,
     /// `dylib_crate` is intentionally NOT a per-suite key. Reading any
     /// value here is rejected at validation time so a typo can't be
     /// silently dropped.
@@ -264,6 +285,7 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
             ),
         }));
     }
+    validate_dylib_crate(&dylib_crate)?;
 
     // Build the default suite from the top-level keys. The default suite
     // is always present in `Config::suites` even when no `[[suite]]`
@@ -355,11 +377,17 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
         }));
     }
 
+    let allow_lints = raw.allow_lints.clone().unwrap_or_default();
+    validate_allow_lints(DEFAULT_SUITE_NAME, &allow_lints)?;
+
+    let features = raw.features.clone().unwrap_or_default();
+    validate_features(DEFAULT_SUITE_NAME, &features)?;
+
     Ok(Suite {
         name: DEFAULT_SUITE_NAME.to_string(),
         extern_crates,
         fixture_dirs,
-        features: raw.features.clone().unwrap_or_default(),
+        features,
         edition,
         dev_deps: raw.dev_deps.clone().unwrap_or_default(),
         compile_fail_marker: raw
@@ -368,6 +396,7 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
             .unwrap_or_else(|| DEFAULT_COMPILE_FAIL_MARKER.to_string()),
         fixture_timeout_secs,
         per_fixture_memory_mb,
+        allow_lints,
     })
 }
 
@@ -448,15 +477,23 @@ fn finalize_named_suite(
         }));
     }
 
+    let allow_lints = raw
+        .allow_lints
+        .unwrap_or_else(|| default_suite.allow_lints.clone());
+    validate_allow_lints(&name, &allow_lints)?;
+
+    // Features intentionally do NOT inherit: a "spatial only" suite
+    // shouldn't accidentally pull in the default suite's `testing`
+    // feature. Adopters who want shared features must list them in
+    // both places.
+    let features = raw.features.unwrap_or_default();
+    validate_features(&name, &features)?;
+
     Ok(Suite {
         name,
         extern_crates,
         fixture_dirs,
-        // Features intentionally do NOT inherit: a "spatial only" suite
-        // shouldn't accidentally pull in the default suite's `testing`
-        // feature. Adopters who want shared features must list them in
-        // both places.
-        features: raw.features.unwrap_or_default(),
+        features,
         edition,
         dev_deps: raw
             .dev_deps
@@ -466,6 +503,7 @@ fn finalize_named_suite(
             .unwrap_or_else(|| default_suite.compile_fail_marker.clone()),
         fixture_timeout_secs,
         per_fixture_memory_mb,
+        allow_lints,
     })
 }
 
@@ -504,6 +542,119 @@ fn validate_edition(suite_label: &str, edition: &str) -> Result<(), Error> {
                 "{suite_label}.edition \"{edition}\" is not in the allowed set ({}).\nWhy this matters: rustc's `--edition` accepts only those values.",
                 ALLOWED_EDITIONS.join(", ")
             ),
+        }));
+    }
+    Ok(())
+}
+
+/// Validate every entry in `allow_lints` against the structural rules:
+/// no empty strings, no NUL bytes, no leading `-` (caller must not supply
+/// the `-A` prefix), and no whitespace / quote / backslash characters (would
+/// break argv tokenization or smuggle extra flags past rustc).
+///
+/// Unknown lint names are NOT pre-validated; rustc surfaces
+/// `warning: unknown lint: X` itself.
+fn validate_allow_lints(suite_label: &str, lints: &[String]) -> Result<(), Error> {
+    for lint in lints {
+        if lint.is_empty() {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.allow_lints contains an empty string.\n\
+                     Why this matters: an empty string is not a valid lint name and would produce an unrecognized flag on the rustc argv."
+                ),
+            }));
+        }
+        if lint.contains('\0') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.allow_lints entry contains a NUL byte.\n\
+                     Why this matters: an interior NUL byte cannot appear in a POSIX argv token; \
+                     spawn would reject the argv and the failure would surface as WORKER_CRASHED \
+                     instead of an actionable CONFIG_INVALID."
+                ),
+            }));
+        }
+        if lint.starts_with('-') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.allow_lints entry \"{lint}\" starts with `-`.\n\
+                     Why this matters: lihaaf supplies the `-A` prefix itself; including it in the entry would produce `-A -A <lint>` on the rustc argv."
+                ),
+            }));
+        }
+        if lint
+            .chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\'' || c == '\\')
+        {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.allow_lints entry \"{lint}\" contains whitespace, quotes, or a backslash.\n\
+                     Why this matters: each entry must be a single argv token; whitespace or shell-meta characters would either break argv tokenization or smuggle extra flags past rustc's argument parser."
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Validate every entry in `features` against the structural rules:
+/// no empty strings and no NUL bytes.
+///
+/// Each entry is forwarded as a single argv token to cargo (`--features <f>`)
+/// and to rustc (`--cfg feature="<f>"`). Empty strings and NUL bytes cannot
+/// appear in a POSIX argv token; an interior NUL would cause spawn to reject
+/// the argv and the failure would surface as WORKER_CRASHED instead of an
+/// actionable CONFIG_INVALID.
+///
+/// Other character restrictions (whitespace, shell-meta) are intentionally
+/// out of scope here — Cargo itself validates feature-name syntax and will
+/// surface those errors with precise diagnostics.
+fn validate_features(suite_label: &str, features: &[String]) -> Result<(), Error> {
+    for feature in features {
+        if feature.is_empty() {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.features contains an empty string.\n\
+                     Why this matters: each entry must be a single argv token forwarded as \
+                     `--features` to cargo and `--cfg feature=\"...\"` to rustc; an empty \
+                     string is not a valid feature name."
+                ),
+            }));
+        }
+        if feature.contains('\0') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.features entry contains a NUL byte.\n\
+                     Why this matters: each entry must be a single argv token forwarded as \
+                     `--features` to cargo and `--cfg feature=\"...\"` to rustc; an interior \
+                     NUL byte cannot appear in a POSIX argv token and spawn would reject it, \
+                     surfacing as WORKER_CRASHED instead of an actionable CONFIG_INVALID."
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `dylib_crate` value after the empty-string check.
+///
+/// Currently rejects interior NUL bytes. The crate name is forwarded as a
+/// `-p` argv token to cargo; an interior NUL byte cannot appear in a POSIX
+/// argv token and spawn would reject it, surfacing as WORKER_CRASHED instead
+/// of an actionable CONFIG_INVALID.
+///
+/// Factored out so it can be unit-tested directly — the TOML decoder already
+/// rejects NUL bytes before `parse` sees them, but programmatic construction
+/// paths (e.g., integration tests that build `Config` by hand) can still
+/// reach this validator.
+fn validate_dylib_crate(dylib_crate: &str) -> Result<(), Error> {
+    if dylib_crate.contains('\0') {
+        return Err(Error::Session(Outcome::ConfigInvalid {
+            message: "[package.metadata.lihaaf].dylib_crate contains a NUL byte.\n\
+                 Why this matters: the crate name is forwarded as a `-p` argv token to cargo; \
+                 an interior NUL byte cannot appear in a POSIX argv token and spawn would reject \
+                 it, surfacing as WORKER_CRASHED instead of an actionable CONFIG_INVALID."
+                .to_string(),
         }));
     }
     Ok(())
@@ -768,6 +919,7 @@ mod tests {
             compile_fail_marker = "compile_fail"
             fixture_timeout_secs = 120
             per_fixture_memory_mb = 2048
+            allow_lints = ["dead_code"]
 
             [[package.metadata.lihaaf.suite]]
             name = "spatial"
@@ -789,6 +941,9 @@ mod tests {
             spatial.extern_crates,
             vec!["consumer".to_string(), "consumer-macros".to_string()]
         );
+        // allow_lints inherits from the default suite when omitted on a
+        // named suite — same precedent as dev_deps (config.rs:461-463).
+        assert_eq!(spatial.allow_lints, vec!["dead_code".to_string()]);
     }
 
     #[test]
@@ -1047,5 +1202,265 @@ mod tests {
         assert_eq!(cfg.suites[0].name, DEFAULT_SUITE_NAME);
         assert_eq!(cfg.suites[1].name, "second");
         assert_eq!(cfg.suites[2].name, "first");
+    }
+
+    // ---- allow_lints tests ----
+
+    #[test]
+    fn allow_lints_default_is_empty() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+        "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.suites[0].allow_lints.is_empty(),
+            "allow_lints must default to an empty vec when the key is absent"
+        );
+    }
+
+    #[test]
+    fn allow_lints_accepts_simple_lint_names() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["unexpected_cfgs", "dead_code"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.suites[0].allow_lints,
+            vec!["unexpected_cfgs".to_string(), "dead_code".to_string()]
+        );
+    }
+
+    #[test]
+    fn allow_lints_accepts_clippy_namespaced_lints() {
+        // Confirms `::` is not rejected by structural validation — namespaced
+        // lints are passed verbatim to rustc which accepts them when the
+        // relevant tool is registered.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["clippy::needless_collect"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.suites[0].allow_lints,
+            vec!["clippy::needless_collect".to_string()]
+        );
+    }
+
+    #[test]
+    fn allow_lints_rejects_empty_string() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = [""]
+        "#,
+            &["allow_lints", "empty string"],
+        );
+    }
+
+    #[test]
+    fn allow_lints_rejects_leading_dash() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["-A unexpected_cfgs"]
+        "#,
+            &["allow_lints", "starts with `-`"],
+        );
+    }
+
+    #[test]
+    fn allow_lints_rejects_whitespace() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["dead code"]
+        "#,
+            &["allow_lints", "whitespace"],
+        );
+    }
+
+    #[test]
+    fn allow_lints_rejects_quote_and_backslash() {
+        // Three parametric assertions: double-quote, single-quote, backslash.
+        //
+        // TOML encoding notes:
+        //   - `'a"b'` is a TOML raw (single-quoted) string containing a
+        //     literal double-quote → Rust string "a\"b".
+        //   - `"a'b"` is a TOML basic (double-quoted) string containing a
+        //     literal single-quote → Rust string "a'b".
+        //   - `'a\b'` is a TOML raw string (no TOML escapes) containing a
+        //     literal backslash → Rust string "a\\b".
+        for (toml_value, bad_label) in &[
+            (r#"'a"b'"#, r#"a"b"#), // double-quote via TOML raw string
+            (r#""a'b""#, "a'b"),    // single-quote via TOML basic string
+            (r#"'a\b'"#, r"a\b"),   // backslash via TOML raw string
+        ] {
+            let toml = format!(
+                r#"
+                [package.metadata.lihaaf]
+                dylib_crate = "consumer"
+                extern_crates = ["consumer"]
+                allow_lints = [{toml_value}]
+                "#,
+            );
+            let err = parse_str(&toml).unwrap_err();
+            let msg = unwrap_invalid(err);
+            assert!(
+                msg.contains("allow_lints"),
+                "error for entry `{bad_label}` did not mention `allow_lints`: {msg}"
+            );
+            assert!(
+                msg.contains("whitespace"),
+                "error for entry `{bad_label}` did not mention `whitespace`: {msg}"
+            );
+        }
+    }
+
+    // ---- NUL-byte / argv-safety tests ----
+
+    #[test]
+    fn allow_lints_rejects_nul_byte() {
+        // TOML's basic-string spec disallows control characters including NUL,
+        // so the TOML decoder would reject a NUL in a TOML literal before the
+        // validator sees it. We test the validator directly here — this covers
+        // any programmatic path that constructs a Vec<String> without going
+        // through TOML (e.g. tests that synthesise Config by hand).
+        let lints = vec![format!("bad{}lint", '\u{0}')];
+        let err = validate_allow_lints("default", &lints).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("allow_lints"),
+            "error did not mention `allow_lints`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
+    }
+
+    #[test]
+    fn features_rejects_nul_byte() {
+        // Same TOML-bypass rationale as allow_lints_rejects_nul_byte above.
+        let features = vec![format!("bad{}feat", '\u{0}')];
+        let err = validate_features("default", &features).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("features"),
+            "error did not mention `features`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
+    }
+
+    #[test]
+    fn features_rejects_empty_string() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            features = [""]
+        "#,
+            &["features", "empty string"],
+        );
+    }
+
+    #[test]
+    fn dylib_crate_rejects_nul_byte() {
+        // Same TOML-bypass rationale as allow_lints_rejects_nul_byte above.
+        let name = format!("con{}sumer", '\u{0}');
+        let err = validate_dylib_crate(&name).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("dylib_crate"),
+            "error did not mention `dylib_crate`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
+    }
+
+    #[test]
+    fn allow_lints_named_suite_overrides_default() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["dead_code"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "extra"
+            fixture_dirs = ["tests/lihaaf/extra"]
+            allow_lints = ["unused"]
+        "#,
+        )
+        .unwrap();
+        // Named suite explicitly sets allow_lints: replacement, not merge.
+        assert_eq!(
+            cfg.suites[1].allow_lints,
+            vec!["unused".to_string()],
+            "named suite allow_lints must replace the default, not merge"
+        );
+        // Default suite value is unchanged.
+        assert_eq!(cfg.suites[0].allow_lints, vec!["dead_code".to_string()]);
+    }
+
+    #[test]
+    fn allow_lints_named_suite_empty_array_overrides_to_empty() {
+        // An adopter who sets allow_lints = [] on a named suite must get [],
+        // not the default suite's lints — this is the per-suite opt-out path.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["dead_code"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "strict"
+            fixture_dirs = ["tests/lihaaf/strict"]
+            allow_lints = []
+        "#,
+        )
+        .unwrap();
+        assert!(
+            cfg.suites[1].allow_lints.is_empty(),
+            "explicit empty allow_lints on named suite must override to empty"
+        );
+    }
+
+    #[test]
+    fn raw_metadata_preserves_allow_lints() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            allow_lints = ["unused_imports", "dead_code"]
+        "#,
+        )
+        .unwrap();
+        let table = cfg.raw_metadata.as_table().unwrap();
+        assert!(
+            table.contains_key("allow_lints"),
+            "raw_metadata must preserve the allow_lints key verbatim for the manifest snapshot"
+        );
+        let lints = table["allow_lints"].as_array().unwrap();
+        let lint_strs: Vec<&str> = lints.iter().filter_map(|v| v.as_str()).collect();
+        assert_eq!(lint_strs, vec!["unused_imports", "dead_code"]);
     }
 }

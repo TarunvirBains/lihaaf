@@ -63,6 +63,9 @@ pub struct WorkerContext {
     /// `features` from the metadata. Each becomes a `--cfg
     /// feature="<f>"` flag.
     pub features: Vec<String>,
+    /// `allow_lints` from the suite. Each becomes a `-A <lint>` flag on
+    /// the per-fixture rustc invocation.
+    pub allow_lints: Vec<String>,
     /// Edition.
     pub edition: String,
     /// Per-fixture timeout in seconds.
@@ -104,7 +107,7 @@ impl WorkerContext {
     /// session), not the suite — see `config::Config` rustdoc for why
     /// `dylib_crate` is intentionally NOT a per-suite key. Everything
     /// else (`features`, `extern_crates`, `edition`, `dev_deps`,
-    /// timeout, memory ceiling) is per-suite and read from `suite`.
+    /// timeout, memory ceiling, `allow_lints`) is per-suite and read from `suite`.
     ///
     /// [`Config`]: crate::config::Config
     #[allow(clippy::too_many_arguments)]
@@ -136,6 +139,7 @@ impl WorkerContext {
             extra_extern_crates,
             dev_deps: suite.dev_deps.clone(),
             features: suite.features.clone(),
+            allow_lints: suite.allow_lints.clone(),
             edition: suite.edition.clone(),
             timeout_secs: suite.fixture_timeout_secs,
             memory_mb_ceiling: suite.per_fixture_memory_mb,
@@ -919,6 +923,22 @@ fn apply_feature_cfgs(cmd: &mut Command, features: &[String]) {
     }
 }
 
+/// Append `-A <lint>` flag pairs for every entry in `lints`.
+///
+/// Each lint is forwarded verbatim as a single argv token via
+/// `Command::arg` — no shell expansion occurs. The function is
+/// a no-op when `lints` is empty.
+///
+/// Placement in `spawn_and_monitor`: called after `apply_feature_cfgs`
+/// and before `cmd.arg(&fx.path)`, so `-A` flags come after `--cfg`
+/// entries and before the source file — matching the existing pattern
+/// of "build up all flags, then the source file last."
+fn apply_allow_lints(cmd: &mut Command, lints: &[String]) {
+    for lint in lints {
+        cmd.arg("-A").arg(lint);
+    }
+}
+
 fn spawn_and_monitor(
     fx: &Fixture,
     ctx: &WorkerContext,
@@ -968,6 +988,11 @@ fn spawn_and_monitor(
     // or stripping the quoted-feature-name format trips the
     // `apply_feature_cfgs_*` unit tests without needing to spawn rustc.
     apply_feature_cfgs(&mut cmd, &ctx.features);
+    // lint suppressions as `-A <lint>` pairs. Placement: after feature
+    // cfgs and before the source file, matching the "all flags then
+    // source file last" ordering. Trips the `apply_allow_lints_*` unit
+    // tests when absent — ensuring this call is not accidentally dropped.
+    apply_allow_lints(&mut cmd, &ctx.allow_lints);
 
     cmd.arg(&fx.path);
 
@@ -1492,6 +1517,7 @@ plain text line
             extra_extern_crates: vec![],
             dev_deps: vec![],
             features: vec![],
+            allow_lints: vec![],
             edition: "2021".into(),
             timeout_secs: 90,
             memory_mb_ceiling: 1024,
@@ -1746,5 +1772,49 @@ plain text line
         let mut cmd = Command::new("rustc");
         apply_feature_cfgs(&mut cmd, &[]);
         assert_eq!(cmd.get_args().count(), 0);
+    }
+
+    #[test]
+    fn apply_allow_lints_emits_dash_a_per_lint() {
+        let mut cmd = Command::new("rustc");
+        apply_allow_lints(
+            &mut cmd,
+            &["unexpected_cfgs".to_string(), "dead_code".to_string()],
+        );
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-A", "unexpected_cfgs", "-A", "dead_code"],
+            "each lint must produce exactly one `-A <lint>` pair on the argv"
+        );
+    }
+
+    #[test]
+    fn apply_allow_lints_is_noop_for_empty_slice() {
+        let mut cmd = Command::new("rustc");
+        apply_allow_lints(&mut cmd, &[]);
+        assert_eq!(
+            cmd.get_args().count(),
+            0,
+            "empty allow_lints must not append any flags"
+        );
+    }
+
+    #[test]
+    fn apply_allow_lints_handles_namespaced_lint() {
+        let mut cmd = Command::new("rustc");
+        apply_allow_lints(&mut cmd, &["clippy::needless_collect".to_string()]);
+        let args: Vec<_> = cmd
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["-A", "clippy::needless_collect"],
+            "namespaced lint must be forwarded verbatim as a single argv token"
+        );
     }
 }

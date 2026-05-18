@@ -148,11 +148,10 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             let name = upstream_name
                 .map(str::to_string)
                 .unwrap_or_else(|| basename_fallback(&compat_root));
-            overlay::SyntheticMetadata {
-                dylib_crate: name.clone(),
-                extern_crates: vec![name],
-                fixture_dirs: vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
-            }
+            overlay::compat_default_synthetic_metadata(
+                &name,
+                vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
+            )
         },
     )?;
     let crate_name = overlay_plan

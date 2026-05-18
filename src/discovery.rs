@@ -161,6 +161,7 @@ mod tests {
             extern_crates: vec!["consumer".into()],
             fixture_dirs: dirs.into_iter().map(PathBuf::from).collect(),
             features: vec![],
+            allow_lints: vec![],
             edition: "2021".into(),
             dev_deps: vec![],
             compile_fail_marker: marker.to_string(),
