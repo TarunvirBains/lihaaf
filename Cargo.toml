@@ -7,9 +7,10 @@ authors = ["Tarunvir Bains"]
 rust-version = "1.95"
 repository = "https://github.com/TarunvirBains/lihaaf"
 homepage = "https://github.com/TarunvirBains/lihaaf"
-description = "A CLI proc-macro test harness for Rust that builds a crate into a dylib once, then attempts compiling fixtures against it with per-fixture rustc dispatch (a la trybuild) — adding more fixtures stays cheap."
-keywords = ["proc-macro", "trybuild", "compile-fail", "testing", "snapshot"]
-categories = ["development-tools::testing"]
+description = "Fast compile-fail and compile-pass test harness for Rust proc macros; a faster trybuild-style workflow"
+keywords = ["trybuild", "proc-macro", "compile-fail", "testing", "rustc"]
+categories = ["development-tools::testing", "development-tools::procedural-macro-helpers"]
+documentation = "https://docs.rs/lihaaf"
 readme = "README.md"
 
 # Exclude the FIX_BEFORE_BETA Spec D integration corpus from the
