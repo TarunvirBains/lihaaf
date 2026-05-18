@@ -14,4 +14,7 @@ path = "__UPSTREAM_DIR__/src/lib.rs"
 [dependencies]
 serde = "1"
 
+[patch.crates-io.demo]
+path = "__UPSTREAM_DIR__/target/lihaaf-overlay"
+
 [workspace]

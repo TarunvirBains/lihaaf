@@ -23,7 +23,7 @@
 //!    (`idempotent_rerun_no_byte_change` — second run does not touch
 //!    mtime).
 //! 5. The cross-binary determinism corpus
-//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — five
+//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — eight
 //!    representative `Cargo.toml` shapes under
 //!    `tests/compat/overlay_corpus/`, each checked against a
 //!    pre-committed `*.expected.toml`).
@@ -254,7 +254,11 @@ version = "0.1.0"
 
     let headers: Vec<&str> = out.lines().filter(|l| l.starts_with('[')).collect();
     // Per `canonical_key_order()` the expected order is:
-    // package, lib (newly inserted), dependencies, features, workspace.
+    // package, lib (newly inserted), dependencies, features,
+    // patch.crates-io.<self> (newly INJECTED by the Option H Rule 1
+    // self-patch policy — issues #40 / #47 — because `[package].name`
+    // is set and no upstream `[patch.crates-io.demo]` exists),
+    // workspace.
     assert_eq!(
         headers,
         vec![
@@ -262,6 +266,7 @@ version = "0.1.0"
             "[lib]",
             "[dependencies]",
             "[features]",
+            "[patch.crates-io.demo]",
             "[workspace]"
         ],
         "canonical order violated; output:\n{out}"
@@ -457,6 +462,15 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         "with_patch_section",
         "with_comments",
         "with_replace_section",
+        // Two new fixtures pin the issue #40/#47 Option H self-patch
+        // policy emission: Rule 1 INJECT for clean upstreams (the
+        // anyhow / thiserror / serde_json shape) and Rule 2 REMAP
+        // for upstreams that already carry `[patch.crates-io.<self>]
+        // = { path = "." }` (the cxx shape). Both rules emit the
+        // same byte form (absolutized staged-overlay-dir); the
+        // distinction is in the INPUT.
+        "with_self_patch_injected",
+        "with_self_patch_remapped",
     ];
     let mut checked = 0usize;
     for name in &names {
@@ -493,8 +507,10 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         checked += 1;
     }
     assert_eq!(
-        checked, 6,
-        "corpus must include all 6 representative fixtures"
+        checked, 8,
+        "corpus must include all 8 representative fixtures \
+         (6 existing + 2 new for the issue #40/#47 Option H \
+         Rule 1 INJECT and Rule 2 REMAP policy)"
     );
 }
 
@@ -986,7 +1002,9 @@ serde = { git = "https://example.com/serde", branch = "main" }
         .and_then(|v| v.get("crates-io"))
         .expect("[patch.crates-io] must survive overlay");
 
-    // cxx-demo path = "." → absolute upstream dir.
+    // cxx-demo path = "." → absolute staged overlay dir (Rule 2 REMAP, Option H §4.2).
+    // The self-patch entry is remapped to the staged dir so cargo resolves the
+    // overlay manifest, not the upstream root directly.
     let cxx_path = crates_io
         .get("cxx-demo")
         .and_then(|v| v.get("path"))
@@ -1707,8 +1725,9 @@ fn cargo_accepts_rich_overlay_for_dylib_build() {
     //   - a [patch.crates-io] entry with path = "." (mirrors cxx pattern)
     //
     // The path-dep crate is a stub with its own Cargo.toml + src/lib.rs.
-    // The patch entry references the same crate; cargo will resolve the
-    // patch to the real upstream dir after absolutization.
+    // The patch entry references the same crate (self-patch); per Option H
+    // Rule 2 REMAP it is absolutized to the staged overlay dir, not the
+    // upstream root, so cargo resolves the overlay manifest directly.
     let tmp = tempfile::tempdir().expect("creating tempdir for rich cargo build test");
     let upstream_dir = tmp.path();
 
@@ -2195,4 +2214,1131 @@ version = "0.1.0"
         content.contains(r#"rev = "abc123""#),
         "git-form [replace] rev field must be unchanged; overlay:\n{content}"
     );
+}
+
+// =====================================================================
+// Issue #40 + #47 §5.2 cargo-build-gated integration tests.
+//
+// These tests prove the Option H 4-rule self-patch policy and the
+// staged-mirror writer at the cargo-build integration layer, end to
+// end. Each gated test spawns a real `cargo rustc` (or `cargo build`)
+// against the materialized overlay and asserts cargo accepts the
+// resulting topology / package-root access pattern.
+//
+// **Gating contract.** All §5.2.5–§5.2.7 / §5.2.9–§5.2.11 tests gate
+// on `LIHAAF_RUN_CARGO_BUILD_TESTS=1` per [[lihaaf-no-local-binary-builds]]
+// — cargo spawns subprocess + downloads + on-disk artifacts that OOM
+// RAM-constrained WSL2 / dev hosts. CI exports the env var so the
+// authoritative verification happens there; local-only test runs
+// silently skip. Section §5.2.8 is intentionally UNGATED — it is a
+// negative test that exercises the materializer's REJECT branch and
+// makes NO cargo invocation, so the OOM gate does not apply (a plan
+// surface deviation: §5.2.8 was labelled "Cargo-build-gated test" in
+// the §5.2 list header, but its mechanics make no cargo call; the
+// gate would silently skip the integration-layer Rule 4 REJECT
+// coverage on local runs, defeating the discipline contract).
+// §5.2.12 (the absolute-path pin) is also UNGATED — it is a
+// unit-style integration assertion that runs `materialize_overlay`
+// and inspects the emitted byte shape, no cargo spawn.
+//
+// Plan reference: `docs/plans/issue-40-47-overlay-vs-registry.md`
+// §5.2 (R4 Option H 4-rule mapping + R5/R6 staged-mirror closure).
+// =====================================================================
+
+/// §5.2.5 — Rule 1 INJECT cargo-graph proof (anyhow-shape).
+///
+/// Constructs the minimal anyhow-shape repro: a clean single-crate
+/// upstream with no pre-existing `[patch.crates-io.<self>]` table.
+/// Rule 1 INJECT fires; the overlay carries
+/// `[patch.crates-io.anyhow-like] = { path = "<staged-overlay-dir>" }`.
+/// Cargo's resolver accepts the injected patch as benign because no
+/// workspace member references the crate by registry name — the patch
+/// is a no-op for the standalone case (plan §6.4).
+///
+/// **What this test bites.** A regression that fails to absolutize
+/// the injected `path` value, or emits a relative `.` form, would
+/// break cargo's `[patch.crates-io.<X>].path` resolution (cargo
+/// anchors the path relative to the staged manifest dir; a `.` path
+/// would resolve to the staged overlay dir itself, accidentally
+/// correct today but coincidence-dependent per plan §6.5). An
+/// absolute path is unambiguous.
+///
+/// **Pre-fix:** without Option H Rule 1, no patch is injected → the
+/// test would PASS trivially (no patch table, no resolution to
+/// verify). Post-fix: the patch is injected AND cargo accepts the
+/// resulting graph.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` per
+/// [[lihaaf-no-local-binary-builds]]; plan §5.2.5.
+#[test]
+fn cargo_accepts_inject_when_clean_upstream_anyhow_shape() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_inject_when_clean_upstream_anyhow_shape: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for Rule 1 anyhow-shape cargo test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "anyhow-like"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Pre-cargo sanity: Rule 1 INJECT must have added the self-patch
+    // entry pointing at the staged-overlay dir (absolute, forward
+    // slash).
+    let content = read_overlay(&plan.sibling_manifest);
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
+    let inject_path = parsed
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("anyhow-like"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("Rule 1 INJECT must add [patch.crates-io.anyhow-like].path");
+    assert!(
+        Path::new(inject_path).is_absolute(),
+        "Rule 1 emission must be absolute; got `{inject_path}`"
+    );
+    assert!(
+        inject_path.ends_with("/target/lihaaf-overlay"),
+        "Rule 1 emission must target the staged-overlay-dir; got `{inject_path}`"
+    );
+
+    // Acid test: cargo rustc against the staged overlay. The patch
+    // is benign for the standalone anyhow-shape (no workspace member
+    // references `anyhow-like` by registry name), so cargo's
+    // resolver collapses the unused patch and proceeds to compile
+    // the root crate.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("anyhow-like")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must succeed against the Rule 1 INJECT overlay; \
+         got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.6 — Rule 2 REMAP cargo-graph proof + staged-mirror (cxx-shape).
+///
+/// Constructs the cxx-shape repro: upstream carries
+/// `[patch.crates-io.foo] = { path = "." }` (resolves to upstream
+/// root). The Option H Rule 2 detection fires (joined path
+/// lexical-normalizes to upstream root) and REMAPs the entry to
+/// `<staged-overlay-dir>`. The shape also has a workspace member
+/// `test-suite` with a registry-name dep `foo = "1.0"`, plus
+/// `links = "foo-native"` on the root — without the REMAP, cargo
+/// would report `package <foo> links to <foo-native> ... conflicts
+/// with a previous package which links to <foo-native> as well`
+/// because the resolved graph would contain two source-ids for
+/// `foo` (overlay's `[package]` + upstream's `path = "."`).
+///
+/// The shape ALSO includes a real file-reading `build.rs` that opens
+/// `src/cxx_stub.cc` via `CARGO_MANIFEST_DIR`. Pre-mirror, this file
+/// is not accessible from the staged overlay dir; post-mirror, the
+/// staged-overlay's `src/` is a symlink (or copy) to upstream's
+/// `src/`, so the build script can read it. The test validates BOTH
+/// the policy correctness AND the mirror correctness in a single
+/// fixture.
+///
+/// **What this test bites.** Two simultaneous regressions:
+///   - Rule 2 mis-detection (e.g. comparing un-normalized paths) →
+///     Rule 4 REJECT fires by mistake, materialize returns Err.
+///   - Mirror writer fails to populate `<staged>/src/` → build.rs
+///     `read_to_string` fails with `No such file or directory`.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.6.
+#[test]
+fn cargo_accepts_remap_when_upstream_self_patch_cxx_shape() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_remap_when_upstream_self_patch_cxx_shape: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for Rule 2 cxx-shape cargo test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    // Upstream package-root layout faithfully mirrors the cxx upstream
+    // Cargo.toml (github.com/dtolnay/cxx, verified Codex rollout 019e3cc3):
+    //   - root manifest with `[package]` + `links` + `build.rs`
+    //   - `[workspace] members = ["test-suite"]` — workspace declaration ONLY;
+    //     cxx does NOT carry a root `[dependencies]` edge to the member
+    //   - workspace member `test-suite` with `foo = "1.0"` registry dep
+    //   - `[patch.crates-io.foo] = { path = "." }` (the cxx self-patch)
+    //   - build.rs reads `src/cxx_stub.cc` via CARGO_MANIFEST_DIR
+    //   - include/stub.h is referenced via `Path::exists()`
+    //
+    // The absence of `[dependencies] test-suite = { path = "test-suite" }` in
+    // the root is load-bearing: adding it creates a `foo → test-suite → foo`
+    // active-dep cycle that cargo rejects even when both `foo` references
+    // resolve to the same source-id (Codex diagnosis, rollout 019e3cc3).
+    // The real cxx avoids this because it never declares test-suite as a
+    // root build dependency.
+    //
+    // cargo rustc below runs `-p foo` against the staged overlay; the member
+    // is in the workspace but is NOT a build dep of the root, mirroring real
+    // cxx's build topology.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "foo"
+version = "1.0.0"
+edition = "2021"
+links = "foo-native"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+members = ["test-suite"]
+
+[patch.crates-io]
+foo = { path = "." }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+
+    // build.rs that exercises CARGO_MANIFEST_DIR-relative file reads
+    // (mirrors cxx build.rs:143-148 + :154-159 read pattern).
+    std::fs::write(
+        upstream_dir.join("build.rs"),
+        r#"fn main() {
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+    let src_path = std::path::Path::new(&manifest_dir).join("src").join("cxx_stub.cc");
+    let _content = std::fs::read_to_string(&src_path)
+        .expect("build.rs: failed to read src/cxx_stub.cc via CARGO_MANIFEST_DIR");
+    let include_path = std::path::Path::new(&manifest_dir).join("include").join("stub.h");
+    assert!(include_path.exists(),
+        "build.rs: include/stub.h not found via CARGO_MANIFEST_DIR: {:?}", include_path);
+    println!("cargo:rerun-if-changed=src/cxx_stub.cc");
+    println!("cargo:rerun-if-changed=include/stub.h");
+}
+"#,
+    )
+    .expect("writing build.rs");
+
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("cxx_stub.cc"),
+        "// stub C++ file for build-script test\n",
+    )
+    .expect("writing src/cxx_stub.cc");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    std::fs::create_dir_all(upstream_dir.join("include")).expect("creating include/");
+    std::fs::write(
+        upstream_dir.join("include").join("stub.h"),
+        "// stub header for build-script test\n",
+    )
+    .expect("writing include/stub.h");
+
+    // Workspace member crate referencing `foo` by registry name.
+    let member_dir = upstream_dir.join("test-suite");
+    std::fs::create_dir_all(member_dir.join("src")).expect("creating test-suite/src/");
+    std::fs::write(
+        member_dir.join("Cargo.toml"),
+        r#"[package]
+name = "test-suite"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+foo = "1.0"
+"#,
+    )
+    .expect("writing test-suite/Cargo.toml");
+    std::fs::write(member_dir.join("src").join("lib.rs"), "pub fn _stub() {}\n")
+        .expect("writing test-suite/src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Pre-cargo sanity: Rule 2 REMAP must have rewritten the patch
+    // entry to the staged-overlay-dir (NOT to upstream root, which
+    // would be the BLOCK-1 self-loop bug).
+    let content = read_overlay(&plan.sibling_manifest);
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
+    let remap_path = parsed
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("foo"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("Rule 2 REMAP must keep [patch.crates-io.foo].path");
+    let staged_overlay_dir_str = plan
+        .sibling_manifest
+        .parent()
+        .expect("staged manifest has a parent")
+        .to_string_lossy()
+        .replace('\\', "/");
+    assert_eq!(
+        remap_path, staged_overlay_dir_str,
+        "Rule 2 REMAP must rewrite [patch.crates-io.foo].path to the \
+         staged-overlay-dir, NOT the upstream root (BLOCK-1 self-loop \
+         avoidance pin); got `{remap_path}`"
+    );
+
+    // Mirror verification: <staged>/src/cxx_stub.cc and
+    // <staged>/include/stub.h must be accessible from the staged
+    // overlay dir (via symlink or copy). The build.rs read_to_string
+    // call exercises this end-to-end below; this is the eager
+    // sanity check.
+    let staged_overlay_dir = plan
+        .sibling_manifest
+        .parent()
+        .expect("staged manifest has a parent");
+    let mirrored_cxx_stub = staged_overlay_dir.join("src").join("cxx_stub.cc");
+    let mirrored_stub_h = staged_overlay_dir.join("include").join("stub.h");
+    assert!(
+        mirrored_cxx_stub.exists(),
+        "mirror must populate <staged>/src/cxx_stub.cc; got missing at {:?}",
+        mirrored_cxx_stub
+    );
+    assert!(
+        mirrored_stub_h.exists(),
+        "mirror must populate <staged>/include/stub.h; got missing at {:?}",
+        mirrored_stub_h
+    );
+
+    // The acid test: cargo rustc against the staged overlay.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("foo")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must succeed against the Rule 2 REMAP cxx-shape overlay \
+         (validates BOTH policy correctness + staged-mirror correctness); \
+         got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.7 — Rule 3 CONTINUE-ABSOLUTIZE cargo-graph proof.
+///
+/// Upstream has BOTH a self-patch (`foo` → Rule 2 REMAP) AND a
+/// non-self sibling patch (`foo-helper = { path = "helper" }` → Rule
+/// 3 CONTINUE-ABSOLUTIZE no-op for `apply_self_patch_policy`; the
+/// existing `absolutize_patch_paths` pass handles the entry as
+/// before). This mirrors cxx's upstream which carries
+/// `[patch.crates-io]` entries for both `cxx` (self-patch) and
+/// `cxx-build` (sibling-crate patch with `path = "gen/build"`).
+///
+/// **What this test bites.** A regression that broadens Rule 2 (or
+/// Rule 4) to match non-self keys would either (a) REMAP the
+/// sibling-crate patch to the staged-overlay-dir (wrong source-id
+/// → cargo resolution diverges) or (b) REJECT the sibling patch
+/// (cargo never runs).
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.7.
+#[test]
+fn cargo_accepts_continue_absolutize_when_non_root_patch() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_continue_absolutize_when_non_root_patch: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for Rule 3 cargo test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "foo"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[patch.crates-io]
+foo = { path = "." }
+foo-helper = { path = "helper" }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    // Sibling crate `foo-helper` at `<upstream>/helper/`.
+    let helper_dir = upstream_dir.join("helper");
+    std::fs::create_dir_all(helper_dir.join("src")).expect("creating helper/src/");
+    std::fs::write(
+        helper_dir.join("Cargo.toml"),
+        r#"[package]
+name = "foo-helper"
+version = "0.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("writing helper/Cargo.toml");
+    std::fs::write(helper_dir.join("src").join("lib.rs"), "pub fn _stub() {}\n")
+        .expect("writing helper/src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Pre-cargo sanity: the `foo` self-patch is REMAPPED (Rule 2);
+    // the `foo-helper` sibling patch survives untouched by Rule 3
+    // and is absolutized to `<upstream>/helper` by the existing
+    // `absolutize_patch_paths` pass.
+    let content = read_overlay(&plan.sibling_manifest);
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
+    let foo_path = parsed
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("foo"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.foo].path must exist (Rule 2 REMAP)");
+    let foo_helper_path = parsed
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("foo-helper"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.foo-helper].path must exist (Rule 3 CONTINUE-ABSOLUTIZE)");
+
+    let upstream_dir_str = upstream_dir.to_string_lossy().replace('\\', "/");
+    assert!(
+        foo_path.ends_with("/target/lihaaf-overlay"),
+        "Rule 2 REMAP: [patch.crates-io.foo].path must target the \
+         staged-overlay-dir; got `{foo_path}`"
+    );
+    assert_eq!(
+        foo_helper_path,
+        format!("{upstream_dir_str}/helper"),
+        "Rule 3 CONTINUE-ABSOLUTIZE: [patch.crates-io.foo-helper].path \
+         must be absolutized to `<upstream>/helper` (unchanged by \
+         apply_self_patch_policy; absolutize_patch_paths handles it); \
+         got `{foo_helper_path}`"
+    );
+
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("foo")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must succeed against the Rule 3 overlay; \
+         got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.8 — Rule 4 REJECT integration test.
+///
+/// Negative test: upstream carries a vendored-fork-style self-patch
+/// (`path = "../my-fork"`). The path resolves to a sibling dir, NOT
+/// upstream root → Rule 4 REJECT fires. The materializer returns
+/// `Error::CompatPatchOverrideConflict` referencing the v0.2/v1.1
+/// escape hatch (`--compat-allow-patch-override`).
+///
+/// **Plan-mechanics deviation.** Plan §5.2.8 was labelled
+/// "Cargo-build-gated test" in the §5.2 list header, but the test
+/// itself makes NO cargo invocation — it stops at the materializer's
+/// REJECT branch. Gating this test would silently skip the
+/// integration-layer Rule 4 REJECT coverage on local dev runs,
+/// defeating the discipline contract. The §5.1.7–§5.1.9 unit tests
+/// cover the same Rule 4 cases at the in-crate layer; this test is
+/// the cross-crate-boundary mirror that exercises the same path via
+/// the `lihaaf::Error::CompatPatchOverrideConflict` re-export.
+///
+/// **What this test bites.** A regression that swaps Rule 4's
+/// `Err(_)` for `Ok(_)` (e.g. silently overwriting the upstream's
+/// vendored-fork entry) would let cargo see a misrouted source-id
+/// at build time, producing a confusing downstream failure rather
+/// than a clear-message-up-front REJECT.
+///
+/// Plan §5.2.8.
+#[test]
+fn materialize_rejects_when_upstream_patch_targets_external_source_rule4() {
+    let tmp = tempfile::tempdir().expect("creating tempdir for Rule 4 REJECT integration test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "foo"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[patch.crates-io]
+foo = { path = "../my-fork" }
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    // The `../my-fork` sibling dir is not required to actually exist
+    // for Rule 4 detection to fire — Rule 4's discriminant is the
+    // lexical-normalized-path inequality vs upstream root, NOT
+    // filesystem existence. We don't create it to keep the test
+    // hermetic.
+
+    let err = materialize_overlay(&upstream_manifest)
+        .expect_err("Rule 4 REJECT must surface as Err(_) at the integration layer");
+
+    match err {
+        lihaaf::Error::CompatPatchOverrideConflict {
+            crate_name,
+            upstream_entry: _,
+            expected_resolution,
+        } => {
+            assert_eq!(
+                crate_name, "foo",
+                "Rule 4 REJECT must name the self-keyed crate (`foo`); \
+                 got `{crate_name}`"
+            );
+            assert!(
+                expected_resolution.contains("compat-allow-patch-override"),
+                "Rule 4 REJECT message must reference the v0.2/v1.1 escape \
+                 hatch (`--compat-allow-patch-override`); got: {expected_resolution}"
+            );
+        }
+        other => panic!(
+            "Rule 4 must return Error::CompatPatchOverrideConflict at the \
+             integration layer; got {other:?}"
+        ),
+    }
+}
+
+/// §5.2.9 — SEC-8 Rule 1 INJECT cargo-graph proof: workspace member registry
+/// dep remapped via injected self-patch (R8 rescope).
+///
+/// **R8 rescope (Codex rollout 019e3cc3, 2026-05-18):** The prior fixture
+/// carried `[dependencies] test-suite = { path = "test-suite" }` in the
+/// root, creating a `bar → test-suite → bar` active-dep cycle that cargo
+/// rejects even when both `bar` references resolve to the same source-id.
+/// The `root → member → root` topology proof is empirically impossible:
+/// cargo rejects it unconditionally at the dep-cycle check.
+///
+/// This test is rescoped to prove what cargo ACTUALLY accepts: a workspace
+/// whose root does NOT depend on the member, but whose member carries
+/// `bar = "1.0"` (registry-name dep). Rule 1 INJECT fires (no upstream
+/// `[patch.crates-io.bar]` entry) and adds the patch. The member's
+/// `bar = "1.0"` reference is redirected via the injected patch to the
+/// staged-overlay path source-id, which is the same source-id as the root
+/// `bar`'s `[package]` → cargo resolves without ambiguity.
+///
+/// **What this test bites.** A regression that fails to absolutize the
+/// injected `[patch.crates-io.bar].path` (or emits a form that cargo
+/// doesn't recognize as a path source) would leave `bar = "1.0"` resolving
+/// to crates.io while the root resolves to the staged-overlay path → cargo's
+/// resolver sees two source-ids for `bar` and reports the ambiguity error
+/// (`specification \`bar\` is ambiguous`).
+///
+/// **What this test does NOT prove.** The `root → member → root` active-dep
+/// cycle (root declares test-suite as a `[dependencies]` entry that also
+/// dep-on-root-by-registry-name) is rejected by cargo regardless of patch
+/// state. That topology is unfaithful to real upstreams (cxx does not carry
+/// a root dep on its test-suite workspace member). Tests §5.2.6 and this
+/// §5.2.9 both mirror faithful upstream shapes.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.9.
+#[test]
+fn cargo_accepts_workspace_member_registry_dep_via_self_patch() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_accepts_workspace_member_registry_dep_via_self_patch: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp =
+        tempfile::tempdir().expect("creating tempdir for SEC-8 Rule 1 INJECT cargo-graph test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    // Root manifest: workspace declaration ONLY — no root dep on member.
+    // cxx-faithful shape: root is in the workspace with its test-suite member,
+    // but root does NOT carry `[dependencies] test-suite = { path = "test-suite" }`.
+    // Adding that edge creates a `bar → test-suite → bar` active-dep cycle
+    // that cargo rejects; omitting it is the correct faithful shape.
+    //
+    // cargo rustc below runs `-p bar` against the staged overlay; the member
+    // is in the workspace but not a build dep of the root.
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "bar"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+members = ["test-suite"]
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        "pub fn _stub() {}\n",
+    )
+    .expect("writing src/lib.rs");
+
+    // Workspace member referencing `bar` by registry name — the dep Rule 1
+    // INJECT must redirect to the staged-overlay path.
+    let member_dir = upstream_dir.join("test-suite");
+    std::fs::create_dir_all(member_dir.join("src")).expect("creating test-suite/src/");
+    std::fs::write(
+        member_dir.join("Cargo.toml"),
+        r#"[package]
+name = "test-suite"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+bar = "1.0"
+"#,
+    )
+    .expect("writing test-suite/Cargo.toml");
+    std::fs::write(member_dir.join("src").join("lib.rs"), "pub fn _stub() {}\n")
+        .expect("writing test-suite/src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Pre-cargo sanity: Rule 1 INJECT must have added
+    // `[patch.crates-io.bar] = { path = "<staged-overlay-dir>" }`.
+    let content = read_overlay(&plan.sibling_manifest);
+    let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
+    let bar_path = parsed
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("bar"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("Rule 1 INJECT must add [patch.crates-io.bar].path");
+    assert!(
+        bar_path.ends_with("/target/lihaaf-overlay"),
+        "Rule 1 INJECT path must target the staged-overlay-dir; got `{bar_path}`"
+    );
+
+    // The acid test: cargo rustc -p bar against the staged overlay. Pre-fix
+    // (without Rule 1 INJECT), cargo's resolver sees `bar` referenced BOTH as
+    // the workspace root (path source) AND via `test-suite`'s `bar = "1.0"`
+    // registry-name dep → `specification \`bar\` is ambiguous`. Post-fix,
+    // the injected patch redirects the registry-name reference to the
+    // staged-overlay path → both references collapse to the same source-id →
+    // resolution clean. Root doesn't dep on member so no active-dep cycle.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("rustc")
+        .arg("-p")
+        .arg("bar")
+        .arg("--lib")
+        .arg("--release")
+        .arg("--crate-type=dylib")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .env("RUSTFLAGS", "-C prefer-dynamic")
+        .output()
+        .expect("spawning cargo rustc; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo rustc must accept the workspace-member-registry-dep-via-self-patch \
+         topology (SEC-8 Rule 1 INJECT closure); got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.10 — M.5 staged-mirror fixes anyhow-shape silent-false probe.
+///
+/// Constructs the anyhow build-script probe pattern: `build.rs`
+/// checks `Path::new("src").join("nightly.rs")` via
+/// `Path::exists()` and emits a custom cfg based on the result.
+/// Pre-mirror, the probe file is not accessible from
+/// `<staged-overlay>/`, so `probe.exists()` returns false → cargo
+/// sets `probe_file_missing` cfg → `src/lib.rs` triggers
+/// `compile_error!`, turning the silent-false probe failure into a
+/// HARD compile error. Post-mirror, `<staged>/src/nightly.rs` is a
+/// symlink to upstream → `probe.exists()` returns true →
+/// `probe_file_found` cfg → cargo build succeeds.
+///
+/// **Why the `compile_error!` is load-bearing.** The anyhow / serde_json
+/// silent-false failure mode is the most insidious class: no error
+/// message, but the wrong cfg is emitted, which silently changes
+/// downstream macro expansions. A test that just asserts cargo build
+/// success would PASS pre-fix too (cargo doesn't error on silent-false).
+/// Gating downstream code on the cfg via `compile_error!` makes the
+/// silent-false a loud, gate-tripping compile failure.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.10.
+#[test]
+fn cargo_build_anyhow_shape_probe_file_resolves_via_mirror() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_build_anyhow_shape_probe_file_resolves_via_mirror: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for M.5 anyhow-probe test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "anyhow-like"
+version = "1.0.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+
+    // build.rs probe pattern (mirrors anyhow build.rs:255-257 + :323-367).
+    std::fs::write(
+        upstream_dir.join("build.rs"),
+        r#"fn main() {
+    let probe = std::path::Path::new("src").join("nightly.rs");
+    if probe.exists() {
+        println!("cargo:rustc-cfg=probe_file_found");
+    } else {
+        println!("cargo:rustc-cfg=probe_file_missing");
+    }
+    // Tell cargo we look at this cfg (suppresses unexpected_cfgs warning
+    // on newer cargos so the test surfaces only the load-bearing failure).
+    println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
+    println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
+    println!("cargo:rerun-if-changed=src/nightly.rs");
+}
+"#,
+    )
+    .expect("writing build.rs");
+
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("nightly.rs"),
+        "// nightly probe stub\n",
+    )
+    .expect("writing src/nightly.rs");
+
+    // src/lib.rs uses `cfg`-gated `compile_error!` to make
+    // `probe_file_missing` a hard build failure. The `cfg(probe_file_found)`
+    // branch is a no-op so the success path compiles cleanly.
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        r#"#[cfg(probe_file_found)]
+pub fn probe_found() {}
+#[cfg(probe_file_missing)]
+compile_error!("probe_file_missing: staged-mirror did not provide src/nightly.rs");
+"#,
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    // Mirror sanity: `<staged>/src/nightly.rs` must be accessible
+    // (via symlink or copy). Pre-fix without the mirror, this file
+    // is missing and the build.rs probe fires the silent-false →
+    // compile_error! path.
+    let staged_overlay_dir = plan
+        .sibling_manifest
+        .parent()
+        .expect("staged manifest has a parent");
+    let mirrored_probe = staged_overlay_dir.join("src").join("nightly.rs");
+    assert!(
+        mirrored_probe.exists(),
+        "mirror must populate <staged>/src/nightly.rs; got missing at {:?}",
+        mirrored_probe
+    );
+
+    // Acid test: cargo build against the staged overlay. The
+    // `compile_error!` in src/lib.rs fires if `probe_file_missing`
+    // → cargo build fails with the message. Post-mirror, the probe
+    // file is accessible → `probe_file_found` → cargo build clean.
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .expect("spawning cargo build; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo build must succeed for the M.5 anyhow-shape probe \
+         (staged-mirror provides src/nightly.rs); got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.11 — M.6 staged-mirror fixes thiserror-shape silent-false probe.
+///
+/// Same pattern as §5.2.10 but for the `build/probe.rs` path form
+/// (distinct top-level mirror entry: `build/` instead of `src/`).
+/// This pins the contract that the mirror writer handles top-level
+/// `build/` as a real directory to be mirrored, not as a cargo-
+/// reserved name. If the implementation special-cases `src/` but
+/// forgets `build/`, this test surfaces the gap.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.11.
+#[test]
+fn cargo_build_thiserror_shape_probe_file_resolves_via_mirror() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_build_thiserror_shape_probe_file_resolves_via_mirror: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for M.6 thiserror-probe test");
+    let upstream_dir = tmp.path();
+
+    assert!(
+        upstream_dir.is_absolute(),
+        "tempdir must be absolute (CompatArgs::from_cli guarantees this at the CLI layer)"
+    );
+
+    let upstream_manifest = upstream_dir.join("Cargo.toml");
+    std::fs::write(
+        &upstream_manifest,
+        r#"[package]
+name = "thiserror-like"
+version = "1.0.0"
+edition = "2021"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("writing upstream Cargo.toml");
+
+    // build.rs probe pattern (mirrors thiserror build.rs:261-263 + :328-371).
+    std::fs::write(
+        upstream_dir.join("build.rs"),
+        r#"fn main() {
+    let probe = std::path::Path::new("build").join("probe.rs");
+    if probe.exists() {
+        println!("cargo:rustc-cfg=probe_file_found");
+    } else {
+        println!("cargo:rustc-cfg=probe_file_missing");
+    }
+    println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
+    println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
+    println!("cargo:rerun-if-changed=build/probe.rs");
+}
+"#,
+    )
+    .expect("writing build.rs");
+
+    // `build/` as an UPSTREAM directory (NOT cargo's reserved
+    // `build = "build.rs"` script — that's a file).
+    std::fs::create_dir_all(upstream_dir.join("build")).expect("creating build/");
+    std::fs::write(
+        upstream_dir.join("build").join("probe.rs"),
+        "// thiserror build probe stub\n",
+    )
+    .expect("writing build/probe.rs");
+
+    std::fs::create_dir_all(upstream_dir.join("src")).expect("creating src/");
+    std::fs::write(
+        upstream_dir.join("src").join("lib.rs"),
+        r#"#[cfg(probe_file_found)]
+pub fn probe_found() {}
+#[cfg(probe_file_missing)]
+compile_error!("probe_file_missing: staged-mirror did not provide build/probe.rs");
+"#,
+    )
+    .expect("writing src/lib.rs");
+
+    let plan = materialize_overlay(&upstream_manifest).expect("overlay must succeed");
+
+    let staged_overlay_dir = plan
+        .sibling_manifest
+        .parent()
+        .expect("staged manifest has a parent");
+    let mirrored_probe = staged_overlay_dir.join("build").join("probe.rs");
+    assert!(
+        mirrored_probe.exists(),
+        "mirror must populate <staged>/build/probe.rs (the M.6 path \
+         form, distinct from the M.5 `src/` form); got missing at {:?}",
+        mirrored_probe
+    );
+
+    let target_dir = upstream_dir.join("target").join("lihaaf-build");
+    let output = std::process::Command::new("cargo")
+        .arg("build")
+        .arg("--manifest-path")
+        .arg(&plan.sibling_manifest)
+        .arg("--target-dir")
+        .arg(&target_dir)
+        .output()
+        .expect("spawning cargo build; CI must have cargo on PATH");
+
+    assert!(
+        output.status.success(),
+        "cargo build must succeed for the M.6 thiserror-shape probe \
+         (staged-mirror provides build/probe.rs); got exit {:?}\n\
+         stdout:\n{}\n\
+         stderr:\n{}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+}
+
+/// §5.2.12 — absolute-path pin for the injected/remapped self-patch.
+///
+/// Unit-style integration test (UNGATED) that asserts the
+/// materialized overlay's `[patch.crates-io.<self>].path` value is:
+///
+///   1. Absolute (starts with `/` on Unix, drive letter prefix on
+///      Windows).
+///   2. Tail-matches `/target/lihaaf-overlay` (the staged-overlay
+///      directory shape).
+///
+/// Applies to BOTH Rule 1 (INJECT) and Rule 2 (REMAP) emission
+/// paths — both rules emit the same absolute byte shape per plan
+/// §6.5 (the unified emission contract).
+///
+/// **Why this is a separate test from §5.1.3 (the unit-test inode
+/// pin).** §5.1.3 is in `src/compat/overlay.rs::tests` and exercises
+/// the policy from inside the crate. §5.2.12 is at the
+/// integration-crate boundary, going through the
+/// `lihaaf::compat_overlay_materialize` re-export. A future
+/// regression that downgraded the re-export's surface (e.g.
+/// returning a stripped path representation across the crate
+/// boundary) would slip past §5.1.3.
+///
+/// Plan §5.2.12 (the absolute-path pin).
+#[test]
+fn patch_crates_io_self_injection_absolute_path_only() {
+    // Rule 1 INJECT case: clean upstream, no pre-existing patch.
+    let rule1_input = r#"[package]
+name = "demo"
+version = "0.1.0"
+"#;
+    let (tmp1, upstream1) = write_upstream(rule1_input);
+    let plan1 = materialize_overlay(&upstream1).expect("Rule 1 INJECT overlay must succeed");
+    let content1 = read_overlay(&plan1.sibling_manifest);
+    let parsed1: toml::Value = toml::from_str(&content1).expect("Rule 1 overlay must be TOML");
+    let rule1_path = parsed1
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("demo"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("Rule 1 INJECT must produce [patch.crates-io.demo].path");
+    assert!(
+        Path::new(rule1_path).is_absolute(),
+        "Rule 1 INJECT path MUST be absolute (plan §6.5: avoids cargo's \
+         coincidental anchoring of `.`; future-proofs against \
+         absolutize_patch_paths policy changes); got `{rule1_path}`"
+    );
+    assert!(
+        rule1_path.ends_with("/target/lihaaf-overlay"),
+        "Rule 1 INJECT path MUST tail-match `/target/lihaaf-overlay` \
+         (plan §6.5 emission contract); got `{rule1_path}`"
+    );
+    drop(tmp1);
+
+    // Rule 2 REMAP case: upstream carries `path = "."` self-patch.
+    let rule2_input = r#"[package]
+name = "demo"
+version = "0.1.0"
+
+[patch.crates-io]
+demo = { path = "." }
+"#;
+    let (tmp2, upstream2) = write_upstream(rule2_input);
+    let plan2 = materialize_overlay(&upstream2).expect("Rule 2 REMAP overlay must succeed");
+    let content2 = read_overlay(&plan2.sibling_manifest);
+    let parsed2: toml::Value = toml::from_str(&content2).expect("Rule 2 overlay must be TOML");
+    let rule2_path = parsed2
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.get("demo"))
+        .and_then(|e| e.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("Rule 2 REMAP must produce [patch.crates-io.demo].path");
+    assert!(
+        Path::new(rule2_path).is_absolute(),
+        "Rule 2 REMAP path MUST be absolute (plan §6.5 emission contract \
+         is unified across Rule 1 / Rule 2); got `{rule2_path}`"
+    );
+    assert!(
+        rule2_path.ends_with("/target/lihaaf-overlay"),
+        "Rule 2 REMAP path MUST tail-match `/target/lihaaf-overlay`; \
+         got `{rule2_path}`"
+    );
+
+    // Cross-rule shape parity pin: Rule 1 and Rule 2 emit the same
+    // tail. If a future regression diverged the emission byte shape
+    // (e.g. trailing slash on one form but not the other), the
+    // corpus-determinism test (`byte_identical_across_two_lihaaf_binaries_on_corpus`)
+    // would catch it on the canonical fixtures, but this assertion
+    // pins the contract in source even if both fixtures drift in
+    // parallel.
+    let rule1_tail = rule1_path
+        .rsplit('/')
+        .next()
+        .expect("rule1 path has at least one component");
+    let rule2_tail = rule2_path
+        .rsplit('/')
+        .next()
+        .expect("rule2 path has at least one component");
+    assert_eq!(
+        rule1_tail, rule2_tail,
+        "Rule 1 / Rule 2 emission must share the same final component \
+         (unified emission contract); got Rule 1 `{rule1_tail}` vs \
+         Rule 2 `{rule2_tail}`"
+    );
+    drop(tmp2);
 }
