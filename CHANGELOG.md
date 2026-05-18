@@ -6,6 +6,18 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+### Changed
+
+### Fixed
+
+## [0.1.0-beta.8] — 2026-05-18
+
+Closes #40 (serde-json `ambiguous specification`) and #47 (cxx
+`links = "cxxbridge1"` collision) via PR #56. Delivers the Option H
+4-rule self-patch policy and a staged package-root mirror.
+
 ### Fixed
 
 - Compat-mode now applies an intent-aware self-patch policy to `[patch.crates-io.<overlay-package-name>]` in the staged overlay (Option H, 4 rules):
