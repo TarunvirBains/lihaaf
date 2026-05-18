@@ -285,6 +285,7 @@ pub fn parse(toml_text: &str, manifest_path: &Path) -> Result<Config, Error> {
             ),
         }));
     }
+    validate_dylib_crate(&dylib_crate)?;
 
     // Build the default suite from the top-level keys. The default suite
     // is always present in `Config::suites` even when no `[[suite]]`
@@ -379,11 +380,14 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
     let allow_lints = raw.allow_lints.clone().unwrap_or_default();
     validate_allow_lints(DEFAULT_SUITE_NAME, &allow_lints)?;
 
+    let features = raw.features.clone().unwrap_or_default();
+    validate_features(DEFAULT_SUITE_NAME, &features)?;
+
     Ok(Suite {
         name: DEFAULT_SUITE_NAME.to_string(),
         extern_crates,
         fixture_dirs,
-        features: raw.features.clone().unwrap_or_default(),
+        features,
         edition,
         dev_deps: raw.dev_deps.clone().unwrap_or_default(),
         compile_fail_marker: raw
@@ -478,15 +482,18 @@ fn finalize_named_suite(
         .unwrap_or_else(|| default_suite.allow_lints.clone());
     validate_allow_lints(&name, &allow_lints)?;
 
+    // Features intentionally do NOT inherit: a "spatial only" suite
+    // shouldn't accidentally pull in the default suite's `testing`
+    // feature. Adopters who want shared features must list them in
+    // both places.
+    let features = raw.features.unwrap_or_default();
+    validate_features(&name, &features)?;
+
     Ok(Suite {
         name,
         extern_crates,
         fixture_dirs,
-        // Features intentionally do NOT inherit: a "spatial only" suite
-        // shouldn't accidentally pull in the default suite's `testing`
-        // feature. Adopters who want shared features must list them in
-        // both places.
-        features: raw.features.unwrap_or_default(),
+        features,
         edition,
         dev_deps: raw
             .dev_deps
@@ -541,8 +548,8 @@ fn validate_edition(suite_label: &str, edition: &str) -> Result<(), Error> {
 }
 
 /// Validate every entry in `allow_lints` against the structural rules:
-/// no empty strings, no leading `-` (caller must not supply the `-A`
-/// prefix), and no whitespace / quote / backslash characters (would
+/// no empty strings, no NUL bytes, no leading `-` (caller must not supply
+/// the `-A` prefix), and no whitespace / quote / backslash characters (would
 /// break argv tokenization or smuggle extra flags past rustc).
 ///
 /// Unknown lint names are NOT pre-validated; rustc surfaces
@@ -554,6 +561,16 @@ fn validate_allow_lints(suite_label: &str, lints: &[String]) -> Result<(), Error
                 message: format!(
                     "{suite_label}.allow_lints contains an empty string.\n\
                      Why this matters: an empty string is not a valid lint name and would produce an unrecognized flag on the rustc argv."
+                ),
+            }));
+        }
+        if lint.contains('\0') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.allow_lints entry contains a NUL byte.\n\
+                     Why this matters: an interior NUL byte cannot appear in a POSIX argv token; \
+                     spawn would reject the argv and the failure would surface as WORKER_CRASHED \
+                     instead of an actionable CONFIG_INVALID."
                 ),
             }));
         }
@@ -576,6 +593,69 @@ fn validate_allow_lints(suite_label: &str, lints: &[String]) -> Result<(), Error
                 ),
             }));
         }
+    }
+    Ok(())
+}
+
+/// Validate every entry in `features` against the structural rules:
+/// no empty strings and no NUL bytes.
+///
+/// Each entry is forwarded as a single argv token to cargo (`--features <f>`)
+/// and to rustc (`--cfg feature="<f>"`). Empty strings and NUL bytes cannot
+/// appear in a POSIX argv token; an interior NUL would cause spawn to reject
+/// the argv and the failure would surface as WORKER_CRASHED instead of an
+/// actionable CONFIG_INVALID.
+///
+/// Other character restrictions (whitespace, shell-meta) are intentionally
+/// out of scope here — Cargo itself validates feature-name syntax and will
+/// surface those errors with precise diagnostics.
+fn validate_features(suite_label: &str, features: &[String]) -> Result<(), Error> {
+    for feature in features {
+        if feature.is_empty() {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.features contains an empty string.\n\
+                     Why this matters: each entry must be a single argv token forwarded as \
+                     `--features` to cargo and `--cfg feature=\"...\"` to rustc; an empty \
+                     string is not a valid feature name."
+                ),
+            }));
+        }
+        if feature.contains('\0') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.features entry contains a NUL byte.\n\
+                     Why this matters: each entry must be a single argv token forwarded as \
+                     `--features` to cargo and `--cfg feature=\"...\"` to rustc; an interior \
+                     NUL byte cannot appear in a POSIX argv token and spawn would reject it, \
+                     surfacing as WORKER_CRASHED instead of an actionable CONFIG_INVALID."
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Validate the `dylib_crate` value after the empty-string check.
+///
+/// Currently rejects interior NUL bytes. The crate name is forwarded as a
+/// `-p` argv token to cargo; an interior NUL byte cannot appear in a POSIX
+/// argv token and spawn would reject it, surfacing as WORKER_CRASHED instead
+/// of an actionable CONFIG_INVALID.
+///
+/// Factored out so it can be unit-tested directly — the TOML decoder already
+/// rejects NUL bytes before `parse` sees them, but programmatic construction
+/// paths (e.g., integration tests that build `Config` by hand) can still
+/// reach this validator.
+fn validate_dylib_crate(dylib_crate: &str) -> Result<(), Error> {
+    if dylib_crate.contains('\0') {
+        return Err(Error::Session(Outcome::ConfigInvalid {
+            message: "[package.metadata.lihaaf].dylib_crate contains a NUL byte.\n\
+                 Why this matters: the crate name is forwarded as a `-p` argv token to cargo; \
+                 an interior NUL byte cannot appear in a POSIX argv token and spawn would reject \
+                 it, surfacing as WORKER_CRASHED instead of an actionable CONFIG_INVALID."
+                .to_string(),
+        }));
     }
     Ok(())
 }
@@ -1253,6 +1333,64 @@ mod tests {
                 "error for entry `{bad_label}` did not mention `whitespace`: {msg}"
             );
         }
+    }
+
+    // ---- NUL-byte / argv-safety tests ----
+
+    #[test]
+    fn allow_lints_rejects_nul_byte() {
+        // TOML's basic-string spec disallows control characters including NUL,
+        // so the TOML decoder would reject a NUL in a TOML literal before the
+        // validator sees it. We test the validator directly here — this covers
+        // any programmatic path that constructs a Vec<String> without going
+        // through TOML (e.g. tests that synthesise Config by hand).
+        let lints = vec![format!("bad{}lint", '\u{0}')];
+        let err = validate_allow_lints("default", &lints).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("allow_lints"),
+            "error did not mention `allow_lints`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
+    }
+
+    #[test]
+    fn features_rejects_nul_byte() {
+        // Same TOML-bypass rationale as allow_lints_rejects_nul_byte above.
+        let features = vec![format!("bad{}feat", '\u{0}')];
+        let err = validate_features("default", &features).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("features"),
+            "error did not mention `features`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
+    }
+
+    #[test]
+    fn features_rejects_empty_string() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            features = [""]
+        "#,
+            &["features", "empty string"],
+        );
+    }
+
+    #[test]
+    fn dylib_crate_rejects_nul_byte() {
+        // Same TOML-bypass rationale as allow_lints_rejects_nul_byte above.
+        let name = format!("con{}sumer", '\u{0}');
+        let err = validate_dylib_crate(&name).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("dylib_crate"),
+            "error did not mention `dylib_crate`: {msg}"
+        );
+        assert!(msg.contains("NUL"), "error did not mention `NUL`: {msg}");
     }
 
     #[test]
