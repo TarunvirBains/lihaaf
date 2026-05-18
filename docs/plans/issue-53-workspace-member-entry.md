@@ -5,22 +5,22 @@ This is a **pre-implementer-dispatch design plan**, NOT durable repository docum
 - Lives on branch `docs/v01-plan-artifacts-53` for the duration of the implementer-dispatch + adversarial-review cycle for lihaaf #53.
 - The implementer's PR (target: `careful-coder` Opus) MUST `rm docs/plans/issue-53-workspace-member-entry.md` as part of its diff so this file does not land on `main`.
 - If the implementer's PR is reviewed and ALLOWed but this file is still present, the post-merge cleanup must remove it before the next release branch cuts.
-- This plan is currently at R1 awaiting adversarial review. Codex xhigh (or equivalent) ALLOW required before implementer dispatch.
+- This plan is currently at R2 awaiting adversarial review (R1 returned Codex `VERDICT: BLOCK` with a 30-item class-enumeration sweep on 2026-05-18). Codex xhigh (or equivalent) ALLOW required before implementer dispatch.
 
 ---
 
 # Plan: lihaaf #53 — workspace-MEMBER subdirectory entry (`-p <package>`)
 
-Revision: R1 (2026-05-18, pre-adversarial-review)
+Revision: R2 (2026-05-18, post-Codex-R1-BLOCK + class-enumeration sweep)
 
 Issue: https://github.com/TarunvirBains/lihaaf/issues/53 (compat: implicit-ancestor REJECT fires on workspace-MEMBER subdirectory entry — axum-macros blocker)
 
-Status entering: beta.6 + #43 landed (`allow_lints` field, commit `586cc68`). PR #37 R4 implicit-ancestor REJECT is the over-broad guard that blocks the legitimate workspace-member entry shape.
+Status entering: beta.8 + #40+#47 landed (Option H 4-rule self-patch policy + staged package-root mirror at commit `cb5d5bf`; see PR #56). PR #37 R4 implicit-ancestor REJECT is the over-broad guard that blocks the legitimate workspace-member entry shape.
 Status target: v0.1.0 (per [[lihaaf-v01-ga-gate]] 2026-05-18 — #53 is the final v0.1.0 blocker after #40, #43, #47; closes Round-2 enrollment of axum-macros).
 
 Target implementer: `careful-coder` Opus, max effort. Reason: change spans CLI surface (`src/cli.rs`), compat-args projection (`src/compat/cli.rs`), compat driver wiring (`src/compat/mod.rs`), overlay resolver (`src/compat/overlay.rs` — new function + REJECT-branch interaction), spec amendment, compat plan amendment, integration tests, corpus expansion, and CHANGELOG. Sonnet variant is wrong tier — this touches the entry-point boundary and the REJECT-branch interaction is design-judgment-heavy.
 
-Target branch (for the implementer to cut): `feat/issue-53-workspace-member-entry` from `main` at `586cc68` or later.
+Target branch (for the implementer to cut): `feat/issue-53-workspace-member-entry` from `main` at `cb5d5bf` or later (PR #56 #40+#47 Option H + staged-mirror MUST be on `main` first — pre-R2 was uncertain about ordering; R2 confirms #40+#47 are landed and removes the conditional branch in §11.9).
 
 Working dir: `/home/tarunvir/projects/lihaaf`.
 
@@ -28,7 +28,23 @@ Working dir: `/home/tarunvir/projects/lihaaf`.
 
 ## Revision history
 
-- **R1 (2026-05-18, initial)** — drafted by strict-swe Opus planner. Sections 1-12 written together; awaiting Codex xhigh adversarial review (per [[lihaaf-plan-adversarial-cycle]]).
+- **R1 (2026-05-18, initial)** — drafted by strict-swe Opus planner. Sections 1-12 written together; sent to Codex xhigh for adversarial review (per [[lihaaf-plan-adversarial-cycle]]).
+- **R2 (2026-05-18, post-Codex-R1-BLOCK + sweep-after-review)** — Codex R1 returned `VERDICT: BLOCK` with 6 HARD_BLOCKs + 4 FIX_BEFORE_IMPL findings; the subsequent class-enumeration sweep produced a 30-item punch list across the 6 BLOCK classes (instances + inverses + adjacents). R2 deltas:
+
+  - **BLOCK-1 fix (dual-root plumbing).** R1 conflated one `compat_root` path for five distinct consumer roles (overlay tracking, discovery, fixture conversion, baseline sidecar, baseline cwd / `Cargo.lock` discovery). For workspace-member entry these roles split between two roots: the WORKSPACE root (baseline cwd, `Cargo.lock` discovery) and the MEMBER root (overlay, discovery, fixture conversion). R2 adds **§3.1.bis "Root vocabulary"** defining `workspace_root`, `member_root`, `workspace_root_manifest`, `member_manifest`, `overlay_root`, and a per-consumer routing table (PUNCH-1, PUNCH-2, PUNCH-3, PUNCH-4). All downstream sections (§4.2 driver wire-up, §4.5 carries-through, §5.4 context-struct shape) updated to consume the dual-root contract.
+  - **BLOCK-2 fix (root-relative path absolutization).** R1's "carried verbatim" wording for workspace-root tables is wrong for path-bearing keys: `[workspace.dependencies.foo].path = "crates/foo"` carried verbatim into an overlay rooted at `<member>/target/lihaaf-overlay/Cargo.toml` would re-anchor relative paths against the overlay dir, not the workspace root — broken. R2 adds **§3.2.bis "Workspace-table path policy"** with a 4-column classification (workspace-root path / member-root path / URL or non-path string / non-copied) for every table key the plan carries down (PUNCH-5 through PUNCH-11). Path-bearing keys are absolutized against `workspace_root` before write into the overlay; non-path keys carried verbatim.
+  - **BLOCK-3 fix (Option H composition order).** R1 left ambiguous what happens when the workspace ROOT carries `[patch.crates-io]` and Option H Rule 1 (INJECT into member's self-patch slot) runs first — a workspace-root self-patch entry covering the member could be hidden by Rule 1's INJECT. R2 adds **§5.3.bis "Option H composition order — root-first, member-second"** specifying: (a) Cargo only reads `[patch.crates-io]` from the workspace ROOT (member-local `[patch.crates-io]` is a cargo error — we match by erroring); (b) the effective patch table is computed from the workspace root's `[patch.crates-io]` with path entries absolutized against `workspace_root` FIRST, then Option H's 4 rules run against the MERGED effective table (PUNCH-12, PUNCH-13). §5.3.bis also documents `[patch.<registry>]` scope-out (PUNCH-14), `[replace]` handling (PUNCH-15), and `[profile.*]` precedence (PUNCH-16).
+  - **BLOCK-4 fix (resolver glob expansion).** R1's resolver supported only top-level directory-name globs (`axum-*`), missing the common axum-style `members = ["crates/*"]` layout. R2 expands **§4.3 step 5 (Glob expansion details)** to support: single-segment-with-slash globs (`crates/*`), explicit nested literal paths (`crates/foo`, `tools/bar`), absolute-path rejection, trailing-slash normalization, deep-glob rejection (`**/*` returns directed error) (PUNCH-17, PUNCH-18, PUNCH-19, PUNCH-20).
+  - **BLOCK-5 fix (`workspace.exclude` + `default-members` + nested workspaces + duplicates).** R1's resolver matched against `[workspace.members]` only, missing `[workspace.exclude]` subtraction, `[workspace.default-members]` semantics, nested-workspace traversal boundaries, and ambiguity behavior on duplicate package names after expansion. R2 adds **§4.3 step 3.5 "Exclude subtraction"** + **§4.3 step 4.5 "Nested-workspace traversal boundary"** + **§4.3 step 7.5 "Default-members non-interaction"** + **§4.3 step 8 "Duplicate package names after expansion"** (PUNCH-21, PUNCH-22, PUNCH-23, PUNCH-24).
+  - **BLOCK-6 fix (test coverage for new classes).** R1's §7 tests (23 unit + 1 integration) missed coverage for the 6 BLOCK classes' instances + inverses. R2 adds 18 new tests to **§7.2** (now 41 unit tests + 1 integration test + corpus addition), grouped by the 6 BLOCK classes' instances + inverses + adjacents: dual-root routing (T-24), workspace-root path absolutization (T-25, T-26), Option H composition with root self-patch + member-local `[patch]` rejection (T-27, T-28), glob/path resolver coverage (T-29 through T-35), exclude / default-members / nested / duplicate coverage (T-36 through T-40), and the package+workspace root rejection per §1 scope (T-41) (PUNCH-25 through PUNCH-30). §7.7 + §10b mirror table extended (rows 47-70).
+  - **FIX_BEFORE_IMPL #1 (stale "#40+#47 not landed" branch).** PR #56 (Option H + staged-mirror) is merged on `main` at `cb5d5bf`. R1 §11.9 had a conditional branch "if #40+#47 has NOT landed, the carry-down for `[patch.crates-io]` is simpler". R2 removes the conditional; #40+#47 is the new floor.
+  - **FIX_BEFORE_IMPL #2 (spec amendments accuracy).** R2 §8.1 / §8.2 / §8.3 spec-amendment text rewritten to reference the dual-root contract (§3.1.bis), path-policy table (§3.2.bis), Option H composition order (§5.3.bis), and the v0.1.0 virtual-workspace-only scope (§1).
+  - **FIX_BEFORE_IMPL #3 (status references).** Updated beta.6 / `586cc68` → beta.8 / `cb5d5bf` throughout (top of plan, §11.9, dispatch shape).
+  - **FIX_BEFORE_IMPL #4 (virtual-vs-package+workspace scope).** R1 was silent on workspace-root-shape scope. R2 **scopes v0.1.0 to VIRTUAL workspaces only** (workspace root declares `[workspace]` without `[package]`; this is the axum / tokio / clap shape and the only case Round-2 needs). Package+workspace shape (root has both `[package]` and `[workspace]`, e.g. some smaller multi-crate repos like `serde_with`) is documented as a v0.2 / v1.0 follow-up with explicit rationale in §1 ("Out of scope") and §11.11. Verified against axum: tokio-rs/axum's root `Cargo.toml` is a virtual workspace (https://github.com/tokio-rs/axum/blob/main/Cargo.toml — `[workspace] members = ["axum", "axum-*"]`, no `[package]`).
+  - **DEFERRABLE_NIT (§10b row 32 stale `R5` marker).** R1 §10b row 32's grep target string `Workspace-member entry via `--package` (R5 / issue #53)` carried a stale `R5 /` prefix from a copy-paste residue of the #40+#47 R8 plan structure. Removed; this plan is at R2 and the module-level rustdoc text now reads `Workspace-member entry via `--package` (issue #53)` (matching §8.5).
+  - **INTERNAL-CONSISTENCY surface (corpus shape correction).** While addressing BLOCK-6, R2 discovered R1 §7.4 invented a TOML schema (`[[entry]]` tables in `compat/baseline.toml`) that does not match the actual code. The byte-determinism corpus lives at `tests/compat/overlay_corpus/<name>.input.toml` + `<name>.expected.toml` (file-pair fixtures); the test (`byte_identical_across_two_lihaaf_binaries_on_corpus` at `tests/compat/overlay_determinism.rs:432-499`) iterates a hardcoded `names` array of 6 fixtures and asserts `checked == 6`. R2 §7.4 rewritten to add a `workspace_member_with_package` fixture pair to that directory and bump the hardcoded names array + count assertion from 6 to 7. `compat/baseline.toml` is the §5 pilot-gate baseline table (per-pilot `n_max` ceilings), unrelated to the corpus. R1's §7.4 description was structurally wrong; R2 corrects to match repo reality. This is in-scope for BLOCK-6 (test coverage) and is not a scope expansion.
+
+  Per [[sweep-after-review]] discipline: BLOCK-class findings + 30-item punch list were sourced from a single Codex xhigh adversarial pass; R2 addresses ALL of them (no carry-forward to R3 unless Codex R2 surfaces a new class).
 
 ---
 
@@ -42,12 +58,13 @@ Working dir: `/home/tarunvir/projects/lihaaf`.
 
 **Out of scope for this PR (explicit, surfaced to head off Codex misclassification):**
 
-- Per-package overlay shape changes — the resolver maps `-p <pkg>` to a member manifest path; downstream overlay materialization (workspace-inheritance preservation, `[patch.crates-io]` self-patch policy) is unchanged for the member case and inherits the #40+#47 fixes that should already be on `main` at implementer-dispatch time.
+- Per-package overlay shape changes — the resolver maps `-p <pkg>` to a member manifest path; downstream overlay materialization (workspace-inheritance preservation, `[patch.crates-io]` self-patch policy) is unchanged for the member case and inherits the #40+#47 fixes (Option H 4-rule policy + staged package-root mirror) now landed on `main` at commit `cb5d5bf` (PR #56).
 - Multiple-package selection — `-p` accepts a single package; `-p axum-macros -p axum-core` is rejected at CLI parse time. Cargo's own `-p` is also single-valued in `cargo rustc`; we match.
 - Non-compat-mode `-p` support — the flag is compat-mode-only. The v0.1 surface outside compat mode does not need a package selector (lihaaf's non-compat mode already takes `--manifest-path` directly to the consumer crate). Adding `-p` to non-compat mode would be a v0.2 conversation.
 - Workspace globs in `-p` — `-p axum-*` is rejected. Cargo's `-p` does not accept globs either; single literal package name.
-- `Cargo.lock` consultation — the resolver reads `Cargo.toml` files only. The lockfile is the dylib build's concern, not the entry-point's.
-- Cross-workspace `-p` — `-p` is resolved within the SINGLE workspace rooted at `compat_root` or the workspace found by walking up from `compat_root` (one or the other; §4 picks the rule). Workspaces containing other workspaces (nested) are addressed in §6.
+- `Cargo.lock` consultation — the resolver reads `Cargo.toml` files only. The lockfile is the dylib build's concern, not the entry-point's. (Note: `Cargo.lock` discovery is the WORKSPACE root's role per §3.1.bis routing table, not the member root's.)
+- Cross-workspace `-p` — `-p` is resolved within the SINGLE workspace rooted at `compat_root` or the workspace found by walking up from `compat_root` (one or the other; §4 picks the rule). Workspaces containing other workspaces (nested) are addressed in §4.3 step 4.5 + §6.1.
+- **Package+workspace root shape (R2 scope decision).** v0.1.0 `--package` is scoped to **VIRTUAL workspaces only** — the workspace root manifest declares `[workspace]` and does NOT declare `[package]`. The package+workspace shape (root carries both `[package]` and `[workspace]`, treating the root as both a workspace coordinator AND a publishable package) is left to v0.2 / v1.0. **Rationale:** (a) the only Round-2 pilot needing `--package` is axum-macros, and `tokio-rs/axum` is a virtual workspace (`members = ["axum", "axum-*"]`, no root `[package]`; verified against https://github.com/tokio-rs/axum/blob/main/Cargo.toml as of 2026-05-18); (b) virtual workspaces are the canonical "multi-crate library" shape in the cargo ecosystem (clap, tokio, tonic, axum, hyper all use this); (c) package+workspace adds a meaningful complication — the root `[package]` is itself a candidate match for `--package <root-pkg-name>`, AND its `[lib]`/`[dependencies]`/`{ workspace = true }` keys interact with the same workspace tables the member would inherit, AND the question of whether `--package <root>` should target the root's `[package]` or REJECT (since the root is the workspace coordinator, not a member subdirectory) needs a clear policy. Punting to v0.2 lets us ship Round-2 GA without designing that policy now. Per §11.11 the v0.2 follow-up issue MUST be filed when this plan lands. The resolver MUST surface a directed diagnostic when `--compat-root` points at a package+workspace root (per §4.3 step 2.5 — new in R2).
 
 **Acceptance criteria (verbatim from issue #53 with §-id refinements):**
 
@@ -167,6 +184,80 @@ pub compat_package: Option<String>,
 
 > Compat-mode workspace-member package selector. Required when `--compat-root` points at a workspace root that declares `[workspace]` without `[package]`. The named package must appear in the workspace's `[workspace.members]` array (literal or glob-expanded match) and its manifest's `[package].name` must equal `<package>`. Conflicts with `--compat-manifest` (which supplies an explicit manifest path, bypassing the member-resolver). Mirrors cargo's `-p` convention.
 
+### 3.1.bis Root vocabulary (R2 — BLOCK-1 fix, PUNCH-1 through PUNCH-4)
+
+Pre-R2, the plan used the single term `compat_root` for five consumer roles. For workspace-member entry these roles split. R2 defines the vocabulary FIRST and binds every downstream section to it.
+
+**Terms (used uniformly in the rest of the plan):**
+
+| Term | Definition | Example (axum-macros via `-p`) |
+|---|---|---|
+| `workspace_root` | The directory the adopter passes via `--compat-root`. For `--package` invocations, this is the workspace ROOT directory (declares `[workspace]` without `[package]` per the v0.1.0 virtual-workspace-only scope, §1). For non-`--package` invocations, this is whatever directory the adopter named (member subdirectory, single-crate, etc.). | `/path/to/tokio-rs/axum/` |
+| `workspace_root_manifest` | `<workspace_root>/Cargo.toml`. The TOML file the resolver parses to find `[workspace.members]`, `[workspace.exclude]`, `[workspace.dependencies]`, `[patch.crates-io]`, etc. | `/path/to/tokio-rs/axum/Cargo.toml` |
+| `member_root` | The directory containing the resolved member's `Cargo.toml`. Computed as `member_manifest.parent().unwrap()`. For `--package axum-macros`, this is the `axum-macros/` subdirectory inside the workspace. For non-`--package` invocations (single-crate, etc.), `member_root == workspace_root`. | `/path/to/tokio-rs/axum/axum-macros/` |
+| `member_manifest` | The resolved member's `Cargo.toml` path. The output of `resolve_workspace_member_manifest`. For non-`--package` invocations, `member_manifest == workspace_root_manifest`. | `/path/to/tokio-rs/axum/axum-macros/Cargo.toml` |
+| `overlay_root` | The directory where the staged overlay's `Cargo.toml` is written. Always `<member_root>/target/lihaaf-overlay/`. The overlay's sibling `Cargo.toml` lives here. (Per #40+#47 R8 staged-mirror plan, the `target/lihaaf-overlay/` dir also carries the symlinked package-root mirror; that infrastructure is unchanged for #53.) | `/path/to/tokio-rs/axum/axum-macros/target/lihaaf-overlay/` |
+
+**Invariant.** For non-`--package` invocations the three roots collapse: `workspace_root == member_root` and `workspace_root_manifest == member_manifest`. The plan's R1 single-root contract was correct for this case. R2's dual-root contract is the proper superset.
+
+**Per-consumer routing table (PUNCH-2).** Every consumer that previously read `compat_root` now reads the explicit role:
+
+| Consumer | Reads | Why | Code site (post-implementer) |
+|---|---|---|---|
+| Overlay materialization (`materialize_overlay_inner`) | `member_root` (parent dir) + `member_manifest` (parse target) | The overlay is staged AT the member, with all `[package]` / `[lib]` / `[dependencies]` keys coming from the member's manifest. | `src/compat/overlay.rs:418-611` (existing surface; takes `member_manifest` as input, derives `member_root` via `.parent()`) |
+| Fixture discovery (`compat::discovery`) | `member_root` | `tests/*.rs` lives under the member, not the workspace root. The workspace root has no `tests/` directory of its own in the virtual-workspace shape. | `src/compat/discovery.rs` (takes `compat_root`-equivalent; rewires to `member_root`) |
+| Corpus / fixture conversion (whichever stage rewrites `__UPSTREAM_DIR__`) | `member_root` | The byte-determinism corpus uses `member_root` as the substitution value (see §7.4 R2 correction — the corpus test lives at `tests/compat/overlay_determinism.rs:432-499` and substitutes `__UPSTREAM_DIR__` with the upstream dir, which for `-p` means the member dir). | `tests/compat/overlay_determinism.rs:478-483` (substitution call) |
+| Baseline cargo cwd | `workspace_root` | `cargo test -p <pkg>` MUST run from the workspace root (cargo discovers `Cargo.lock` and the workspace state from the cwd; running from the member would either fail to locate the workspace OR pick up the member's local lockfile if any). | `src/compat/baseline.rs` (or whatever module spawns the baseline `cargo test`); takes a cwd, currently passes `compat_root` — rewires to `workspace_root` when `--package` is set, else `compat_root` per the collapse invariant. |
+| `Cargo.lock` discovery (cargo internal) | `workspace_root` (implicit via baseline cwd) | Cargo writes `Cargo.lock` at the workspace root; both the baseline `cargo test` invocation and the dylib build (via overlay) consume this lockfile. The dylib build discovers it by walking up from the overlay manifest, which walks past `<member>/target/lihaaf-overlay/` → `<member>/target/` → `<member>/` → `<workspace_root>/` and finds `Cargo.lock` there. | Cargo's own behavior; no lihaaf code site. |
+| Baseline sidecar (envelope sidecar files written next to `--compat-report`) | `--compat-report.parent()` — unchanged by #53 | The sidecar is anchored to the report path, not to any compat root. R2 surfaces this for completeness; no change. | `src/compat/envelope.rs` (path computed from `--compat-report`) |
+| Diagnostics (REJECT messages, no-match errors) | Both `workspace_root_manifest` AND `member_manifest` (when applicable) | Error messages must cite the resolved manifest path AND the workspace-root path so the adopter can audit both. | `src/compat/overlay.rs` (resolver + override_workspace_inheritance diagnostics; §4.4 R2 cases 1–6 cite both paths). |
+| Active-toolchain capture (envelope §3.4) | `workspace_root` | The `rust-toolchain.toml` discovery walks up from the cargo invocation cwd, which is the workspace root for baseline cargo. Both baseline and overlay must capture the same toolchain. | `src/compat/envelope.rs` (existing surface; takes a cwd) |
+
+**Non-`--package` single-crate path (PUNCH-4).** For invocations WITHOUT `--package`:
+
+- `workspace_root` = the dir passed via `--compat-root`.
+- `member_root = workspace_root` (collapse).
+- `workspace_root_manifest = member_manifest = <workspace_root>/Cargo.toml`.
+- All consumers read the single value; behavior is byte-identical to pre-#53 main.
+
+The exact cases this collapse applies to:
+
+1. Single-crate repos (e.g. cxx, serde_json, anyhow, thiserror — all Round-1 pilots). `Cargo.toml` is a `[package]`-only manifest; no `[workspace]`. The collapse is trivial.
+2. Workspace-member subdirectory entry WITHOUT `--package` (the buggy shape #53 fixes). Today this REJECTs at Branch 2; the collapse still applies during the REJECT path because the resolver is not consulted. (R1's Branch 2 diagnostic is augmented in §6.9 to point the adopter at the workspace-root + `--package` shape.)
+3. Adopter passes `--compat-manifest` (explicit manifest path, bypassing both `--compat-root`/`Cargo.toml` discovery and the resolver). `workspace_root = --compat-manifest.parent()`, `member_root = workspace_root`. The resolver is not consulted.
+
+**Dual-root path (PUNCH-3).** For invocations WITH `--package`:
+
+- `workspace_root` = the dir passed via `--compat-root` (MUST be a virtual workspace root per §1 scope).
+- `workspace_root_manifest = <workspace_root>/Cargo.toml`.
+- The resolver reads `workspace_root_manifest`, expands `[workspace.members]` against `workspace_root`, matches by `[package].name`, and returns `(member_manifest, workspace_root_manifest, workspace_root_value)` — the parsed TOML value is carried through (per §5.4 `WorkspaceMemberContext`) so the materializer doesn't re-parse.
+- `member_root = member_manifest.parent().unwrap()`.
+- All consumers route per the table above.
+
+**Data-flow checkpoint.** The implementer's primary surface change is in `src/compat/mod.rs::run` and `src/compat/cli.rs::CompatArgs::from_cli`:
+
+1. CLI parse → `Cli` carries `compat_package: Option<String>` (§3.1).
+2. `CompatArgs::from_cli` projects → `CompatArgs` carries `compat_package: Option<String>` (§3.2).
+3. `compat::run` calls a NEW helper `resolve_dual_root(&args)` that returns a `DualRoot` struct (the resolver's structured output; replaces R1's `UpstreamManifest` enum — R2 simplification, single shape covers both single-crate and dual-root via the collapse invariant):
+
+   ```rust
+   pub(crate) struct DualRoot {
+       pub(crate) workspace_root: PathBuf,
+       pub(crate) workspace_root_manifest: PathBuf,
+       pub(crate) member_root: PathBuf,
+       pub(crate) member_manifest: PathBuf,
+       pub(crate) workspace_member_context: Option<WorkspaceMemberContext>,
+   }
+   ```
+
+   When `args.compat_package.is_none()`, `workspace_member_context = None` and the four paths collapse (per the invariant). When `args.compat_package.is_some()`, the resolver populates `workspace_member_context = Some(WorkspaceMemberContext { workspace_root_manifest, workspace_root_value })`.
+
+4. Every downstream consumer takes the explicit role from `DualRoot` (not the legacy `compat_root`).
+
+This is the single most important structural change R2 introduces. R1 carried the dual-root semantics implicitly across §4 / §5 / §6 / §7 without a unified vocabulary; R2 anchors them all in this section.
+
+---
+
 ### 3.2 New field on `CompatArgs`
 
 `crate::compat::cli::CompatArgs` in `src/compat/cli.rs:87-114` projects validated `Cli` into a typed bundle. New field:
@@ -178,6 +269,91 @@ pub(crate) compat_package: Option<String>,
 ```
 
 Field placement: between `compat_filter` and `compat_trybuild_macro` (alphabetical within the `compat_*` block). `from_cli` (`src/compat/cli.rs:133-179`) clones `cli.compat_package` into the projection (one new line, mirrors the existing `compat_filter = cli.compat_filter.clone();` pattern). No new validation logic in `from_cli` — the mode-error matrix in `Cli::validate_mode_consistency` (`src/cli.rs:262-313`) handles validation.
+
+### 3.2.bis Workspace-table path policy (R2 — BLOCK-2 fix, PUNCH-5 through PUNCH-11)
+
+R1 used the phrase "carried verbatim" for all workspace-root-level tables flowing into the overlay. This is wrong for any TOML key holding a filesystem path: `path = "crates/foo"` carried verbatim to an overlay rooted at `<member>/target/lihaaf-overlay/Cargo.toml` would resolve against the overlay dir (giving `<member>/target/lihaaf-overlay/crates/foo` — broken), not against the workspace root.
+
+R2 defines a 4-column classification policy for every workspace-root-level key the plan carries down. The implementer MUST apply the classification before writing the overlay.
+
+**Classification semantics.**
+
+- **Workspace-root path** — a relative path that cargo would resolve against the workspace-root directory. MUST be absolutized against `workspace_root` before carry-down.
+- **Member-root path** — a relative path that cargo would resolve against the member-root directory (a `[lib].path`, `[[bin]].path`, etc., living inside the member's own `[package]`). MUST be absolutized against `member_root` before carry-down. NOTE: these keys live in the MEMBER's manifest, not the workspace root's; this category appears in §3.2.bis for completeness (the implementer also handles member-level path resolution; details below).
+- **URL or non-path string** — a git URL, registry URL, version string, identifier, etc. Carried verbatim. No path semantics; no absolutization.
+- **Non-copied** — a key the overlay does NOT carry down (membership keys like `members`, deprecated keys like `[workspace.metadata.cargo.rerun-if-changed]` adopters may set on the workspace but not used by lihaaf, etc.).
+
+**Policy table for workspace-root-level keys (PUNCH-5).**
+
+| Table / key path | Category | Absolutization rule | Notes |
+|---|---|---|---|
+| `[workspace.dependencies.<name>].path` | Workspace-root path | Absolutize against `workspace_root` | PUNCH-6. Common shape: `serde = { path = "crates/serde-internal" }` for workspace-internal deps. R1's "carried verbatim" wording is WRONG here. |
+| `[workspace.dependencies.<name>].git` | URL | Verbatim | PUNCH-7. URL string, no path. |
+| `[workspace.dependencies.<name>].branch` | Identifier | Verbatim | PUNCH-7. Git ref, no path. |
+| `[workspace.dependencies.<name>].tag` | Identifier | Verbatim | PUNCH-7. Git ref, no path. |
+| `[workspace.dependencies.<name>].rev` | Identifier | Verbatim | PUNCH-7. Git ref, no path. |
+| `[workspace.dependencies.<name>].version` | Version string | Verbatim | Semver spec, no path. |
+| `[workspace.dependencies.<name>].features` | Array of identifiers | Verbatim | Feature names. |
+| `[workspace.dependencies.<name>].default-features` | Bool | Verbatim | — |
+| `[workspace.dependencies.<name>].optional` | Bool | Verbatim | — |
+| `[workspace.dependencies.<name>].package` | Identifier | Verbatim | Package-rename target name. |
+| `[workspace.package.readme]` | Workspace-root path | Absolutize against `workspace_root` | PUNCH-8. Members inheriting `readme = { workspace = true }` resolve to a path; cargo would resolve relative to the WORKSPACE root, not the inheriting member. |
+| `[workspace.package.license-file]` | Workspace-root path | Absolutize against `workspace_root` | PUNCH-8. Same shape as `readme`. |
+| `[workspace.package.repository]` | URL | Verbatim | PUNCH-8. URL string. |
+| `[workspace.package.homepage]` | URL | Verbatim | URL string. |
+| `[workspace.package.documentation]` | URL | Verbatim | URL string. |
+| `[workspace.package.description]` | String | Verbatim | Free-form text. |
+| `[workspace.package.keywords]` | Array | Verbatim | Identifiers. |
+| `[workspace.package.categories]` | Array | Verbatim | Identifiers. |
+| `[workspace.package.license]` | String | Verbatim | SPDX identifier. |
+| `[workspace.package.edition]` | String | Verbatim | Year-string. |
+| `[workspace.package.rust-version]` | String | Verbatim | MSRV version. |
+| `[workspace.package.version]` | String | Verbatim | Semver. |
+| `[workspace.package.authors]` | Array | Verbatim | Free-form. |
+| `[workspace.package.publish]` | Bool / array | Verbatim | Registry name list. |
+| `[workspace.lints.*]` (entire table) | Identifier tree | Verbatim | Lint names; no paths. |
+| `[workspace.metadata.*]` (entire table) | Opaque | Verbatim — PUNCH-9 caveat | PUNCH-9: `[workspace.metadata]` is adopter-defined; lihaaf does NOT perform deep metadata rewriting. If an adopter encodes a path inside `[workspace.metadata.X]` (e.g. `[workspace.metadata.docs.rs] features = ["full"]` or a custom `[workspace.metadata.deploy.target-dir] = "deploy/"`), lihaaf carries the byte sequence verbatim — adopters with path-bearing metadata MUST use absolute paths or accept the overlay's anchoring. This is a documented limitation. |
+| `[workspace.resolver]` | Integer / string | Verbatim | "1", "2", "3". |
+| `[workspace.members]` | Array of paths/globs | NON-COPIED (stripped) | PUNCH-10. Membership keys are stripped from the overlay's `[workspace]` table (existing Branch 4 behavior; preserved in R2). |
+| `[workspace.exclude]` | Array of paths/globs | NON-COPIED (stripped) | PUNCH-10. Membership exclusion key; stripped. The resolver USES this table (per §4.3 step 3.5) but the overlay does not carry it. |
+| `[workspace.default-members]` | Array of paths | NON-COPIED (stripped) | PUNCH-10. Used by cargo CLI default selection; not consulted by `--package`-resolved overlay. Stripped. |
+| `[patch.crates-io.<name>].path` | Workspace-root path | Absolutize against `workspace_root` BEFORE Option H | PUNCH-6 + cargo behavior — cargo's own `[patch]` path resolution is relative to the DECLARING manifest, which is the workspace root. Must absolutize before Option H Rules 1-4 run on the merged table. See §5.3.bis. |
+| `[patch.crates-io.<name>].git`, `branch`, `tag`, `rev`, `version` | URL / identifier / version | Verbatim | Same shape as `[workspace.dependencies]`. |
+| `[replace.<spec>]` | Workspace-root path (when `path = "..."` set) | Absolutize against `workspace_root` | PUNCH-15. Deprecated; rare; modern crates use `[patch]`. axum does not use it. |
+| `[profile.*]` (entire table) | Profile config (no paths) | Verbatim | PUNCH-16. Profile keys are LTO settings, opt-level, codegen-units, etc.; no paths. |
+
+**Policy table for member-root-level keys (PUNCH-11).** These keys live in the MEMBER's manifest (not the workspace root's), but the overlay materialization touches them and must apply the right resolution:
+
+| Table / key path | Category | Absolutization rule | Notes |
+|---|---|---|---|
+| `[package.build]` | Member-root path | Absolutize against `member_root` | Build-script path; relative to the member's own dir. The existing `materialize_overlay_inner` already handles this for the single-root case; R2 confirms it stays member-root-anchored when `member_root != workspace_root`. |
+| `[lib].path` | Member-root path | Absolutize against `member_root` | Existing `materialize_overlay_inner` behavior (it currently does `member_root.join(lib_path)`); unchanged. |
+| `[[bin]].path` | Member-root path | Absolutize against `member_root` | Same as `[lib].path`. |
+| `[[test]].path` | Member-root path | Absolutize against `member_root` | Same shape. |
+| `[[bench]].path` | Member-root path | Absolutize against `member_root` | Same shape. |
+| `[[example]].path` | Member-root path | Absolutize against `member_root` | Same shape. |
+| `[package.readme]`, `[package.license-file]` | Member-root path (when not inheriting) | Absolutize against `member_root`; when inheriting from `[workspace.package.readme]`, resolve against `workspace_root` per the inheritance policy. | The inherit-vs-local distinction is handled by Option A1 carry-down (§4.6): the workspace-root values flow down absolutized; if the member also declares a local `[package.readme]`, the local form takes precedence and resolves member-root. |
+| `[dependencies.<name>].path` | Member-root path | Absolutize against `member_root` | Member-local path-deps. Existing behavior. |
+| `[dev-dependencies.<name>].path` | Member-root path | Absolutize against `member_root` | Existing. |
+| `[build-dependencies.<name>].path` | Member-root path | Absolutize against `member_root` | Existing. |
+
+**Implementation contract for the carry-down function.**
+
+The `apply_workspace_member_inheritance` function (§5.3 R1 surface; R2 finalizes the contract) takes `&WorkspaceMemberContext` (carrying `workspace_root_manifest` + parsed `workspace_root_value`) and the overlay's `top` TOML map, and:
+
+1. **For workspace-root-path keys** in the policy table above, reads the relative path from `workspace_root_value`, computes `absolutized = workspace_root.join(relative_path)` (using `member_manifest.parent().unwrap()`-equivalent for `workspace_root`, derivable as `workspace_root_manifest.parent().unwrap()`), normalizes to forward-slash form (per existing `to_forward_slash` convention used elsewhere in `overlay.rs`), and writes the absolutized form into the overlay's matching key under `[workspace.*]` or top-level `[patch.crates-io]`.
+
+2. **For URL / verbatim keys**, copies the TOML value byte-for-byte (using `toml::Value::clone()`).
+
+3. **For non-copied keys**, drops them (does not write into the overlay).
+
+4. **For member-root-path keys**, NO action by `apply_workspace_member_inheritance` — those keys live in the MEMBER's manifest and are handled by the existing `materialize_overlay_inner` path-rewriting machinery, which already takes `member_root` as its base.
+
+**Why this matters in practice.** axum's `Cargo.toml` declares `[workspace.dependencies.serde] = { version = "1.0", features = [...] }` (verbatim — URL/version/identifier only, no path; this carry-down is straightforward). But adopter forks of cargo workspaces sometimes use workspace-relative `path = "..."` for sibling-crate development; if R2 did not catch BLOCK-2, those forks would produce an overlay with broken path-resolution and the compat verdict would be a false-negative.
+
+**Test surface (cross-reference §7.2 R2).** T-30 (`workspace_root_path_absolutization_for_dependencies_path`) covers the dependencies.path case; T-31 (`workspace_root_path_absolutization_for_package_readme_license_file`) covers the inherited package path-fields case. Both new in R2.
+
+---
 
 ### 3.3 Validator extensions in `Cli::validate_mode_consistency`
 
@@ -211,60 +387,97 @@ Placement: in the if-compat branch, after the existing required-flag checks (`:2
 
 ### 4.1 Where the resolver runs
 
-A new function `resolve_workspace_member_manifest` lives in `src/compat/overlay.rs` (collocated with the existing `detect_implicit_ancestor_workspace` and the workspace-root-rejection logic; the function deals with workspace-shape navigation). Signature:
+A new function `resolve_workspace_member_manifest` lives in `src/compat/overlay.rs` (collocated with the existing `detect_implicit_ancestor_workspace` and the workspace-root-rejection logic; the function deals with workspace-shape navigation). R2 signature returns the parsed workspace-root TOML value alongside the manifest path so the materializer doesn't re-parse:
 
 ```rust
 /// Resolve `<workspace_root>/Cargo.toml` + `<package_name>` to the
 /// member's manifest path. Reads the workspace root's `[workspace.members]`
 /// array, expands globs against the workspace-root directory, reads each
 /// candidate member's `Cargo.toml`, and returns the path of the manifest
-/// whose `[package].name == package_name`.
+/// whose `[package].name == package_name` together with the parsed
+/// workspace-root TOML value (consumed by `apply_workspace_member_inheritance`
+/// for the carry-down per §5.3 + §5.3.bis).
 ///
-/// **Returns** `Ok(manifest_path)` on a single unambiguous match,
-/// `Err(Error::Cli)` on no-match / multiple-match / unparseable-workspace-root
-/// / unparseable-member-manifest / workspace-root-not-a-workspace-root.
+/// **Returns** `Ok((member_manifest_path, workspace_root_value))` on a single
+/// unambiguous match, `Err(Error::Cli)` on no-match / multiple-match /
+/// unparseable-workspace-root / unparseable-member-manifest /
+/// workspace-root-not-a-workspace-root (per §4.3 step 2 and step 2.5 for the
+/// v0.1.0 virtual-workspace-only scope).
 pub(crate) fn resolve_workspace_member_manifest(
     workspace_root_manifest: &Path,
     package_name: &str,
-) -> Result<PathBuf, Error>
+) -> Result<(PathBuf, toml::Value), Error>
 ```
 
-### 4.2 Driver wire-up
+### 4.2 Driver wire-up (R2 — `DualRoot` shape)
 
-The driver (`src/compat/mod.rs`) calls the resolver IF `args.compat_package.is_some()` AND the parsed `compat_root` Cargo.toml is a workspace-root manifest. The decision happens in a new helper `resolve_upstream_manifest_with_package` that replaces / extends the existing `resolve_upstream_manifest` (`src/compat/mod.rs:329-334`).
+The driver (`src/compat/mod.rs`) calls a new helper `resolve_dual_root` that returns a `DualRoot` struct (per §3.1.bis) covering both the dual-root (`--package`-supplied) and collapsed single-root (non-`--package`) cases. This REPLACES R1's `resolve_upstream_manifest` returning `Result<PathBuf, Error>`.
 
 Pseudocode (final form belongs to the implementer, but the decision tree is pre-committed):
 
 ```rust
-fn resolve_upstream_manifest(args: &cli::CompatArgs) -> Result<PathBuf, Error> {
+fn resolve_dual_root(args: &cli::CompatArgs) -> Result<DualRoot, Error> {
+    let workspace_root = args.compat_root.clone();
+
     // 1. Explicit `--compat-manifest` always wins (mutual-exclusion with
     //    `--package` is enforced by validate_mode_consistency; if we
     //    reach here with both set, that's a validator bug).
     if let Some(m) = &args.compat_manifest {
-        return Ok(m.clone());
+        // Single-root collapse — `--compat-manifest` overrides the default
+        // `<compat_root>/Cargo.toml`. Both roots collapse to the manifest's
+        // parent dir.
+        let member_root = m.parent().expect("manifest has parent").to_owned();
+        return Ok(DualRoot {
+            workspace_root: member_root.clone(),
+            workspace_root_manifest: m.clone(),
+            member_root,
+            member_manifest: m.clone(),
+            workspace_member_context: None,
+        });
     }
 
     // 2. Conventional default: <compat_root>/Cargo.toml.
-    let default_manifest = args.compat_root.join("Cargo.toml");
+    let default_manifest = workspace_root.join("Cargo.toml");
 
-    // 3. If `--package` was not supplied, return the default. The
-    //    overlay materializer will REJECT a workspace-root manifest
-    //    here with a directed diagnostic (existing
+    // 3. If `--package` was not supplied, return the default in collapsed
+    //    single-root form. The overlay materializer will REJECT a workspace-
+    //    root manifest here with a directed diagnostic (existing
     //    `is_workspace_root_manifest` branch at overlay.rs:488-498),
     //    augmented in §4.4 below to suggest `--package`.
     let Some(pkg) = &args.compat_package else {
-        return Ok(default_manifest);
+        return Ok(DualRoot {
+            workspace_root: workspace_root.clone(),
+            workspace_root_manifest: default_manifest.clone(),
+            member_root: workspace_root,
+            member_manifest: default_manifest,
+            workspace_member_context: None,
+        });
     };
 
-    // 4. `--package` is supplied. The default manifest MUST be a
-    //    workspace-root manifest (declares `[workspace]` without
-    //    `[package]`); the resolver verifies and rejects otherwise
-    //    (§4.4).
-    overlay::resolve_workspace_member_manifest(&default_manifest, pkg)
+    // 4. `--package` is supplied. The default manifest MUST be a virtual
+    //    workspace-root manifest (declares `[workspace]` without `[package]`);
+    //    the resolver verifies and rejects otherwise (§4.3 step 2 + step 2.5
+    //    for the v0.1.0 virtual-workspace-only scope).
+    let (member_manifest, workspace_root_value) =
+        overlay::resolve_workspace_member_manifest(&default_manifest, pkg)?;
+    let member_root = member_manifest
+        .parent()
+        .expect("member manifest has parent")
+        .to_owned();
+    Ok(DualRoot {
+        workspace_root,
+        workspace_root_manifest: default_manifest.clone(),
+        member_root,
+        member_manifest,
+        workspace_member_context: Some(WorkspaceMemberContext {
+            workspace_root_manifest: default_manifest,
+            workspace_root_value,
+        }),
+    })
 }
 ```
 
-The driver call site at `src/compat/mod.rs:86` (`let upstream_manifest = resolve_upstream_manifest(&args)?;`) is unchanged — the function name and signature stay the same; only the body changes.
+The driver call site at `src/compat/mod.rs:86` (`let upstream_manifest = resolve_upstream_manifest(&args)?;`) is REPLACED with `let dual_root = resolve_dual_root(&args)?;`. Every downstream consumer of `compat_root` or `upstream_manifest` is updated to take the explicit `DualRoot` field per the §3.1.bis routing table.
 
 ### 4.3 Resolver algorithm
 
@@ -278,23 +491,50 @@ Step-by-step (this is the contract the implementer follows):
 
    This is the §6 edge case "`-p` supplied AND invocation is NOT from a workspace" — surfaced inside the resolver, not the validator (filesystem read required).
 
+   **2.5 (R2 — package+workspace root rejection).** `is_workspace_root_manifest` returns `true` ONLY for virtual workspaces (declares `[workspace]` WITHOUT `[package]`); see `overlay.rs:1528-1535` predicate body. If a package+workspace shape slipped in (root declares both `[package]` AND `[workspace]`), the predicate returns `false` and step 2's diagnostic fires. R2 §1 scopes v0.1.0 to virtual-workspace-only, so this REJECT is correct. The diagnostic text in step 2 specifically names "without `[package]`" so adopters of package+workspace roots get a precise reason. v0.2 / v1.0 may relax this; v0.1.0 does not. See §11.11 for the follow-up issue requirement.
+
 3. **Read `[workspace.members]` array.** `value.get("workspace").and_then(|w| w.get("members")).and_then(|m| m.as_array())`. If absent or non-array, return `Error::Cli`:
 
    > "error: `--package <pkg>` resolver: `<workspace_root_manifest>` has `[workspace]` but no `[workspace.members]` array; cannot resolve `<pkg>`. Add the package to `[workspace.members]` or pass the member's manifest path directly via `--compat-manifest`."
 
-4. **Iterate workspace-root entries.** For each entry in the `members` array:
+   **3.5 (R2 — `[workspace.exclude]` subtraction, BLOCK-5 PUNCH-21).** After reading `members`, ALSO read `[workspace.exclude]`: `value.get("workspace").and_then(|w| w.get("exclude")).and_then(|e| e.as_array())`. If present, parse each entry by the same string-or-glob rules as step 5 below, and build a `HashSet<PathBuf>` of excluded directories (each resolved against `workspace_root` per step 5). The resolver then SKIPS any candidate directory whose canonicalized path is in the exclude set BEFORE applying any package-name match. If `workspace.exclude` is absent, the exclude set is empty. Rationale: cargo's own semantics — `members - exclude` is the effective workspace member set. Without this subtraction, the resolver could pick a directory the adopter intended to exclude.
+
+4. **Iterate workspace-root entries.** For each entry in the `members` array (after exclude subtraction per step 3.5):
    - The entry must be a string (TOML schema; non-string entries return `Error::TomlParse` with a directed diagnostic).
-   - Determine glob-or-literal:
-     - Contains `*`, `?`, or `[` → glob.
-     - Otherwise → literal directory name.
+   - Determine glob-or-literal-or-nested-literal:
+     - Contains `*`, `?`, or `[` → glob (handled in step 5).
+     - Otherwise → literal entry (no glob metachars). The literal can be a simple directory name (`"axum"`) OR an explicit nested path (`"crates/foo"`, `"tools/bar"` — slash separators, PUNCH-18).
    - Resolve against the workspace-root directory:
      - Workspace root dir = `workspace_root_manifest.parent()` (panics-not-possible: `workspace_root_manifest` always has a parent since it's a file path with a parent dir).
-     - Glob: enumerate the workspace-root dir using `std::fs::read_dir`; for each child, if the child name matches the glob pattern AND the child is a directory AND `<child>/Cargo.toml` exists, treat it as a candidate.
-     - Literal: `<workspace_root>/<entry>` is the candidate directory; `<workspace_root>/<entry>/Cargo.toml` is the candidate manifest. If the candidate manifest does NOT exist, skip it (cargo behavior: missing members are noted but not enumerated unless explicitly requested). The skip is silent in the resolver — the no-match diagnostic below will surface if no candidates match.
+     - Literal entry: `<workspace_root>/<entry>` is the candidate directory; `<workspace_root>/<entry>/Cargo.toml` is the candidate manifest. Slash separators within `<entry>` are honored as path traversal (so `crates/foo` resolves to `<workspace_root>/crates/foo/Cargo.toml`). If the candidate manifest does NOT exist, skip it (cargo behavior: missing members are noted but not enumerated unless explicitly requested). The skip is silent in the resolver — the no-match diagnostic below will surface if no candidates match.
+     - Glob entry: see step 5.
 
-5. **Glob expansion details.** Per the v0.1 "no `glob` crate dependency" rule (consistent with `src/discovery.rs:117-131` for fixture glob expansion), the resolver uses stdlib `std::fs::read_dir` + pattern matching. The pattern matcher is a small helper inline in the resolver, NOT a re-export from discovery — the discovery glob matcher applies to file paths (literal/`*`/`?`/`[abc]`); the workspace-members pattern is simpler (directory names only, no nested separators in a single glob entry). Implementation:
-   - Split `axum-*` into prefix `axum-` and suffix `` (empty). For each `read_dir` entry whose name starts with prefix AND ends with suffix AND has at least one char between, accept.
-   - Support `?` (single-char wildcard) and `[abc]` (character class) using the same simple matcher as discovery. Reference `src/discovery.rs:117-131` for the existing helper; if that helper is general enough to apply, reuse; otherwise inline.
+   **4.5 (R2 — nested-workspace traversal boundary, BLOCK-5 PUNCH-23).** When the resolver descends into a candidate directory, if that directory's own `Cargo.toml` declares `[workspace]`, the candidate is a nested-workspace root rather than a normal member. The resolver does NOT recurse into the nested workspace's `[workspace.members]`; the candidate is treated as a single match candidate by its own `[package].name` (if any). Rationale: cargo's own behavior — each `[workspace]` declaration is a workspace boundary; the outer workspace's `members` array points AT the nested root, not THROUGH it. If the adopter wants to target a member of the nested workspace, they pass the nested workspace's `Cargo.toml` as `--compat-root` and use `--package <nested-member>`. The outer-workspace resolver does NOT cross the boundary.
+
+5. **Glob expansion details (R2 — PUNCH-17, PUNCH-18, PUNCH-19, PUNCH-20).** Per the v0.1 "no `glob` crate dependency" rule (consistent with `src/discovery.rs:117-131` for fixture glob expansion), the resolver uses stdlib `std::fs::read_dir` + pattern matching. The pattern matcher is a small helper inline in the resolver, NOT a re-export from discovery — the discovery glob matcher applies to file paths (literal/`*`/`?`/`[abc]`); the workspace-members pattern is more permissive (supports a single slash-separated parent segment).
+
+   **Supported glob shapes (the resolver MUST accept):**
+
+   | Shape | Example | Resolution | Notes |
+   |---|---|---|---|
+   | Bare wildcard | `axum-*` | Enumerates `<workspace_root>/*/Cargo.toml` matching pattern `axum-*` against the child dir name. | Most common shape (axum, tokio, tonic use this). |
+   | Single-segment-with-slash | `crates/*` | Enumerates `<workspace_root>/crates/*/Cargo.toml` matching pattern `*` against grandchild dir names under `<workspace_root>/crates/`. | PUNCH-17. Common alternative shape (rust-lang/cargo, rust-lang/rust, many adopter forks). The parent segment (`crates/`) is a literal directory name; the glob applies only to the LAST segment. |
+   | Explicit nested literal | `crates/foo` | Resolves to `<workspace_root>/crates/foo/Cargo.toml`. | PUNCH-18. No glob; literal nested path. Handled by step 4 (literal branch). |
+   | Character class | `axum-[mc]ore` | Single-segment glob with character class; behaves as `axum-core` OR `axum-more`. | Rare. Supported per `src/discovery.rs:117-131` matcher. |
+   | Single-char wildcard | `axum-?` | Single-segment glob; `?` matches exactly one char. | Rare. Supported. |
+
+   **REJECTED glob shapes (the resolver MUST error with directed diagnostic):**
+
+   | Shape | Example | Diagnostic |
+   |---|---|---|
+   | Deep glob (`**`) | `**/*`, `crates/**`, `**/sub/*` | PUNCH-19. Cargo's `[workspace.members]` does NOT support `**` (verified against cargo reference — `**` is a fileglob convention from gitignore, not a cargo workspace-member pattern). Return `Error::Cli` with: "error: `--package <pkg>` resolver: workspace member entry `<entry>` uses `**` (deep glob); cargo does not support `**` in `[workspace.members]`. Use `*` (single-segment glob) or an explicit literal path instead." |
+   | Multiple slashes with glob in non-last segment | `crates/*/foo`, `*/foo/*` | PUNCH-19 corollary. Reject with: "error: `--package <pkg>` resolver: workspace member entry `<entry>` uses a glob in a non-final path segment; only the LAST segment may contain glob metachars (`*`, `?`, `[...]`). Use a literal parent path or split into multiple entries." |
+   | Absolute path | `/usr/local/foo`, `C:\workspace\foo` (Windows) | PUNCH-20. Reject with: "error: `--package <pkg>` resolver: workspace member entry `<entry>` is absolute; `[workspace.members]` entries are workspace-relative paths only. Use a relative path." Cargo's own behavior matches: absolute paths in `[workspace.members]` are an error. |
+   | Parent traversal | `../sibling`, `../../uncle` | PUNCH-20 corollary. Reject with: "error: `--package <pkg>` resolver: workspace member entry `<entry>` uses `..` (parent traversal); workspace members must be descendants of the workspace root. Use a relative path within the workspace." Cargo's own behavior: parent-traversing members are an error. |
+
+   **Trailing-slash normalization (R2 — PUNCH-20).** Entries like `crates/foo/` or `axum-macros/` are normalized by trimming the trailing slash before resolution. This is a forgiveness rule; cargo accepts both forms. The resolver normalizes to no-trailing-slash internally so the exclude-set membership check (step 3.5) is consistent.
+
+   **Glob matcher implementation.** Reference `src/discovery.rs:117-131` for the existing helper; if that helper supports the `axum-*` single-segment shape, REUSE it (with a thin wrapper for the `crates/*` two-segment case that pre-splits on `/`). Otherwise, inline a new helper. The implementer's choice; §10b row 4 / row 33 verify behavior correctness via test outputs.
 
 6. **Read each candidate's `Cargo.toml`.** `std::fs::read_to_string(<candidate>/Cargo.toml)` → `toml::from_str::<toml::Value>(...)` → `value.get("package").and_then(|p| p.get("name")).and_then(|n| n.as_str())`. **Workspace-inheritance note:** the `[package].name` field is NOT inheritable in cargo (verify against cargo source — see §11 risks). A package may inherit `version`, `authors`, `description`, `edition`, `rust-version`, `repository`, `license`, etc. from `[workspace.package]`, but NOT `name`. So the resolver can trust the literal string at `package.name` without recursing into the workspace inheritance tables.
 
@@ -302,10 +542,16 @@ Step-by-step (this is the contract the implementer follows):
 
    If a candidate's manifest fails to parse, log a non-fatal warning (mirror the `detect_implicit_ancestor_workspace` skipping behavior at `overlay.rs:953-966`) and continue. The candidate is not a match.
 
+   **6.5 (R2 — nested-workspace candidate skip).** If a candidate's manifest declares `[workspace]` (a nested-workspace root), AND it ALSO has `[package]` with a matching name, the candidate is a valid match (per step 4.5 — the outer resolver treats nested-workspace roots as match candidates by their own `[package].name`, without descending into the nested workspace). If the candidate has `[workspace]` but no `[package]`, it is a pure-virtual nested workspace — skipped as a non-match (the outer resolver does not descend; if the adopter wants to target a nested-workspace member, see §6.1).
+
 7. **Match `<package_name>`.** Collect candidates whose `package.name == package_name`. Possible outcomes:
    - Zero matches → `Error::Cli` with no-match diagnostic (§4.4 case 1).
    - One match → return `Ok(candidate_manifest_path)`.
    - Multiple matches → `Error::Cli` with multiple-match diagnostic (§4.4 case 2). In normal cargo workspaces this shape is impossible (cargo enforces unique package names within a workspace), but we surface it as a directed error in case the workspace shape is corrupted.
+
+   **7.5 (R2 — `workspace.default-members` non-interaction, BLOCK-5 PUNCH-22).** `[workspace.default-members]` declares which packages cargo's CLI selects by default for unqualified `cargo build` / `cargo test`. It is a SUBSET of `[workspace.members]` and does NOT change membership. The resolver does NOT consult `[workspace.default-members]`. The adopter's `--package <pkg>` selects ANY member by name regardless of whether it appears in `default-members`. (For the baseline cargo argv, the adopter chooses whether to add `-p <pkg>` themselves — per §6.13; the compat driver does not inject it. If the adopter wants the baseline to ALSO consult `default-members` semantics, they invoke baseline cargo without `-p`. This is documented in §8.3.)
+
+8. **Duplicate-package handling after expansion (R2 — BLOCK-5 PUNCH-24).** Multiple member entries (literal + glob, or two globs with overlapping match sets) may resolve to the SAME directory. The resolver de-duplicates candidates by canonicalized directory path before applying the package-name match. Distinct directories that BOTH declare the same `[package].name` (which cargo itself would error on at load time) reach step 7's "multiple matches" branch and surface §4.4 case 2 ("multiple workspace members claim …") with both manifest paths in the error message. The de-duplication is important: without it, an adopter using both `members = ["axum-*"]` and `members = ["axum-macros"]` (overlapping) would receive a spurious multiple-match error for axum-macros.
 
 ### 4.4 Directed diagnostics
 
@@ -325,15 +571,18 @@ Step-by-step (this is the contract the implementer follows):
 
 > "error: `--compat-root` `<...>/Cargo.toml` is a workspace root (declares `[workspace]` without `[package]`); pass `--package <pkg>` to target a specific workspace member, or set `--compat-root` to a single-crate Cargo.toml."
 
-### 4.5 Carries-through to subsequent compat-mode stages
+### 4.5 Carries-through to subsequent compat-mode stages (R2 — dual-root routing)
 
-Once the resolver returns the member manifest path, the rest of compat mode operates on that path verbatim:
+Once `resolve_dual_root` returns a `DualRoot`, the rest of compat mode operates per the §3.1.bis routing table:
 
-- `materialize_overlay_with_synthetic_metadata_builder` (`src/compat/overlay.rs:418-446`) reads the MEMBER manifest. The overlay is staged at `<member-dir>/target/lihaaf-overlay/Cargo.toml` (using `member_manifest.parent()` as the crate dir, which the existing code already does at `overlay.rs:578-584`).
-- `[lib] crate-type` canonicalization runs on the member's `[lib]` table (mirroring the existing behavior).
-- `override_workspace_inheritance` runs on the MEMBER's TOML. Branches 1, 3, 4, 5 behave normally — the member may use workspace inheritance refs (`{ workspace = true }`) which Branch 3 would normally REJECT, but Branch 2 (the over-broad one) is bypassed by §5's policy choice. Branch 3 will still fire if §5 picks Option A (BYPASS-ON-EXPLICIT-TARGET) without supplemental work — §5 picks Option A and Branch 3 is therefore SUPPRESSED for the `-p` case (the member's workspace inheritance is resolved by carrying the workspace-root's `[workspace.dependencies]` / `[workspace.package]` / `[workspace.lints]` tables DOWN into the overlay).
-- Baseline cargo test runs at `<workspace_root>` (NOT the member dir) and the argv must include `-p <pkg>` so cargo only runs the target package's tests. **THIS IS A BASELINE-RUNNER INTERACTION POINT** — see §6 edge case.
-- Fixture discovery (`src/compat/discovery.rs`) reads the member's `tests/*.rs`, not the workspace root's tests. The existing discovery already takes `compat_root` as input; this becomes the MEMBER dir, not the workspace root dir.
+- `materialize_overlay_with_synthetic_metadata_builder` (`src/compat/overlay.rs:418-446`) reads `dual_root.member_manifest`. The overlay is staged at `<dual_root.member_root>/target/lihaaf-overlay/Cargo.toml` (using `dual_root.member_root` as the crate dir; the existing code already derives this via `member_manifest.parent()` at `overlay.rs:578-584` — unchanged).
+- `[lib] crate-type` canonicalization runs on the member's `[lib]` table (mirroring the existing behavior). Path keys (`[lib].path`, `[[bin]].path`, etc.) are absolutized against `dual_root.member_root` per §3.2.bis policy table (member-root path category) — existing behavior, unchanged.
+- `override_workspace_inheritance` runs on the MEMBER's TOML, passing `dual_root.workspace_member_context.as_ref()`. When `Some(ctx)`, Branches 2 + 3 are SUPPRESSED and `apply_workspace_member_inheritance(ctx)` runs to carry down workspace-root tables per §5 Option A1 + §5.3.bis composition order. Branch 1 (explicit `[package].workspace`) still fires. When `None` (the collapsed single-root case), all five branches behave as today — zero behavior change for existing pilots.
+- Baseline cargo test runs at `dual_root.workspace_root` (NOT `dual_root.member_root`) and the argv must include `-p <pkg>` so cargo only runs the target package's tests. **THIS IS A BASELINE-RUNNER INTERACTION POINT** — see §6.13 edge case for the adopter-explicit argv-injection decision.
+- Fixture discovery (`src/compat/discovery.rs`) reads the member's `tests/*.rs` from `dual_root.member_root`. The existing discovery takes a base dir as input; the driver passes `dual_root.member_root` (which equals `dual_root.workspace_root` in the collapsed case, so existing non-`--package` pilots see no change).
+- Corpus / byte-determinism substitution (`tests/compat/overlay_determinism.rs:478-483` `__UPSTREAM_DIR__` placeholder substitution) uses `dual_root.member_root` per §3.1.bis routing table — the corpus test's tempdir IS the member dir for the new `workspace_member_with_package` fixture (§7.4 R2).
+- Cargo.lock discovery (cargo internal) walks up from `dual_root.member_root` / `target/lihaaf-overlay/Cargo.toml` and finds `Cargo.lock` at `dual_root.workspace_root` — exactly the behavior we want; no code change.
+- Active-toolchain capture (envelope §3.4) uses `dual_root.workspace_root` per §3.1.bis routing table.
 
 ### 4.6 Workspace-inheritance materialization (§5 Option A required)
 
@@ -348,35 +597,37 @@ Two implementation options:
 
 **§5 picks Option A1 (carry-down).** Rationale: simpler, preserves byte-shape of the member's manifest (so the §3.2.3 byte-determinism rule applies cleanly), and the existing Branch 4 of `override_workspace_inheritance` already handles "clone upstream `[workspace]`, strip membership keys" — the only delta is that the upstream `[workspace]` came from the WORKSPACE ROOT manifest, not the member manifest.
 
-Implementation: the resolver returns a `(member_manifest_path, workspace_root_manifest_path)` tuple instead of a single path. The overlay materializer takes the workspace root manifest as a NEW second parameter and consults it when building the overlay's `[workspace]` table. The driver wire-up passes both.
+Implementation: the resolver returns a `(member_manifest_path, workspace_root_manifest_path, workspace_root_value)` triple instead of a single path. The overlay materializer takes the workspace root context as a NEW parameter and consults it when building the overlay's `[workspace]` table. The driver wire-up passes both.
 
-**Plan refinement: the resolver signature becomes:**
+**R2 refinement.** The R1 plan introduced `ResolvedMember` and `UpstreamManifest` (enum) as separate types. R2 §3.1.bis consolidates this into a single `DualRoot` struct that covers BOTH the dual-root case (when `args.compat_package.is_some()`) and the collapsed single-root case (when `args.compat_package.is_none()`), using the explicit `workspace_member_context: Option<WorkspaceMemberContext>` field as the discriminator:
 
 ```rust
+// R2 — unified shape (replaces R1's UpstreamManifest enum + ResolvedMember struct)
+pub(crate) struct DualRoot {
+    pub(crate) workspace_root: PathBuf,
+    pub(crate) workspace_root_manifest: PathBuf,
+    pub(crate) member_root: PathBuf,
+    pub(crate) member_manifest: PathBuf,
+    pub(crate) workspace_member_context: Option<WorkspaceMemberContext>,
+}
+
+pub(crate) struct WorkspaceMemberContext {
+    pub(crate) workspace_root_manifest: PathBuf,
+    pub(crate) workspace_root_value: toml::Value,
+}
+
 pub(crate) fn resolve_workspace_member_manifest(
     workspace_root_manifest: &Path,
     package_name: &str,
-) -> Result<ResolvedMember, Error>;
-
-pub(crate) struct ResolvedMember {
-    pub(crate) member_manifest: PathBuf,
-    pub(crate) workspace_root_manifest: PathBuf,
-}
+) -> Result<(PathBuf, toml::Value), Error>;
+// Returns (member_manifest_path, workspace_root_value parsed once for downstream use).
+// The driver wraps this into a DualRoot together with the workspace_root_manifest
+// it already has from CLI parsing.
 ```
 
-The driver's `resolve_upstream_manifest` becomes:
+**Why a single struct, not an enum.** The five consumer routes (per §3.1.bis routing table) all consume the same set of fields; the enum form forced every consumer to match on `Direct` / `WorkspaceMember` and re-derive the four paths from the matched variant. The struct form unifies the API surface; the collapse invariant (`workspace_root == member_root` when `workspace_member_context.is_none()`) handles the non-`--package` case without a dispatch.
 
-```rust
-fn resolve_upstream_manifest(args: &cli::CompatArgs)
-    -> Result<UpstreamManifest, Error>;
-
-enum UpstreamManifest {
-    Direct(PathBuf),
-    WorkspaceMember(ResolvedMember),
-}
-```
-
-`compat::run` matches on the result and passes the workspace root through to `materialize_overlay_with_synthetic_metadata_builder` as an optional second arg.
+`compat::run` calls `resolve_dual_root(&args) -> Result<DualRoot, Error>` (the new helper replacing R1's `resolve_upstream_manifest`), then passes `&dual_root` through to every consumer that previously took `compat_root` or `upstream_manifest`. The materializer takes `dual_root.member_manifest` as input and `dual_root.workspace_member_context.as_ref()` as optional context; when `Some`, it runs `apply_workspace_member_inheritance` per §5.3 / §5.3.bis composition order.
 
 `materialize_overlay_inner` (`src/compat/overlay.rs:448-611`) gains a new optional parameter `workspace_root_manifest: Option<&Path>`. When `Some`, after the `override_workspace_inheritance` call (which currently REJECTs Branches 2 + 3), a new pre-pass `apply_workspace_member_inheritance` runs FIRST, reads the workspace root's `[workspace.*]` tables, and merges them into the staged overlay's `[workspace]` table (Branch 4 of `override_workspace_inheritance` builds the overlay's `[workspace]` from the upstream's `[workspace]`; we want it built from the WORKSPACE ROOT's `[workspace]` instead when `-p` is set).
 
@@ -466,11 +717,56 @@ But the workspace ROOT also has potentially:
 
 - `members`, `exclude`, `default-members` (membership keys; existing Branch 4 already handles).
 
+### 5.3.bis Option H composition order — root-first, member-second (R2 — BLOCK-3 fix, PUNCH-12 through PUNCH-16)
+
+R1 §6.2 stated that "the workspace root's `[patch.crates-io]` is layered into the overlay using the same Option H 4-rule policy that #40+#47 use", but left ambiguous what order things happen in. Specifically: if the WORKSPACE root carries `[patch.crates-io.<self>] = { path = "..." }` (an upstream self-patch on the member), and Option H Rule 1 INJECTs a synthetic self-patch into the MEMBER's slot first, the workspace-root self-patch could be hidden — the member would compare the merged table against the WRONG baseline.
+
+R2 fixes this by specifying the composition order explicitly. The implementer follows this order verbatim.
+
+**Composition order (PUNCH-12).** When `--package` is supplied AND the workspace root's `[patch.crates-io]` is non-empty:
+
+1. **Step 1 — Compute the effective `[patch.crates-io]` table from the workspace root FIRST.**
+   - Read `[patch.crates-io]` from `workspace_root_value`.
+   - For each entry, classify the path-bearing keys per §3.2.bis policy table:
+     - `[patch.crates-io.<name>].path` (workspace-root path) → absolutize against `workspace_root` (NOT against `member_root`, NOT against `overlay_root`). Per cargo's own behavior — `[patch]` paths are anchored to the declaring manifest, which is the workspace root.
+     - `[patch.crates-io.<name>].git/branch/tag/rev/version` (URL/identifier) → verbatim.
+   - The output is the "effective workspace-root patch table".
+
+2. **Step 2 — Read the MEMBER's `[patch.crates-io]` table.** Per cargo's own behavior — `[patch.crates-io]` in a member manifest is a hard ERROR (cargo source: `crates/cargo/src/cargo/util/toml/mod.rs` rejects member-level `[patch]`). The resolver MUST match by rejecting member-level `[patch.crates-io]`:
+   - If the member's `Cargo.toml` declares `[patch.crates-io]`, return `Error::Cli` with: "error: `--package <pkg>` resolver: workspace member `<member_manifest>` declares `[patch.crates-io]`; cargo does not permit `[patch]` in workspace members (only the workspace root). Move the patch entries to the workspace root's `[patch.crates-io]` or remove them."
+   - In practice this is unreachable for valid workspaces (cargo would itself error on baseline `cargo test`). The check is defense-in-depth + clear diagnostic if an adopter is mid-conversion.
+
+3. **Step 3 — Run Option H's 4 rules against the effective workspace-root patch table (with the member as the "self" target).**
+   - Rule 1 (INJECT) — if no `[patch.crates-io.<self>]` exists in the effective table AND the member's `[package].name` does not appear, inject the synthetic self-patch `{ path = "<overlay_root>" }` per #40+#47 Option H Rule 1.
+   - Rule 2 (REMAP) — if an existing `[patch.crates-io.<self>] = { path = "..." }` is present in the effective table, re-anchor its `path` to the overlay-root form per Rule 2.
+   - Rules 3, 4 — apply per the existing #40+#47 R8 plan.
+   - The 4-rule logic is OWNED by the existing `apply_self_patch_policy` function in `src/compat/overlay.rs` (per #40+#47 R8 plan §4.X — function exists on `main` at `cb5d5bf`). R2 EXTENDS this function with an optional `workspace_root_patch_table: Option<&toml::Value>` parameter; when `Some`, the function operates on the merged effective table rather than the member's own (invariably-empty) `[patch.crates-io]`.
+
+4. **Step 4 — Write the resolved `[patch.crates-io]` into the overlay's top-level `[patch.crates-io]` table.**
+   - Path entries are stored absolutized per step 1 (already absolutized from workspace_root) or per Rule 1/2's overlay-root injection.
+   - The overlay's `[workspace]` table does NOT carry `[patch.crates-io]` (cargo reads `[patch]` from top-level only, not from `[workspace]`).
+
+**Why root-first.** If the implementer ran Option H Rule 1 against the MEMBER's empty `[patch.crates-io]` FIRST (injecting a synthetic self-patch into an empty table), then merged the workspace-root entries SECOND, the synthetic self-patch would either be silently overwritten by a workspace-root entry (false-negative on the upstream's own self-patch) OR shadow the workspace-root entry (false-positive). The correct merge is: compute the effective workspace-root table first (carrying the upstream's authoritative `[patch.crates-io]` state), then let Option H's 4 rules adjust the SELF entry within that effective table.
+
+**Cargo-behavior cross-check.** Cargo's runtime reads `[patch.crates-io]` ONLY from the workspace root (https://doc.rust-lang.org/cargo/reference/overriding-dependencies.html#the-patch-section). For workspace-member entry, the workspace root's `[patch.crates-io]` IS the upstream's `[patch.crates-io]`; treating it as the input to Option H is what makes the lihaaf overlay's `[patch]` resolution match cargo's behavior.
+
+**Member-manifest `[patch.crates-io]` rejection (PUNCH-13).** Per step 2 above: if the resolved member manifest declares `[patch.crates-io]`, the resolver REJECTS with the cargo-compat diagnostic. Reasoning: matches cargo (which would itself error); avoids ambiguity about which table the implementer should respect.
+
+**Non-`crates-io` patch tables (PUNCH-14).** R2 SCOPES `[patch.<registry>]` carry-down to `[patch.crates-io]` only. The Round-1 pilots and axum's workspace do not use alternate-registry patches. Adopter forks using `[patch.https-some-private-registry-url]` MUST currently rebase onto a workspace shape using `[patch.crates-io]` until v0.2 expands the scope. R2 explicitly DOES NOT carry `[patch.<other-registry>]` tables down to the overlay; if a workspace declares one, it is silently dropped (no diagnostic in this PR; v0.2 may surface a warning). The §5.3 bullet-list "(entire table)" wording is REFINED to be `[patch.crates-io]` only.
+
+**`[replace]` handling (PUNCH-15).** Cargo's `[replace]` is deprecated in favor of `[patch]`. R2's carry-down policy: read `[replace]` from `workspace_root_value`, absolutize `path = "..."` entries per §3.2.bis, write into the overlay's top-level `[replace]` table verbatim otherwise. Path absolutization uses `workspace_root` (same rule as `[patch.crates-io]`). axum does not use `[replace]`; thiserror does not; serde_json does not. Most Round-2 pilots will not exercise this code path. Implementer adds the carry-down for completeness; tests T-15 (R1) cover it indirectly via the `apply_workspace_member_inheritance_carries_workspace_package_lints_metadata`-shaped test family.
+
+**`[profile.*]` precedence (PUNCH-16).** Cargo's profile resolution reads `[profile.*]` ONLY from the workspace root when building a workspace member (https://doc.rust-lang.org/cargo/reference/profiles.html#profile-settings — "Profiles can be specified at the workspace level"). A member-local `[profile.*]` table is IGNORED by cargo. R2's policy: carry the workspace root's `[profile.*]` into the overlay's top-level `[profile.*]` table verbatim (no path absolutization — profiles have no path keys, only LTO settings / opt-levels / codegen-units / etc.). The member-local `[profile.*]` (if any) is also carried (it's part of the member manifest the overlay clones), but cargo will ignore it at build time. R1 §11 listed `[profile.*]` precedence as an open item; R2 closes it: workspace-root wins, per cargo. The implementer does NOT need to detect or warn about member-local `[profile.*]`.
+
+**Test surface (cross-reference §7.2 R2).** T-32 (`apply_workspace_member_inheritance_carries_workspace_root_patch_crates_io_via_option_h`) covers the workspace-root `[patch.crates-io]` carry-down with Option H Rule 1 INJECT and Rule 2 REMAP cases. T-32 also covers the member-`[patch.crates-io]`-rejection diagnostic (the inverse).
+
+---
+
 ### 5.4 The over-broad REJECT is RELAXED, not removed
 
-**Branch 2 of `override_workspace_inheritance` remains in code.** It still fires when `args.compat_package.is_none()` AND the upstream manifest is a workspace member (no local `[workspace]` + ancestor `Cargo.toml` carries `[workspace]`).
+**Branch 2 of `override_workspace_inheritance` remains in code.** It still fires when `dual_root.workspace_member_context.is_none()` AND the upstream manifest is a workspace member (no local `[workspace]` + ancestor `Cargo.toml` carries `[workspace]`).
 
-The relaxation is: when `args.compat_package.is_some()` AND the resolver succeeded, the overlay materializer takes a new optional parameter `workspace_member_context: Option<&WorkspaceMemberContext>` (analogous to `synthetic_metadata` builder). When `Some(ctx)`, the materializer:
+The relaxation is: when `dual_root.workspace_member_context.is_some()` (i.e. the resolver succeeded for a `--package` invocation per §3.1.bis), the overlay materializer takes a new optional parameter `workspace_member_context: Option<&WorkspaceMemberContext>` (analogous to `synthetic_metadata` builder) and gets it from the `DualRoot` struct (per §3.1.bis routing table). When `Some(ctx)`, the materializer:
 
 1. Skips Branch 2 of `override_workspace_inheritance` (passes a flag through, or `override_workspace_inheritance` consults `ctx.is_some()` directly).
 2. Runs `apply_workspace_member_inheritance(ctx.workspace_root_manifest)` to carry down the workspace tables.
@@ -698,6 +994,49 @@ Section IDs the implementer must update — see §8 spec amendment.
 22. `cli_rejects_package_with_compat_manifest` — `cargo lihaaf --compat --compat-root /x --compat-manifest /y -p foo --compat-report /z` → mutual-exclusion error.
 23. `compat_args_from_cli_carries_compat_package` — `CompatArgs::from_cli(cli)` where `cli.compat_package == Some("axum-macros")` → `args.compat_package == Some("axum-macros")`.
 
+**R2 NEW — Dual-root routing tests (BLOCK-1 / PUNCH-25):**
+
+24. `dual_root_routing_baseline_cwd_is_workspace_root_member_consumers_use_member_root` — synthesizes a 2-member workspace, resolves `-p member-a`, and verifies that the resulting `DualRoot` struct routes: `workspace_root` to baseline cargo cwd, `member_root` to overlay materialization sibling-manifest computation, `member_root` to fixture discovery base, and that diagnostics emitted during the run (forced via an injected error in a fixture) cite BOTH `workspace_root_manifest` AND `member_manifest` in the error message. Inverse: in the non-`--package` collapse case, all routes resolve to the same path (asserted by reading `DualRoot.workspace_root == DualRoot.member_root`). Test class: unit (synthesized DualRoot struct + assertion on routing destination strings). Bites pre-fix: R1's single-`compat_root` plumbing would route `member_root` to baseline cargo cwd (incorrect — baseline must run at workspace root to find `Cargo.lock`).
+
+**R2 NEW — Workspace-root path absolutization tests (BLOCK-2 / PUNCH-26):**
+
+25. `workspace_root_path_absolutization_for_dependencies_path` — synthesizes a workspace with `[workspace.dependencies.foo] = { path = "crates/foo" }` (relative path), resolves `-p some-member`, and asserts the overlay's `[workspace.dependencies.foo].path` is absolutized to `<workspace_root>/crates/foo` (NOT to a path under `<overlay_root>` or `<member_root>`). Inverse: a `git = "..."` entry on the same workspace dep is preserved verbatim (no path absolutization on URL keys). Test class: unit. Bites pre-fix: R1's "carried verbatim" wording would leave the relative path as-is; cargo at overlay build time would resolve it against the overlay root, finding nothing and erroring.
+
+**R2 NEW — Inherited workspace-package path-fields tests (BLOCK-2 / PUNCH-27):**
+
+26. `workspace_root_path_absolutization_for_package_readme_license_file` — synthesizes a workspace with `[workspace.package] readme = "../../README.md" license-file = "LICENSE-MIT"` (both relative paths). The member uses `readme = { workspace = true }` and `license-file = { workspace = true }`. Resolves `-p the-member` and asserts the overlay's resolved `[package].readme` (after Option A1 carry-down through `[workspace.package]`) is absolutized to `<workspace_root>/../../README.md` (canonicalized form) and `[package].license-file` is absolutized to `<workspace_root>/LICENSE-MIT`. Test class: unit. Bites pre-fix: R1 §3.2.bis was missing; the implementer following R1 would carry these verbatim, breaking the overlay's readme/license-file resolution. (Notably, cargo's own behavior anchors inherited paths to the workspace root per https://doc.rust-lang.org/cargo/reference/workspaces.html#the-package-table — verified.)
+
+**R2 NEW — Option H composition with workspace-root self-patch (BLOCK-3 / PUNCH-28):**
+
+27. `option_h_root_first_member_second_with_workspace_root_self_patch_entry` — synthesizes a workspace where the WORKSPACE root declares `[patch.crates-io.pkg-name] = { path = "../local-fork" }` (an upstream self-patch on a member named `pkg-name`). Resolves `-p pkg-name` and asserts:
+    - The overlay's top-level `[patch.crates-io.pkg-name].path` exists and is absolutized to `<workspace_root>/../local-fork` (NOT to overlay-root).
+    - Option H Rule 1 (INJECT) does NOT inject a synthetic self-patch (the workspace-root entry already covers the member; the merged table is non-empty for `pkg-name`).
+    - Option H Rule 2 (REMAP) is applied if the workspace-root entry's path needed re-anchoring (verify on a test variant). Test class: unit. Bites pre-fix: R1's underspecified composition order would either silently overwrite the workspace-root entry (Rule 1 INJECT-after-merge case) or shadow it (Rule 1 INJECT-before-merge case); R2's root-first order produces the correct merged table.
+
+28. `option_h_rejects_member_local_patch_crates_io` — synthesizes a workspace where the MEMBER declares `[patch.crates-io]` (which cargo itself would error on). Resolves `-p the-member` and asserts the resolver returns `Error::Cli` with the directed diagnostic naming the member manifest path. Test class: unit. Bites pre-fix: silent merge of member-local `[patch.crates-io]` with workspace-root `[patch.crates-io]` would produce divergent overlay state vs baseline cargo (which errors). R2's PUNCH-13 surfaces a clear error.
+
+**R2 NEW — Resolver glob / path / exclude / nested tests (BLOCK-4 / PUNCH-29):**
+
+29. `resolver_glob_crates_star_finds_nested_member` — `members = ["crates/*"]`, directory `<root>/crates/foo/` with `Cargo.toml` declaring `[package].name = "foo"`. Resolves `-p foo` → `<root>/crates/foo/Cargo.toml`. Class: unit.
+30. `resolver_glob_crates_explicit_nested_literal_finds_member` — `members = ["crates/foo", "tools/bar"]`, resolves `-p foo` to `<root>/crates/foo/Cargo.toml` AND a sibling test resolves `-p bar` to `<root>/tools/bar/Cargo.toml`. Class: unit.
+31. `resolver_glob_rejects_deep_glob` — `members = ["**/*"]` or `members = ["crates/**"]`. Resolves `-p anything` → `Error::Cli` directed diagnostic ("cargo does not support `**`"). Class: unit.
+32. `resolver_glob_rejects_glob_in_non_final_segment` — `members = ["*/foo"]`. Resolves `-p foo` → `Error::Cli` directed diagnostic ("only the LAST segment may contain glob metachars"). Class: unit.
+33. `resolver_glob_normalizes_trailing_slash` — `members = ["axum-macros/"]` (trailing slash) → matches the same directory as `members = ["axum-macros"]`. Resolves `-p axum-macros` succeeds. Class: unit.
+34. `resolver_glob_rejects_absolute_path_member` — `members = ["/usr/local/foo"]` → `Error::Cli` directed diagnostic ("entries are workspace-relative paths only"). Class: unit. On Windows, `members = ["C:\\\\workspace\\\\foo"]` produces the same error.
+35. `resolver_glob_rejects_parent_traversal_member` — `members = ["../sibling"]` → `Error::Cli` directed diagnostic ("members must be descendants of the workspace root"). Class: unit.
+
+**R2 NEW — Exclude / default-members / nested / duplicate tests (BLOCK-5 / PUNCH-30):**
+
+36. `resolver_subtracts_workspace_exclude_set` — `members = ["pkg-*"]`, `exclude = ["pkg-private"]`. Directory `pkg-private/` exists with `[package].name = "pkg-private"`. Resolves `-p pkg-private` → no match → `Error::Cli` (the exclude subtraction removed the candidate before match). The diagnostic's "scanned" list does NOT include `pkg-private` (it was excluded before the scan). Class: unit. Bites pre-fix: R1 resolver would match `pkg-private` despite the exclude, producing a divergent overlay vs baseline cargo (which respects exclude).
+37. `resolver_default_members_does_not_filter_package_resolution` — `members = ["a", "b"]`, `default-members = ["a"]`. Resolves `-p b` → succeeds (the resolver consults `members`, NOT `default-members`). Inverse: `-p a` also succeeds (default-members membership does not bias the resolver). Class: unit. Bites pre-fix: R1 §1 was silent on `default-members` semantics; a naive implementer might filter by `default-members` first, which would break `-p` for non-default members.
+38. `resolver_excluded_package_diagnostic_lists_excluded_name` — `members = ["a", "b"]`, `exclude = ["b"]`. Resolves `-p b` → `Error::Cli` with the no-match diagnostic explicitly noting that `b` IS in `members` but ALSO in `exclude`, so it was subtracted before scanning. (Implementer judgment on exact wording; the test asserts that the diagnostic mentions both the package name and that it was excluded.) Class: unit.
+39. `resolver_does_not_descend_into_nested_workspace` — `members = ["outer-pkg", "nested-ws"]`. `<root>/outer-pkg/Cargo.toml` is a normal `[package]`. `<root>/nested-ws/Cargo.toml` declares `[workspace] members = ["inner-pkg"]` (a nested virtual workspace). `<root>/nested-ws/inner-pkg/Cargo.toml` declares `[package].name = "inner-pkg"`. Resolves `-p inner-pkg` from the OUTER workspace → no-match → `Error::Cli`. The diagnostic's scanned list includes `outer-pkg` and `nested-ws` (the outer's members), but NOT `inner-pkg` (the resolver does not descend). Sibling assertion: resolving `-p nested-ws` from the outer workspace ALSO no-matches (nested-ws has no `[package]` — it's a pure-virtual nested workspace). Class: unit. Bites pre-fix: R1 §6.1 was vague on traversal boundary; an over-eager implementer might recurse into nested workspaces, which would cross a cargo workspace boundary and produce confusing carry-down state.
+40. `resolver_duplicate_package_after_glob_expansion_returns_multiple_match_error` — `members = ["pkg-a"]` + `members = ["pkg-*"]` (overlapping). Both expand to include `pkg-a/`. The de-duplication step canonicalizes the path; if `pkg-a/Cargo.toml` is matched once (correct), `-p pkg-a` resolves cleanly. If a separate manifest at `pkg-a-clone/Cargo.toml` ALSO declares `[package].name = "pkg-a"` (cargo would error on baseline; the test synthesizes the corrupted-workspace shape to exercise the resolver's diagnostic), `-p pkg-a` returns `Error::Cli` case 2 listing both manifest paths. Class: unit. Bites pre-fix: R1's resolver had no de-duplication step; an adopter using overlapping `members` entries would receive spurious multiple-match errors.
+
+**R2 NEW — Package+workspace root rejection test:**
+
+41. `resolver_rejects_package_plus_workspace_root_per_v01_scope` — synthesizes a root manifest declaring BOTH `[package].name = "the-root-pkg"` AND `[workspace] members = ["the-member"]`. Resolves `-p the-member` → `Error::Cli` directed diagnostic per §4.3 step 2.5 (`is_workspace_root_manifest` returns `false` because `[package]` is present; the diagnostic says v0.1.0 supports virtual-workspace-only and points the adopter at the v0.2 follow-up issue once filed). Class: unit. R2 NEW per §1 scope decision.
+
 ### 7.3 Integration test (cargo-build-gated)
 
 Test name: `cargo_lihaaf_resolves_axum_macros_shape_workspace_member`. Placement: `tests/compat/overlay_determinism.rs` (the existing integration-test home for compat-mode cargo-build tests).
@@ -747,60 +1086,94 @@ Assertions:
 
 Gate: `LIHAAF_RUN_CARGO_BUILD_TESTS=1` (per [[lihaaf-no-local-binary-builds]]).
 
-### 7.4 `compat/baseline.toml` corpus addition
+### 7.4 Byte-determinism corpus addition (R2 — CORRECTED, see revision history "INTERNAL-CONSISTENCY surface")
 
-The existing corpus file (`compat/baseline.toml`) declares the Round-1 + Round-2 enrollable shapes. Add a new entry for the workspace-member shape:
+**R1 correction.** R1 invented a TOML schema (`[[entry]]` tables embedded in `compat/baseline.toml`) that does not match the actual code. The real byte-determinism corpus lives at `tests/compat/overlay_corpus/<name>.input.toml` + `<name>.expected.toml` (file-pair fixtures); the test (`byte_identical_across_two_lihaaf_binaries_on_corpus` at `tests/compat/overlay_determinism.rs:432-499`) iterates a hardcoded `names = ["bare_package", "with_rlib_only", "with_cdylib", "with_patch_section", "with_comments", "with_replace_section"]` array (6 names) and asserts `checked == 6`. `compat/baseline.toml` is the unrelated §5 pilot-gate baseline table (`<crate-name>.n_max` ceilings; see `src/compat/gate.rs::parse_baseline`).
 
-```toml
-[[entry]]
-name = "workspace-member-with-package"
-shape = "workspace_member_via_package_flag"
-description = "Workspace ROOT cargo.toml + --package <pkg> resolves to the member manifest"
+**R2 corpus addition.** Add ONE new fixture pair to `tests/compat/overlay_corpus/`:
 
-# Files synthesized for the byte-determinism corpus test
-[entry.files."Cargo.toml"]
-content = '''
-[workspace]
-members = ["pkg-a", "pkg-*"]
+- `workspace_member_with_package.input.toml` — the **MEMBER's** input `Cargo.toml`. The corpus shape stores ONE `Cargo.toml` per fixture pair (the overlay materialization runs on the member's manifest as input, parameterized by the workspace-root context). The existing fixtures (`bare_package`, etc.) are all member-shape inputs; the new fixture follows the same convention.
 
-[workspace.package]
-edition = "2021"
+  ```toml
+  # tests/compat/overlay_corpus/workspace_member_with_package.input.toml
+  [package]
+  name = "pkg-macros"
+  version = "0.1.0"
+  edition = { workspace = true }
 
-[workspace.dependencies]
-serde = "1.0"
-'''
+  [lib]
+  proc-macro = true
 
-[entry.files."pkg-macros/Cargo.toml"]
-content = '''
-[package]
-name = "pkg-macros"
-version = "0.1.0"
-edition = { workspace = true }
+  [dependencies]
+  serde = { workspace = true }
 
-[lib]
-proc-macro = true
+  [lints]
+  workspace = true
+  ```
 
-[dependencies]
-serde = { workspace = true }
+- `workspace_member_with_package.expected.toml` — the expected overlay output after `materialize_overlay` + `apply_workspace_member_inheritance` runs against the workspace-root context. The `__UPSTREAM_DIR__` placeholder is substituted at test time with the member's tempdir (per the existing test's substitution convention at `overlay_determinism.rs:478-483`). Sketch (exact bytes determined at implementation time by running the materializer once, capturing output, and pinning it):
 
-[lints]
-workspace = true
-'''
+  ```toml
+  # tests/compat/overlay_corpus/workspace_member_with_package.expected.toml
+  [workspace]
 
-[entry.files."pkg-a/Cargo.toml"]
-content = '''
-[package]
-name = "pkg-a"
-version = "0.1.0"
-edition = { workspace = true }
-'''
+  [workspace.package]
+  edition = "2021"
+  rust-version = "1.65"
 
-[entry.compat_args]
-compat_root = "."     # workspace root
-compat_package = "pkg-macros"
+  [workspace.dependencies]
+  serde = "1.0"
+
+  [workspace.lints.rust]
+  unsafe_code = "forbid"
+
+  [package]
+  name = "pkg-macros"
+  version = "0.1.0"
+  edition = "2021"
+
+  [lib]
+  proc-macro = true
+  crate-type = ["dylib", "rlib"]
+  path = "__UPSTREAM_DIR__/src/lib.rs"
+
+  [dependencies]
+  serde = { version = "1.0" }
+
+  [lints]
+  workspace = true
+  ```
+
+  Notes for the implementer:
+
+  - The corpus test uses a SYNTHESIZED workspace-root context: the test setup creates a tempdir containing the workspace root's `Cargo.toml` (with the carry-down tables: `[workspace.package]`, `[workspace.dependencies]`, `[workspace.lints.rust]`) and the member's manifest at `__UPSTREAM_DIR__/Cargo.toml`. The materializer is called with `WorkspaceMemberContext { workspace_root_manifest, workspace_root_value }` populated from the synthesized workspace root.
+  - The expected output captures Option A1 carry-down: the workspace-root `[workspace.package]`, `[workspace.dependencies]`, and `[workspace.lints]` tables flow into the overlay's matching top-level `[workspace.*]` tables.
+  - The `{ workspace = true }` references on the MEMBER side are NOT re-written to literal values by R2's policy (Option A1 carry-down, not Option A2 reference-rewrite). The overlay carries the inheritance refs verbatim; cargo at build time resolves them against the overlay's own `[workspace.*]` tables.
+
+**Implementer responsibility.** Generate `workspace_member_with_package.expected.toml` by running the implementation once with the synthesized workspace-root + member manifests, capturing the output, and pinning. The expected file's exact bytes are NOT pre-committed in this plan (that would lock the implementer into a specific TOML serializer ordering); the test's contract is "two binaries produce identical output", and the pinned bytes become the contract after the first successful run. If a `toml` crate patch bump produces drift, the corpus test fires and the careful-coder handling the bump regenerates the fixture.
+
+**Count assertion bump.** `overlay_determinism.rs:495-498` asserts `checked == 6`; R2 bumps this to `checked == 7` and extends the hardcoded names array:
+
+```rust
+let names = [
+    "bare_package",
+    "with_rlib_only",
+    "with_cdylib",
+    "with_patch_section",
+    "with_comments",
+    "with_replace_section",
+    "workspace_member_with_package",  // R2 NEW
+];
+// ...
+assert_eq!(
+    checked, 7,
+    "corpus must include all 7 representative fixtures"
+);
 ```
 
-The existing corpus-list assertion (the count check, currently 8 entries per #40+#47 plan) is bumped to 9. The implementer verifies the count in the corresponding test.
+The `tests/compat/overlay_determinism.rs:26-28` module-level docstring (`"The cross-binary determinism corpus (byte_identical_across_two_lihaaf_binaries_on_corpus — five [actually six] fixtures synthesized in tempdirs from tests/compat/overlay_corpus/, each checked against a ..."`) ALSO updates: the prose count is bumped from "five" / "six" to "seven" (R2 leaves the implementer judgment on the exact wording; the §10b mirror table verifies the count assertion at line 497 — see §10b row 26 R2 update).
+
+**Compat-test argv shape (separate concern).** `compat/baseline.toml` (the §5 pilot-gate baseline table) is unrelated to the overlay corpus. axum-macros' pilot enrollment is a SEPARATE PR (per §7.6 — outside #53's scope); when that PR lands, the implementer adds an `[axum-macros]` table with `n_max = ...` to `compat/baseline.toml`. R2 does NOT pre-commit that addition; #53 lands the CAPABILITY, the follow-up pilot-enrollment PR uses it.
 
 ### 7.5 Backward-compat re-verification
 
@@ -820,7 +1193,7 @@ The pilot enrollment PR is a separate follow-up (not part of #53's PR). #53 land
 
 ### 7.7 Test-name list for §10b mirror table
 
-The §10b mirror table (§10b) MUST reference every test by name. Test names, in order of plan introduction:
+The §10b mirror table (§10b) MUST reference every test by name. Test names, in order of plan introduction (R2 extends the R1 list with tests 24-41 covering the BLOCK-1 through BLOCK-5 classes from Codex R1):
 
 | § | Test name |
 |---|---|
@@ -840,15 +1213,33 @@ The §10b mirror table (§10b) MUST reference every test by name. Test names, in
 | 7.2 #14 | `apply_workspace_member_inheritance_carries_workspace_dependencies` |
 | 7.2 #15 | `apply_workspace_member_inheritance_carries_workspace_package_lints_metadata` |
 | 7.2 #16 | `apply_workspace_member_inheritance_strips_membership_keys` |
-| 7.2 #17 | `apply_workspace_member_inheritance_carries_workspace_root_patch_crates_io` |
+| 7.2 #17 | `apply_workspace_member_inheritance_carries_workspace_root_patch_crates_io` (R2: name retained but the implementation now goes through `apply_self_patch_policy(workspace_root_patch_table: Some(...))` per §5.3.bis composition order; the test asserts the merged-table outcome, not the intermediate inject step) |
 | 7.2 #18 | `cli_parses_short_p_flag` |
 | 7.2 #19 | `cli_parses_long_package_flag` |
 | 7.2 #20 | `cli_rejects_empty_package_name` |
 | 7.2 #21 | `cli_rejects_package_outside_compat_mode` |
 | 7.2 #22 | `cli_rejects_package_with_compat_manifest` |
 | 7.2 #23 | `compat_args_from_cli_carries_compat_package` |
+| 7.2 #24 | **(R2 NEW — BLOCK-1)** `dual_root_routing_baseline_cwd_is_workspace_root_member_consumers_use_member_root` |
+| 7.2 #25 | **(R2 NEW — BLOCK-2)** `workspace_root_path_absolutization_for_dependencies_path` |
+| 7.2 #26 | **(R2 NEW — BLOCK-2)** `workspace_root_path_absolutization_for_package_readme_license_file` |
+| 7.2 #27 | **(R2 NEW — BLOCK-3)** `option_h_root_first_member_second_with_workspace_root_self_patch_entry` |
+| 7.2 #28 | **(R2 NEW — BLOCK-3)** `option_h_rejects_member_local_patch_crates_io` |
+| 7.2 #29 | **(R2 NEW — BLOCK-4)** `resolver_glob_crates_star_finds_nested_member` |
+| 7.2 #30 | **(R2 NEW — BLOCK-4)** `resolver_glob_crates_explicit_nested_literal_finds_member` |
+| 7.2 #31 | **(R2 NEW — BLOCK-4)** `resolver_glob_rejects_deep_glob` |
+| 7.2 #32 | **(R2 NEW — BLOCK-4)** `resolver_glob_rejects_glob_in_non_final_segment` |
+| 7.2 #33 | **(R2 NEW — BLOCK-4)** `resolver_glob_normalizes_trailing_slash` |
+| 7.2 #34 | **(R2 NEW — BLOCK-4)** `resolver_glob_rejects_absolute_path_member` |
+| 7.2 #35 | **(R2 NEW — BLOCK-4)** `resolver_glob_rejects_parent_traversal_member` |
+| 7.2 #36 | **(R2 NEW — BLOCK-5)** `resolver_subtracts_workspace_exclude_set` |
+| 7.2 #37 | **(R2 NEW — BLOCK-5)** `resolver_default_members_does_not_filter_package_resolution` |
+| 7.2 #38 | **(R2 NEW — BLOCK-5)** `resolver_excluded_package_diagnostic_lists_excluded_name` |
+| 7.2 #39 | **(R2 NEW — BLOCK-5)** `resolver_does_not_descend_into_nested_workspace` |
+| 7.2 #40 | **(R2 NEW — BLOCK-5)** `resolver_duplicate_package_after_glob_expansion_returns_multiple_match_error` |
+| 7.2 #41 | **(R2 NEW — scope decision)** `resolver_rejects_package_plus_workspace_root_per_v01_scope` |
 | 7.3 | `cargo_lihaaf_resolves_axum_macros_shape_workspace_member` |
-| 7.4 | `byte_identical_across_two_lihaaf_binaries_on_corpus` (count bumped from 8 to 9) |
+| 7.4 | `byte_identical_across_two_lihaaf_binaries_on_corpus` (R2: count assertion bumped from 6 to 7; new fixture pair `workspace_member_with_package.input.toml` + `workspace_member_with_package.expected.toml` added to `tests/compat/overlay_corpus/`) |
 
 ---
 
@@ -942,7 +1333,7 @@ Add a `### Added` entry to the next release section in `CHANGELOG.md`:
 
 Extend the existing module-level docs (`overlay.rs:1-238`) with a new sub-section under the "Workspace-member cases" paragraph (currently at `overlay.rs:703-723`). The text:
 
-> "**Workspace-member entry via `--package` (R5 / issue #53).** When the adopter supplies `--package <pkg>` and `--compat-root` is a workspace root, the resolver (`resolve_workspace_member_manifest`) maps `<pkg>` to the member's manifest path. The materializer takes a `WorkspaceMemberContext` parameter and:
+> "**Workspace-member entry via `--package` (issue #53).** When the adopter supplies `--package <pkg>` and `--compat-root` is a virtual workspace root (per the v0.1.0 scope; see compat plan §3.2.3), the resolver (`resolve_workspace_member_manifest`) maps `<pkg>` to the member's manifest path. The materializer takes a `WorkspaceMemberContext` parameter and:
 >
 > - Skips Branch 2 (implicit-ancestor REJECT) of `override_workspace_inheritance`.
 > - Skips Branch 3 (inheritance-refs REJECT) of `override_workspace_inheritance`.
@@ -1069,14 +1460,16 @@ The §10b table is the contract for reviewer-side completion verification. If a 
 | 22 | `cli_rejects_package_with_compat_manifest` | `grep -F 'fn cli_rejects_package_with_compat_manifest' src/cli.rs` | 1 | §7.2 #22 — mutual-exclusion error |
 | 23 | `compat_args_from_cli_carries_compat_package` | `grep -F 'fn compat_args_from_cli_carries_compat_package' src/compat/cli.rs` | 1 | §7.2 #23 — projection plumbing |
 | 24 | `cargo_lihaaf_resolves_axum_macros_shape_workspace_member` | `grep -F 'fn cargo_lihaaf_resolves_axum_macros_shape_workspace_member' tests/compat/overlay_determinism.rs` | 1 | §7.3 — integration test (cargo-build-gated) |
-| 25 | corpus count bumped to 9 | `grep -F 'workspace-member-with-package' compat/baseline.toml` | 1 | §7.4 — new corpus entry |
-| 26 | corpus count assertion | `grep -F 'expected_corpus_entry_count = 9' tests/compat/overlay_determinism.rs` | 1 | §7.4 — count-bump pin (or equivalent assertion; if the test uses a different constant name, the implementer updates this row) |
+| 25 | corpus fixture input present (R2 corrected) | `test -f tests/compat/overlay_corpus/workspace_member_with_package.input.toml && echo found \|\| echo missing` | output `found` | §7.4 — new corpus fixture input (R2 corrected target — file at `tests/compat/overlay_corpus/`, NOT in `compat/baseline.toml` as R1 misclaimed) |
+| 25b | corpus fixture expected present (R2 corrected) | `test -f tests/compat/overlay_corpus/workspace_member_with_package.expected.toml && echo found \|\| echo missing` | output `found` | §7.4 — new corpus fixture expected output |
+| 26 | corpus names array extended (R2 corrected) | `grep -F '"workspace_member_with_package",' tests/compat/overlay_determinism.rs` | 1 | §7.4 — count assertion bump from 6 to 7; new entry in `let names = [...]` array at `overlay_determinism.rs:453-460` |
+| 26b | corpus count assertion bumped to 7 (R2 corrected) | `grep -F 'checked, 7' tests/compat/overlay_determinism.rs` | 1 | §7.4 — `assert_eq!(checked, 7, ...)` at `overlay_determinism.rs:495-498` |
 | 27 | spec §8.2 flag entry | `grep -F '#### \`-p <package>\`, \`--package <package>\` (compat mode only)' docs/spec/lihaaf-v0.1.md` | 1 | §8.1 — spec flag entry |
 | 28 | spec §8.2 example block | `grep -F 'cargo lihaaf --compat \\' docs/spec/lihaaf-v0.1.md` | 1 | §8.1 — invocation example present |
 | 29 | compat plan §3.1 optional-flag bullet | `grep -F '- \`--package <pkg>\` / \`-p <pkg>\` — workspace-member' docs/compatibility-plan.md` | 1 | §8.2 — compat plan bullet |
 | 30 | compat plan §3.2.3 workspace-member sub-section | `grep -F 'Workspace-member entry via `--package`' docs/compatibility-plan.md` | 1 | §8.3 — compat plan sub-section header |
 | 31 | CHANGELOG `Added` entry | `grep -F '- Compat-mode `--package <pkg>` / `-p <pkg>` flag for workspace-member entry' CHANGELOG.md` | 1 | §8.4 — CHANGELOG entry |
-| 32 | module-level rustdoc extension | `grep -F 'Workspace-member entry via `--package` (R5 / issue #53)' src/compat/overlay.rs` | 1 | §8.5 — module-level docs extended |
+| 32 | module-level rustdoc extension (R2 — stale `R5 /` marker removed) | `grep -F 'Workspace-member entry via `--package` (issue #53)' src/compat/overlay.rs` | 1 | §8.5 — module-level docs extended (R1's `R5 / issue #53` was copy-paste residue from the #40+#47 R8 plan; R2 strips `R5 /` since this plan is at R2). The §8.5 rustdoc text in this plan is also updated to drop `R5 /`. |
 | 33 | inline call-site comment | `grep -F 'Workspace-member entry via `--package` (issue #53)' src/compat/mod.rs` | 1 | §8.7 — driver call-site comment |
 | 34 | new field on `Cli` struct | `grep -F 'pub compat_package: Option<String>,' src/cli.rs` | 1 | §3.1 — field present |
 | 35 | new field on `CompatArgs` struct | `grep -F 'pub(crate) compat_package: Option<String>,' src/compat/cli.rs` | 1 | §3.2 — projection field present |
@@ -1091,6 +1484,30 @@ The §10b table is the contract for reviewer-side completion verification. If a 
 | 44 | resolver-rejection no-members diagnostic | `grep -F 'has `[workspace]` but no `[workspace.members]` array' src/compat/overlay.rs` | 1 | §4.4 case 3 |
 | 45 | resolver-rejection no-match diagnostic | `grep -F 'no member of workspace' src/compat/overlay.rs` | 1 | §4.4 case 1 |
 | 46 | resolver-rejection multiple-match diagnostic | `grep -F 'multiple workspace members claim' src/compat/overlay.rs` | 1 | §4.4 case 2 |
+| 47 | **(R2 NEW — BLOCK-1)** dual-root routing test | `grep -F 'fn dual_root_routing_baseline_cwd_is_workspace_root_member_consumers_use_member_root' src/compat/overlay.rs` | 1 | §7.2 #24 — PUNCH-25 |
+| 48 | **(R2 NEW — BLOCK-1)** `DualRoot` struct exists | `grep -F 'pub(crate) struct DualRoot' src/compat/overlay.rs` | 1 | §3.1.bis — dual-root struct |
+| 49 | **(R2 NEW — BLOCK-2)** workspace-root path absolutization test (dependencies.path) | `grep -F 'fn workspace_root_path_absolutization_for_dependencies_path' src/compat/overlay.rs` | 1 | §7.2 #25 — PUNCH-26 |
+| 50 | **(R2 NEW — BLOCK-2)** workspace-root path absolutization test (readme/license-file) | `grep -F 'fn workspace_root_path_absolutization_for_package_readme_license_file' src/compat/overlay.rs` | 1 | §7.2 #26 — PUNCH-27 |
+| 51 | **(R2 NEW — BLOCK-3)** Option H root-first composition test | `grep -F 'fn option_h_root_first_member_second_with_workspace_root_self_patch_entry' src/compat/overlay.rs` | 1 | §7.2 #27 — PUNCH-28 |
+| 52 | **(R2 NEW — BLOCK-3)** member-local `[patch.crates-io]` rejection test | `grep -F 'fn option_h_rejects_member_local_patch_crates_io' src/compat/overlay.rs` | 1 | §7.2 #28 — PUNCH-28 inverse / PUNCH-13 |
+| 53 | **(R2 NEW — BLOCK-3)** member-local `[patch.crates-io]` rejection diagnostic | `grep -F 'cargo does not permit `[patch]` in workspace members' src/compat/overlay.rs` | 1 | §5.3.bis PUNCH-13 — directed diagnostic text |
+| 54 | **(R2 NEW — BLOCK-4)** glob `crates/*` test | `grep -F 'fn resolver_glob_crates_star_finds_nested_member' src/compat/overlay.rs` | 1 | §7.2 #29 — PUNCH-29 |
+| 55 | **(R2 NEW — BLOCK-4)** explicit nested literal test | `grep -F 'fn resolver_glob_crates_explicit_nested_literal_finds_member' src/compat/overlay.rs` | 1 | §7.2 #30 — PUNCH-29 |
+| 56 | **(R2 NEW — BLOCK-4)** deep-glob rejection test | `grep -F 'fn resolver_glob_rejects_deep_glob' src/compat/overlay.rs` | 1 | §7.2 #31 — PUNCH-29 |
+| 57 | **(R2 NEW — BLOCK-4)** deep-glob rejection diagnostic | `grep -F 'cargo does not support `**` in `[workspace.members]`' src/compat/overlay.rs` | 1 | §4.3 step 5 — directed diagnostic text |
+| 58 | **(R2 NEW — BLOCK-4)** non-final-segment glob rejection test | `grep -F 'fn resolver_glob_rejects_glob_in_non_final_segment' src/compat/overlay.rs` | 1 | §7.2 #32 — PUNCH-29 |
+| 59 | **(R2 NEW — BLOCK-4)** non-final-segment glob diagnostic | `grep -F 'only the LAST segment may contain glob metachars' src/compat/overlay.rs` | 1 | §4.3 step 5 — directed diagnostic text |
+| 60 | **(R2 NEW — BLOCK-4)** trailing-slash normalization test | `grep -F 'fn resolver_glob_normalizes_trailing_slash' src/compat/overlay.rs` | 1 | §7.2 #33 — PUNCH-29 |
+| 61 | **(R2 NEW — BLOCK-4)** absolute-path rejection test | `grep -F 'fn resolver_glob_rejects_absolute_path_member' src/compat/overlay.rs` | 1 | §7.2 #34 — PUNCH-29 |
+| 62 | **(R2 NEW — BLOCK-4)** absolute-path rejection diagnostic | `grep -F '`[workspace.members]` entries are workspace-relative paths only' src/compat/overlay.rs` | 1 | §4.3 step 5 — directed diagnostic text |
+| 63 | **(R2 NEW — BLOCK-4)** parent-traversal rejection test | `grep -F 'fn resolver_glob_rejects_parent_traversal_member' src/compat/overlay.rs` | 1 | §7.2 #35 — PUNCH-29 |
+| 64 | **(R2 NEW — BLOCK-4)** parent-traversal rejection diagnostic | `grep -F 'members must be descendants of the workspace root' src/compat/overlay.rs` | 1 | §4.3 step 5 — directed diagnostic text |
+| 65 | **(R2 NEW — BLOCK-5)** `workspace.exclude` subtraction test | `grep -F 'fn resolver_subtracts_workspace_exclude_set' src/compat/overlay.rs` | 1 | §7.2 #36 — PUNCH-30 |
+| 66 | **(R2 NEW — BLOCK-5)** `default-members` non-interaction test | `grep -F 'fn resolver_default_members_does_not_filter_package_resolution' src/compat/overlay.rs` | 1 | §7.2 #37 — PUNCH-30 |
+| 67 | **(R2 NEW — BLOCK-5)** excluded-package diagnostic test | `grep -F 'fn resolver_excluded_package_diagnostic_lists_excluded_name' src/compat/overlay.rs` | 1 | §7.2 #38 — PUNCH-30 |
+| 68 | **(R2 NEW — BLOCK-5)** nested-workspace traversal-boundary test | `grep -F 'fn resolver_does_not_descend_into_nested_workspace' src/compat/overlay.rs` | 1 | §7.2 #39 — PUNCH-30 |
+| 69 | **(R2 NEW — BLOCK-5)** duplicate-after-expansion test | `grep -F 'fn resolver_duplicate_package_after_glob_expansion_returns_multiple_match_error' src/compat/overlay.rs` | 1 | §7.2 #40 — PUNCH-30 |
+| 70 | **(R2 NEW — scope decision)** package+workspace root rejection test | `grep -F 'fn resolver_rejects_package_plus_workspace_root_per_v01_scope' src/compat/overlay.rs` | 1 | §7.2 #41 — §1 scope decision |
 | 47 | validator rule A: non-compat rejection | `grep -F 'return Err(non_compat_mode_error("--package"));' src/cli.rs` | 1 | §3.3 rule A |
 | 48 | validator rule B: mutual exclusion | `grep -F 'cannot be combined: `--compat-manifest` supplies an explicit' src/cli.rs` | 1 | §3.3 rule B |
 
@@ -1141,34 +1558,61 @@ The baseline runner's `cargo test` invocation receives the argv verbatim from `-
 
 The issue body explicitly says: "Restructure pilot fork — forks lihaaf's pilot infra from upstream's actual workspace layout — bad fidelity. **Don't pick this.**" **Pre-committed:** do NOT restructure the axum-macros fork; ship the `-p` resolver.
 
-### 11.9 Touching the #40+#47 `apply_self_patch_policy` function (CONDITIONAL on order)
+### 11.9 Touching the #40+#47 `apply_self_patch_policy` function (R2 UPDATE — #40+#47 IS LANDED)
 
-If #40+#47 has landed before #53 starts implementation, the resolver's `apply_workspace_member_inheritance` will call into `apply_self_patch_policy` (or its equivalent) for the workspace root's `[patch.crates-io]` carry-down. The implementer:
+**R2 update.** PR #56 (#40+#47 Option H + staged-mirror) is merged on `main` at commit `cb5d5bf` as of 2026-05-18 (before this plan starts implementer dispatch). The R1 conditional branch ("if #40+#47 has NOT landed…") is REMOVED.
 
-- Extends the existing function with an optional workspace-root context parameter.
+The resolver's `apply_workspace_member_inheritance` MUST call into `apply_self_patch_policy` (or the function's actual final name on `main`; verify the exact symbol via `grep -F 'fn apply_self_patch_policy' src/compat/overlay.rs` before implementer dispatch) for the workspace root's `[patch.crates-io]` carry-down per §5.3.bis composition order (root-first, member-second). The implementer:
+
+- Extends the existing function with an optional `workspace_root_patch_table: Option<&toml::Value>` parameter. When `Some`, the function:
+  - Takes the supplied workspace-root patch table as the input (with path entries absolutized against `workspace_root` per §3.2.bis policy table).
+  - Runs Rules 1-4 against this effective table with the MEMBER as the "self" target.
+  - Returns the merged output for write into the overlay's top-level `[patch.crates-io]`.
+- When `None` (the non-`--package` path), the function behaves exactly as today.
 - Does NOT rewrite the function's core 4-rule policy.
 
-If #40+#47 has NOT landed (#53 lands first), the carry-down for `[patch.crates-io]` is simpler (no Option H rules to apply); the implementer carries the workspace root's `[patch.crates-io]` table verbatim into the overlay. **Pre-committed:** the implementer surfaces the dependency order in the PR description; reviewer verifies the order assumption.
+The §5.3.bis composition order constraint is the contract; reviewer verifies via §10b row 17 (apply_workspace_member_inheritance test) + row 51 (Option H root-first test).
 
 ### 11.10 Cross-platform symlink concerns (OUT of scope for #53)
 
-The staged-overlay path uses `target/lihaaf-overlay/Cargo.toml` (relative to the member dir). The package-root mirror (per #40+#47 plan §4.5) is the only cross-platform symlink concern, and it's in #40+#47's scope, not #53's. **Pre-committed:** do NOT add new cross-platform symlink logic in #53.
+The staged-overlay path uses `target/lihaaf-overlay/Cargo.toml` (relative to the member dir). The package-root mirror (per #40+#47 plan §4.5 — now landed on `main` at `cb5d5bf` via PR #56) is the only cross-platform symlink concern, and it's in #40+#47's scope, not #53's. **Pre-committed:** do NOT add new cross-platform symlink logic in #53.
+
+### 11.11 Package+workspace root shape (R2 — scope decision, v0.2 / v1.0 follow-up)
+
+v0.1.0 `--package` is scoped to **virtual workspaces only** (workspace root declares `[workspace]` without `[package]`). See §1 Out of scope for the rationale.
+
+**Implementer responsibility for the v0.2 follow-up.** When this plan lands, the implementer's PR description MUST file a follow-up GitHub issue titled `compat: --package support for package+workspace root shape (v0.2)` with the following acceptance-criteria sketch (the v0.2 / v1.0 design conversation owns the final shape):
+
+- Decide whether `--package <root-pkg-name>` (matching the root's own `[package].name`) should target the root's `[package]` (which is a publishable crate AT the workspace root) OR REJECT (since the workspace root is the coordinator, not a member subdirectory).
+- Decide how the root's `[lib]` / `[dependencies]` keys interact with carry-down: are the root's `[dependencies]` ALSO carried into the overlay when targeting a member, OR are they ignored (since the member has its own `[dependencies]`)?
+- Decide whether the root being publishable changes any `[package].publish` / `[package].license` handling in carry-down.
+- Add resolver tests for the package+workspace root shape; the resolver's step 2.5 REJECT diagnostic is replaced with the v0.2 policy.
+
+R2 §4.3 step 2.5 ensures the v0.1.0 resolver REJECTs the package+workspace shape with a clear diagnostic, so adopters of that shape get a direct pointer to the v0.2 follow-up rather than a silent or confusing failure.
+
+**Why v0.2 not v0.1.0.** The only Round-2 pilot needing `--package` is axum-macros, which lives in a virtual workspace. No v0.1.0 GA pilot is blocked by the package+workspace scope deferral. Adopters of package+workspace shape are a smaller cohort (most modern multi-crate libraries adopt the virtual-workspace shape); v0.2 is the right timing to design the policy properly rather than rush a decision for v0.1.0 GA.
 
 ---
 
 ## 12. Revision history
 
 - **R1 (2026-05-18, initial)** — drafted by strict-swe Opus planner. All 12 sections written in one pass. Pre-adversarial-review (Codex xhigh expected to flag at least one round; per [[lihaaf-plan-adversarial-cycle]]).
+- **R2 (2026-05-18, post-Codex-R1-BLOCK + sweep-after-review)** — see top-of-plan "Revision history" section for the full R1 → R2 delta map. Summary: 6 HARD_BLOCKs addressed (dual-root plumbing, root-relative path absolutization, Option H composition order, glob expansion, exclude/default/nested/duplicate, test coverage); 4 FIX_BEFORE_IMPL items addressed (stale #40+#47 conditional, spec amendments accuracy, status references, virtual-vs-package+workspace scope); 1 DEFERRABLE_NIT addressed (§10b row 32 stale R5 marker); 1 INTERNAL-CONSISTENCY surface corrected (R1 §7.4 invented a TOML schema that did not match the actual code; R2 §7.4 rewritten to target `tests/compat/overlay_corpus/` fixture pairs). All 30 punch items from Codex's class-enumeration sweep are addressed across the new §3.1.bis, §3.2.bis, §5.3.bis, expanded §4.3 steps 2.5/3.5/4.5/6.5/7.5/8, and expanded §7.2 tests 24-41 + §10b rows 47-70.
 
 ---
 
 ## Open items the implementer must NOT decide alone
 
 - Whether `apply_workspace_member_inheritance` (or equivalent) is a NEW function or an extension of the existing Branch 4 of `override_workspace_inheritance`. R1 specifies new function for clarity; implementer may inline into Branch 4 if reviewer panel accepts. Either choice keeps the §10b grep row 37 satisfied (function-name match; if inlined, row 37 is replaced by "inlined; verify Branch 4 takes workspace_member_context: Option<&WorkspaceMemberContext> parameter" — implementer updates §10b in the temporary plan file accordingly).
-- The exact carry-down policy for `[profile.*]` — verbatim merge vs key-by-key with overlay precedence. R1 specifies verbatim; reviewer panel may flag profile-key conflicts (e.g. `[profile.release.lto]` differing between root and member's own profile if any). **Pre-committed:** verbatim carry-down from workspace root; member-local `[profile.*]` (rare) takes precedence on conflict.
 - The exact integration-test fixture surface (synthesized in tempdir vs new pilot-style fixture). R1 specifies synthesized-in-tempdir; if the implementer wants to use a checked-in fixture under `tests/fixtures/`, the cleanup pattern from the existing tests applies.
-- Whether the resolver returns `ResolvedMember` (struct with `member_manifest` + `workspace_root_manifest`) or a tuple `(PathBuf, PathBuf)`. R1 specifies struct for self-documentation; tuple is acceptable if reviewers prefer.
-- Whether `UpstreamManifest` enum (per §4.6) is exposed at `pub(crate)` or kept private to the module. R1 specifies `pub(crate)` so the driver in `src/compat/mod.rs` can pattern-match. Implementer may flatten if reviewer panel prefers.
+- The `DualRoot` struct's exact visibility — `pub(crate)` (R2 default, allows the driver in `src/compat/mod.rs` to construct + consume) vs `pub(super)` (tighter scoping, requires the resolver and driver to share a module). R2 §3.1.bis specifies `pub(crate)`; implementer may flatten if the reviewer panel prefers, as long as §10b row 48 grep still succeeds (`pub(crate) struct DualRoot` may become `pub(super) struct DualRoot` or similar — update §10b row 48 in the temporary plan file).
 - Whether the baseline-runner argv auto-injection (§6.13) should be reconsidered as a v0.2 follow-up. R1 keeps it adopter-explicit; if a Round-2 pilot UX session shows the manual `--compat-cargo-test-argv` override is consistently painful, file a v0.2 follow-up. Out of scope for #53.
+- The exact wording of the v0.2 follow-up issue filed per §11.11 (package+workspace root shape support). R2 specifies the title `compat: --package support for package+workspace root shape (v0.2)` and a sketch acceptance-criteria list; the implementer files the issue when this plan lands and the URL goes into the §11.11 reference.
 
-All other decisions in this plan are pre-committed; the implementer follows them as-written unless adversarial review of THIS plan flags them.
+R2 closes the following R1 open items (which are now pre-committed in R2):
+
+- `[profile.*]` carry-down policy → §5.3.bis PUNCH-16 closes this: workspace-root `[profile.*]` is carried verbatim; member-local `[profile.*]` is ignored by cargo at build time anyway, so the implementer does NOT need to handle member-local profile precedence (it's a no-op).
+- `ResolvedMember` struct vs tuple → §3.1.bis closes this by consolidating into the `DualRoot` struct; the resolver returns `(PathBuf, toml::Value)` (a minimal tuple — just enough for the driver to construct a `DualRoot`), and `DualRoot` is the public API.
+- `UpstreamManifest` enum vs flat struct → §3.1.bis closes this by replacing the enum with the `DualRoot` struct (single shape, collapse via the `workspace_member_context: Option<_>` field).
+
+All other decisions in this plan are pre-committed; the implementer follows them as-written unless adversarial review of THIS plan (R2 → R3) flags them.
