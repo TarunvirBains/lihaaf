@@ -4,7 +4,8 @@
 //! It is designed for proc-macro crates that need many compile-pass and
 //! compile-fail fixtures without paying unnecessary rebuild overhead.
 //!
-//! `lihaaf` ("quilt", Urdu) compiles the consumer crate once as a dynamic
+//! `lihaaf` ("quilt"; Urdu and Punjabi, also written ਲਿਹਾਫ਼ in Gurmukhi)
+//! compiles the consumer crate once as a dynamic
 //! library, then runs each fixture as a standalone `rustc` invocation that
 //! links the prebuilt dylib via `--extern`. In many real projects this is the
 //! difference between waiting forever and getting quick feedback.

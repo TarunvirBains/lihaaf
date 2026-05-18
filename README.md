@@ -6,7 +6,7 @@ compile-fail / compile-pass fixtures.
 
 ## Why lihaaf?
 
-`lihaaf` ("quilt", Urdu) was inspired by
+`lihaaf` ("quilt"; Urdu and Punjabi, also written ਲਿਹਾਫ਼ in Gurmukhi) was inspired by
 [Trybuild](https://github.com/dtolnay/trybuild) but driven by a need for
 quick iteration: the compile-fail/compile-pass fixture style `trybuild` made
 practical, combined with a build model that keeps adding fixtures cheap.
