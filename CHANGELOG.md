@@ -6,7 +6,146 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.1.0-beta.5] — next
+## [0.1.0-beta.6] — 2026-05-17
+
+Targeted GA-blocker fix for compat-mode workspace identity. v0.1.0-beta.5
+correctly resolved the manifest-name + envelope-determinism bugs, but the
+post-publish refresh-pilots run
+([Actions run 26000403851](https://github.com/TarunvirBains/lihaaf/actions/runs/26000403851))
+revealed a NEW bug class: the staged overlay at
+`<upstream>/target/lihaaf-overlay/Cargo.toml` collided with upstream
+workspace identity for workspace-style pilots. Three of four Round-1
+pilots (cxx, serde-json, thiserror) failed with
+`package <X> is a member of the wrong workspace`; only anyhow
+(single-crate, no `[workspace]`) succeeded. Tracked as issue #36; fixed
+by PR #37 across four adversarial-panel rounds.
+
+### Fixed
+- **Workspace-identity collision in staged overlay** (`src/compat/overlay.rs`):
+  the overlay-materialization pipeline now applies a 5-branch decision
+  tree to the upstream manifest before writing the staged overlay:
+  1. **Explicit member** (`[package].workspace = "<path>"`) → REJECT
+     with `Error::Cli { clap_exit_code: 2, ... }` and a directed
+     diagnostic naming the ancestor pointer and pointing the user at
+     the workspace root.
+  2. **Implicit ancestor member** (walk-up finds an ancestor
+     `Cargo.toml` declaring `[workspace]`) → REJECT with a
+     directed diagnostic naming the ancestor manifest path. This
+     conservative check catches the silent-graph-divergence case where
+     baseline cargo inherits ancestor `[patch.crates-io]` /
+     `[replace]` / `resolver` / `[profile]` / `[workspace.dependencies]`
+     state but the lihaaf overlay would terminate cargo's walk-up at
+     `target/lihaaf-overlay/Cargo.toml` — producing differing dependency
+     graphs and false pass/fail compat results.
+  3. **Implicit member via inheritance refs** (no local `[workspace]`
+     and at least one `{ workspace = true }` reference in
+     `[package]` / `[dependencies]` / `[dev-dependencies]` /
+     `[build-dependencies]` / `[target.<cfg>.<deps>]` / `[lints]`) →
+     REJECT (would otherwise strand the inheritance reference at cargo
+     parse time).
+  4. **Workspace root** (manifest has its own `[workspace]` table) →
+     clone, strip the membership keys (`members`, `exclude`,
+     `default-members`), preserve all inheritance / configuration
+     tables (`workspace.dependencies`, `workspace.package`,
+     `workspace.lints`, `workspace.metadata`, `resolver`, and any
+     unknown forward-compat sub-keys). The overlay declares no members,
+     so the upstream's path-dep crates remain owned by the upstream
+     workspace; the preserved tables keep every `{ workspace = true }`
+     reference resolvable.
+  5. **Standalone single-crate** (no workspace markers, no ancestor
+     workspace) → inject an empty `[workspace] = {}` table to terminate
+     cargo's walk-up at the staged overlay.
+- **`detect_implicit_ancestor_workspace` helper** (`src/compat/overlay.rs`):
+  walks parent directories from `parent_of(parent_of(upstream))` upward
+  via lexical `Path::parent()` traversal (no `canonicalize` —
+  intentional, see Known limitations). Returns `Some(ancestor_path)`
+  on the first parseable `Cargo.toml` declaring `[workspace]`. Malformed
+  ancestor manifests emit a non-fatal stderr warning and the walk
+  continues; only hard I/O errors propagate.
+- **`manifest_has_inheritance_reference` helper** (`src/compat/overlay.rs`):
+  detects `{ workspace = true }` shapes across all 10+ inheritance
+  families (package fields via the dotted-style + table-style, every
+  dependency table including target-conditional and dev/build variants,
+  the top-level `[lints]` form, and per-namespace
+  `[lints.{rust,clippy,rustdoc}]`). Strictly checks
+  `value.is_bool() == Some(true)` so false positives like
+  `[package.metadata] workspace = "foo"` (string value) don't fire.
+
+### Known limitations
+- Issue #38 — ancestor `workspace.exclude` array not honored in
+  implicit-ancestor detection. Conservative false-positive rejection
+  on intentionally-excluded descendants; low likelihood. POST_BETA.
+- Issue #39 — ancestor-walk doesn't follow symlinks. If upstream is
+  reached via a symlink and the ancestor `[workspace]` lives only on
+  the real path side, the walk misses it and the silent-divergence
+  failure mode survives. Low likelihood. POST_BETA.
+- Issue #40 — serde_json `specification serde_json is ambiguous`
+  remains. A SEPARATE failure mode (resolution-time, not
+  manifest-parse-time) not addressed by this PR. May be collateral-
+  fixed by the new workspace handling; refresh-pilots against beta.6
+  will reveal.
+- Workspace-member case (lihaaf invoked from a sub-crate within a
+  workspace, NOT from the workspace root) is explicitly rejected with
+  a clean diagnostic. Ancestor-workspace inheritance flattening is
+  out-of-scope for v0.1 (would require cross-manifest reads).
+- Windows path portability deferred to v0.2 (carried over from beta.5).
+
+### Tests
+- `tests/compat/overlay_determinism.rs`: new
+  `staged_overlay_overrides_upstream_workspace_inheritance` pins the
+  workspace-root preservation contract (R2).
+- `tests/compat/overlay_determinism.rs`: new
+  `cargo_accepts_workspace_inheritance_reference_in_overlay`
+  (LIHAAF_RUN_CARGO_BUILD_TESTS=1 gate) — constructs the exact
+  Codex R1-BLOCK repro (`[workspace.dependencies] foo = { path = "..." }`
+  + `[dependencies] foo = { workspace = true }`) and asserts cargo
+  rustc succeeds end-to-end.
+- `tests/compat/overlay_determinism.rs`: new
+  `cargo_accepts_workspace_style_overlay_for_dylib_build`
+  (LIHAAF_RUN_CARGO_BUILD_TESTS=1 gate) — constructs a real
+  workspace-style upstream and asserts cargo rustc succeeds.
+- `tests/compat/overlay_determinism.rs`: new
+  `staged_overlay_rejects_workspace_member_manifest` and
+  `staged_overlay_rejects_implicit_workspace_member_manifest` and
+  `staged_overlay_rejects_manifest_with_ancestor_workspace` —
+  variant-match assertions (not loose `format!("{err:?}").contains()`)
+  so a future refactor swapping the error variant trips a panic
+  instead of a silent test pass.
+- `src/compat/overlay.rs::tests`: 17 new unit tests across all 5
+  branches plus the new helper functions
+  (`manifest_has_inheritance_reference_detects_every_family` covers
+  10 inheritance shapes; `override_workspace_*` tests pin preservation,
+  injection, idempotency, all rejection paths).
+- Test counts at beta.6: 268 lib tests (was 251), 29
+  `overlay_determinism` integration tests (was 22), 15
+  `report_determinism` tests, 4 cargo-build-gated `cargo_accepts_*`
+  tests (was 2).
+
+### Changed
+- **5-branch decision tree** in `override_workspace_inheritance`
+  replaces the v0.1.0-beta.5 absolutization-only path. The
+  absolutization pass for `[workspace] members/exclude/default-members`
+  (carried over from beta.5) still runs but its output is harmlessly
+  clobbered by the override; the unit tests on the absolutize pass
+  call it directly so they remain pinned.
+- **`src/compat/overlay.rs` module-level docs**: expanded with the
+  R1 → R2 → R3 → R4 decision-tree rationale; explains why empty
+  workspace was wrong (R1), why preserving inheritance tables matters
+  (R2), why implicit-via-refs needs rejection (R3), why ancestor-walk
+  is required for correctness (R4), and why the workspace-member case
+  is intentionally out-of-scope for v0.1.
+
+### Process
+- 4-round adversarial-panel review (Codex xhigh + Gemini 3.1-pro-preview
+  + strict-swe Opus); each BLOCK was investigated, fixed, and
+  re-reviewed:
+  - R1 (`1f6520b`) BLOCK by Codex + Gemini → R2 (`cc19ecc`)
+  - R2 BLOCK by Codex with Gemini COUNTER → R3 (`83ca8d9`)
+  - R3 BLOCK by Codex → R4 (`8d2517a`)
+  - R4 triple-ALLOW with 3 informational COUNTERs filed as issues
+    #38, #39, #40
+
+## [0.1.0-beta.5] — 2026-05-17
 
 Targeted GA-blocker fix for the compat-mode manifest staging path. The
 v0.1.0-beta.4 release shipped the compat driver with the overlay
