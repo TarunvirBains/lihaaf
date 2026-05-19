@@ -238,6 +238,91 @@ use std::path::{Path, PathBuf};
 use crate::error::Error;
 use crate::util;
 
+/// Dual-root vocabulary for compat-mode invocations (issue #53 — see
+/// plan §3.1.bis).
+///
+/// When the adopter invokes compat mode with `-p <package>` /
+/// `--package <package>`, the consumer roles previously occupied by the
+/// single `compat_root` path split between two roots: the WORKSPACE
+/// root (the directory `--compat-root` points at; cargo's baseline test
+/// cwd; `Cargo.lock` discovery anchor) and the MEMBER root (the
+/// subdirectory containing the resolved member's `Cargo.toml`; the
+/// overlay materialization root; fixture-discovery base). For
+/// non-`--package` invocations all four paths collapse: `workspace_root
+/// == member_root` and `workspace_root_manifest == member_manifest`.
+///
+/// The struct is the resolver's structured output. Every downstream
+/// consumer (per §3.1.bis routing table) reads the explicit role
+/// instead of the legacy `compat_root` / `upstream_manifest`. The
+/// `workspace_member_context` field carries the parsed workspace-root
+/// TOML value (consumed by [`apply_workspace_member_inheritance`] for
+/// the §5.3 carry-down) and the workspace-root manifest path (consumed
+/// by [`apply_self_patch_policy`] when computing the workspace-root
+/// `[patch.crates-io]` effective table per §5.3.bis).
+///
+/// **Invariant.** When `workspace_member_context.is_none()`:
+/// - `workspace_root == member_root`
+/// - `workspace_root_manifest == member_manifest`
+///
+/// This is the v0.1-pre-#53 single-root collapse case (single-crate
+/// repos, single-crate roots, `--compat-manifest` overrides).
+#[derive(Debug, Clone)]
+pub(crate) struct DualRoot {
+    /// Workspace-root directory. The dir passed via `--compat-root`. For
+    /// `--package` invocations this MUST be a virtual workspace root
+    /// (per the v0.1.0 §1 scope). For non-`--package` invocations this
+    /// equals `member_root`.
+    pub(crate) workspace_root: PathBuf,
+    /// Workspace-root manifest path. `<workspace_root>/Cargo.toml` (or
+    /// the `--compat-manifest` override for non-`--package` invocations).
+    ///
+    /// Currently unused by the compat driver impl (the driver routes
+    /// through `workspace_member_context.as_ref()` when it needs the
+    /// workspace-root manifest path), but pinned by §3.1.bis as a
+    /// first-class field for diagnostics and future consumers — the
+    /// dual-root vocabulary is the contract, not a one-off shape. T-10
+    /// + T-24 unit tests assert the field round-trips correctly.
+    ///
+    /// The `#[allow(dead_code)]` is scoped to non-test builds where
+    /// the field isn't yet read in impl; removing the allow when an
+    /// impl consumer is added is the natural unwinding.
+    #[allow(dead_code)]
+    pub(crate) workspace_root_manifest: PathBuf,
+    /// Member-root directory. The dir containing the resolved member's
+    /// `Cargo.toml`. For non-`--package` invocations equals
+    /// `workspace_root`.
+    pub(crate) member_root: PathBuf,
+    /// Member manifest path. The `Cargo.toml` the overlay materializer
+    /// parses. For non-`--package` invocations equals
+    /// `workspace_root_manifest`.
+    pub(crate) member_manifest: PathBuf,
+    /// `Some` when `--package` was supplied (dual-root case); `None`
+    /// when the four paths collapse (single-root case).
+    pub(crate) workspace_member_context: Option<WorkspaceMemberContext>,
+}
+
+/// Carry-down context for the workspace-member entry shape (issue #53 —
+/// see plan §5.4). When `DualRoot.workspace_member_context.is_some()`,
+/// the overlay materializer uses this struct to (a) skip the
+/// implicit-ancestor REJECT branches of
+/// [`override_workspace_inheritance`] and (b) carry the workspace
+/// root's `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and
+/// `[profile.*]` tables down into the staged overlay per §5.3 / §5.3.bis.
+///
+/// `workspace_root_value` is the parsed workspace-root TOML, captured
+/// once by [`resolve_workspace_member_manifest`] so the materializer
+/// does not re-parse the file.
+#[derive(Debug, Clone)]
+pub(crate) struct WorkspaceMemberContext {
+    /// Path to the workspace-root `Cargo.toml` (informational; also
+    /// used in diagnostics).
+    pub(crate) workspace_root_manifest: PathBuf,
+    /// Parsed workspace-root TOML value. The carry-down reads
+    /// `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and
+    /// `[profile.*]` from this value.
+    pub(crate) workspace_root_value: toml::Value,
+}
+
 /// One materialized overlay run. Constructed by [`materialize_overlay`]
 /// after the sibling manifest is written (or skipped as idempotent).
 ///
@@ -419,7 +504,11 @@ pub fn materialize_overlay_with_metadata(
     // Bridge to the builder-shaped entry: the builder ignores the
     // upstream name and returns the caller's pre-constructed metadata
     // (cloned because the builder owns the returned value).
-    materialize_overlay_inner(upstream_manifest_path, |_name| synthetic_metadata.cloned())
+    materialize_overlay_inner(
+        upstream_manifest_path,
+        |_name| synthetic_metadata.cloned(),
+        None,
+    )
 }
 
 /// Variant of [`materialize_overlay_with_metadata`] whose synthetic
@@ -434,20 +523,42 @@ pub fn materialize_overlay_with_metadata(
 /// malformed manifests (where the caller decides on a fallback). The
 /// builder may return `None` to skip metadata injection entirely.
 ///
-/// **Errors.** Same shape as [`materialize_overlay`].
-pub fn materialize_overlay_with_synthetic_metadata_builder<F>(
+/// `workspace_member_ctx` (issue #53) — when `Some`, the materializer:
+///
+/// 1. Suppresses Branches 2 + 3 of [`override_workspace_inheritance`]
+///    (the implicit-ancestor + inheritance-ref REJECTs — the adopter
+///    explicitly named the member via `--package`).
+/// 2. Carries the workspace root's `[workspace.*]`, `[patch.crates-io]`,
+///    `[replace]`, and `[profile.*]` tables down into the staged
+///    overlay (per plan §5.3 / §5.3.bis composition order).
+///
+/// When `workspace_member_ctx` is `None`, behavior is identical to
+/// pre-#53 single-root materialization — the byte-determinism corpus
+/// and all pre-#53 pilots are unaffected.
+///
+/// **Errors.** Same shape as [`materialize_overlay`], plus resolver-
+/// specific errors propagated from
+/// [`apply_workspace_member_inheritance`] (the member-local
+/// `[patch.crates-io]` REJECT per §5.3.bis Step 2).
+pub(crate) fn materialize_overlay_with_workspace_member_context<F>(
     upstream_manifest_path: &Path,
     builder: F,
+    workspace_member_ctx: Option<&WorkspaceMemberContext>,
 ) -> Result<OverlayPlan, Error>
 where
     F: FnOnce(Option<&str>) -> SyntheticMetadata,
 {
-    materialize_overlay_inner(upstream_manifest_path, |name| Some(builder(name)))
+    materialize_overlay_inner(
+        upstream_manifest_path,
+        |name| Some(builder(name)),
+        workspace_member_ctx,
+    )
 }
 
 fn materialize_overlay_inner<F>(
     upstream_manifest_path: &Path,
     synthetic_metadata: F,
+    workspace_member_ctx: Option<&WorkspaceMemberContext>,
 ) -> Result<OverlayPlan, Error>
 where
     F: FnOnce(Option<&str>) -> Option<SyntheticMetadata>,
@@ -485,13 +596,22 @@ where
     // member crate's Cargo.toml. The empty / unusual case (neither
     // `[package]` nor `[workspace]`) stays tolerant — that may be a
     // test fixture or a partial manifest the operator is constructing.
+    //
+    // Issue #53 — the workspace-member entry shape (axum-macros) is now
+    // supported via `--package <pkg>`. When the adopter passes
+    // `--package`, the resolver finds the member manifest and we don't
+    // reach this branch (the materializer is invoked with the member's
+    // manifest path, which has `[package]`). When the adopter does NOT
+    // pass `--package` AND `--compat-root` is a workspace root, this
+    // branch fires — the augmented diagnostic suggests `--package` so
+    // the adopter gets an actionable fix.
     if is_workspace_root_manifest(&value) {
         return Err(Error::Cli {
             clap_exit_code: 2,
             message: format!(
-                "error: `--compat-root` must point to a single-crate Cargo.toml; \
-                 `{}` is a workspace root (declares `[workspace]` without `[package]`). \
-                 Pass a member crate's Cargo.toml as `--compat-root` instead.",
+                "error: `--compat-root` `{}` is a workspace root (declares `[workspace]` \
+                 without `[package]`); pass `--package <pkg>` to target a specific workspace \
+                 member, or set `--compat-root` to a single-crate Cargo.toml.",
                 upstream_manifest_path.display()
             ),
         });
@@ -580,16 +700,34 @@ where
         // `--compat-allow-patch-override` escape hatch is deferred to
         // v0.2 / v1.1.
         //
+        // Issue #53 — apply workspace-member inheritance carry-down
+        // BEFORE `apply_self_patch_policy`. The carry-down (a) rejects
+        // member-local `[patch.crates-io]` per §5.3.bis Step 2 and (b)
+        // copies the workspace root's `[workspace.*]`, `[replace]`,
+        // `[profile.*]` tables into `top`. `apply_self_patch_policy`
+        // then receives the workspace-root `[patch.crates-io]` table
+        // via the `workspace_member_ctx` parameter and runs the 4-rule
+        // dispatch on the merged effective table (per §5.3.bis Step 3
+        // composition order: root-first, member-second).
+        if let Some(ctx) = workspace_member_ctx {
+            apply_workspace_member_inheritance(top, ctx, upstream_manifest_path)?;
+        }
+
         // Targets the STAGED OVERLAY DIR (not the upstream dir) to
         // avoid the R1 self-loop bug: pointing the patch at the upstream
         // dir IS the source-id cargo already aliases to crates.io. See
         // `apply_self_patch_policy` rustdoc and §2.1 / §2.6 of the
-        // implementation plan for the cargo-anchoring reasoning.
+        // implementation plan for the cargo-anchoring reasoning. When
+        // `workspace_member_ctx` is `Some`, the function uses the
+        // workspace-root's `[patch.crates-io]` as the effective input
+        // and applies the simplified Rule 2 (unconditional REMAP on
+        // any `.path` self-entry) per §5.3.bis.
         apply_self_patch_policy(
             top,
             upstream_crate_name.as_deref(),
             &upstream_dir,
             &staged_overlay_dir,
+            workspace_member_ctx,
         )?;
 
         if let Some(meta) = synthetic.as_ref() {
@@ -610,13 +748,14 @@ where
         // carried through, while the absolutization of the stripped
         // `members` / `exclude` / `default-members` is harmlessly discarded.
         //
-        // REJECTS workspace-member cases (EXPLICIT `[package].workspace
-        // = "<path>"`, IMPLICIT no-`[workspace]` + ancestor `[workspace]`,
-        // and IMPLICIT no-`[workspace]` + `{ workspace = true }` references).
-        // See module-level docs (lines 130-238) and function-level docs
-        // for the cargo-walk-up discovery rationale and the five-branch
-        // decision tree.
-        override_workspace_inheritance(top, upstream_manifest_path)?;
+        // REJECTS workspace-member cases EXCEPT when
+        // `workspace_member_ctx` is `Some` (issue #53). When `Some`,
+        // Branches 2 + 3 are SUPPRESSED (the adopter named the member
+        // explicitly via `--package`; the carry-down has populated the
+        // workspace tables); Branch 1 (explicit `[package].workspace =
+        // "<path>"`) still fires because the explicit declaration is
+        // incompatible with the resolver-determined workspace.
+        override_workspace_inheritance(top, upstream_manifest_path, workspace_member_ctx)?;
     }
 
     let serialized = serialize_canonical(&value)?;
@@ -821,6 +960,7 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 fn override_workspace_inheritance(
     top: &mut toml::map::Map<String, toml::Value>,
     upstream_manifest_path: &Path,
+    workspace_member_ctx: Option<&WorkspaceMemberContext>,
 ) -> Result<(), Error> {
     // 1. Reject the EXPLICIT workspace-member case. A package
     //    declaring itself as a member of an ancestor workspace
@@ -829,6 +969,13 @@ fn override_workspace_inheritance(
     //    inheritance tables into the overlay is out-of-scope for
     //    v0.1.0-beta.6 (see function-level docs above for the full
     //    rationale).
+    //
+    //    Issue #53: Branch 1 STILL fires even when
+    //    `workspace_member_ctx.is_some()`. An explicit
+    //    `[package].workspace = "<path>"` is incompatible with the
+    //    resolver-determined workspace — the adopter named the member
+    //    via `--package`, but the member itself declares an explicit
+    //    membership pointer elsewhere. Surface the conflict.
     if let Some(toml::Value::Table(pkg)) = top.get("package")
         && pkg.contains_key("workspace")
     {
@@ -857,18 +1004,18 @@ fn override_workspace_inheritance(
     //    `Cargo.toml` walk-up (R4 — Codex BLOCK fixup in PR #37 R3
     //    review). If the manifest has no local `[workspace]` table
     //    AND any ancestor `Cargo.toml` on the filesystem walk-up
-    //    carries `[workspace]`, REJECT. The ancestor workspace may
-    //    carry `[patch.crates-io]`, `[replace]`, `[profile]`,
-    //    `resolver`, or `[workspace.dependencies]` tables that
-    //    affect baseline cargo's dependency resolution; the lihaaf
-    //    overlay terminates cargo's walk-up at the staged manifest
-    //    and skips the ancestor's state entirely, producing a
-    //    divergent dependency graph between baseline and overlay and
-    //    therefore false compat verdicts. The check is CONSERVATIVE:
-    //    any ancestor workspace triggers rejection regardless of
-    //    whether its `members` array explicitly names this manifest
-    //    (see module-level docs for the rationale).
-    if !has_local_workspace
+    //    carries `[workspace]`, REJECT.
+    //
+    //    Issue #53 — when `workspace_member_ctx.is_some()`, this
+    //    Branch is SUPPRESSED. The adopter named the member
+    //    explicitly via `--package <pkg>`; `apply_workspace_member_inheritance`
+    //    has already carried the ancestor workspace's tables down
+    //    into the overlay (so the "divergent dependency graph"
+    //    hypothesis is closed). The augmented diagnostic when ctx
+    //    IS None and the implicit case fires now suggests
+    //    `--package` so the adopter gets an actionable fix.
+    if workspace_member_ctx.is_none()
+        && !has_local_workspace
         && let Some(ancestor_manifest) = detect_implicit_ancestor_workspace(upstream_manifest_path)?
     {
         return Err(Error::Cli {
@@ -876,18 +1023,21 @@ fn override_workspace_inheritance(
             message: format!(
                 "error: `--compat-root` `{}` is an implicit workspace member: \
                  it has no local `[workspace]` table but an ancestor manifest \
-                 at `{}` carries `[workspace]`. Cargo's baseline build walks \
-                 up the filesystem and would apply the ancestor's `[patch]` / \
+                 at `{}` carries `[workspace]`. Pass the workspace ROOT \
+                 (`{}` or its containing directory) as `--compat-root` AND \
+                 target this specific member with `--package <pkg-name>`, \
+                 where `<pkg-name>` is the value of the member's \
+                 `[package].name`. Cargo's baseline build walks up the \
+                 filesystem and would apply the ancestor's `[patch]` / \
                  `[replace]` / `[profile]` / `resolver` / \
                  `[workspace.dependencies]` tables during dependency \
-                 resolution, but the lihaaf overlay declares its own \
-                 `[workspace]` and terminates cargo's walk-up at the staged \
-                 manifest — producing a divergent dependency graph and \
-                 false compat verdicts. Compat mode currently cannot copy \
-                 the ancestor workspace state down into the overlay. \
-                 Either invoke `cargo lihaaf --compat` from the workspace \
-                 ROOT (`{}` or its containing directory), or restructure \
-                 the fork so the crate-under-test has no ancestor workspace.",
+                 resolution; without `--package`, the lihaaf overlay \
+                 terminates cargo's walk-up at the staged manifest and \
+                 produces a divergent dependency graph between baseline \
+                 and overlay — and therefore false compat verdicts. \
+                 `--package` enables compat mode to carry the workspace \
+                 root's tables down into the staged overlay so the \
+                 dependency graphs converge.",
                 upstream_manifest_path.display(),
                 ancestor_manifest.display(),
                 ancestor_manifest.display(),
@@ -903,16 +1053,15 @@ fn override_workspace_inheritance(
     //    `members = [...]` array. The R4 ancestor-walk above
     //    catches the common case where the ancestor exists as a
     //    parseable `Cargo.toml`; this branch catches the residual
-    //    case where the ancestor is unreachable on the walk-up
-    //    (e.g., outside the working tree, behind a symlink we did
-    //    not follow, or a Cargo.toml we could not parse). Injecting
-    //    an empty `[workspace]` here would strand every such
-    //    reference at cargo parse time with the cryptic "workspace
-    //    inheritance was specified but `[workspace.X]` was not
-    //    defined" error. Reject with the same directed diagnostic
-    //    family as branches 1 and 2 so the user gets actionable
-    //    output.
-    if !has_local_workspace && manifest_has_inheritance_reference(top) {
+    //    case where the ancestor is unreachable on the walk-up.
+    //
+    //    Issue #53 — when `workspace_member_ctx.is_some()`, this
+    //    Branch is SUPPRESSED. The carry-down has populated the
+    //    workspace tables; inheritance references resolve cleanly.
+    if workspace_member_ctx.is_none()
+        && !has_local_workspace
+        && manifest_has_inheritance_reference(top)
+    {
         return Err(Error::Cli {
             clap_exit_code: 2,
             message: format!(
@@ -928,8 +1077,8 @@ fn override_workspace_inheritance(
                  `[workspace.package]` / `[workspace.lints]` tables \
                  the inheritance references resolve against. \
                  Pass the workspace-ROOT Cargo.toml as `--compat-root` \
-                 instead; the staged overlay preserves its \
-                 `[workspace.*]` inheritance tables verbatim.",
+                 AND target this member with `--package <pkg-name>`; \
+                 the carry-down then populates the workspace tables.",
                 upstream_manifest_path.display()
             ),
         });
@@ -1176,6 +1325,708 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
     }
 
     false
+}
+
+/// Resolve `<workspace_root>/Cargo.toml` + `<package_name>` to the
+/// member's manifest path (issue #53 — see plan §4).
+///
+/// Reads the workspace root's `[workspace.members]` array, expands
+/// globs against the workspace-root directory, subtracts
+/// `[workspace.exclude]`, reads each candidate member's `Cargo.toml`,
+/// and returns the path of the manifest whose `[package].name ==
+/// package_name`, together with the parsed workspace-root TOML value
+/// (so the materializer's [`apply_workspace_member_inheritance`] carry-
+/// down does not re-parse the file).
+///
+/// # Algorithm (plan §4.3)
+///
+/// 1. Read + parse `workspace_root_manifest`. I/O / TOML errors map
+///    to [`Error::Io`] / [`Error::TomlParse`].
+/// 2. Verify the manifest is a workspace root (the [`is_workspace_root_manifest`]
+///    predicate: declares `[workspace]` AND does NOT declare
+///    `[package]`). Other shapes — single-crate (`[package]` only),
+///    workspace-member (no local `[workspace]`), package+workspace
+///    (both `[package]` AND `[workspace]`) — REJECT with a directed
+///    diagnostic per §4.3 step 2 / step 2.5. The package+workspace
+///    shape is out of scope for v0.1.0 (see plan §1 / §11.11).
+/// 3. Read `[workspace.members]` (REJECT if absent / non-array).
+/// 4. Read `[workspace.exclude]` (optional); each entry is parsed by
+///    the same string-or-glob rules as step 5 and subtracted from the
+///    effective member set before scanning.
+/// 5. Iterate `members` (after exclude subtraction). For each entry:
+///    - Classify as literal, single-segment glob, single-segment-with-
+///      slash glob (`crates/*`), or explicit nested literal
+///      (`crates/foo`).
+///    - REJECT `**` deep globs, glob-in-non-final-segment, absolute
+///      paths, parent traversal (`..`).
+///    - Trailing-slash normalization (`axum-macros/` ≡ `axum-macros`).
+///    - For a glob entry, enumerate the parent directory and match
+///      the LAST segment against the pattern.
+/// 6. Read each candidate's `Cargo.toml`, find `[package].name`.
+///    Workspace-inheritance note: `[package].name` is NOT inheritable
+///    in cargo, so the literal field value is trusted (no recursion
+///    into `[workspace.package]`).
+/// 7. Match `<package_name>`. Zero matches → no-match diagnostic;
+///    one match → return; multiple matches → multiple-match
+///    diagnostic.
+/// 8. Nested-workspace boundary: if a candidate directory's own
+///    `Cargo.toml` declares `[workspace]`, the resolver does NOT
+///    recurse into the nested workspace's members. A nested-workspace
+///    root that ALSO declares `[package]` is a valid match candidate
+///    by its own `[package].name`; a pure-virtual nested workspace
+///    (no `[package]`) is skipped as a non-match.
+/// 9. Duplicate-after-expansion: candidates are de-duplicated by
+///    canonicalized directory path before applying the package-name
+///    match, so overlapping `members = ["pkg-a", "pkg-*"]` entries
+///    produce ONE candidate for `pkg-a/`, not two. The multiple-match
+///    diagnostic only fires when two DIFFERENT directories both
+///    declare the same `[package].name`.
+///
+/// # Returns
+///
+/// `Ok((member_manifest_path, workspace_root_value))` on a single
+/// unambiguous match. The caller wraps this into a
+/// [`WorkspaceMemberContext`] inside a [`DualRoot`].
+///
+/// `Err(Error::Cli)` on no-match / multiple-match / unparseable-
+/// workspace-root / unparseable-member-manifest / workspace-root-not-
+/// a-workspace-root / `**`-deep-glob / absolute-path member /
+/// parent-traversal member / glob-in-non-final-segment / member-local
+/// `[patch.crates-io]` (the last is enforced inside the materializer's
+/// [`apply_self_patch_policy`], not here — the resolver does not read
+/// the member's `[patch]` table).
+///
+/// `Err(Error::Io)` on filesystem failures (workspace-root read
+/// failure; permissions errors on a candidate's `Cargo.toml`).
+///
+/// `Err(Error::TomlParse)` on TOML parse failures of the workspace-
+/// root manifest. Per-candidate parse failures are logged via the
+/// non-fatal `eprintln!` path (mirroring [`detect_implicit_ancestor_workspace`])
+/// and the candidate is skipped as a non-match.
+pub(crate) fn resolve_workspace_member_manifest(
+    workspace_root_manifest: &Path,
+    package_name: &str,
+) -> Result<(PathBuf, toml::Value), Error> {
+    // Step 1 — read + parse workspace-root manifest.
+    let raw_bytes = std::fs::read(workspace_root_manifest).map_err(|e| {
+        Error::io(
+            e,
+            "reading workspace-root Cargo.toml for `--package` resolver",
+            Some(workspace_root_manifest.to_path_buf()),
+        )
+    })?;
+    let raw_text = String::from_utf8(raw_bytes).map_err(|e| {
+        Error::io(
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+            "decoding workspace-root Cargo.toml as UTF-8",
+            Some(workspace_root_manifest.to_path_buf()),
+        )
+    })?;
+    let value: toml::Value =
+        toml::from_str(&raw_text).map_err(|e: toml::de::Error| Error::TomlParse {
+            path: workspace_root_manifest.to_path_buf(),
+            message: e.to_string(),
+        })?;
+
+    // Step 2 + 2.5 — verify workspace-root shape (virtual workspace
+    // only per v0.1.0 §1 scope; package+workspace REJECT).
+    if !is_workspace_root_manifest(&value) {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` requires `--compat-root` to point at a \
+                 workspace root (a `Cargo.toml` declaring `[workspace]` without `[package]`); \
+                 `{}` does not match this shape. Either drop `--package` and point `--compat-root` \
+                 directly at the member's `Cargo.toml`, or fix `--compat-root` to the \
+                 workspace-root directory.",
+                workspace_root_manifest.display()
+            ),
+        });
+    }
+
+    let workspace_root_dir = workspace_root_manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Step 3 — read `[workspace.members]`.
+    let members_array = value
+        .get("workspace")
+        .and_then(|w| w.get("members"))
+        .and_then(|m| m.as_array());
+    let Some(members_array) = members_array else {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: `{}` has `[workspace]` but no \
+                 `[workspace.members]` array; cannot resolve `{package_name}`. Add the package \
+                 to `[workspace.members]` or pass the member's manifest path directly via \
+                 `--compat-manifest`.",
+                workspace_root_manifest.display()
+            ),
+        });
+    };
+
+    // Step 4 — read `[workspace.exclude]` (optional, may be absent).
+    let exclude_array = value
+        .get("workspace")
+        .and_then(|w| w.get("exclude"))
+        .and_then(|e| e.as_array());
+
+    // Build the exclude set (canonicalized to byte form) by resolving
+    // every exclude entry against the workspace-root dir using the
+    // same rules as step 5. Path normalization (trailing slash,
+    // forward-slash form) matches the candidate paths.
+    let mut exclude_dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
+    if let Some(arr) = exclude_array {
+        for entry in arr {
+            let Some(entry_str) = entry.as_str() else {
+                continue;
+            };
+            let normalized = entry_str.trim_end_matches('/');
+            // Reject obvious malformed entries with the same diagnostics
+            // as members; exclude is rarely user-controlled at the
+            // entry-level, but we apply consistent shape checks.
+            if validate_workspace_member_entry(normalized, package_name).is_err() {
+                // Silently skip malformed exclude entries — cargo's
+                // own behavior on a malformed exclude is undefined,
+                // but our resolver does not depend on exclude shapes
+                // beyond the canonicalized path comparison. Continue
+                // with the rest.
+                continue;
+            }
+            // Expand globs in exclude entries the same way as members.
+            let expanded =
+                expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+            for path in expanded {
+                exclude_dirs.insert(path);
+            }
+        }
+    }
+
+    // Step 5 + 8 — iterate members, expand, deduplicate by
+    // canonicalized directory path.
+    let mut candidate_dirs: std::collections::BTreeMap<PathBuf, ()> =
+        std::collections::BTreeMap::new();
+    let mut scanned_member_names: Vec<String> = Vec::new();
+    for entry in members_array {
+        let Some(entry_str) = entry.as_str() else {
+            return Err(Error::TomlParse {
+                path: workspace_root_manifest.to_path_buf(),
+                message: format!(
+                    "`[workspace.members]` element is not a string; `--package <{package_name}>` \
+                     resolver requires every member entry to be a path or glob string"
+                ),
+            });
+        };
+        let normalized = entry_str.trim_end_matches('/');
+        validate_workspace_member_entry(normalized, package_name)?;
+        scanned_member_names.push(normalized.to_string());
+        let expanded =
+            expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+        for path in expanded {
+            // Apply exclude subtraction here (step 4 / §4.3 step 3.5).
+            if exclude_dirs.contains(&path) {
+                continue;
+            }
+            candidate_dirs.insert(path, ());
+        }
+    }
+
+    // Step 6 + 7 — read each candidate's `Cargo.toml` and match by
+    // `[package].name`. Collect ALL matches so the multiple-match
+    // diagnostic can list them.
+    let mut matches: Vec<PathBuf> = Vec::new();
+    for candidate_dir in candidate_dirs.keys() {
+        let candidate_manifest = candidate_dir.join("Cargo.toml");
+        let text = match std::fs::read_to_string(&candidate_manifest) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Step 4 (silent skip): missing member directory /
+                // manifest is silently skipped — cargo's own behavior.
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::io(
+                    e,
+                    "reading workspace-member Cargo.toml for `--package` resolver",
+                    Some(candidate_manifest),
+                ));
+            }
+        };
+        let parsed: toml::Value = match toml::from_str(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                // Step 6 (non-fatal parse warning): an unparseable
+                // member manifest is logged and skipped, mirroring
+                // `detect_implicit_ancestor_workspace`'s defensive
+                // posture. The adopter does not control every
+                // member's manifest shape (e.g. mid-conversion forks),
+                // and one malformed member should not abort the
+                // resolver entirely.
+                eprintln!(
+                    "warning: skipping unparseable workspace-member `{}`: {}",
+                    candidate_manifest.display(),
+                    e
+                );
+                continue;
+            }
+        };
+        // Step 6.5 — nested-workspace candidate skip: if the candidate
+        // has `[workspace]` but no `[package]`, it's a pure-virtual
+        // nested workspace; skip (cargo's outer-workspace `members`
+        // entry pointed AT it, not THROUGH it; the resolver does not
+        // descend).
+        if is_workspace_root_manifest(&parsed) {
+            continue;
+        }
+        // Read `[package].name`. Per §4.3 step 6, name is NOT inheritable;
+        // trust the literal field.
+        let candidate_name = parsed
+            .get("package")
+            .and_then(|p| p.get("name"))
+            .and_then(|n| n.as_str());
+        if candidate_name == Some(package_name) {
+            matches.push(candidate_manifest);
+        }
+    }
+
+    // Step 7 — match outcomes.
+    match matches.len() {
+        0 => Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: no member of workspace `{}` has \
+                 `[package].name = \"{package_name}\"`. Members scanned: [{}]. Confirm \
+                 `{package_name}` exists in `[workspace.members]` and its `Cargo.toml` declares \
+                 the expected package name (if `{package_name}` is also in `[workspace.exclude]`, \
+                 it was subtracted before scanning).",
+                workspace_root_manifest.display(),
+                scanned_member_names.join(", "),
+            ),
+        }),
+        1 => Ok((matches.remove(0), value)),
+        _ => Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: multiple workspace members claim \
+                 `[package].name = \"{package_name}\"`: [{}]. Workspace package names must be \
+                 unique. Inspect each manifest and resolve the duplicate.",
+                matches
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }),
+    }
+}
+
+/// Validate a single `[workspace.members]` / `[workspace.exclude]`
+/// entry shape (issue #53 — see plan §4.3 step 5). REJECT shapes:
+///
+/// - Deep glob `**` (any segment containing `**`). Cargo does not
+///   support `**` in workspace-members.
+/// - Glob metachars (`*` / `?` / `[`) in any segment OTHER than the
+///   last. Only the LAST segment may contain glob metachars.
+/// - Absolute paths (e.g. `/usr/local/foo`). Workspace members are
+///   relative to the workspace root.
+/// - Parent traversal (`..`). Members must be descendants of the
+///   workspace root.
+fn validate_workspace_member_entry(entry: &str, package_name: &str) -> Result<(), Error> {
+    let segments: Vec<&str> = entry.split('/').collect();
+
+    // Absolute-path rejection: a Unix-absolute path begins with `/`
+    // (the first split segment is empty); a Windows-absolute path
+    // begins with a drive letter `X:` or a UNC `\\`. Path::is_absolute
+    // is the cross-platform check.
+    if Path::new(entry).is_absolute() {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
+                 is absolute; `[workspace.members]` entries are workspace-relative paths only. \
+                 Use a relative path."
+            ),
+        });
+    }
+
+    // Deep-glob rejection: `**` anywhere in any segment.
+    if entry.contains("**") {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
+                 uses `**` (deep glob); cargo does not support `**` in `[workspace.members]`. \
+                 Use `*` (single-segment glob) or an explicit literal path instead."
+            ),
+        });
+    }
+
+    // Parent-traversal rejection: any segment is literally `..`.
+    if segments.contains(&"..") {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
+                 uses `..` (parent traversal); members must be descendants of the workspace root. \
+                 Use a relative path within the workspace."
+            ),
+        });
+    }
+
+    // Glob-in-non-final-segment rejection: only the LAST segment may
+    // contain `*` / `?` / `[`.
+    let has_glob_chars = |s: &str| s.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
+    let non_empty: Vec<&&str> = segments.iter().filter(|s| !s.is_empty()).collect();
+    if non_empty.len() > 1 {
+        for seg in &non_empty[..non_empty.len() - 1] {
+            if has_glob_chars(seg) {
+                return Err(Error::Cli {
+                    clap_exit_code: 2,
+                    message: format!(
+                        "error: `--package <{package_name}>` resolver: workspace member entry \
+                         `{entry}` uses a glob in a non-final path segment; only the LAST segment \
+                         may contain glob metachars (`*`, `?`, `[...]`). Use a literal parent \
+                         path or split into multiple entries."
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Expand a single `[workspace.members]` entry into the candidate
+/// directories it resolves to, relative to `workspace_root_dir` (issue
+/// #53 — see plan §4.3 step 5).
+///
+/// The entry has already been validated by [`validate_workspace_member_entry`];
+/// this function assumes shape correctness and only performs the
+/// expansion. Returned paths are absolute (joined against
+/// `workspace_root_dir`).
+///
+/// Shapes:
+/// - Literal entry without metachars: returns the single joined path
+///   (no existence check — caller skips missing dirs silently per
+///   §4.3 step 4).
+/// - Bare wildcard `axum-*`: enumerates `<workspace_root>/*/` matching
+///   the pattern against child names via `compat::discovery::glob_segment_matches`.
+/// - Single-segment-with-slash `crates/*`: enumerates
+///   `<workspace_root>/crates/*/` matching the LAST segment against
+///   grandchild names.
+/// - Explicit nested literal `crates/foo`: returns the single joined
+///   path (no glob).
+fn expand_workspace_member_entry(
+    entry: &str,
+    workspace_root_dir: &Path,
+    package_name: &str,
+) -> Result<Vec<PathBuf>, Error> {
+    let segments: Vec<&str> = entry.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let has_glob_chars = |s: &str| s.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
+    let last = segments.last().expect("non-empty after filter");
+    let parent_segments: Vec<&str> = segments[..segments.len() - 1].to_vec();
+
+    // Compute the parent directory (the dir we enumerate when the LAST
+    // segment is a glob, or the dir we anchor a literal join against).
+    let mut parent_dir = workspace_root_dir.to_path_buf();
+    for seg in &parent_segments {
+        parent_dir.push(seg);
+    }
+
+    if has_glob_chars(last) {
+        // Glob in the last segment — enumerate `parent_dir` and match
+        // child names against the pattern.
+        let read_dir_result = match std::fs::read_dir(&parent_dir) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => {
+                return Err(Error::io(
+                    e,
+                    "reading workspace-member parent dir for `--package` glob expansion",
+                    Some(parent_dir),
+                ));
+            }
+        };
+        let pattern_bytes = last.as_bytes();
+        let mut matches: Vec<PathBuf> = Vec::new();
+        for child_res in read_dir_result {
+            let child = child_res.map_err(|e| {
+                Error::io(
+                    e,
+                    "iterating workspace-member parent dir for `--package` glob expansion",
+                    Some(parent_dir.clone()),
+                )
+            })?;
+            let name_os = child.file_name();
+            let Some(name_str) = name_os.to_str() else {
+                continue;
+            };
+            // Skip non-directories — workspace members are dirs.
+            let Ok(file_type) = child.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
+            }
+            if super::discovery::glob_segment_matches(pattern_bytes, name_str.as_bytes()) {
+                matches.push(child.path());
+            }
+        }
+        // Stable order for deterministic diagnostics + de-duplication.
+        matches.sort();
+        // Bind `_` so the helper-function variable name is referenced;
+        // suppresses the unused-warning for `package_name` when this
+        // branch returns with no further use.
+        let _ = package_name;
+        Ok(matches)
+    } else {
+        // Literal entry — join against the parent dir (which is the
+        // workspace root when there are no parent segments). The
+        // caller's downstream `read_to_string` returns NotFound on a
+        // missing manifest, which we skip silently.
+        let mut joined = parent_dir;
+        joined.push(last);
+        let _ = package_name;
+        Ok(vec![joined])
+    }
+}
+
+/// Carry the workspace root's `[workspace.dependencies]`,
+/// `[workspace.package]`, `[workspace.lints]`, `[workspace.metadata]`,
+/// `[workspace.resolver]`, `[replace]`, and `[profile.*]` tables down
+/// into the staged overlay's matching top-level / `[workspace.*]`
+/// tables (issue #53 — see plan §5.3 / §5.3.bis).
+///
+/// `[patch.crates-io]` is NOT handled by this function — it is the
+/// concern of the Option H 4-rule policy implemented in
+/// [`apply_self_patch_policy`], which is extended in #53 to accept an
+/// optional `workspace_root_patch_table` parameter for the workspace-
+/// member case (per §5.3.bis composition order: root-first, member-
+/// second).
+///
+/// # Path policy
+///
+/// Workspace-root path-bearing keys are absolutized against
+/// `workspace_root_dir` per §3.2.bis policy table (the workspace-root
+/// path category). The current implementation handles:
+///
+/// - `[workspace.dependencies.<name>].path` — absolutized.
+/// - `[workspace.package.readme]` — absolutized.
+/// - `[workspace.package.license-file]` — absolutized.
+/// - `[workspace.package.include]` / `[workspace.package.exclude]` —
+///   carried verbatim per §3.2.bis (path globs; build-time-orthogonal,
+///   see policy table note for the publish-time caveat).
+/// - `[replace.<source-id>].path` — absolutized.
+///
+/// Non-path workspace-root keys (URL / version / identifier) are
+/// carried verbatim. Membership keys (`members`, `exclude`,
+/// `default-members`) are NOT carried — they are stripped by
+/// [`override_workspace_inheritance`] Branch 4 in any case.
+///
+/// # Member-local `[patch.crates-io]` rejection
+///
+/// Per §5.3.bis Step 2, a workspace MEMBER manifest declaring
+/// `[patch.crates-io]` is rejected with a directed diagnostic. Cargo
+/// itself errors on member-level `[patch]`; we match by surfacing the
+/// error here before any merge.
+fn apply_workspace_member_inheritance(
+    top: &mut toml::map::Map<String, toml::Value>,
+    ctx: &WorkspaceMemberContext,
+    member_manifest: &Path,
+) -> Result<(), Error> {
+    // Step 2 (§5.3.bis) — reject member-local `[patch.crates-io]`. The
+    // resolver did not read the member's `[patch]` table (it does not
+    // see member manifests). The check lives here because this is the
+    // point where we decide what `[patch.crates-io]` the overlay
+    // carries down. A member with `[patch.crates-io]` would have
+    // failed cargo's own baseline load anyway; we surface the
+    // directed diagnostic eagerly.
+    if let Some(patch_table) = top
+        .get("patch")
+        .and_then(|p| p.get("crates-io"))
+        .and_then(|c| c.as_table())
+        && !patch_table.is_empty()
+    {
+        return Err(Error::Cli {
+            clap_exit_code: 2,
+            message: format!(
+                "error: `--package` resolver: workspace member `{}` declares `[patch.crates-io]`; \
+                 cargo does not permit `[patch]` in workspace members (only the workspace root). \
+                 Move the patch entries to the workspace root's `[patch.crates-io]` or remove them.",
+                member_manifest.display()
+            ),
+        });
+    }
+
+    // Workspace-root dir for path absolutization.
+    let workspace_root_dir = ctx
+        .workspace_root_manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Helper: absolutize a relative string path against
+    // `workspace_root_dir` (forward-slash form for cross-platform
+    // determinism, matching `absolutize_path_bearing_keys`).
+    let absolutize_against_ws_root = |s: &str| -> String {
+        let p = Path::new(s);
+        if p.is_absolute() {
+            crate::util::to_forward_slash(&p.to_string_lossy())
+        } else {
+            crate::util::to_forward_slash(&workspace_root_dir.join(p).to_string_lossy())
+        }
+    };
+
+    // Read the workspace-root TOML once.
+    let Some(ws_root_top) = ctx.workspace_root_value.as_table() else {
+        return Err(Error::TomlParse {
+            path: ctx.workspace_root_manifest.clone(),
+            message: "workspace-root TOML value is not a table".to_string(),
+        });
+    };
+
+    // Carry `[workspace.dependencies]` / `[workspace.package]` /
+    // `[workspace.lints]` / `[workspace.metadata]` / `[workspace.resolver]`
+    // — these go into the overlay's `[workspace]` table. The
+    // `override_workspace_inheritance` Branch 4 (when ctx is Some)
+    // builds the overlay's `[workspace]` from these.
+    //
+    // We collect into a fresh map first, then merge into `top["workspace"]`
+    // so a pre-existing `[workspace]` on the member (which is uncommon
+    // but possible for nested-workspace members) is preserved with
+    // member values taking precedence over workspace-root values.
+    let mut carried_workspace: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+
+    let Some(ws_root_workspace) = ws_root_top.get("workspace").and_then(|v| v.as_table()) else {
+        // is_workspace_root_manifest already verified the workspace
+        // root has `[workspace]`; this should be unreachable.
+        return Err(Error::TomlParse {
+            path: ctx.workspace_root_manifest.clone(),
+            message: "workspace-root has no `[workspace]` table despite passing the predicate"
+                .to_string(),
+        });
+    };
+
+    for (key, value) in ws_root_workspace.iter() {
+        match key.as_str() {
+            // Membership keys — NEVER carried (stripped by
+            // override_workspace_inheritance Branch 4 anyway, but we
+            // skip them here so the member's pre-existing workspace
+            // table doesn't get them either).
+            "members" | "exclude" | "default-members" => continue,
+            // `[workspace.dependencies]` — absolutize `.path` keys
+            // against `workspace_root_dir`.
+            "dependencies" => {
+                if let Some(deps) = value.as_table() {
+                    let mut carried_deps: toml::map::Map<String, toml::Value> =
+                        toml::map::Map::new();
+                    for (dep_name, dep_value) in deps.iter() {
+                        if let Some(dep_table) = dep_value.as_table() {
+                            let mut carried_dep = dep_table.clone();
+                            if let Some(s) = carried_dep.get("path").and_then(|v| v.as_str()) {
+                                let abs = absolutize_against_ws_root(s);
+                                carried_dep.insert("path".to_string(), toml::Value::String(abs));
+                            }
+                            carried_deps.insert(dep_name.clone(), toml::Value::Table(carried_dep));
+                        } else {
+                            // Non-table entries (e.g. shorthand string
+                            // version `serde = "1.0"`) carry verbatim.
+                            carried_deps.insert(dep_name.clone(), dep_value.clone());
+                        }
+                    }
+                    carried_workspace
+                        .insert("dependencies".to_string(), toml::Value::Table(carried_deps));
+                }
+            }
+            // `[workspace.package]` — absolutize `readme` and
+            // `license-file` path keys; carry the rest verbatim.
+            "package" => {
+                if let Some(pkg_table) = value.as_table() {
+                    let mut carried_pkg = pkg_table.clone();
+                    for path_key in &["readme", "license-file"] {
+                        if let Some(s) = carried_pkg.get(*path_key).and_then(|v| v.as_str()) {
+                            let abs = absolutize_against_ws_root(s);
+                            carried_pkg.insert((*path_key).to_string(), toml::Value::String(abs));
+                        }
+                    }
+                    carried_workspace
+                        .insert("package".to_string(), toml::Value::Table(carried_pkg));
+                }
+            }
+            // `[workspace.lints]`, `[workspace.metadata]`,
+            // `[workspace.resolver]`, and any unknown forward-compat
+            // key — carry verbatim.
+            _ => {
+                carried_workspace.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    // Merge carried_workspace into `top["workspace"]`. Member-level
+    // workspace tables (rare nested-workspace case) take precedence
+    // over workspace-root values; the override_workspace_inheritance
+    // Branch 4 strips membership keys downstream.
+    let workspace_entry = top
+        .entry("workspace".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    if let toml::Value::Table(member_workspace) = workspace_entry {
+        for (key, value) in carried_workspace {
+            // Don't clobber an existing key on the member (precedence
+            // rule — member overrides workspace-root). For the common
+            // case (member has no `[workspace]` at all) the entry is
+            // empty and every key is inserted.
+            member_workspace.entry(key).or_insert(value);
+        }
+    } else {
+        return Err(Error::TomlParse {
+            path: member_manifest.to_path_buf(),
+            message: "member manifest's `[workspace]` is not a table; cannot carry down \
+                      workspace-root inheritance"
+                .to_string(),
+        });
+    }
+
+    // Carry `[replace]` from the workspace root (absolutize `.path`
+    // keys against workspace_root_dir).
+    if let Some(ws_replace) = ws_root_top.get("replace").and_then(|v| v.as_table()) {
+        let mut carried_replace: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        for (source_id, replace_value) in ws_replace.iter() {
+            if let Some(replace_table) = replace_value.as_table() {
+                let mut carried = replace_table.clone();
+                if let Some(s) = carried.get("path").and_then(|v| v.as_str()) {
+                    let abs = absolutize_against_ws_root(s);
+                    carried.insert("path".to_string(), toml::Value::String(abs));
+                }
+                carried_replace.insert(source_id.clone(), toml::Value::Table(carried));
+            } else {
+                carried_replace.insert(source_id.clone(), replace_value.clone());
+            }
+        }
+        // Only write if we have something to write — keep the overlay
+        // byte-shape tidy.
+        if !carried_replace.is_empty() {
+            top.insert("replace".to_string(), toml::Value::Table(carried_replace));
+        }
+    }
+
+    // Carry `[profile.*]` from the workspace root — profile keys have
+    // no path values, so verbatim copy is correct.
+    if let Some(ws_profile) = ws_root_top.get("profile").and_then(|v| v.as_table())
+        && !ws_profile.is_empty()
+    {
+        top.insert(
+            "profile".to_string(),
+            toml::Value::Table(ws_profile.clone()),
+        );
+    }
+
+    Ok(())
 }
 
 /// Splice the synthetic `[package.metadata.lihaaf]` table into `top`.
@@ -1713,6 +2564,33 @@ fn lexical_path_normalize_path(p: &Path) -> Vec<std::path::Component<'_>> {
 /// `/abs/path` on Unix (the prefix wins) so the join is correct
 /// regardless of whether the value is pre-absolutized.
 ///
+/// # Workspace-member case (issue #53)
+///
+/// When `workspace_member_ctx` is `Some`, the effective `[patch.crates-io]`
+/// table is the WORKSPACE ROOT's (per §5.3.bis composition order:
+/// root-first, member-second). The function:
+///
+/// 1. Absolutizes path entries in the workspace-root's `[patch.crates-io]`
+///    against `workspace_root_dir` (NOT against `upstream_dir`).
+/// 2. INSERTS the workspace-root entries into `top["patch"]["crates-io"]`,
+///    replacing any member-local entries (member-local `[patch.crates-io]`
+///    is rejected upstream by [`apply_workspace_member_inheritance`] step
+///    2, so a non-empty member table here would already have errored).
+/// 3. Runs the simplified workspace-member dispatch on the merged
+///    table:
+///    - Self-entry absent → Rule 1 INJECT (synthetic self-patch).
+///    - Self-entry with `.path` (no git keys) → Rule 2 REMAP
+///      unconditionally (the workspace-root declared a self-patch
+///      intent; we honor by re-anchoring to overlay-root form
+///      regardless of whether the original path resolves to upstream
+///      root).
+///    - Self-entry with git/branch/tag/rev keys → Rule 4 REJECT
+///      (vendored fork / git source; deferred to v0.2 / v1.1).
+///
+/// When `workspace_member_ctx` is `None`, the function behaves
+/// exactly as on pre-#53 main (the single-root case): Rule 2 fires
+/// only when the path resolves lexically to `upstream_dir`.
+///
 /// # Errors
 ///
 /// Returns [`Error::CompatPatchOverrideConflict`] on Rule 4. Returns
@@ -1723,6 +2601,7 @@ fn apply_self_patch_policy(
     upstream_crate_name: Option<&str>,
     upstream_dir: &Path,
     staged_overlay_dir: &Path,
+    workspace_member_ctx: Option<&WorkspaceMemberContext>,
 ) -> Result<(), Error> {
     // Step 1: bail when the upstream has no crate name. Workspace-root
     // manifests are already rejected by `is_workspace_root_manifest`
@@ -1764,8 +2643,61 @@ fn apply_self_patch_policy(
         });
     };
 
+    // Issue #53 — workspace-member case: merge the workspace-root's
+    // `[patch.crates-io]` into the overlay's table BEFORE the 4-rule
+    // dispatch (per §5.3.bis Step 1 composition order).
+    //
+    // The merge is a SIMPLE INSERT: member-local `[patch.crates-io]`
+    // was rejected by `apply_workspace_member_inheritance` (Step 2)
+    // before we reached this function, so any pre-existing entries in
+    // `top["patch"]["crates-io"]` are spurious or empty. Path entries
+    // in the workspace-root table are absolutized against
+    // `workspace_root_dir` (NOT against `upstream_dir`/`member_root`).
+    if let Some(ctx) = workspace_member_ctx {
+        let workspace_root_dir = ctx
+            .workspace_root_manifest
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        if let Some(ws_patch_crates_io) = ctx
+            .workspace_root_value
+            .as_table()
+            .and_then(|t| t.get("patch"))
+            .and_then(|p| p.as_table())
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.as_table())
+        {
+            for (name, value) in ws_patch_crates_io.iter() {
+                let mut carried = match value {
+                    toml::Value::Table(t) => t.clone(),
+                    other => {
+                        // Defensive: non-table entries are invalid
+                        // cargo grammar but we don't want to silently
+                        // drop them. Wrap into an entry — cargo will
+                        // diagnose the bad shape if it ever loads
+                        // this overlay.
+                        crates_io.insert(name.clone(), other.clone());
+                        continue;
+                    }
+                };
+                if let Some(s) = carried.get("path").and_then(|v| v.as_str()) {
+                    let p = Path::new(s);
+                    let abs = if p.is_absolute() {
+                        crate::util::to_forward_slash(&p.to_string_lossy())
+                    } else {
+                        crate::util::to_forward_slash(&workspace_root_dir.join(p).to_string_lossy())
+                    };
+                    carried.insert("path".to_string(), toml::Value::String(abs));
+                }
+                crates_io.insert(name.clone(), toml::Value::Table(carried));
+            }
+        }
+    }
+
     // Step 5: Option H 4-rule dispatch on
-    // `top["patch"]["crates-io"][<self>]`.
+    // `top["patch"]["crates-io"][<self>]`. In the workspace-member case
+    // (ctx is Some), the merged effective table is what we dispatch
+    // against per §5.3.bis Step 3.
     match crates_io.get(self_name).cloned() {
         // Rule 1: INJECT. No upstream entry; create a fresh one.
         None => {
@@ -1783,17 +2715,37 @@ fn apply_self_patch_policy(
             let any_git_keys = has_git || has_branch || has_tag || has_rev;
             let path_raw = existing_entry.get("path").and_then(|v| v.as_str());
 
-            // Rule 2 fires only when (a) the entry has `.path`,
-            // (b) NO git-source keys, AND (c) the joined-and-
-            // lexical-normalized path equals the upstream manifest
-            // dir.
+            // Rule 2 fires when (a) the entry has `.path` AND (b) NO
+            // git-source keys. The path-resolution condition differs
+            // between the single-root and workspace-member cases:
+            //
+            // - Single-root (workspace_member_ctx is None): the
+            //   joined-and-lexical-normalized path MUST equal the
+            //   upstream manifest dir (the pre-#53 condition). This
+            //   keeps the rule narrow for the standalone case where
+            //   the upstream's intent is unambiguously "patch myself
+            //   to my own root".
+            //
+            // - Workspace-member (workspace_member_ctx is Some): Rule
+            //   2 fires unconditionally on any `.path` entry. Per
+            //   §5.3.bis Step 3, the workspace-root's intent to self-
+            //   patch the member is honored by re-anchoring to the
+            //   overlay-root form regardless of where the original
+            //   path pointed. The workspace-root's self-patch was
+            //   declared with the member's overlay-target intent;
+            //   #53 honors it.
             if let Some(path_raw) = path_raw
                 && !any_git_keys
             {
-                let joined = upstream_dir.join(path_raw);
-                let joined_normalized = lexical_path_normalize_path(&joined);
-                let upstream_normalized = lexical_path_normalize_path(upstream_dir);
-                if joined_normalized == upstream_normalized {
+                let fire_remap = if workspace_member_ctx.is_some() {
+                    true
+                } else {
+                    let joined = upstream_dir.join(path_raw);
+                    let joined_normalized = lexical_path_normalize_path(&joined);
+                    let upstream_normalized = lexical_path_normalize_path(upstream_dir);
+                    joined_normalized == upstream_normalized
+                };
+                if fire_remap {
                     // Rule 2 REMAP: replace the entire entry with a
                     // clean `{ path = "<staged-overlay-dir>" }`.
                     // Clearing (vs. upsert-path) is intentional per
@@ -3743,7 +4695,7 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("test".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None)
             .expect("workspace-root case must succeed");
 
         let ws_out = top.get("workspace").and_then(|v| v.as_table()).unwrap();
@@ -3819,7 +4771,7 @@ version = "0.1.0"
         // No `[workspace]` in input.
         assert!(!top.contains_key("workspace"));
 
-        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None)
             .expect("missing `[workspace]` must inject an empty one");
 
         let ws_out = top.get("workspace").and_then(|v| v.as_table()).unwrap();
@@ -3856,7 +4808,7 @@ version = "0.1.0"
         pkg.insert("workspace".to_string(), toml::Value::String("../".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        let err = override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+        let err = override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None)
             .expect_err("workspace-member manifest must be rejected");
 
         match err {
@@ -3941,7 +4893,7 @@ version = "0.1.0"
         deps.insert("foo".to_string(), toml::Value::Table(foo));
         top.insert("dependencies".to_string(), toml::Value::Table(deps));
 
-        let err = override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+        let err = override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None)
             .expect_err("implicit workspace-member manifest must be rejected");
 
         match err {
@@ -4056,7 +5008,7 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("sub".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        let err = override_workspace_inheritance(&mut top, &sub_manifest)
+        let err = override_workspace_inheritance(&mut top, &sub_manifest, None)
             .expect_err("manifest with ancestor workspace must be rejected");
 
         match err {
@@ -4165,7 +5117,7 @@ version = "0.1.0"
         // The override MUST succeed — no ancestor workspace on the
         // walk-up, no inheritance refs, no local workspace. Branch 5
         // (standalone injection) fires.
-        override_workspace_inheritance(&mut top, &manifest).unwrap_or_else(|err| {
+        override_workspace_inheritance(&mut top, &manifest, None).unwrap_or_else(|err| {
             panic!(
                 "standalone manifest with no ancestor workspace must NOT be rejected; \
                  got: {err:?} (this would indicate an R4 regression — the ancestor walk \
@@ -4477,7 +5429,7 @@ version = "0.1.0"
         ws.insert("package".to_string(), toml::Value::Table(ws_pkg));
         top.insert("workspace".to_string(), toml::Value::Table(ws));
 
-        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path())
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None)
             .expect("root with local [workspace] + inheritance refs must succeed (not implicit)");
 
         // The inheritance reference must survive.
@@ -4521,9 +5473,9 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("test".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path()).unwrap();
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None).unwrap();
         let after_first = top.clone();
-        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path()).unwrap();
+        override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), None).unwrap();
         assert_eq!(
             top, after_first,
             "second call must be a no-op on already-overridden output"
@@ -5376,6 +6328,1048 @@ demo = { path = "." }
             !staged_src.join("b.rs").exists(),
             "CASE 6 copy-fallback exact-sync: destination-only b.rs MUST be removed (decision 5)"
         );
+        drop(tmp);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Issue #53 — workspace-member entry via `--package` (tests T-1
+    // through T-17 + R2 NEW tests T-24 through T-41 per plan §7.2).
+    //
+    // Each test exercises one acceptance contract from the plan; group
+    // boundaries mirror the §7.2 sub-sections.
+    // ────────────────────────────────────────────────────────────────────
+
+    /// Test helper: synthesize a workspace root + members on disk.
+    /// Returns the tempdir + the workspace-root manifest path. The
+    /// caller writes additional member manifests as needed.
+    fn synthesize_workspace_root(
+        members_toml: &str,
+        exclude_toml: Option<&str>,
+        extra_workspace_toml: &str,
+    ) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().expect("tempdir for workspace-member resolver test");
+        let ws_root_manifest = tmp.path().join("Cargo.toml");
+        let exclude_part = exclude_toml
+            .map(|s| format!("exclude = {s}\n"))
+            .unwrap_or_default();
+        let toml_text = format!(
+            "[workspace]\nmembers = {members_toml}\n{exclude_part}{extra_workspace_toml}\n"
+        );
+        std::fs::write(&ws_root_manifest, toml_text).expect("write workspace-root Cargo.toml");
+        (tmp, ws_root_manifest)
+    }
+
+    /// Test helper: write a member manifest at `<root>/<rel>/Cargo.toml`
+    /// with the given `[package].name`.
+    fn write_member_manifest(root: &Path, rel: &str, package_name: &str, extra: &str) {
+        let dir = root.join(rel);
+        std::fs::create_dir_all(&dir).expect("create member dir");
+        let toml_text =
+            format!("[package]\nname = \"{package_name}\"\nversion = \"0.1.0\"\n{extra}");
+        std::fs::write(dir.join("Cargo.toml"), toml_text).expect("write member Cargo.toml");
+    }
+
+    // ── §7.2 #1: literal member match ────────────────────────────────
+
+    /// `members = ["axum"]` + pkg `axum` → resolves to `<root>/axum/Cargo.toml`.
+    #[test]
+    fn resolve_workspace_member_manifest_succeeds_on_literal_member() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["axum"]"#, None, "");
+        write_member_manifest(tmp.path(), "axum", "axum", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "axum")
+            .expect("literal member must resolve");
+        assert_eq!(member_manifest, tmp.path().join("axum").join("Cargo.toml"));
+        drop(tmp);
+    }
+
+    // ── §7.2 #2: glob match (axum-* shape pin) ─────────────────────
+
+    /// `members = ["axum-*"]` + pkg `axum-macros` → resolves to
+    /// `<root>/axum-macros/Cargo.toml`. The axum-macros shape pin.
+    #[test]
+    fn resolve_workspace_member_manifest_succeeds_on_glob_match() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["axum-*"]"#, None, "");
+        write_member_manifest(tmp.path(), "axum-macros", "axum-macros", "");
+        write_member_manifest(tmp.path(), "axum-core", "axum-core", "");
+        let (member_manifest, _ws_value) =
+            resolve_workspace_member_manifest(&ws_manifest, "axum-macros")
+                .expect("glob match for axum-macros must resolve");
+        assert_eq!(
+            member_manifest,
+            tmp.path().join("axum-macros").join("Cargo.toml")
+        );
+        drop(tmp);
+    }
+
+    // ── §7.2 #3: matches by package name, not directory name ─────
+
+    /// Directory `foo/`, manifest declares `[package].name = "bar"`,
+    /// `members = ["foo"]` + pkg `bar` → resolves to `<root>/foo/Cargo.toml`.
+    #[test]
+    fn resolve_workspace_member_manifest_matches_by_package_name_not_dir_name() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["foo"]"#, None, "");
+        write_member_manifest(tmp.path(), "foo", "bar", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "bar")
+            .expect("match-by-package-name must resolve");
+        assert_eq!(member_manifest, tmp.path().join("foo").join("Cargo.toml"));
+        // Inverse: matching by the directory name must fail.
+        assert!(
+            resolve_workspace_member_manifest(&ws_manifest, "foo").is_err(),
+            "matching by directory name must NOT resolve when the package name differs"
+        );
+        drop(tmp);
+    }
+
+    // ── §7.2 #4: glob does not match bare prefix ──────────────────
+
+    /// `members = ["axum-*"]` + pkg `axum` → no-match. The glob
+    /// requires the `-` separator literally; a directory named `axum`
+    /// (no dash suffix) does not match.
+    #[test]
+    fn resolve_workspace_member_manifest_glob_does_not_match_bare_prefix() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["axum-*"]"#, None, "");
+        write_member_manifest(tmp.path(), "axum", "axum", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "axum")
+            .expect_err("glob `axum-*` must NOT match bare `axum`");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no member of workspace"),
+                "diagnostic must name no-match: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #5: workspace-root not actually a workspace root ─────
+
+    /// Workspace-root manifest is a single-crate `[package]` Cargo.toml
+    /// (no `[workspace]`) → §6.6a diagnostic.
+    #[test]
+    fn resolve_workspace_member_manifest_rejects_when_root_not_workspace_root() {
+        let tmp = tempfile::tempdir().expect("tempdir for non-workspace-root test");
+        let single_crate_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &single_crate_manifest,
+            "[package]\nname = \"single\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write single-crate Cargo.toml");
+        let err = resolve_workspace_member_manifest(&single_crate_manifest, "any")
+            .expect_err("non-workspace-root must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("workspace root") && message.contains("does not match this shape"),
+                "diagnostic must name the requirement: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #6: workspace root has no `[workspace.members]` ──────
+
+    /// Workspace root has `[workspace]` but no `[workspace.members]` →
+    /// directed diagnostic per §4.3 step 3.
+    #[test]
+    fn resolve_workspace_member_manifest_rejects_when_no_members_array() {
+        let tmp = tempfile::tempdir().expect("tempdir for no-members test");
+        let ws_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&ws_manifest, "[workspace]\nresolver = \"2\"\n")
+            .expect("write empty workspace Cargo.toml");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "any")
+            .expect_err("workspace root without `members` must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no `[workspace.members]` array"),
+                "diagnostic must name the missing array: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #7: no-match diagnostic lists scanned members ────────
+
+    /// `members = ["a","b"]` + pkg `c` → error mentions both `a` and
+    /// `b` in the scanned list.
+    #[test]
+    fn resolve_workspace_member_manifest_no_match_lists_scanned_members() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["a", "b"]"#, None, "");
+        write_member_manifest(tmp.path(), "a", "a", "");
+        write_member_manifest(tmp.path(), "b", "b", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "c")
+            .expect_err("missing package must produce no-match");
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(message.contains("a"), "diagnostic must list `a`: {message}");
+                assert!(message.contains("b"), "diagnostic must list `b`: {message}");
+                assert!(
+                    message.contains("Members scanned"),
+                    "diagnostic must label the list: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #8: skips unparseable member manifest ────────────────
+
+    /// A member with malformed TOML is logged + skipped (non-fatal).
+    /// The resolver treats it as a non-match candidate.
+    #[test]
+    fn resolve_workspace_member_manifest_skips_unparseable_member_manifest() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["a"]"#, None, "");
+        let a_dir = tmp.path().join("a");
+        std::fs::create_dir_all(&a_dir).expect("create a/");
+        // Malformed TOML (mismatched brackets).
+        std::fs::write(a_dir.join("Cargo.toml"), "[package\nname = \"a\"\n")
+            .expect("write malformed a/Cargo.toml");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "a")
+            .expect_err("malformed member must be skipped → no-match");
+        // Should land in the no-match diagnostic (not a parse error
+        // for the workspace root, since the workspace root parses
+        // fine).
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no member"),
+                "diagnostic must be no-match: {message}"
+            ),
+            other => panic!("expected Cli no-match, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #9: skips missing member directory ───────────────────
+
+    /// `members = ["a"]`, no `a/` directory, pkg `a` → silently
+    /// skipped, no-match.
+    #[test]
+    fn resolve_workspace_member_manifest_skips_missing_member_directory() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["a"]"#, None, "");
+        // Deliberately do NOT create `<root>/a/`.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "a")
+            .expect_err("missing dir must produce no-match");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no member"),
+                "diagnostic must be no-match: {message}"
+            ),
+            other => panic!("expected Cli no-match, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #10: workspace inheritance captured in returned value ─
+
+    /// The resolver returns the parsed workspace-root `toml::Value`;
+    /// the driver wraps it into `WorkspaceMemberContext.workspace_root_value`
+    /// for downstream carry-down.
+    #[test]
+    fn resolve_workspace_member_manifest_workspace_inheritance_captured() {
+        let extra = "[workspace.package]\nedition = \"2021\"\n\
+                     [workspace.dependencies]\nserde = \"1.0\"\n";
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["pkg-a"]"#, None, extra);
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (_manifest, ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("inheritance-capturing resolve must succeed");
+        // Verify the returned value carries the workspace tables the
+        // carry-down will use.
+        let ws_table = ws_value.as_table().unwrap();
+        let workspace = ws_table.get("workspace").unwrap().as_table().unwrap();
+        assert!(workspace.contains_key("package"));
+        assert!(workspace.contains_key("dependencies"));
+        let dr = DualRoot {
+            workspace_root: tmp.path().to_path_buf(),
+            workspace_root_manifest: ws_manifest.clone(),
+            member_root: tmp.path().join("pkg-a"),
+            member_manifest: tmp.path().join("pkg-a").join("Cargo.toml"),
+            workspace_member_context: Some(WorkspaceMemberContext {
+                workspace_root_manifest: ws_manifest.clone(),
+                workspace_root_value: ws_value,
+            }),
+        };
+        // The driver wraps the resolver's return into a DualRoot;
+        // confirm the field round-trips.
+        assert_eq!(dr.workspace_root_manifest, ws_manifest);
+        assert!(dr.workspace_member_context.is_some());
+        drop(tmp);
+    }
+
+    // ── §7.2 #11: override_workspace_inheritance skips Branch 2 with ctx ─
+
+    /// With `workspace_member_context: Some(_)`, the implicit-ancestor
+    /// REJECT (Branch 2) is suppressed and the function succeeds.
+    /// Inverse: with `None`, the same input REJECTs.
+    #[test]
+    fn override_workspace_skips_branch_2_with_workspace_member_context() {
+        // Synthesize an upstream/Cargo.toml under a parent dir that
+        // carries `[workspace]`. detect_implicit_ancestor_workspace
+        // returns Some(ancestor); without ctx the implicit-member
+        // REJECT fires. WITH ctx, the resolver-provided ancestor
+        // context suppresses the REJECT.
+        let tmp = tempfile::tempdir().expect("tempdir for Branch 2 suppression test");
+        let ws_root_manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(&ws_root_manifest, "[workspace]\nmembers = [\"member\"]\n")
+            .expect("write workspace root");
+        let member_dir = tmp.path().join("member");
+        std::fs::create_dir_all(&member_dir).expect("create member dir");
+        let member_manifest = member_dir.join("Cargo.toml");
+        std::fs::write(
+            &member_manifest,
+            "[package]\nname = \"member\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write member manifest");
+
+        // First — no ctx: must REJECT with implicit-ancestor diagnostic.
+        let mut top_none: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("member".into()));
+        top_none.insert("package".to_string(), toml::Value::Table(pkg.clone()));
+        let err = override_workspace_inheritance(&mut top_none, &member_manifest, None)
+            .expect_err("Branch 2 must fire without ctx");
+        assert!(matches!(err, Error::Cli { .. }));
+
+        // Then — with ctx: must succeed (Branch 2 suppressed).
+        let mut top_ctx: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        top_ctx.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"member\"]\n").unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: ws_root_manifest.clone(),
+            workspace_root_value: ws_value,
+        };
+        override_workspace_inheritance(&mut top_ctx, &member_manifest, Some(&ctx))
+            .expect("Branch 2 must be suppressed with ctx Some");
+        drop(tmp);
+    }
+
+    // ── §7.2 #12: override_workspace_inheritance skips Branch 3 with ctx ─
+
+    /// Manifest with `{ workspace = true }` inheritance reference and
+    /// `workspace_member_context: Some(_)`: Branch 3 is suppressed,
+    /// function succeeds.
+    #[test]
+    fn override_workspace_skips_branch_3_with_workspace_member_context() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        // Inheritance ref on `[package]`.
+        let mut pkg = toml::map::Map::new();
+        let mut rust_version = toml::map::Map::new();
+        rust_version.insert("workspace".to_string(), toml::Value::Boolean(true));
+        pkg.insert("rust-version".to_string(), toml::Value::Table(rust_version));
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        // ctx with a synthesized workspace-root value.
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n[workspace.package]\nrust-version = \"1.65\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/tmp/nonexistent/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        // Use a manifest path that has no ancestor workspace on disk
+        // — so Branch 2 won't fire even without suppression (we want
+        // to isolate Branch 3).
+        let isolated_manifest = PathBuf::from("/this/path/does/not/exist/Cargo.toml");
+        override_workspace_inheritance(&mut top, &isolated_manifest, Some(&ctx))
+            .expect("Branch 3 must be suppressed with ctx Some");
+    }
+
+    // ── §7.2 #13: Branch 1 STILL rejects even with ctx ────────────
+
+    /// Manifest with explicit `[package].workspace = "<path>"` AND
+    /// `workspace_member_context: Some(_)`: Branch 1 REJECTs (the
+    /// explicit declaration is incompatible with `--package`).
+    #[test]
+    fn override_workspace_still_rejects_branch_1_explicit_member_with_context() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        pkg.insert("workspace".to_string(), toml::Value::String("../".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+
+        let ws_value: toml::Value = toml::from_str("[workspace]\nmembers = [\"m\"]\n").unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/tmp/x/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err =
+            override_workspace_inheritance(&mut top, &dummy_upstream_manifest_path(), Some(&ctx))
+                .expect_err("explicit `[package].workspace` MUST still REJECT with ctx Some");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("workspace member") && message.contains("[package].workspace"),
+                "diagnostic must name the explicit-member case: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 #14: apply_workspace_member_inheritance carries deps ─
+
+    /// `[workspace.dependencies]` from workspace root flows into
+    /// overlay's `[workspace.dependencies]`.
+    #[test]
+    fn apply_workspace_member_inheritance_carries_workspace_dependencies() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.dependencies]\nserde = \"1.0\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let member_manifest = PathBuf::from("/ws/m/Cargo.toml");
+        apply_workspace_member_inheritance(&mut top, &ctx, &member_manifest)
+            .expect("carry-down must succeed");
+        let workspace = top.get("workspace").unwrap().as_table().unwrap();
+        let deps = workspace
+            .get("dependencies")
+            .and_then(|v| v.as_table())
+            .expect("[workspace.dependencies] must be present after carry-down");
+        assert!(deps.contains_key("serde"), "serde dep must be carried");
+    }
+
+    // ── §7.2 #15: carries package/lints/metadata ──────────────────
+
+    /// `[workspace.package]`, `[workspace.lints]`, `[workspace.metadata]`
+    /// all flow into the overlay's `[workspace.*]`.
+    #[test]
+    fn apply_workspace_member_inheritance_carries_workspace_package_lints_metadata() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.package]\nedition = \"2021\"\n\
+             [workspace.lints.rust]\nunsafe_code = \"forbid\"\n\
+             [workspace.metadata.docs]\ncustom = \"value\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_workspace_member_inheritance(&mut top, &ctx, &PathBuf::from("/ws/m/Cargo.toml"))
+            .expect("carry-down must succeed");
+        let workspace = top.get("workspace").unwrap().as_table().unwrap();
+        assert!(workspace.contains_key("package"));
+        assert!(workspace.contains_key("lints"));
+        assert!(workspace.contains_key("metadata"));
+    }
+
+    // ── §7.2 #16: strips membership keys ──────────────────────────
+
+    /// After the carry-down + override_workspace_inheritance Branch 4,
+    /// the overlay's `[workspace]` MUST NOT carry `members`, `exclude`,
+    /// or `default-members`.
+    #[test]
+    fn apply_workspace_member_inheritance_strips_membership_keys() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        // Pre-populate `[package]` so the manifest looks like a member.
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\nexclude = [\"old\"]\ndefault-members = [\"m\"]\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_workspace_member_inheritance(&mut top, &ctx, &PathBuf::from("/ws/m/Cargo.toml"))
+            .expect("carry-down must succeed");
+        // Then the override runs (this is the full pipeline shape).
+        override_workspace_inheritance(&mut top, &PathBuf::from("/ws/m/Cargo.toml"), Some(&ctx))
+            .expect("override must succeed");
+        let workspace = top.get("workspace").unwrap().as_table().unwrap();
+        assert!(
+            !workspace.contains_key("members"),
+            "members must be stripped"
+        );
+        assert!(
+            !workspace.contains_key("exclude"),
+            "exclude must be stripped"
+        );
+        assert!(
+            !workspace.contains_key("default-members"),
+            "default-members must be stripped"
+        );
+    }
+
+    // ── §7.2 #17: carries workspace-root `[patch.crates-io]` via Option H ─
+
+    /// Workspace-root `[patch.crates-io.other-dep] = { path = "vendored/other-dep" }`
+    /// flows through `apply_self_patch_policy(..., ctx)` into the
+    /// overlay's `[patch.crates-io]`. The non-self entry (`other-dep`)
+    /// is absolutized against `workspace_root` (per §5.3.bis Step 1)
+    /// but NOT Rule-2-REMAPPED (Rule 2 only fires for the `<self>`
+    /// crate).
+    #[test]
+    fn apply_workspace_member_inheritance_carries_workspace_root_patch_crates_io() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        // Synthesize a member manifest with a `[package].name`.
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("pkg-macros".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"pkg-macros\"]\n\
+             [patch.crates-io.other-dep]\npath = \"vendored/other-dep\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        // Run the full pipeline (carry-down + apply_self_patch_policy).
+        apply_workspace_member_inheritance(
+            &mut top,
+            &ctx,
+            &PathBuf::from("/ws/pkg-macros/Cargo.toml"),
+        )
+        .expect("carry-down must succeed");
+        apply_self_patch_policy(
+            &mut top,
+            Some("pkg-macros"),
+            &PathBuf::from("/ws/pkg-macros"),
+            &PathBuf::from("/ws/pkg-macros/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect("apply_self_patch_policy must succeed");
+        let patch = top
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.as_table())
+            .expect("`[patch.crates-io]` must be present after carry-down");
+        // The non-self entry is carried (with workspace-root absolutization).
+        let other_dep_path = patch
+            .get("other-dep")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("[patch.crates-io.other-dep].path must exist");
+        assert!(
+            other_dep_path.contains("vendored/other-dep"),
+            "non-self entry retains workspace-root-relative segment: {other_dep_path}"
+        );
+        assert!(
+            other_dep_path.starts_with("/ws"),
+            "non-self entry must be absolutized against workspace_root: {other_dep_path}"
+        );
+        // The self entry was INJECTED (Rule 1) — workspace root did
+        // not declare a self-patch for pkg-macros.
+        let self_path = patch
+            .get("pkg-macros")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("[patch.crates-io.pkg-macros].path must exist (Rule 1 INJECT)");
+        assert!(
+            self_path.ends_with("lihaaf-overlay"),
+            "self-entry must point at the staged-overlay dir: {self_path}"
+        );
+    }
+
+    // ── §7.2 #24: dual-root routing ───────────────────────────────
+
+    /// `DualRoot` struct routes paths to consumers per §3.1.bis. In
+    /// the non-`--package` collapse case, all paths equal; in the
+    /// `--package` case, `workspace_root` and `member_root` differ.
+    #[test]
+    fn dual_root_routing_baseline_cwd_is_workspace_root_member_consumers_use_member_root() {
+        // Collapse case: workspace_root == member_root.
+        let collapse = DualRoot {
+            workspace_root: PathBuf::from("/single/crate"),
+            workspace_root_manifest: PathBuf::from("/single/crate/Cargo.toml"),
+            member_root: PathBuf::from("/single/crate"),
+            member_manifest: PathBuf::from("/single/crate/Cargo.toml"),
+            workspace_member_context: None,
+        };
+        assert_eq!(collapse.workspace_root, collapse.member_root);
+        assert_eq!(collapse.workspace_root_manifest, collapse.member_manifest);
+        assert!(collapse.workspace_member_context.is_none());
+
+        // Dual-root case: workspace_root != member_root.
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"axum-macros\"]\n").unwrap();
+        let dual = DualRoot {
+            workspace_root: PathBuf::from("/ws"),
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            member_root: PathBuf::from("/ws/axum-macros"),
+            member_manifest: PathBuf::from("/ws/axum-macros/Cargo.toml"),
+            workspace_member_context: Some(WorkspaceMemberContext {
+                workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+                workspace_root_value: ws_value,
+            }),
+        };
+        assert_ne!(dual.workspace_root, dual.member_root);
+        assert_ne!(dual.workspace_root_manifest, dual.member_manifest);
+        assert!(dual.workspace_member_context.is_some());
+        // Per §3.1.bis routing table, the BASELINE cargo cwd uses
+        // `workspace_root` (not `member_root`) and the OVERLAY uses
+        // `member_root` (not `workspace_root`).
+        assert_eq!(dual.workspace_root, PathBuf::from("/ws"));
+        assert_eq!(dual.member_root, PathBuf::from("/ws/axum-macros"));
+    }
+
+    // ── §7.2 #25: workspace-root path absolutization (dependencies.path) ─
+
+    /// `[workspace.dependencies.foo] = { path = "crates/foo" }`
+    /// (workspace-root-relative) is absolutized to
+    /// `<workspace_root>/crates/foo` in the overlay's carry-down.
+    /// Inverse: `git = "..."` is preserved verbatim.
+    #[test]
+    fn workspace_root_path_absolutization_for_dependencies_path() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.dependencies]\n\
+             foo = { path = \"crates/foo\" }\n\
+             bar = { git = \"https://example.com/bar.git\" }\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/abs/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_workspace_member_inheritance(&mut top, &ctx, &PathBuf::from("/abs/ws/m/Cargo.toml"))
+            .expect("carry-down must succeed");
+        let deps = top
+            .get("workspace")
+            .and_then(|w| w.get("dependencies"))
+            .and_then(|d| d.as_table())
+            .expect("[workspace.dependencies] must be present");
+        let foo_path = deps
+            .get("foo")
+            .and_then(|v| v.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("foo.path must exist");
+        assert!(
+            foo_path.starts_with("/abs/ws/"),
+            "foo.path must be absolutized against workspace_root: {foo_path}"
+        );
+        assert!(
+            foo_path.ends_with("crates/foo"),
+            "foo.path must end with the relative segment: {foo_path}"
+        );
+        // bar should retain its git URL verbatim.
+        let bar_git = deps
+            .get("bar")
+            .and_then(|v| v.get("git"))
+            .and_then(|v| v.as_str())
+            .expect("bar.git must exist");
+        assert_eq!(bar_git, "https://example.com/bar.git");
+    }
+
+    // ── §7.2 #26: workspace-root path absolutization (package readme/license-file) ─
+
+    /// `[workspace.package].readme` and `.license-file` are absolutized
+    /// against `workspace_root` before carry-down.
+    #[test]
+    fn workspace_root_path_absolutization_for_package_readme_license_file() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [workspace.package]\n\
+             readme = \"../../README.md\"\n\
+             license-file = \"LICENSE-MIT\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/abs/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_workspace_member_inheritance(&mut top, &ctx, &PathBuf::from("/abs/ws/m/Cargo.toml"))
+            .expect("carry-down must succeed");
+        let pkg = top
+            .get("workspace")
+            .and_then(|w| w.get("package"))
+            .and_then(|p| p.as_table())
+            .expect("[workspace.package] must be present");
+        let readme = pkg.get("readme").and_then(|v| v.as_str()).expect("readme");
+        assert!(
+            readme.starts_with("/abs/ws/"),
+            "readme must be absolutized: {readme}"
+        );
+        assert!(readme.ends_with("README.md"), "readme suffix: {readme}");
+        let license = pkg
+            .get("license-file")
+            .and_then(|v| v.as_str())
+            .expect("license-file");
+        assert!(
+            license.starts_with("/abs/ws/"),
+            "license-file must be absolutized: {license}"
+        );
+        assert!(
+            license.ends_with("LICENSE-MIT"),
+            "license-file suffix: {license}"
+        );
+    }
+
+    // ── §7.2 #27: Option H root-first with workspace-root self-patch ─
+
+    /// Workspace root declares `[patch.crates-io.pkg-name].path = "../local-fork"`
+    /// (a self-patch on the member-under-test). The pipeline:
+    ///  - Step 1: absolutize against workspace_root → `<ws>/../local-fork`.
+    ///  - Step 2: member-local `[patch]` is empty → no REJECT.
+    ///  - Step 3: Rule 2 REMAPs the self entry to the overlay-root form.
+    #[test]
+    fn option_h_root_first_member_second_with_workspace_root_self_patch_entry() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("pkg-name".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"pkg-name\"]\n\
+             [patch.crates-io.pkg-name]\npath = \"../local-fork\"\n",
+        )
+        .unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/abs/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_workspace_member_inheritance(
+            &mut top,
+            &ctx,
+            &PathBuf::from("/abs/ws/pkg-name/Cargo.toml"),
+        )
+        .expect("carry-down must succeed");
+        let staged_overlay_dir = PathBuf::from("/abs/ws/pkg-name/target/lihaaf-overlay");
+        apply_self_patch_policy(
+            &mut top,
+            Some("pkg-name"),
+            &PathBuf::from("/abs/ws/pkg-name"),
+            &staged_overlay_dir,
+            Some(&ctx),
+        )
+        .expect("apply_self_patch_policy must succeed");
+        let self_path = top
+            .get("patch")
+            .and_then(|p| p.get("crates-io"))
+            .and_then(|c| c.get("pkg-name"))
+            .and_then(|e| e.get("path"))
+            .and_then(|v| v.as_str())
+            .expect("self-entry must have a path");
+        // Rule 2 REMAP must produce the overlay-root form.
+        assert!(
+            self_path.ends_with("lihaaf-overlay"),
+            "Rule 2 REMAP must produce overlay-root form: {self_path}"
+        );
+        // It must NOT be the workspace-root-relative form (the Step 1
+        // intermediate).
+        assert!(
+            !self_path.contains("local-fork"),
+            "self-entry must NOT contain the upstream's intermediate path: {self_path}"
+        );
+    }
+
+    // ── §7.2 #28: rejects member-local `[patch.crates-io]` ──────
+
+    /// A workspace member declaring `[patch.crates-io]` is rejected
+    /// per §5.3.bis Step 2 — cargo itself errors on member-level
+    /// `[patch]`; we match.
+    #[test]
+    fn option_h_rejects_member_local_patch_crates_io() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut patch_table = toml::map::Map::new();
+        let mut crates_io = toml::map::Map::new();
+        let mut entry = toml::map::Map::new();
+        entry.insert("path".to_string(), toml::Value::String("./local".into()));
+        crates_io.insert("some-dep".to_string(), toml::Value::Table(entry));
+        patch_table.insert("crates-io".to_string(), toml::Value::Table(crates_io));
+        top.insert("patch".to_string(), toml::Value::Table(patch_table));
+
+        let ws_value: toml::Value = toml::from_str("[workspace]\nmembers = [\"m\"]\n").unwrap();
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err =
+            apply_workspace_member_inheritance(&mut top, &ctx, &PathBuf::from("/ws/m/Cargo.toml"))
+                .expect_err("member-local [patch.crates-io] must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("cargo does not permit `[patch]` in workspace members"),
+                "diagnostic must name the rejection rationale: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 #29-#35: resolver glob / path / exclude / nested tests ───
+
+    /// `members = ["crates/*"]` resolves to nested members.
+    #[test]
+    fn resolver_glob_crates_star_finds_nested_member() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["crates/*"]"#, None, "");
+        write_member_manifest(tmp.path(), "crates/foo", "foo", "");
+        let (member_manifest, _) =
+            resolve_workspace_member_manifest(&ws_manifest, "foo").expect("crates/* must match");
+        assert_eq!(
+            member_manifest,
+            tmp.path().join("crates").join("foo").join("Cargo.toml")
+        );
+        drop(tmp);
+    }
+
+    /// `members = ["crates/foo", "tools/bar"]` resolves explicit
+    /// nested literals.
+    #[test]
+    fn resolver_glob_crates_explicit_nested_literal_finds_member() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["crates/foo", "tools/bar"]"#, None, "");
+        write_member_manifest(tmp.path(), "crates/foo", "foo", "");
+        write_member_manifest(tmp.path(), "tools/bar", "bar", "");
+        let (foo_manifest, _) =
+            resolve_workspace_member_manifest(&ws_manifest, "foo").expect("crates/foo literal");
+        assert_eq!(
+            foo_manifest,
+            tmp.path().join("crates").join("foo").join("Cargo.toml")
+        );
+        let (bar_manifest, _) =
+            resolve_workspace_member_manifest(&ws_manifest, "bar").expect("tools/bar literal");
+        assert_eq!(
+            bar_manifest,
+            tmp.path().join("tools").join("bar").join("Cargo.toml")
+        );
+        drop(tmp);
+    }
+
+    /// `members = ["**/*"]` or `["crates/**"]` is rejected.
+    #[test]
+    fn resolver_glob_rejects_deep_glob() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["**/*"]"#, None, "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "any")
+            .expect_err("deep glob must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("cargo does not support `**` in `[workspace.members]`"),
+                "diagnostic must name `**`: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// `members = ["*/foo"]` (glob in non-final segment) is rejected.
+    #[test]
+    fn resolver_glob_rejects_glob_in_non_final_segment() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["*/foo"]"#, None, "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "foo")
+            .expect_err("glob in non-final segment must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("only the LAST segment may contain glob metachars"),
+                "diagnostic must name the constraint: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// `members = ["axum-macros/"]` (trailing slash) normalizes to
+    /// `axum-macros`.
+    #[test]
+    fn resolver_glob_normalizes_trailing_slash() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["axum-macros/"]"#, None, "");
+        write_member_manifest(tmp.path(), "axum-macros", "axum-macros", "");
+        let (member_manifest, _) = resolve_workspace_member_manifest(&ws_manifest, "axum-macros")
+            .expect("trailing slash must normalize");
+        assert_eq!(
+            member_manifest,
+            tmp.path().join("axum-macros").join("Cargo.toml")
+        );
+        drop(tmp);
+    }
+
+    /// `members = ["/usr/local/foo"]` (absolute path) is rejected.
+    #[test]
+    fn resolver_glob_rejects_absolute_path_member() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["/usr/local/foo"]"#, None, "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "foo")
+            .expect_err("absolute-path member must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("`[workspace.members]` entries are workspace-relative paths only"),
+                "diagnostic must name the constraint: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// `members = ["../sibling"]` (parent traversal) is rejected.
+    #[test]
+    fn resolver_glob_rejects_parent_traversal_member() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["../sibling"]"#, None, "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "sibling")
+            .expect_err("parent traversal must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("members must be descendants of the workspace root"),
+                "diagnostic must name the constraint: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #36-#41: exclude/default/nested/dup/scope tests ─────
+
+    /// `[workspace.exclude]` is subtracted before package-name match.
+    #[test]
+    fn resolver_subtracts_workspace_exclude_set() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["pkg-*"]"#, Some(r#"["pkg-private"]"#), "");
+        write_member_manifest(tmp.path(), "pkg-public", "pkg-public", "");
+        write_member_manifest(tmp.path(), "pkg-private", "pkg-private", "");
+        // The public package matches.
+        let (manifest_public, _) = resolve_workspace_member_manifest(&ws_manifest, "pkg-public")
+            .expect("pkg-public must resolve (not in exclude)");
+        assert!(manifest_public.ends_with("pkg-public/Cargo.toml"));
+        // The private (excluded) package does not.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "pkg-private")
+            .expect_err("pkg-private must be excluded → no-match");
+        assert!(matches!(err, Error::Cli { .. }));
+        drop(tmp);
+    }
+
+    /// `[workspace.default-members]` does NOT filter `--package`
+    /// resolution (the resolver consults `members`, not
+    /// `default-members`).
+    #[test]
+    fn resolver_default_members_does_not_filter_package_resolution() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["a", "b"]"#, None, "default-members = [\"a\"]\n");
+        write_member_manifest(tmp.path(), "a", "a", "");
+        write_member_manifest(tmp.path(), "b", "b", "");
+        // Both packages resolve regardless of default-members membership.
+        let (manifest_a, _) =
+            resolve_workspace_member_manifest(&ws_manifest, "a").expect("a must resolve");
+        assert!(manifest_a.ends_with("a/Cargo.toml"));
+        let (manifest_b, _) =
+            resolve_workspace_member_manifest(&ws_manifest, "b").expect("b must resolve");
+        assert!(manifest_b.ends_with("b/Cargo.toml"));
+        drop(tmp);
+    }
+
+    /// When a package IS in `[workspace.exclude]`, the no-match
+    /// diagnostic does not include it in `Members scanned`.
+    #[test]
+    fn resolver_excluded_package_diagnostic_lists_excluded_name() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["a", "b"]"#, Some(r#"["b"]"#), "");
+        write_member_manifest(tmp.path(), "a", "a", "");
+        write_member_manifest(tmp.path(), "b", "b", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "b")
+            .expect_err("b is excluded → no-match");
+        match err {
+            Error::Cli { message, .. } => {
+                // The scanned list should include `a` and `b` (both
+                // are in `members`), but the exclude subtraction
+                // means b was removed from candidates before the
+                // scan. The diagnostic phrases the exclude case
+                // explicitly in the trailing note.
+                assert!(
+                    message.contains("`b`") || message.contains("\"b\""),
+                    "diagnostic should reference the missing package name: {message}"
+                );
+                assert!(
+                    message.contains("excluded") || message.contains("exclude"),
+                    "diagnostic should explain exclude subtraction: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// The resolver does NOT descend into a nested workspace. A
+    /// nested-workspace root (with `[workspace]` but no `[package]`)
+    /// is skipped as a non-match candidate; its members are not
+    /// scanned by the outer resolver.
+    #[test]
+    fn resolver_does_not_descend_into_nested_workspace() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["outer-pkg", "nested-ws"]"#, None, "");
+        write_member_manifest(tmp.path(), "outer-pkg", "outer-pkg", "");
+        // `nested-ws/` is a pure-virtual nested workspace.
+        let nested_dir = tmp.path().join("nested-ws");
+        std::fs::create_dir_all(&nested_dir).expect("create nested-ws dir");
+        std::fs::write(
+            nested_dir.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"inner-pkg\"]\n",
+        )
+        .expect("write nested workspace manifest");
+        // The inner package is reachable through the nested workspace.
+        write_member_manifest(tmp.path(), "nested-ws/inner-pkg", "inner-pkg", "");
+        // The outer resolver does NOT descend; inner-pkg is not found.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "inner-pkg")
+            .expect_err("nested-ws.inner-pkg must NOT be found by outer resolver");
+        assert!(matches!(err, Error::Cli { .. }));
+        // Sibling: targeting the nested workspace by its dir name also
+        // no-matches (it has no [package]).
+        let err2 = resolve_workspace_member_manifest(&ws_manifest, "nested-ws")
+            .expect_err("nested-ws (pure-virtual) must NOT match by name");
+        assert!(matches!(err2, Error::Cli { .. }));
+        drop(tmp);
+    }
+
+    /// Overlapping members (literal + glob both pointing at the same
+    /// dir) are de-duplicated. Distinct dirs both declaring the same
+    /// `[package].name` produce the multiple-match diagnostic.
+    #[test]
+    fn resolver_duplicate_package_after_glob_expansion_returns_multiple_match_error() {
+        // Sub-case 1: overlapping members on the same dir — dedup is
+        // transparent.
+        let (tmp1, ws_manifest1) = synthesize_workspace_root(r#"["pkg-a", "pkg-*"]"#, None, "");
+        write_member_manifest(tmp1.path(), "pkg-a", "pkg-a", "");
+        let (manifest_a, _) = resolve_workspace_member_manifest(&ws_manifest1, "pkg-a")
+            .expect("overlapping literal + glob must dedup, not multi-match");
+        assert!(manifest_a.ends_with("pkg-a/Cargo.toml"));
+        drop(tmp1);
+
+        // Sub-case 2: distinct dirs declaring the SAME package name
+        // (corrupted workspace shape) → multiple-match diagnostic.
+        let (tmp2, ws_manifest2) =
+            synthesize_workspace_root(r#"["pkg-a", "pkg-a-clone"]"#, None, "");
+        write_member_manifest(tmp2.path(), "pkg-a", "pkg-a", "");
+        write_member_manifest(tmp2.path(), "pkg-a-clone", "pkg-a", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest2, "pkg-a")
+            .expect_err("two dirs claiming pkg-a must produce multiple-match");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("multiple workspace members claim"),
+                "diagnostic must name the multiple-match case: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+        drop(tmp2);
+    }
+
+    /// Per §1 v0.1.0 scope: package+workspace root manifests (declaring
+    /// both `[package]` AND `[workspace]`) are rejected with a directed
+    /// diagnostic. The v0.2 follow-up issue (per §11.11) will design
+    /// the policy for that shape.
+    #[test]
+    fn resolver_rejects_package_plus_workspace_root_per_v01_scope() {
+        let tmp = tempfile::tempdir().expect("tempdir for package+workspace test");
+        let manifest = tmp.path().join("Cargo.toml");
+        std::fs::write(
+            &manifest,
+            "[package]\nname = \"the-root-pkg\"\nversion = \"0.1.0\"\n\
+             [workspace]\nmembers = [\"the-member\"]\n",
+        )
+        .expect("write package+workspace manifest");
+        let err = resolve_workspace_member_manifest(&manifest, "the-member")
+            .expect_err("package+workspace root must be rejected per v0.1.0 scope");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("workspace root") && message.contains("without `[package]`"),
+                "diagnostic must name the virtual-workspace requirement: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
         drop(tmp);
     }
 }
