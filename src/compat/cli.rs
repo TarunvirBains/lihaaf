@@ -99,6 +99,12 @@ pub struct CompatArgs {
     /// `None`, the compat driver derives the path from `--compat-root`
     /// (the upstream manifest sits at `<compat_root>/Cargo.toml`).
     pub(crate) compat_manifest: Option<PathBuf>,
+    /// Workspace-member package selector forwarded from `--package`
+    /// (issue #53). Resolved to a member-manifest path inside the
+    /// compat driver via [`crate::compat::overlay::resolve_workspace_member_manifest`].
+    /// Mutually exclusive with `compat_manifest` (enforced at validator
+    /// time — see `crate::cli::Cli::validate_mode_consistency`).
+    pub(crate) compat_package: Option<String>,
     /// Commit SHA to record in the report envelope.
     pub(crate) compat_commit: Option<String>,
     /// Compat-mode fixture-path filter (substring; OR'd).
@@ -163,6 +169,10 @@ impl CompatArgs {
         // --compat-manifest is optional; absolutize it too so callers in
         // overlay.rs never receive a relative manifest path.
         let compat_manifest = absolutize_optional_path(cli.compat_manifest.clone())?;
+        // --package is a string identifier; no path absolutization
+        // applies. The validator (`Cli::validate_mode_consistency`)
+        // already enforced mutual exclusion with `--compat-manifest`.
+        let compat_package = cli.compat_package.clone();
         let compat_commit = cli.compat_commit.clone();
         let compat_filter = cli.compat_filter.clone();
         let compat_trybuild_macro = cli.compat_trybuild_macro.clone();
@@ -171,6 +181,7 @@ impl CompatArgs {
             compat_report,
             compat_cargo_test_argv,
             compat_manifest,
+            compat_package,
             compat_commit,
             compat_filter,
             compat_trybuild_macro,
@@ -305,6 +316,7 @@ mod tests {
                 compat_commit: None,
                 compat_filter: Vec::new(),
                 compat_manifest: None,
+                compat_package: None,
                 compat_report: Some(tmp.path().join("report.json")),
                 compat_root: Some(std::path::PathBuf::from(subdir_name)),
                 compat_trybuild_macro: Vec::new(),
@@ -406,6 +418,46 @@ mod tests {
             ),
             other => panic!("expected Cli error, got {other:?}"),
         }
+    }
+
+    /// **Issue #53 — `CompatArgs::from_cli` carries `compat_package`.**
+    ///
+    /// The projection plumbing is a single-line clone. This test pins
+    /// the contract so a future refactor that drops the carry trips
+    /// immediately; the resolver in `compat::run` cannot succeed
+    /// without the field on `CompatArgs`.
+    #[test]
+    fn compat_args_from_cli_carries_compat_package() {
+        let tmp = tempfile::tempdir().expect("creating tempdir for projection test");
+        let cli = crate::cli::Cli {
+            bless: false,
+            compat: true,
+            compat_cargo_test_argv: None,
+            compat_commit: None,
+            compat_filter: Vec::new(),
+            compat_manifest: None,
+            compat_package: Some("axum-macros".to_string()),
+            compat_report: Some(tmp.path().join("report.json")),
+            compat_root: Some(tmp.path().to_path_buf()),
+            compat_trybuild_macro: Vec::new(),
+            filter: Vec::new(),
+            jobs: None,
+            suite: Vec::new(),
+            no_cache: false,
+            manifest_path: None,
+            list: false,
+            quiet: false,
+            verbose: false,
+            use_symlink: false,
+            keep_output: false,
+            inner_compat_normalize: false,
+        };
+        let args = CompatArgs::from_cli(cli).expect("from_cli must succeed with valid Cli");
+        assert_eq!(
+            args.compat_package.as_deref(),
+            Some("axum-macros"),
+            "from_cli must carry compat_package through unchanged"
+        );
     }
 
     #[test]

@@ -81,9 +81,36 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     let started = Instant::now();
     cleanup::install_panic_hook();
 
-    let compat_root = args.compat_root.clone();
     let compat_report = args.compat_report.clone();
-    let upstream_manifest = resolve_upstream_manifest(&args)?;
+    // Issue #53 — `resolve_dual_root` returns the dual-root vocabulary
+    // (workspace_root / member_root) and the optional
+    // `WorkspaceMemberContext`. Every downstream consumer reads the
+    // explicit role from `DualRoot` instead of the legacy single
+    // `compat_root` field. The collapse invariant (workspace_root ==
+    // member_root when workspace_member_context is None) means
+    // non-`--package` pilots see the same paths as pre-#53.
+    //
+    // Workspace-member entry via `--package` (issue #53): the adopter
+    // invokes from the workspace root + names a member explicitly; the
+    // resolver maps the package name to the member manifest path. The
+    // overlay materializer takes a WorkspaceMemberContext that carries
+    // the workspace root through, so it can:
+    //   1. Skip the over-broad implicit-ancestor REJECT (Branch 2 of
+    //      override_workspace_inheritance) — the adopter opted in.
+    //   2. Carry the workspace root's [workspace.*] / [patch] / [profile]
+    //      tables down into the overlay (apply_workspace_member_inheritance)
+    //      so the dependency graph + patch resolution match baseline cargo.
+    // See docs/compatibility-plan.md §3.2.3 (workspace-member entry).
+    let dual_root = resolve_dual_root(&args)?;
+    // `compat_root` (legacy name preserved for diff minimality) now
+    // points at `workspace_root` per the §3.1.bis routing table.
+    // Consumers that need member-anchored paths route through
+    // `member_root` explicitly below. In the non-`--package` collapse
+    // case (`workspace_member_context.is_none()`) both paths are
+    // identical and behavior is unchanged from pre-#53.
+    let compat_root = dual_root.workspace_root.clone();
+    let member_root = dual_root.member_root.clone();
+    let upstream_manifest = dual_root.member_manifest.clone();
 
     let guard = cleanup::CleanupGuard::new(args.inner_cli.keep_output);
 
@@ -131,7 +158,16 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // existing v0.1 surface only exposes one root. Approach A keeps
     // the §3.2.3 invariants while landing the GA fix in the smallest
     // possible change.
-    let converted_fixtures_root = compat_root.join("target").join("lihaaf-compat-converted");
+    // Issue #53 — fixture conversion + discovery anchor on `member_root`
+    // (per §3.1.bis routing table). The overlay is staged at
+    // `<member_root>/target/lihaaf-overlay/`; converted fixtures live
+    // at `<member_root>/target/lihaaf-compat-converted/` so the inner
+    // session's `fixture_dirs` reference points at the correct on-disk
+    // location after the cargo walk-up from the overlay manifest. In
+    // the non-`--package` collapse case (`member_root == workspace_root`),
+    // both points are equivalent — non-`--package` pilots see no
+    // behavioral drift.
+    let converted_fixtures_root = member_root.join("target").join("lihaaf-compat-converted");
     let abs_compile_pass = crate::util::to_forward_slash(
         &converted_fixtures_root
             .join("compile_pass")
@@ -142,26 +178,45 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
             .join("compile_fail")
             .to_string_lossy(),
     );
-    let overlay_plan = overlay::materialize_overlay_with_synthetic_metadata_builder(
+    let overlay_plan = overlay::materialize_overlay_with_workspace_member_context(
         &upstream_manifest,
         |upstream_name| {
             let name = upstream_name
                 .map(str::to_string)
-                .unwrap_or_else(|| basename_fallback(&compat_root));
+                .unwrap_or_else(|| basename_fallback(&member_root));
             overlay::compat_default_synthetic_metadata(
                 &name,
                 vec![abs_compile_pass.clone(), abs_compile_fail.clone()],
             )
         },
+        dual_root.workspace_member_context.as_ref(),
     )?;
     let crate_name = overlay_plan
         .upstream_crate_name
         .clone()
-        .unwrap_or_else(|| basename_fallback(&compat_root));
+        .unwrap_or_else(|| basename_fallback(&member_root));
+    // `guard.track` relativizes the tracked path against the supplied
+    // root for the §3.3 envelope's `generated_paths` field. We use
+    // `compat_root` (= workspace_root) here so the envelope reports
+    // paths relative to the dir the adopter passed. In the workspace-
+    // member case, the overlay sibling at
+    // `<member_root>/target/lihaaf-overlay/Cargo.toml` is rendered as
+    // `<member-subdir>/target/lihaaf-overlay/Cargo.toml` relative to
+    // the workspace root, which is the natural form for the envelope.
     guard.track(overlay_plan.sibling_manifest.clone(), &compat_root);
 
-    let discovery_output = discovery::discover(&compat_root, &args.compat_trybuild_macro)?;
+    // Issue #53 — discovery walks `<member_root>/tests/*.rs`. The
+    // workspace root has no `tests/` of its own in the virtual-
+    // workspace shape, so anchoring on `compat_root` (= workspace_root)
+    // would find zero fixtures. Anchor on `member_root` per §3.1.bis
+    // routing table.
+    let discovery_output = discovery::discover(&member_root, &args.compat_trybuild_macro)?;
 
+    // Baseline sidecar + baseline cargo cwd anchor on `workspace_root`
+    // (per §3.1.bis routing table). Cargo writes `Cargo.lock` at the
+    // workspace root; the baseline `cargo test` invocation must run
+    // from the workspace root for cargo to discover the lockfile +
+    // workspace state. `compat_root` aliases `workspace_root` here.
     let baseline_sidecar = compat_root
         .join("target")
         .join("lihaaf-compat-baseline.json");
@@ -180,8 +235,11 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     )?;
     guard.track(baseline_sidecar.clone(), &compat_root);
 
+    // Fixture conversion writes to `<member_root>/target/lihaaf-compat-converted/`
+    // per the routing table; the overlay's `[package.metadata.lihaaf].fixture_dirs`
+    // synthetic block already points there.
     let converted =
-        fixture_convert::convert_fixtures(&compat_root, &discovery_output.fixtures, &guard)?;
+        fixture_convert::convert_fixtures(&member_root, &discovery_output.fixtures, &guard)?;
 
     let lihaaf_started = Instant::now();
     let inner_cli = build_inner_cli(&args, &overlay_plan.sibling_manifest);
@@ -321,16 +379,96 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Resolve the upstream `Cargo.toml` path the overlay reads.
+/// Resolve the dual-root vocabulary from `CompatArgs` (issue #53 — see
+/// plan §3.1.bis routing table + §4.2 driver wire-up).
 ///
-/// `--compat-manifest` (when set) wins; otherwise the conventional
-/// `<compat_root>/Cargo.toml` is used. The path must exist; a missing
-/// manifest produces an [`Error::Io`] diagnostic at the overlay layer.
-fn resolve_upstream_manifest(args: &cli::CompatArgs) -> Result<PathBuf, Error> {
+/// Decision tree:
+///
+/// 1. **`--compat-manifest` wins.** When the adopter passes
+///    `--compat-manifest`, both roots collapse to the manifest's
+///    parent dir. This is the v0.1 escape hatch — bypasses workspace
+///    resolution entirely. (`--package` and `--compat-manifest` are
+///    mutually exclusive per `Cli::validate_mode_consistency`.)
+///
+/// 2. **No `--package`: single-root collapse.** When `--package` is
+///    absent, the four paths collapse: `workspace_root == member_root`
+///    and `workspace_root_manifest == member_manifest`. The overlay
+///    materializer's existing single-root logic runs unchanged. Round-1
+///    pilots (cxx, serde_json, anyhow, thiserror) all hit this branch.
+///
+/// 3. **`--package` supplied: dual-root resolver.** The default
+///    manifest at `<compat_root>/Cargo.toml` MUST be a virtual
+///    workspace root (declares `[workspace]` without `[package]` per
+///    v0.1.0 scope; see §1 / §11.11). The resolver
+///    [`overlay::resolve_workspace_member_manifest`] verifies the
+///    shape and walks `[workspace.members]` to find the member whose
+///    `[package].name == args.compat_package`. The resolver returns
+///    `(member_manifest, workspace_root_value)`; this function wraps
+///    them into a `DualRoot` with `workspace_member_context: Some(_)`.
+///
+/// # Returns
+///
+/// `Ok(DualRoot)` on a successful resolution (single-root or dual-
+/// root). `Err(Error::Cli)` on resolver failures (no-match,
+/// multiple-match, package+workspace shape, etc.); `Err(Error::Io)`
+/// or `Err(Error::TomlParse)` propagating from the resolver.
+fn resolve_dual_root(args: &cli::CompatArgs) -> Result<overlay::DualRoot, Error> {
+    let workspace_root = args.compat_root.clone();
+
+    // 1. `--compat-manifest` overrides everything else. Collapse both
+    //    roots to the manifest's parent dir.
     if let Some(m) = &args.compat_manifest {
-        return Ok(m.clone());
+        let member_root = m
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        return Ok(overlay::DualRoot {
+            workspace_root: member_root.clone(),
+            workspace_root_manifest: m.clone(),
+            member_root,
+            member_manifest: m.clone(),
+            workspace_member_context: None,
+        });
     }
-    Ok(args.compat_root.join("Cargo.toml"))
+
+    // 2. Default manifest. `<compat_root>/Cargo.toml`.
+    let default_manifest = workspace_root.join("Cargo.toml");
+
+    // 3. `--package` absent → single-root collapse. The overlay
+    //    materializer's existing workspace-root-rejection branch at
+    //    `is_workspace_root_manifest` REJECT (§4.4 case 5 augmented)
+    //    fires here if `compat_root` is a workspace root — the
+    //    augmented diagnostic suggests `--package`.
+    let Some(pkg) = &args.compat_package else {
+        return Ok(overlay::DualRoot {
+            workspace_root: workspace_root.clone(),
+            workspace_root_manifest: default_manifest.clone(),
+            member_root: workspace_root,
+            member_manifest: default_manifest,
+            workspace_member_context: None,
+        });
+    };
+
+    // 4. `--package` supplied → dual-root resolver. The resolver
+    //    verifies the workspace-root shape (rejects package+workspace
+    //    + non-workspace-root manifests via §4.3 step 2 / step 2.5)
+    //    and returns `(member_manifest, workspace_root_value)`.
+    let (member_manifest, workspace_root_value) =
+        overlay::resolve_workspace_member_manifest(&default_manifest, pkg)?;
+    let member_root = member_manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    Ok(overlay::DualRoot {
+        workspace_root,
+        workspace_root_manifest: default_manifest.clone(),
+        member_root,
+        member_manifest,
+        workspace_member_context: Some(overlay::WorkspaceMemberContext {
+            workspace_root_manifest: default_manifest,
+            workspace_root_value,
+        }),
+    })
 }
 
 fn basename_fallback(compat_root: &Path) -> String {
@@ -366,6 +504,12 @@ fn build_inner_cli(args: &cli::CompatArgs, overlay_manifest: &Path) -> crate::cl
         compat_commit: None,
         compat_filter: Vec::new(),
         compat_manifest: None,
+        // `--package` is a compat-mode-only outer flag (per #53); the
+        // inner session sees a v0.1 surface and the field is always
+        // `None` here. The compat driver has already used the field to
+        // resolve the member manifest; the inner session does not
+        // re-consume it.
+        compat_package: None,
         compat_report: None,
         compat_root: None,
         compat_trybuild_macro: Vec::new(),
@@ -593,6 +737,7 @@ mod tests {
             compat_report: PathBuf::from("/tmp/lihaaf-build-inner-cli-test-report.json"),
             compat_cargo_test_argv: vec!["cargo".to_string(), "test".to_string()],
             compat_manifest: None,
+            compat_package: None,
             compat_commit: None,
             compat_filter: Vec::new(),
             compat_trybuild_macro: Vec::new(),
@@ -603,6 +748,7 @@ mod tests {
                 compat_commit: None,
                 compat_filter: Vec::new(),
                 compat_manifest: None,
+                compat_package: None,
                 compat_report: Some(PathBuf::from(
                     "/tmp/lihaaf-build-inner-cli-test-report.json",
                 )),

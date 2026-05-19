@@ -23,10 +23,13 @@
 //!    (`idempotent_rerun_no_byte_change` — second run does not touch
 //!    mtime).
 //! 5. The cross-binary determinism corpus
-//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — eight
+//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — nine
 //!    representative `Cargo.toml` shapes under
 //!    `tests/compat/overlay_corpus/`, each checked against a
-//!    pre-committed `*.expected.toml`).
+//!    pre-committed `*.expected.toml`). The ninth fixture
+//!    (`workspace_member_with_package`) was added in issue #53 and
+//!    materializes through the `--package`-resolver shape with a
+//!    populated `WorkspaceMemberContext`.
 //! 6. The §3.2.3 risk section's invariant
 //!    (`patch_tables_preserved_verbatim` — `[patch.crates-io]`
 //!    `git`/`branch`/`tag`/`rev` fields pass through verbatim;
@@ -95,7 +98,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use lihaaf::CompatWorkspaceMemberContext as WorkspaceMemberContext;
 use lihaaf::compat_overlay_materialize as materialize_overlay;
+use lihaaf::compat_overlay_materialize_with_metadata_and_workspace_member_context as materialize_overlay_with_metadata_and_ctx;
 
 /// Helper: drop an input `Cargo.toml` in a fresh tempdir and return
 /// the directory handle plus the path to the new manifest.
@@ -278,8 +283,12 @@ fn workspace_root_manifest_is_rejected_with_directed_diagnostic() {
     // `[workspace]` without `[package]` is a workspace root — cargo
     // cannot build it as a library and the lihaaf stage-3 dylib pass
     // would fail with an opaque error. Phase 2 overlay rejects this
-    // upfront with a directed diagnostic pointing the adopter at a
-    // member crate's Cargo.toml.
+    // upfront with a directed diagnostic.
+    //
+    // Issue #53 augments the diagnostic to recommend `--package
+    // <pkg>` as the actionable workspace-member entry shape, so the
+    // assertions below check for the augmented text shape ("workspace
+    // member" + "--package").
     let input = r#"[workspace]
 members = ["crate-a", "crate-b"]
 "#;
@@ -299,9 +308,17 @@ members = ["crate-a", "crate-b"]
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
+            // Issue #53 — diagnostic now recommends `--package` so
+            // the adopter has an actionable workspace-member entry
+            // shape. The legacy "member crate" wording is replaced
+            // with "workspace member" + "--package".
             assert!(
-                message.contains("member crate"),
-                "diagnostic must direct adopter to a member crate; got: {message}"
+                message.contains("--package"),
+                "diagnostic must recommend `--package` per #53; got: {message}"
+            );
+            assert!(
+                message.contains("workspace member") || message.contains("Cargo.toml"),
+                "diagnostic must direct the adopter; got: {message}"
             );
         }
         other => panic!("expected Error::Cli, got {other:?}"),
@@ -343,9 +360,12 @@ edition = "2021"
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
+            // Issue #53 — diagnostic now recommends `--package`
+            // (see workspace_root_manifest_is_rejected_with_directed_diagnostic
+            // above for the rationale).
             assert!(
-                message.contains("member crate"),
-                "diagnostic must direct adopter to a member crate; got: {message}"
+                message.contains("--package"),
+                "diagnostic must recommend `--package` per #53; got: {message}"
             );
         }
         other => panic!("expected Error::Cli, got {other:?}"),
@@ -471,6 +491,15 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         // distinction is in the INPUT.
         "with_self_patch_injected",
         "with_self_patch_remapped",
+        // Issue #53 — workspace-member entry via `--package`. The
+        // fixture exercises the workspace-root carry-down +
+        // `apply_workspace_member_inheritance` + Option H Rule 1
+        // INJECT on a member-shaped input (`{ workspace = true }`
+        // inheritance refs, no `[workspace]` of its own). The
+        // corpus-iteration loop runs a special path for this name
+        // (synthesizes a workspace root + ctx alongside the member
+        // input) — see the per-fixture conditional below.
+        "workspace_member_with_package",
     ];
     let mut checked = 0usize;
     for name in &names {
@@ -481,19 +510,79 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         let expected_template = std::fs::read_to_string(&expected_path)
             .unwrap_or_else(|e| panic!("reading corpus expected {expected_path:?}: {e}"));
 
-        let (_tmp, upstream) = write_upstream(&input);
-        let plan = materialize_overlay(&upstream).expect("overlay must succeed");
-        let actual = read_overlay(&plan.sibling_manifest);
+        // Issue #53 — the workspace-member fixture requires a
+        // synthesized workspace-root context. The `--package`
+        // resolver's natural shape is `<ws-root>/Cargo.toml` carrying
+        // `[workspace.*]` carry-down tables + `<ws-root>/<member>/Cargo.toml`
+        // as the input. We materialize with
+        // `materialize_overlay_with_metadata_and_workspace_member_context`,
+        // passing a populated `WorkspaceMemberContext` so the
+        // carry-down + Option H apply. The tempdir owner is bound
+        // OUTSIDE the if-branch so it lives until the assertion below
+        // (mem::forget would leak; an early drop would invalidate
+        // file references inside the overlay during assert_eq).
+        let mut _wm_tmp: Option<tempfile::TempDir> = None;
+        let (actual, upstream_dir) = if *name == "workspace_member_with_package" {
+            let tmp = tempfile::tempdir().expect("tempdir for workspace_member fixture");
+            std::fs::create_dir(tmp.path().join("mem")).expect("create member subdir");
+            let ws_root_text = r#"[workspace]
+members = ["mem"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+serde = "1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+"#;
+            let ws_root_manifest = tmp.path().join("Cargo.toml");
+            std::fs::write(&ws_root_manifest, ws_root_text).expect("write workspace-root manifest");
+            let member_manifest = tmp.path().join("mem").join("Cargo.toml");
+            std::fs::write(&member_manifest, &input).expect("write member manifest");
+            let ws_root_value: toml::Value =
+                toml::from_str(ws_root_text).expect("workspace-root TOML parses");
+            let ctx = WorkspaceMemberContext {
+                workspace_root_manifest: ws_root_manifest.clone(),
+                workspace_root_value: ws_root_value,
+            };
+            let plan =
+                materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+                    .expect("workspace-member overlay must succeed");
+            let actual = read_overlay(&plan.sibling_manifest);
+            // The overlay's `[lib].path` and Rule-1-INJECTed
+            // self-patch path are anchored against the MEMBER root
+            // (per §3.1.bis routing table — overlay materialization
+            // anchors on `member_root`), so the `__UPSTREAM_DIR__`
+            // placeholder substitutes for the member dir.
+            let member_dir = member_manifest
+                .parent()
+                .expect("member manifest has parent")
+                .to_string_lossy()
+                .replace('\\', "/");
+            _wm_tmp = Some(tmp);
+            (actual, member_dir)
+        } else {
+            let (_tmp, upstream) = write_upstream(&input);
+            let plan = materialize_overlay(&upstream).expect("overlay must succeed");
+            let actual = read_overlay(&plan.sibling_manifest);
+            let upstream_dir = upstream
+                .parent()
+                .expect("upstream manifest has a parent dir")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // For the non-workspace-member fixtures, `_tmp` was bound
+            // inside `write_upstream` and went out of scope already
+            // (the original test code accepts that — the overlay
+            // bytes were captured above by `read_overlay`).
+            (actual, upstream_dir)
+        };
 
         // Substitute the `__UPSTREAM_DIR__` placeholder in the expected
         // template with the real tempdir (forward-slash form, matching
         // the overlay code's `to_forward_slash` call). The placeholder
         // is a fixed-string substitution — no regex, per spec §6.1.
-        let upstream_dir = upstream
-            .parent()
-            .expect("upstream manifest has a parent dir")
-            .to_string_lossy()
-            .replace('\\', "/");
         let expected = expected_template.replace("__UPSTREAM_DIR__", &upstream_dir);
 
         assert_eq!(
@@ -507,10 +596,10 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         checked += 1;
     }
     assert_eq!(
-        checked, 8,
-        "corpus must include all 8 representative fixtures \
-         (6 existing + 2 new for the issue #40/#47 Option H \
-         Rule 1 INJECT and Rule 2 REMAP policy)"
+        checked, 9,
+        "corpus must include all 9 representative fixtures \
+         (6 baseline + 2 issue #40/#47 Option H + 1 issue #53 \
+         workspace-member-with-package)"
     );
 }
 
@@ -3341,4 +3430,329 @@ demo = { path = "." }
          Rule 2 `{rule2_tail}`"
     );
     drop(tmp2);
+}
+
+/// **Issue #53 §7.3 integration test: axum-macros workspace-member shape.**
+///
+/// Synthesizes a workspace that mirrors `tokio-rs/axum`'s shape (virtual
+/// workspace with `members = ["pkg-a", "pkg-*"]`, `[workspace.package]
+/// edition = "2021"`, `[workspace.dependencies] serde = "1.0"`) and a
+/// member `pkg-macros` with `{ workspace = true }` inheritance refs
+/// (`rust-version`, `[lints] workspace = true`, `[dependencies] serde =
+/// { workspace = true }`). Resolves via `resolve_workspace_member_manifest`,
+/// then materializes via `materialize_overlay_with_metadata_and_workspace_member_context`
+/// with a populated `WorkspaceMemberContext`. Asserts:
+///
+/// 1. The resolver returns the member manifest at
+///    `<ws>/pkg-macros/Cargo.toml`.
+/// 2. The overlay is staged at
+///    `<ws>/pkg-macros/target/lihaaf-overlay/Cargo.toml` per §3.1.bis
+///    (the staging dir is `<member_root>/target/lihaaf-overlay/`, NOT
+///    `<workspace_root>/target/lihaaf-overlay/`).
+/// 3. The overlay's `[workspace.dependencies.serde]` carries the
+///    workspace-root value (carry-down from §5.3).
+/// 4. The overlay's `[workspace.package.edition]` carries the
+///    workspace-root value.
+/// 5. The overlay's `[workspace]` table does NOT carry `members`,
+///    `exclude`, or `default-members` (stripped per
+///    `override_workspace_inheritance` Branch 4).
+/// 6. The materialization does NOT hit any REJECT branch — the
+///    workspace-member context suppresses Branches 2 + 3 of
+///    `override_workspace_inheritance`.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` per
+/// [[lihaaf-no-local-binary-builds]] — although this test does not
+/// spawn `cargo`, it stays under the same gate as the other compat-
+/// pipeline integration tests so adopters running `cargo test --lib`
+/// on RAM-limited boxes can opt in once for the whole compat-pipeline
+/// surface.
+#[test]
+fn cargo_lihaaf_resolves_axum_macros_shape_workspace_member() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_lihaaf_resolves_axum_macros_shape_workspace_member: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for axum-macros shape test");
+    let ws_root = tmp.path();
+    let ws_root_manifest = ws_root.join("Cargo.toml");
+
+    // Synthesize the workspace root (axum-macros shape: virtual
+    // workspace with `[workspace.package]` carry-down +
+    // `[workspace.dependencies]` carry-down + glob members).
+    let ws_root_toml = r#"[workspace]
+members = ["pkg-a", "pkg-*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.65"
+
+[workspace.dependencies]
+serde = "1.0"
+"#;
+    std::fs::write(&ws_root_manifest, ws_root_toml).expect("write workspace-root manifest");
+
+    // Synthesize pkg-a (non-target member; the glob `pkg-*` will also
+    // match pkg-macros, but pkg-a needs to exist as a non-target to
+    // verify the resolver picks pkg-macros by name not by directory
+    // enumeration order).
+    let pkg_a_dir = ws_root.join("pkg-a");
+    std::fs::create_dir_all(pkg_a_dir.join("src")).expect("create pkg-a/src");
+    std::fs::write(
+        pkg_a_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-a"
+version = "0.1.0"
+rust-version = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-a Cargo.toml");
+    std::fs::write(
+        pkg_a_dir.join("src").join("lib.rs"),
+        "pub fn _stub_a() {}\n",
+    )
+    .expect("write pkg-a src/lib.rs");
+
+    // Synthesize pkg-macros (the target member).
+    let pkg_macros_dir = ws_root.join("pkg-macros");
+    std::fs::create_dir_all(pkg_macros_dir.join("src")).expect("create pkg-macros/src");
+    std::fs::write(
+        pkg_macros_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-macros"
+version = "0.1.0"
+rust-version = { workspace = true }
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+"#,
+    )
+    .expect("write pkg-macros Cargo.toml");
+    std::fs::write(
+        pkg_macros_dir.join("src").join("lib.rs"),
+        "// minimal proc-macro lib stub for #53 integration test\n",
+    )
+    .expect("write pkg-macros src/lib.rs");
+
+    // 1. Resolver step.
+    let (member_manifest, ws_root_value) =
+        lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-macros")
+            .expect("resolver must find pkg-macros via glob match");
+    assert_eq!(
+        member_manifest,
+        pkg_macros_dir.join("Cargo.toml"),
+        "resolver must return the pkg-macros manifest path"
+    );
+
+    // 2. Materializer step.
+    let ctx = WorkspaceMemberContext {
+        workspace_root_manifest: ws_root_manifest.clone(),
+        workspace_root_value: ws_root_value,
+    };
+    let plan = materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+        .expect("materialization must succeed under workspace-member context");
+
+    // Overlay is staged at <member>/target/lihaaf-overlay/Cargo.toml.
+    let expected_overlay_path = pkg_macros_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_overlay_path,
+        "overlay must be staged under <member_root>/target/lihaaf-overlay/ per §3.1.bis"
+    );
+
+    // 3-5. Read the overlay and assert the carry-down + strip
+    // contracts.
+    let overlay_text = read_overlay(&plan.sibling_manifest);
+    let overlay_value: toml::Value =
+        toml::from_str(&overlay_text).expect("overlay TOML must parse");
+    let overlay_table = overlay_value.as_table().expect("overlay is a table");
+
+    let workspace_table = overlay_table
+        .get("workspace")
+        .and_then(|v| v.as_table())
+        .expect("overlay must have [workspace]");
+    // [workspace.dependencies.serde] carried from workspace root.
+    let ws_deps = workspace_table
+        .get("dependencies")
+        .and_then(|v| v.as_table())
+        .expect("[workspace.dependencies] must be carried");
+    assert!(
+        ws_deps.contains_key("serde"),
+        "[workspace.dependencies.serde] must be carried from workspace root"
+    );
+    // [workspace.package.edition] carried.
+    let ws_pkg = workspace_table
+        .get("package")
+        .and_then(|v| v.as_table())
+        .expect("[workspace.package] must be carried");
+    assert_eq!(
+        ws_pkg.get("edition").and_then(|v| v.as_str()),
+        Some("2021"),
+        "[workspace.package.edition] must be carried verbatim"
+    );
+
+    // Membership keys must be stripped.
+    assert!(
+        !workspace_table.contains_key("members"),
+        "[workspace.members] must be stripped from overlay"
+    );
+    assert!(
+        !workspace_table.contains_key("exclude"),
+        "[workspace.exclude] must be stripped from overlay"
+    );
+    assert!(
+        !workspace_table.contains_key("default-members"),
+        "[workspace.default-members] must be stripped from overlay"
+    );
+
+    // 6. Option H Rule 1 INJECT: the workspace root did not declare a
+    // self-patch for pkg-macros, so an injected self-patch points at
+    // the staged-overlay dir.
+    let patch_self = overlay_table
+        .get("patch")
+        .and_then(|v| v.get("crates-io"))
+        .and_then(|v| v.get("pkg-macros"))
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.pkg-macros].path must be INJECTed (Option H Rule 1)");
+    assert!(
+        patch_self.ends_with("lihaaf-overlay"),
+        "Rule 1 INJECT must target the staged-overlay dir; got `{patch_self}`"
+    );
+
+    drop(tmp);
+}
+
+/// **Issue #53 BLOCK-1 §7.3 extension: dot-prefix + exclude integration test.**
+///
+/// Variant of `cargo_lihaaf_resolves_axum_macros_shape_workspace_member` that
+/// exercises the BLOCK-1 path-normalization contract end-to-end:
+///
+/// - `members = ["./pkg-a", "./pkg-*"]` (dot-prefixed literal + glob),
+/// - `exclude = ["pkg-a"]` (bare exclude, no dot prefix),
+///
+/// **Expected:** `pkg-a` is excluded (proving `./pkg-a` member lexically
+/// matches `pkg-a` exclude), `./pkg-*` glob matches `pkg-macros` as the
+/// target — the resolver succeeds and materialization proceeds.
+///
+/// **What this pins:** the resolver and the overlay absolutization
+/// agree on the canonical lexical form. A regression where the
+/// resolver normalized one side and the absolutizer normalized the
+/// other (or neither) would show up here as either a no-match error
+/// or a duplicate-match error.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` for parity with the
+/// sibling axum-macros test.
+#[test]
+fn cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for dot-prefix + exclude test");
+    let ws_root = tmp.path();
+    let ws_root_manifest = ws_root.join("Cargo.toml");
+
+    // Members carry dot-prefix; exclude is bare. Without BLOCK-1
+    // normalization the `pkg-a` exclude would not subtract the
+    // `./pkg-a` member, breaking the resolver's intent.
+    let ws_root_toml = r#"[workspace]
+members = ["./pkg-a", "./pkg-*"]
+exclude = ["pkg-a"]
+
+[workspace.package]
+edition = "2021"
+"#;
+    std::fs::write(&ws_root_manifest, ws_root_toml).expect("write workspace-root manifest");
+
+    let pkg_a_dir = ws_root.join("pkg-a");
+    std::fs::create_dir_all(pkg_a_dir.join("src")).expect("create pkg-a/src");
+    std::fs::write(
+        pkg_a_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-a"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-a Cargo.toml");
+    std::fs::write(
+        pkg_a_dir.join("src").join("lib.rs"),
+        "pub fn _stub_a() {}\n",
+    )
+    .expect("write pkg-a src/lib.rs");
+
+    let pkg_macros_dir = ws_root.join("pkg-macros");
+    std::fs::create_dir_all(pkg_macros_dir.join("src")).expect("create pkg-macros/src");
+    std::fs::write(
+        pkg_macros_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-macros"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-macros Cargo.toml");
+    std::fs::write(
+        pkg_macros_dir.join("src").join("lib.rs"),
+        "// minimal proc-macro lib stub for BLOCK-1 integration test\n",
+    )
+    .expect("write pkg-macros src/lib.rs");
+
+    // pkg-a should be EXCLUDED (proving `./pkg-a` member ≡ `pkg-a`
+    // exclude). pkg-macros must still resolve via `./pkg-*` glob.
+    let pkg_a_result = lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-a");
+    assert!(
+        pkg_a_result.is_err(),
+        "`./pkg-a` member must be subtracted by `pkg-a` exclude; \
+         resolving `pkg-a` must error (BLOCK-1: lexical normalization)"
+    );
+
+    let (member_manifest, ws_root_value) =
+        lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-macros")
+            .expect("resolver must find pkg-macros via `./pkg-*` glob match");
+    assert_eq!(
+        member_manifest,
+        pkg_macros_dir.join("Cargo.toml"),
+        "resolver must return the pkg-macros manifest path"
+    );
+
+    let ctx = WorkspaceMemberContext {
+        workspace_root_manifest: ws_root_manifest.clone(),
+        workspace_root_value: ws_root_value,
+    };
+    let plan = materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+        .expect("materialization must succeed under workspace-member context");
+
+    let expected_overlay_path = pkg_macros_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_overlay_path,
+        "overlay must be staged under <member_root>/target/lihaaf-overlay/"
+    );
+
+    drop(tmp);
 }

@@ -851,6 +851,7 @@ mod tests {
             compat_commit: None,
             compat_filter: vec![],
             compat_manifest: None,
+            compat_package: None,
             compat_report: None,
             compat_root: None,
             compat_trybuild_macro: vec![],

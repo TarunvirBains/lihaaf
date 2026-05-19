@@ -1,0 +1,13 @@
+[package]
+name = "pkg-macros"
+version = "0.1.0"
+edition = { workspace = true }
+
+[lib]
+proc-macro = true
+
+[dependencies]
+serde = { workspace = true }
+
+[lints]
+workspace = true

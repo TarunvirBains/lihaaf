@@ -1625,7 +1625,15 @@ fn walk_glob_segments(
 /// The matcher is a backtracking walk — the patterns we accept are
 /// small (one file-name segment, no nested wildcards) so the
 /// worst-case cost is bounded by `pattern.len() * name.len()`.
-fn glob_segment_matches(pattern: &[u8], name: &[u8]) -> bool {
+///
+/// `pub(super)` so the workspace-member resolver in `overlay.rs` (issue
+/// #53) can reuse the same matcher for `[workspace.members]` glob
+/// expansion without duplicating the implementation. The pattern shape
+/// the resolver feeds in is identical (single path segment; no
+/// metacharacters in the parent segment of a `crates/*` pattern, which
+/// the resolver pre-splits on `/` and routes only the LAST segment
+/// here).
+pub(super) fn glob_segment_matches(pattern: &[u8], name: &[u8]) -> bool {
     fn rec(p: &[u8], n: &[u8]) -> bool {
         let mut pi = 0;
         let mut ni = 0;

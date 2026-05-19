@@ -75,6 +75,26 @@ pub struct Cli {
     #[arg(long, value_name = "DIR")]
     pub compat_root: Option<PathBuf>,
 
+    /// Compat-mode workspace-member package selector. When set, the
+    /// upstream manifest is resolved from the workspace rooted at
+    /// `--compat-root` by matching `<package>` against each member's
+    /// `[package].name`. Required when `--compat-root` points at a
+    /// workspace ROOT that declares `[workspace]` without `[package]`;
+    /// rejected otherwise (see `validate_mode_consistency`).
+    ///
+    /// The short form `-p` mirrors cargo's `-p` convention. Multi-valued
+    /// is rejected at parse time (single package per invocation); the
+    /// field type `Option<String>` (not `Vec<String>`) makes clap reject
+    /// a second occurrence at parse time.
+    ///
+    /// Mutually exclusive with `--compat-manifest` (which supplies an
+    /// explicit manifest path, bypassing the workspace-member resolver).
+    /// See `docs/spec/lihaaf-v0.1.md` §8.2 and `docs/compatibility-plan.md`
+    /// §3.2.3 ("Workspace-member entry via `--package`") for the
+    /// adopter-facing surface.
+    #[arg(short = 'p', long = "package", value_name = "PACKAGE", value_parser = parse_compat_package)]
+    pub compat_package: Option<String>,
+
     /// Additional fully-qualified macro paths the §3.2.1 AST walk treats as
     /// aliases for `trybuild::TestCases::new()`. Repeatable; OR'd.
     #[arg(long, value_name = "PATH")]
@@ -157,6 +177,22 @@ pub struct Cli {
     /// using `cargo lihaaf --compat` do not need to know it exists.
     #[arg(skip)]
     pub(crate) inner_compat_normalize: bool,
+}
+
+/// Reject empty `--package` values at parse time (issue #53 — see
+/// plan §6.16). clap's default `Option<String>` value parser accepts
+/// empty strings; we tighten to "non-empty required" so the bad
+/// invocation fails immediately with a clap error rather than reaching
+/// the resolver and surfacing as a no-match diagnostic that doesn't
+/// name the empty-string root cause. Further package-name validation
+/// (cargo's `[a-zA-Z0-9_-]+` rule) lives at resolver time; cargo would
+/// itself have rejected the invalid name at workspace-load time, so an
+/// adopter passing a malformed name reaches the no-match diagnostic.
+fn parse_compat_package(s: &str) -> Result<String, String> {
+    if s.is_empty() {
+        return Err("`--package` requires a non-empty package name".to_string());
+    }
+    Ok(s.to_string())
 }
 
 /// Reject `-j 0` at parse time. The default
@@ -283,6 +319,26 @@ impl Cli {
             if self.compat_report.is_none() {
                 return Err(missing_required_compat_flag("--compat-report"));
             }
+            // Issue #53 — `--package` and `--compat-manifest` are
+            // mutually exclusive (see plan §3.3 Rule B). The two flags
+            // address opposite ends of the same problem space:
+            // `--compat-manifest` supplies an explicit manifest path
+            // directly to compat mode, bypassing the workspace-member
+            // resolver; `--package` invokes the resolver to find the
+            // member from a workspace root. Combining them is
+            // incoherent — clap's generic conflicts-with would say
+            // "cannot be used with" but not explain why; we surface a
+            // directed diagnostic instead.
+            if self.compat_package.is_some() && self.compat_manifest.is_some() {
+                return Err(Error::Cli {
+                    clap_exit_code: 2,
+                    message: "error: `--package` and `--compat-manifest` cannot be combined: \
+                         `--compat-manifest` supplies an explicit manifest path directly to \
+                         compat mode, while `--package` invokes the workspace-member resolver. \
+                         Use one or the other."
+                        .to_string(),
+                });
+            }
         } else {
             // Outside compat mode: every --compat-* flag is a mode error.
             // Order matters here only for the first-error-wins diagnostic;
@@ -298,6 +354,12 @@ impl Cli {
             }
             if self.compat_manifest.is_some() {
                 return Err(non_compat_mode_error("--compat-manifest"));
+            }
+            // Issue #53 — `--package` outside compat mode is a mode error.
+            // Surface via the existing `non_compat_mode_error` helper so the
+            // diagnostic shape matches the rest of the matrix.
+            if self.compat_package.is_some() {
+                return Err(non_compat_mode_error("--package"));
             }
             if self.compat_report.is_some() {
                 return Err(non_compat_mode_error("--compat-report"));
@@ -396,6 +458,7 @@ mod tests {
         assert!(c.compat_commit.is_none());
         assert!(c.compat_filter.is_empty());
         assert!(c.compat_manifest.is_none());
+        assert!(c.compat_package.is_none());
         assert!(c.compat_report.is_none());
         assert!(c.compat_root.is_none());
         assert!(c.compat_trybuild_macro.is_empty());
@@ -440,6 +503,135 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert!(parse_from(argv).is_err());
+    }
+
+    /// **Issue #53 — short `-p` form parses into `compat_package`.**
+    ///
+    /// The clap-derive `short = 'p'` attribute makes the CLI accept the
+    /// short form. This test pins that the parsed `Cli` carries the
+    /// package name on `compat_package` (not on any unrelated field) so
+    /// a future refactor that drops the `short = 'p'` attribute (or
+    /// renames the field) trips here immediately.
+    #[test]
+    fn cli_parses_short_p_flag() {
+        let c = parse(&[
+            "--compat",
+            "--compat-root",
+            "/tmp/ws",
+            "--compat-report",
+            "/tmp/r.json",
+            "-p",
+            "axum-macros",
+        ]);
+        assert_eq!(c.compat_package.as_deref(), Some("axum-macros"));
+    }
+
+    /// **Issue #53 — long `--package` form parses into `compat_package`.**
+    /// Mirror of `cli_parses_short_p_flag` for the long form.
+    #[test]
+    fn cli_parses_long_package_flag() {
+        let c = parse(&[
+            "--compat",
+            "--compat-root",
+            "/tmp/ws",
+            "--compat-report",
+            "/tmp/r.json",
+            "--package",
+            "axum-macros",
+        ]);
+        assert_eq!(c.compat_package.as_deref(), Some("axum-macros"));
+    }
+
+    /// **Issue #53 — `--package ""` is rejected at parse time.**
+    ///
+    /// The `parse_compat_package` value parser tightens clap's default
+    /// `Option<String>` parser (which would accept the empty string) so
+    /// the bad invocation fails immediately with a clap error instead
+    /// of reaching the resolver and surfacing as a no-match diagnostic.
+    /// The diagnostic must name `--package` so the adopter knows which
+    /// flag is at fault.
+    #[test]
+    fn cli_rejects_empty_package_name() {
+        let argv: Vec<String> = [
+            "cargo-lihaaf",
+            "--compat",
+            "--compat-root",
+            "/tmp/ws",
+            "--compat-report",
+            "/tmp/r.json",
+            "-p",
+            "",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = parse_from(argv).expect_err("empty `--package` must be rejected");
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("`--package` requires a non-empty package name"),
+                "diagnostic must name the requirement: {message}"
+            ),
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    /// **Issue #53 — `--package` outside compat mode is a mode error.**
+    ///
+    /// Symmetric with the rest of the compat-mode matrix; the
+    /// `validate_mode_consistency` validator owns the rejection per the
+    /// existing pattern. The diagnostic uses `non_compat_mode_error`
+    /// (same helper as `--compat-manifest`, `--compat-report`, etc.) so
+    /// the message shape is uniform across the matrix.
+    #[test]
+    fn cli_rejects_package_outside_compat_mode() {
+        let argv: Vec<String> = ["cargo-lihaaf", "-p", "axum-macros"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = parse_from(argv).expect_err("`--package` outside compat mode must be rejected");
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(
+                    message.contains("`--package` requires `--compat`"),
+                    "diagnostic must name the requirement: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    /// **Issue #53 — `--package` and `--compat-manifest` are mutually
+    /// exclusive.** Combining them is incoherent (the two flags address
+    /// opposite ends of the manifest-resolution problem); the validator
+    /// surfaces a directed diagnostic naming both flags.
+    #[test]
+    fn cli_rejects_package_with_compat_manifest() {
+        let argv: Vec<String> = [
+            "cargo-lihaaf",
+            "--compat",
+            "--compat-root",
+            "/x",
+            "--compat-manifest",
+            "/y/Cargo.toml",
+            "-p",
+            "foo",
+            "--compat-report",
+            "/z",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let err = parse_from(argv).expect_err("`--package` + `--compat-manifest` must be rejected");
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(
+                    message
+                        .contains("cannot be combined: `--compat-manifest` supplies an explicit"),
+                    "diagnostic must explain mutual exclusion: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
     }
 
     #[test]
