@@ -2011,42 +2011,63 @@ fn apply_workspace_member_inheritance(
             "members" | "exclude" | "default-members" => continue,
             // `[workspace.dependencies]` — absolutize `.path` keys
             // against `workspace_root_dir`.
+            //
+            // **Non-table rejection (issue #53 BLOCK-2).** When the
+            // key is PRESENT but the value is NOT a table, that is a
+            // malformed cargo workspace root (cargo itself would
+            // reject it). Surfacing as a `TomlParse` error is correct;
+            // silently skipping would proceed against an incorrect
+            // model of the workspace.
             "dependencies" => {
-                if let Some(deps) = value.as_table() {
-                    let mut carried_deps: toml::map::Map<String, toml::Value> =
-                        toml::map::Map::new();
-                    for (dep_name, dep_value) in deps.iter() {
-                        if let Some(dep_table) = dep_value.as_table() {
-                            let mut carried_dep = dep_table.clone();
-                            if let Some(s) = carried_dep.get("path").and_then(|v| v.as_str()) {
-                                let abs = absolutize_against_ws_root(s);
-                                carried_dep.insert("path".to_string(), toml::Value::String(abs));
-                            }
-                            carried_deps.insert(dep_name.clone(), toml::Value::Table(carried_dep));
-                        } else {
-                            // Non-table entries (e.g. shorthand string
-                            // version `serde = "1.0"`) carry verbatim.
-                            carried_deps.insert(dep_name.clone(), dep_value.clone());
+                let toml::Value::Table(deps) = value else {
+                    return Err(Error::TomlParse {
+                        path: ctx.workspace_root_manifest.clone(),
+                        message:
+                            "`[workspace.dependencies]` must be a table; found a non-table value"
+                                .to_string(),
+                    });
+                };
+                let mut carried_deps: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+                for (dep_name, dep_value) in deps.iter() {
+                    if let Some(dep_table) = dep_value.as_table() {
+                        let mut carried_dep = dep_table.clone();
+                        if let Some(s) = carried_dep.get("path").and_then(|v| v.as_str()) {
+                            let abs = absolutize_against_ws_root(s);
+                            carried_dep.insert("path".to_string(), toml::Value::String(abs));
                         }
+                        carried_deps.insert(dep_name.clone(), toml::Value::Table(carried_dep));
+                    } else {
+                        // Non-table entries (e.g. shorthand string
+                        // version `serde = "1.0"`) carry verbatim.
+                        carried_deps.insert(dep_name.clone(), dep_value.clone());
                     }
-                    carried_workspace
-                        .insert("dependencies".to_string(), toml::Value::Table(carried_deps));
                 }
+                carried_workspace
+                    .insert("dependencies".to_string(), toml::Value::Table(carried_deps));
             }
             // `[workspace.package]` — absolutize `readme` and
             // `license-file` path keys; carry the rest verbatim.
+            //
+            // **Non-table rejection (issue #53 BLOCK-2).** Same
+            // pattern as `[workspace.dependencies]`: present-but-not-
+            // a-table is a malformed workspace root and must be
+            // rejected, not silently skipped.
             "package" => {
-                if let Some(pkg_table) = value.as_table() {
-                    let mut carried_pkg = pkg_table.clone();
-                    for path_key in &["readme", "license-file"] {
-                        if let Some(s) = carried_pkg.get(*path_key).and_then(|v| v.as_str()) {
-                            let abs = absolutize_against_ws_root(s);
-                            carried_pkg.insert((*path_key).to_string(), toml::Value::String(abs));
-                        }
+                let toml::Value::Table(pkg_table) = value else {
+                    return Err(Error::TomlParse {
+                        path: ctx.workspace_root_manifest.clone(),
+                        message: "`[workspace.package]` must be a table; found a non-table value"
+                            .to_string(),
+                    });
+                };
+                let mut carried_pkg = pkg_table.clone();
+                for path_key in &["readme", "license-file"] {
+                    if let Some(s) = carried_pkg.get(*path_key).and_then(|v| v.as_str()) {
+                        let abs = absolutize_against_ws_root(s);
+                        carried_pkg.insert((*path_key).to_string(), toml::Value::String(abs));
                     }
-                    carried_workspace
-                        .insert("package".to_string(), toml::Value::Table(carried_pkg));
                 }
+                carried_workspace.insert("package".to_string(), toml::Value::Table(carried_pkg));
             }
             // `[workspace.lints]`, `[workspace.metadata]`,
             // `[workspace.resolver]`, and any unknown forward-compat
@@ -2083,7 +2104,18 @@ fn apply_workspace_member_inheritance(
 
     // Carry `[replace]` from the workspace root (absolutize `.path`
     // keys against workspace_root_dir).
-    if let Some(ws_replace) = ws_root_top.get("replace").and_then(|v| v.as_table()) {
+    //
+    // **Non-table rejection (issue #53 BLOCK-2).** When `[replace]`
+    // is PRESENT but not a table, that is malformed cargo grammar.
+    // Surface as `TomlParse`; silently skipping would discard a real
+    // `[replace]` table the operator intended to carry.
+    if let Some(replace_value) = ws_root_top.get("replace") {
+        let toml::Value::Table(ws_replace) = replace_value else {
+            return Err(Error::TomlParse {
+                path: ctx.workspace_root_manifest.clone(),
+                message: "`[replace]` must be a table; found a non-table value".to_string(),
+            });
+        };
         let mut carried_replace: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         for (source_id, replace_value) in ws_replace.iter() {
             if let Some(replace_table) = replace_value.as_table() {
@@ -2106,13 +2138,22 @@ fn apply_workspace_member_inheritance(
 
     // Carry `[profile.*]` from the workspace root — profile keys have
     // no path values, so verbatim copy is correct.
-    if let Some(ws_profile) = ws_root_top.get("profile").and_then(|v| v.as_table())
-        && !ws_profile.is_empty()
-    {
-        top.insert(
-            "profile".to_string(),
-            toml::Value::Table(ws_profile.clone()),
-        );
+    //
+    // **Non-table rejection (issue #53 BLOCK-2).** Same pattern:
+    // `[profile]` present but non-table is malformed and must error.
+    if let Some(profile_value) = ws_root_top.get("profile") {
+        let toml::Value::Table(ws_profile) = profile_value else {
+            return Err(Error::TomlParse {
+                path: ctx.workspace_root_manifest.clone(),
+                message: "`[profile]` must be a table; found a non-table value".to_string(),
+            });
+        };
+        if !ws_profile.is_empty() {
+            top.insert(
+                "profile".to_string(),
+                toml::Value::Table(ws_profile.clone()),
+            );
+        }
     }
 
     Ok(())
@@ -2787,20 +2828,51 @@ fn apply_self_patch_policy(
     // `top["patch"]["crates-io"]` are spurious or empty. Path entries
     // in the workspace-root table are absolutized against
     // `workspace_root_dir` (NOT against `upstream_dir`/`member_root`).
+    //
+    // **Non-table rejection (issue #53 BLOCK-2).** Each layer of the
+    // workspace-root patch table (`[patch]` and `[patch.crates-io]`)
+    // is validated to be a TABLE when present. Silently skipping the
+    // carry-down on a non-table value would mask a malformed upstream
+    // manifest the operator should fix. Errors carry the workspace-
+    // root manifest path so the operator can locate the file.
     if let Some(ctx) = workspace_member_ctx {
         let workspace_root_dir = ctx
             .workspace_root_manifest
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
-        if let Some(ws_patch_crates_io) = ctx
-            .workspace_root_value
-            .as_table()
-            .and_then(|t| t.get("patch"))
-            .and_then(|p| p.as_table())
-            .and_then(|p| p.get("crates-io"))
-            .and_then(|c| c.as_table())
-        {
+        let ws_root_top = ctx.workspace_root_value.as_table().ok_or_else(|| {
+            // ctx.workspace_root_value is validated as a table by the
+            // resolver upstream; defense-in-depth.
+            Error::TomlParse {
+                path: ctx.workspace_root_manifest.clone(),
+                message: "workspace-root TOML value is not a table".to_string(),
+            }
+        })?;
+        let ws_patch_opt = match ws_root_top.get("patch") {
+            Some(toml::Value::Table(t)) => Some(t),
+            None => None,
+            Some(_) => {
+                return Err(Error::TomlParse {
+                    path: ctx.workspace_root_manifest.clone(),
+                    message: "workspace-root `[patch]` must be a table; found a non-table value"
+                        .to_string(),
+                });
+            }
+        };
+        let ws_patch_crates_io_opt = match ws_patch_opt.and_then(|p| p.get("crates-io")) {
+            Some(toml::Value::Table(t)) => Some(t),
+            None => None,
+            Some(_) => {
+                return Err(Error::TomlParse {
+                    path: ctx.workspace_root_manifest.clone(),
+                    message: "workspace-root `[patch.crates-io]` must be a table; found a \
+                              non-table value"
+                        .to_string(),
+                });
+            }
+        };
+        if let Some(ws_patch_crates_io) = ws_patch_crates_io_opt {
             for (name, value) in ws_patch_crates_io.iter() {
                 let mut carried = match value {
                     toml::Value::Table(t) => t.clone(),
@@ -7679,5 +7751,165 @@ demo = { path = "." }
             .expect("overlapping `./pkg-a`/`pkg-a`/`pkg-a/` must dedup to one match");
         assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
         drop(tmp);
+    }
+
+    // ── §7.2 BLOCK-2 (issue #53 post-review): workspace-root non-table
+    //    silent-absence → hard rejection ─────────────────────────────
+    //
+    // Workspace-root keys that MUST be tables (`[workspace.dependencies]`,
+    // `[workspace.package]`, `[replace]`, `[profile]`, `[patch]`,
+    // `[patch.crates-io]`) previously fell through to "treat as absent"
+    // when the user declared them as a non-table value. That masks
+    // user error and proceeds against an incorrect model of the
+    // workspace. Each of these now rejects with a `TomlParse` error
+    // naming the offending key + workspace-root manifest path.
+
+    /// Helper: invoke `apply_workspace_member_inheritance` with a
+    /// synthetic workspace-root TOML and assert it rejects with
+    /// `TomlParse` whose message contains `expected_phrase`.
+    fn assert_inheritance_rejects(workspace_root_toml: &str, expected_phrase: &str) {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value =
+            toml::from_str(workspace_root_toml).expect("workspace-root TOML parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let member_manifest = PathBuf::from("/ws/m/Cargo.toml");
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, &member_manifest)
+            .expect_err("non-table workspace-root key must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(
+                    path,
+                    PathBuf::from("/ws/Cargo.toml"),
+                    "error must name the workspace-root manifest path"
+                );
+                assert!(
+                    message.contains(expected_phrase),
+                    "diagnostic must mention `{expected_phrase}`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `[workspace.dependencies] = "string"` (non-table) is rejected
+    /// with a `TomlParse` error naming the key.
+    #[test]
+    fn workspace_root_workspace_dependencies_non_table_is_rejected() {
+        assert_inheritance_rejects(
+            "[workspace]\nmembers = [\"m\"]\ndependencies = \"oops\"\n",
+            "`[workspace.dependencies]` must be a table",
+        );
+    }
+
+    /// `[workspace.package] = 42` (non-table) is rejected with a
+    /// `TomlParse` error naming the key.
+    #[test]
+    fn workspace_root_workspace_package_non_table_is_rejected() {
+        assert_inheritance_rejects(
+            "[workspace]\nmembers = [\"m\"]\npackage = 42\n",
+            "`[workspace.package]` must be a table",
+        );
+    }
+
+    /// `replace = ["oops"]` at top level (non-table) is rejected with a
+    /// `TomlParse` error. Note `replace` must be set BEFORE the
+    /// `[workspace]` header so it stays at top level — otherwise TOML
+    /// would scope it under `[workspace]`.
+    #[test]
+    fn workspace_root_replace_non_table_is_rejected() {
+        assert_inheritance_rejects(
+            "replace = [\"oops\"]\n[workspace]\nmembers = [\"m\"]\n",
+            "`[replace]` must be a table",
+        );
+    }
+
+    /// `profile = true` at top level (non-table) is rejected with a
+    /// `TomlParse` error. Like `replace`, must precede `[workspace]`
+    /// header to stay at top level.
+    #[test]
+    fn workspace_root_profile_non_table_is_rejected() {
+        assert_inheritance_rejects(
+            "profile = true\n[workspace]\nmembers = [\"m\"]\n",
+            "`[profile]` must be a table",
+        );
+    }
+
+    /// Workspace-root `patch = "oops"` (non-table) is rejected
+    /// during the workspace-member self-patch carry-down. Distinct
+    /// from the OVERLAY's `[patch]` non-table rejection (which is a
+    /// separate guard inside `apply_self_patch_policy`); the test
+    /// here exercises the WORKSPACE-ROOT shape via the carry-down
+    /// path. Like `replace` / `profile`, must precede `[workspace]`
+    /// header to stay at top level.
+    #[test]
+    fn workspace_root_patch_non_table_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        // Pre-populate `[package]` so the manifest looks like a member.
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value =
+            toml::from_str("patch = \"oops\"\n[workspace]\nmembers = [\"m\"]\n")
+                .expect("workspace-root TOML parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_self_patch_policy(
+            &mut top,
+            Some("m"),
+            Path::new("/ws/m"),
+            Path::new("/ws/m/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect_err("workspace-root `[patch]` non-table must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/Cargo.toml"));
+                assert!(
+                    message.contains("workspace-root `[patch]` must be a table"),
+                    "diagnostic must name workspace-root `[patch]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// Workspace-root `[patch] = { crates-io = "oops" }`
+    /// (non-table inner key) is rejected during the carry-down.
+    #[test]
+    fn workspace_root_patch_crates_io_non_table_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n\n[patch]\ncrates-io = \"oops\"\n")
+                .expect("workspace-root TOML parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_self_patch_policy(
+            &mut top,
+            Some("m"),
+            Path::new("/ws/m"),
+            Path::new("/ws/m/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect_err("workspace-root `[patch.crates-io]` non-table must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/Cargo.toml"));
+                assert!(
+                    message.contains("workspace-root `[patch.crates-io]` must be a table"),
+                    "diagnostic must name workspace-root `[patch.crates-io]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
     }
 }
