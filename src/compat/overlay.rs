@@ -581,9 +581,10 @@ pub fn materialize_overlay_with_metadata_and_workspace_member_context(
 /// 1. Suppresses Branches 2 + 3 of [`override_workspace_inheritance`]
 ///    (the implicit-ancestor + inheritance-ref REJECTs — the adopter
 ///    explicitly named the member via `--package`).
-/// 2. Carries the workspace root's `[workspace.*]`, `[patch.crates-io]`,
-///    `[replace]`, and `[profile.*]` tables down into the staged
-///    overlay (per plan §5.3 / §5.3.bis composition order).
+/// 2. Carries the workspace root's `[workspace.*]`, all
+///    `[patch.<registry>]` tables, `[replace]`, and `[profile.*]` tables
+///    down into the staged overlay (per plan §5.3 / §5.3.bis composition
+///    order).
 ///
 /// When `workspace_member_ctx` is `None`, behavior is identical to
 /// pre-#53 single-root materialization — the byte-determinism corpus
@@ -592,7 +593,7 @@ pub fn materialize_overlay_with_metadata_and_workspace_member_context(
 /// **Errors.** Same shape as [`materialize_overlay`], plus resolver-
 /// specific errors propagated from
 /// [`apply_workspace_member_inheritance`] (the member-local
-/// `[patch.crates-io]` REJECT per §5.3.bis Step 2).
+/// `[patch.<registry>]` REJECT for all registries per §5.3.bis Step 2).
 pub fn materialize_overlay_with_workspace_member_context<F>(
     upstream_manifest_path: &Path,
     builder: F,
@@ -755,13 +756,14 @@ where
         //
         // Issue #53 — apply workspace-member inheritance carry-down
         // BEFORE `apply_self_patch_policy`. The carry-down (a) rejects
-        // member-local `[patch.crates-io]` per §5.3.bis Step 2 and (b)
-        // copies the workspace root's `[workspace.*]`, `[replace]`,
-        // `[profile.*]` tables into `top`. `apply_self_patch_policy`
-        // then receives the workspace-root `[patch.crates-io]` table
-        // via the `workspace_member_ctx` parameter and runs the 4-rule
-        // dispatch on the merged effective table (per §5.3.bis Step 3
-        // composition order: root-first, member-second).
+        // all member-local `[patch.<registry>]` tables per §5.3.bis
+        // Step 2 and (b) copies the workspace root's `[workspace.*]`,
+        // `[replace]`, `[profile.*]` tables into `top`.
+        // `apply_self_patch_policy` then receives the workspace-root
+        // `[patch.crates-io]` table via the `workspace_member_ctx`
+        // parameter and runs the 4-rule dispatch on the merged effective
+        // table (per §5.3.bis Step 3 composition order: root-first,
+        // member-second).
         if let Some(ctx) = workspace_member_ctx {
             apply_workspace_member_inheritance(top, ctx, upstream_manifest_path)?;
         }
@@ -1488,9 +1490,9 @@ fn manifest_has_inheritance_reference(
 /// workspace-root / unparseable-member-manifest / workspace-root-not-
 /// a-workspace-root / `**`-deep-glob / absolute-path member /
 /// parent-traversal member / glob-in-non-final-segment / member-local
-/// `[patch.crates-io]` (the last is enforced inside the materializer's
-/// self-patch policy, not here — the resolver does not read the
-/// member's `[patch]` table).
+/// `[patch.<registry>]` for any registry (the last is enforced inside
+/// the materializer's self-patch policy, not here — the resolver does
+/// not read the member's `[patch]` table).
 ///
 /// `Err(Error::Io)` on filesystem failures (workspace-root read
 /// failure; permissions errors on a candidate's `Cargo.toml`).
@@ -1964,12 +1966,12 @@ fn expand_workspace_member_entry(
 /// `default-members`) are NOT carried — they are stripped by
 /// [`override_workspace_inheritance`] Branch 4 in any case.
 ///
-/// # Member-local `[patch.crates-io]` rejection
+/// # Member-local `[patch.<registry>]` rejection (all registries)
 ///
-/// Per §5.3.bis Step 2, a workspace MEMBER manifest declaring
-/// `[patch.crates-io]` is rejected with a directed diagnostic. Cargo
-/// itself errors on member-level `[patch]`; we match by surfacing the
-/// error here before any merge.
+/// Per §5.3.bis Step 2, a workspace MEMBER manifest declaring any
+/// `[patch.<registry>]` table is rejected with a directed diagnostic.
+/// Cargo itself errors on member-level `[patch]`; we match by surfacing
+/// the error here before any merge.
 fn apply_workspace_member_inheritance(
     top: &mut toml::map::Map<String, toml::Value>,
     ctx: &WorkspaceMemberContext,
@@ -8521,10 +8523,15 @@ demo = { path = "." }
         }
     }
 
-    /// Member-local manifest with BOTH `[patch.crates-io]` and
-    /// `[patch.vendored]` is rejected. The error identifies whichever
-    /// registry is encountered first during the iteration (both are
-    /// forbidden; the rejection stops at the first non-empty table).
+    /// Member-local manifest with TWO non-crates-io registries
+    /// (`[patch.my-vendor-a]` + `[patch.my-vendor-b]`) is rejected.
+    /// Neither registry is `crates-io`, which rules out a false-pass
+    /// via the pre-existing crates-io rejection path alone.
+    ///
+    /// `toml::map::Map` is `BTreeMap`-backed, so keys are iterated
+    /// alphabetically. `my-vendor-a` sorts before `my-vendor-b`, so the
+    /// rejection is triggered on `my-vendor-a` first — proving the
+    /// all-registry guard fires on non-crates-io keys.
     #[test]
     fn member_local_multi_registry_patch_rejection_includes_all() {
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
@@ -8532,18 +8539,18 @@ demo = { path = "." }
         pkg.insert("name".to_string(), toml::Value::String("m".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
         let mut patch_table = toml::map::Map::new();
-        // crates-io entry
-        let mut crates_io = toml::map::Map::new();
-        let mut ci_entry = toml::map::Map::new();
-        ci_entry.insert("path".to_string(), toml::Value::String("./ci-local".into()));
-        crates_io.insert("some-dep".to_string(), toml::Value::Table(ci_entry));
-        patch_table.insert("crates-io".to_string(), toml::Value::Table(crates_io));
-        // vendored registry entry
-        let mut vendored = toml::map::Map::new();
-        let mut v_entry = toml::map::Map::new();
-        v_entry.insert("path".to_string(), toml::Value::String("./vendored".into()));
-        vendored.insert("other-crate".to_string(), toml::Value::Table(v_entry));
-        patch_table.insert("vendored".to_string(), toml::Value::Table(vendored));
+        // First non-crates-io vendor registry.
+        let mut vendor_a = toml::map::Map::new();
+        let mut va_entry = toml::map::Map::new();
+        va_entry.insert("path".to_string(), toml::Value::String("./vendor-a".into()));
+        vendor_a.insert("some-crate".to_string(), toml::Value::Table(va_entry));
+        patch_table.insert("my-vendor-a".to_string(), toml::Value::Table(vendor_a));
+        // Second non-crates-io vendor registry.
+        let mut vendor_b = toml::map::Map::new();
+        let mut vb_entry = toml::map::Map::new();
+        vb_entry.insert("path".to_string(), toml::Value::String("./vendor-b".into()));
+        vendor_b.insert("other-crate".to_string(), toml::Value::Table(vb_entry));
+        patch_table.insert("my-vendor-b".to_string(), toml::Value::Table(vendor_b));
         top.insert("patch".to_string(), toml::Value::Table(patch_table));
         let ws_value: toml::Value =
             toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
@@ -8553,15 +8560,18 @@ demo = { path = "." }
         };
         let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
             .expect_err("member-local multi-registry `[patch]` must be rejected");
-        // Either registry rejection is valid. `toml::map::Map` preserves
-        // insertion order, so "crates-io" is encountered first in this
-        // fixture. The important invariant is that SOME registry triggers
-        // the Cli rejection — both are forbidden.
+        // BTreeMap iteration: "my-vendor-a" < "my-vendor-b" alphabetically,
+        // so the rejection fires on my-vendor-a. The diagnostic must name
+        // the rejection rationale and the offending registry key.
         match err {
             Error::Cli { message, .. } => {
                 assert!(
                     message.contains("cargo does not permit `[patch]` in workspace members"),
                     "diagnostic must name the rejection rationale: {message}"
+                );
+                assert!(
+                    message.contains("my-vendor-a"),
+                    "diagnostic must name the first offending registry key: {message}"
                 );
             }
             other => panic!("expected Cli error, got {other:?}"),
