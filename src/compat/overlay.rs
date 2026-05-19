@@ -6713,11 +6713,9 @@ demo = { path = "." }
         );
 
         // CASE 12: mixed partial state. Run mirror once more; the
-        // newly-canonical symlinks for src/include/build must skip
-        // (CASE 2). Capture inode identity to prove no recreation.
-        let src_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
-            .unwrap()
-            .ino();
+        // newly-canonical symlinks for include/build must skip (CASE 2)
+        // — proved by inode identity. The reintroduced wrong-target src/
+        // must be reconciled (CASE 3) — proved by read_link target.
         let inc_ino_before = std::fs::symlink_metadata(staged_overlay_dir.join("include"))
             .unwrap()
             .ino();
@@ -6751,12 +6749,12 @@ demo = { path = "." }
             build_ino_before, build_ino_after,
             "CASE 12: canonical build/ symlink must be skipped under mixed-state rerun"
         );
-        let src_ino_after = std::fs::symlink_metadata(staged_overlay_dir.join("src"))
-            .unwrap()
-            .ino();
-        assert_ne!(
-            src_ino_before, src_ino_after,
-            "CASE 12: reintroduced wrong-target src/ must be re-created (CASE 3 reconcile)"
+        let src_target =
+            std::fs::read_link(staged_overlay_dir.join("src")).expect("readlink src after rerun");
+        assert_eq!(
+            src_target,
+            upstream_dir.join("src"),
+            "CASE 12: reintroduced wrong-target src/ must be re-created with correct target (CASE 3 reconcile)"
         );
         drop(tmp);
     }
