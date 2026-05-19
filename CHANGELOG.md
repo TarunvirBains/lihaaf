@@ -6,6 +6,106 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.10] — 2026-05-19
+
+Delivers the `extra_substitutions` adopter-configuration framework (issue #45,
+PR #68) with disjoint path-shape and banner-shape allowlists. The plan went
+through 6 rounds of strict-swe Opus PLANNER + Codex 5.5 xhigh adversarial
+review (3 adversarial cycles + 3 DOC cleanup rounds). The PR went through
+Codex final-review BLOCK→FIX→ALLOW iteration: round-1 ALLOW with one
+FIX_BEFORE_BETA (serde `Deserialize` bypass surface); round-2 BLOCK on
+validation-ordering drift between TOML and serde paths; round-3 ALLOW.
+
+### Added
+
+- **`extra_substitutions` config key** (#45, PR #68): list of
+  `{ from, to }` literal-substring substitutions applied per-line during
+  snapshot normalization, AFTER built-in path placeholders and BEFORE
+  TypeId collapse. Adopters supply environment-specific path mappings
+  (NixOS store paths, vendored toolchains, Bazel sandboxes) without
+  forking lihaaf's normalizer defaults. `from` is gated by `is_path_like`;
+  `to` is constrained only by no-newline. Substitutions apply
+  left-to-right in declared order; earlier rules can feed later rules.
+
+- **`strip_lines` and `strip_line_prefixes` config keys** (#45, PR #68):
+  per-line drop matching with exact-equality and prefix semantics
+  respectively. Operate at line granularity (whole-line drop), distinct
+  from `extra_substitutions`'s substring-replacement semantics. Both
+  keys gate via the disjunction `is_path_like || is_banner_shape`, so
+  adopters can drop either path-noise (NixOS / vendored / sandbox
+  paths) OR banner lines (rustc explain footers, macro-origin trailers,
+  error-count summaries, CI deprecation banners, vendored-toolchain
+  version banners).
+
+- **`is_path_like` allowlist predicate**: validates
+  `extra_substitutions.from`. Requires `/`, `\`, or full-string match
+  of `^\$[A-Z][A-Za-z0-9_]*$` (uppercase-anchored bare placeholder).
+  Leading-`$` guard rejects `$lowercase/path`, `$1/path`, and similar
+  bypass attempts via the `/` branch. Rule 4(c) is full-string anchored
+  to reject `$DIR-`, `$DIR.`, `$A!` style trailing-junk patterns.
+  Interior `$lowercase` within paths (e.g., `/path/$nix/sub`) is
+  accepted as path text per the OQ-B leading-only clarification.
+
+- **`is_banner_shape` allowlist predicate**: validates strip patterns
+  via disjunction with `is_path_like`. Three-layer hybrid: (A) shared
+  preconditions — len ≥ 20, no `\n`, no leading whitespace, no leading
+  `^`/`=`/`|`; (B) 11-entry anti-prefix REJECT list (`expected `,
+  `found `, `the trait `, `the type `, `cannot find `, `mismatched types`,
+  `consider `, `help: `, `warning: `, `error[`, `  `); (C) disjunction
+  of either (C.1) one of 5 enumerated rustc/tool banner prefixes
+  (`For more information about this error`, `error: aborting due to `,
+  `note: this error originates from `, `info: `, `linker version: `)
+  OR (C.2) structural banner shape — len ≥ 40, ASCII uppercase first
+  byte, contains space, contains at least one deprecation marker
+  (`deprecated`, `deprecation`, `Please update`, `actions to use`,
+  `EOL`, `end-of-life`).
+
+- **Per-suite REPLACE semantics**: all three new keys live on `Suite`
+  (not `Config`). Omission on a named suite resolves to empty `[]`
+  (REPLACE, no inheritance from default suite). Mirrors the `features`
+  precedent.
+
+- **Serde `Deserialize` validation closure**: `Substitution` deserializes
+  via `#[serde(try_from = "RawSubstitution")]`; strip keys deserialize
+  via `StripPattern` newtype with `#[serde(try_from = "String")]`.
+  Closes the public-API bypass route surfaced by Codex final review
+  (the CLI TOML path was already safe via `validate_extra_substitutions`).
+  Validation order across both paths now matches: `from` presence →
+  `to` presence → `from` shape → newline-in-`to`.
+
+- **Spec amendments** to `docs/spec/lihaaf-v0.1.md`: §3.2 (schema), §3.4
+  (validation rules), §3.6 (per-suite inheritance non-list), §6.2
+  (adopter extras bullet), §6.5 (determinism tuple), and new §6.6
+  (~120 lines covering adopter-facing predicate contracts, per-suite
+  REPLACE semantics, structural-banner-shape framing, compat-mode
+  unsupported status, full-string-anchor convention for bare
+  placeholders, interior `$lowercase` acceptance clarification).
+
+### Notes
+
+- **Compat mode for v0.1.0-beta.10:** the three new keys are documented
+  as *unsupported in compat mode*. Adopter manifests using them with
+  `cargo lihaaf --compat ...` are silently no-op'd at the overlay
+  layer; this is the documented v0.1.0 contract, not an implementation
+  gap. Compat-mode support is a v0.2 deliverable.
+
+- **76 new tests** added (444 → 451 lib tests since beta.9; 76 new
+  reflects the full plan §7 surface plus 6 round-1-fixup regression
+  tests plus 1 ordering-parity test). Coverage includes: predicate
+  matrices (8 acceptance + 11+ rejection classes for `is_path_like`;
+  banner-shape acceptance + structural-banner non-CI + round-2 BLOCK
+  regression guards for `is_banner_shape`); field-level wiring through
+  both validators; composition + interaction with built-in placeholders,
+  TypeId collapse, and compat short-CARGO; serde-bypass closure tests
+  for `Substitution` + both strip keys; TOML/serde ordering-parity
+  test for multiply-malformed inputs.
+
+- **No predicate or default behavior change** for adopters who do not
+  set any of the three new keys. Byte-identical normalizer output vs
+  beta.9 in the absence of configuration. The 13 existing normalizer
+  unit tests at `src/normalize.rs:493-840` and every in-tree fixture
+  snapshot pass unchanged.
+
 ## [0.1.0-beta.9] — 2026-05-18
 
 Delivers workspace-member entry via `--package` / `-p` flag (issue #53, PR #61),
