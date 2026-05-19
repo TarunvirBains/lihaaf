@@ -67,6 +67,11 @@ on:
         required: false
         type: string
         default: '0.1.0-beta.4'
+      package:
+        description: 'Optional --package flag for workspace-member entry (e.g. axum-macros for the axum monorepo). Empty = lihaaf treats root manifest as the entry, which is correct for single-crate forks.'
+        required: false
+        type: string
+        default: ''
     outputs:
       crate_name:
         description: 'Crate name parsed from the envelope (upstream `[package].name`)'
@@ -194,22 +199,46 @@ jobs:
         # SHA into the envelope's `commit` field; stage-3 PR reviewers
         # need that to reproduce.
         #
+        # Workspace-member entry: when `package` input is non-empty,
+        # `--package "$PACKAGE"` is appended via a bash array (cleaner
+        # than `eval`, no quoting traps). PACKAGE is validated against
+        # the Cargo crate-name grammar (`^[a-zA-Z0-9_-]+$`) before use;
+        # any other shape is rejected as a defense-in-depth measure
+        # even though `package` is operator-supplied. Empty PACKAGE is
+        # the documented default — lihaaf then treats the root
+        # manifest as the entry (correct for single-crate forks).
+        #
         # We intentionally OMIT `set -e` in the run block: the
         # `continue-on-error: true` directive above is the
         # error-handling primitive, and we want any non-zero cargo
         # exit to reach the next `if: always()` step. `set -uo
         # pipefail` retains the safety-belts that do not abort on
-        # non-zero exit.
+        # non-zero exit. The PACKAGE-validation guard exits 1
+        # explicitly on a regex miss so cargo never sees a malformed
+        # value.
         continue-on-error: true
         env:
           FORK_SHA: ${{ steps.checkout.outputs.commit }}
+          PACKAGE: ${{ inputs.package }}
         run: |
           set -uo pipefail
           mkdir -p target/lihaaf-compat
-          cargo lihaaf --compat \
-            --compat-root . \
-            --compat-report target/lihaaf-compat/compat-report.json \
+          ARGS=(
+            lihaaf
+            --compat
+            --compat-root .
+            --compat-report target/lihaaf-compat/compat-report.json
             --compat-commit "$FORK_SHA"
+          )
+          if [ -n "$PACKAGE" ]; then
+            PACKAGE_RE='^[a-zA-Z0-9_-]+$'
+            if [[ ! "$PACKAGE" =~ $PACKAGE_RE ]]; then
+              echo "::error::Invalid package (must match Cargo crate-name grammar [a-zA-Z0-9_-]+): $PACKAGE"
+              exit 1
+            fi
+            ARGS+=(--package "$PACKAGE")
+          fi
+          cargo "${ARGS[@]}"
 
       - name: Parse §3.3 envelope
         id: parse
@@ -330,6 +359,7 @@ jobs:
           FORK_REF: ${{ inputs.fork_ref }}
           FORK_SHA: ${{ steps.checkout.outputs.commit }}
           LIHAAF_VERSION: ${{ inputs.lihaaf_version }}
+          PACKAGE: ${{ inputs.package }}
           CRATE_NAME: ${{ steps.parse.outputs.crate_name }}
           MISMATCH_COUNT: ${{ steps.parse.outputs.mismatch_count }}
           BASELINE_EXIT: ${{ steps.parse.outputs.baseline_exit_code }}
@@ -346,6 +376,9 @@ jobs:
             echo "| fork ref | \`$FORK_REF\` |"
             echo "| fork SHA | \`$FORK_SHA\` |"
             echo "| lihaaf version | \`$LIHAAF_VERSION\` |"
+            if [ -n "$PACKAGE" ]; then
+              echo "| package | \`$PACKAGE\` |"
+            fi
             echo "| crate_name | \`$CRATE_NAME\` |"
             echo "| mismatch_count | \`$MISMATCH_COUNT\` |"
             echo "| baseline.exit_code | \`$BASELINE_EXIT\` |"
