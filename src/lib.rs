@@ -116,6 +116,18 @@ pub use compat::run as run_compat;
 #[doc(hidden)]
 pub use compat::overlay::materialize_overlay as compat_overlay_materialize;
 
+// Issue #53 — re-export the workspace-member-context-aware materializer
+// + the resolver result types so `tests/compat/overlay_determinism.rs`
+// can exercise the `workspace_member_with_package` corpus fixture. The
+// stability contract is the same: NOT part of any v0.1 surface; the
+// supported entry to compat mode is `cargo lihaaf --compat`.
+#[doc(hidden)]
+pub use compat::overlay::WorkspaceMemberContext as CompatWorkspaceMemberContext;
+#[doc(hidden)]
+pub use compat::overlay::materialize_overlay_with_metadata_and_workspace_member_context as compat_overlay_materialize_with_metadata_and_workspace_member_context;
+#[doc(hidden)]
+pub use compat::overlay::resolve_workspace_member_manifest as compat_resolve_workspace_member_manifest;
+
 // Compat-mode baseline runner (GH #8). Re-exported for the same
 // reason as the overlay above — `tests/compat/argv_baseline_no_shell.rs`
 // lives in a separate test crate and reaches the baseline module

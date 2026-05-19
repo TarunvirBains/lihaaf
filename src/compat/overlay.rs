@@ -302,25 +302,30 @@ pub(crate) struct DualRoot {
 }
 
 /// Carry-down context for the workspace-member entry shape (issue #53 —
-/// see plan §5.4). When `DualRoot.workspace_member_context.is_some()`,
-/// the overlay materializer uses this struct to (a) skip the
-/// implicit-ancestor REJECT branches of
-/// [`override_workspace_inheritance`] and (b) carry the workspace
-/// root's `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and
-/// `[profile.*]` tables down into the staged overlay per §5.3 / §5.3.bis.
+/// see plan §5.4). When the materializer is invoked with a populated
+/// `WorkspaceMemberContext`, it (a) skips the implicit-ancestor REJECT
+/// branches of the workspace-inheritance override and (b) carries the
+/// workspace root's `[workspace.*]`, `[patch.crates-io]`, `[replace]`,
+/// and `[profile.*]` tables down into the staged overlay per §5.3 /
+/// §5.3.bis.
 ///
 /// `workspace_root_value` is the parsed workspace-root TOML, captured
 /// once by [`resolve_workspace_member_manifest`] so the materializer
 /// does not re-parse the file.
 #[derive(Debug, Clone)]
-pub(crate) struct WorkspaceMemberContext {
+pub struct WorkspaceMemberContext {
     /// Path to the workspace-root `Cargo.toml` (informational; also
     /// used in diagnostics).
-    pub(crate) workspace_root_manifest: PathBuf,
+    ///
+    /// `pub` (matching the struct) so the test crate can construct
+    /// the context for the `workspace_member_with_package` corpus
+    /// fixture. The supported entry to compat mode is `cargo lihaaf
+    /// --compat`; adopters should not construct this struct directly.
+    pub workspace_root_manifest: PathBuf,
     /// Parsed workspace-root TOML value. The carry-down reads
     /// `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and
     /// `[profile.*]` from this value.
-    pub(crate) workspace_root_value: toml::Value,
+    pub workspace_root_value: toml::Value,
 }
 
 /// One materialized overlay run. Constructed by [`materialize_overlay`]
@@ -501,13 +506,30 @@ pub fn materialize_overlay_with_metadata(
     upstream_manifest_path: &Path,
     synthetic_metadata: Option<&SyntheticMetadata>,
 ) -> Result<OverlayPlan, Error> {
-    // Bridge to the builder-shaped entry: the builder ignores the
-    // upstream name and returns the caller's pre-constructed metadata
-    // (cloned because the builder owns the returned value).
+    materialize_overlay_with_metadata_and_workspace_member_context(
+        upstream_manifest_path,
+        synthetic_metadata,
+        None,
+    )
+}
+
+/// Variant of `materialize_overlay_with_metadata` that ALSO accepts
+/// an optional [`WorkspaceMemberContext`] (issue #53). Used by the
+/// byte-determinism corpus test for the `workspace_member_with_package`
+/// fixture, which exercises the carry-down without injecting synthetic
+/// metadata (the corpus expected files are pre-committed and would
+/// drift if metadata were injected). For compat-driver runs, use the
+/// crate-private builder variant which constructs the metadata via a
+/// closure given the upstream crate name.
+pub fn materialize_overlay_with_metadata_and_workspace_member_context(
+    upstream_manifest_path: &Path,
+    synthetic_metadata: Option<&SyntheticMetadata>,
+    workspace_member_ctx: Option<&WorkspaceMemberContext>,
+) -> Result<OverlayPlan, Error> {
     materialize_overlay_inner(
         upstream_manifest_path,
         |_name| synthetic_metadata.cloned(),
-        None,
+        workspace_member_ctx,
     )
 }
 
@@ -540,7 +562,7 @@ pub fn materialize_overlay_with_metadata(
 /// specific errors propagated from
 /// [`apply_workspace_member_inheritance`] (the member-local
 /// `[patch.crates-io]` REJECT per §5.3.bis Step 2).
-pub(crate) fn materialize_overlay_with_workspace_member_context<F>(
+pub fn materialize_overlay_with_workspace_member_context<F>(
     upstream_manifest_path: &Path,
     builder: F,
     workspace_member_ctx: Option<&WorkspaceMemberContext>,
@@ -1335,20 +1357,19 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
 /// `[workspace.exclude]`, reads each candidate member's `Cargo.toml`,
 /// and returns the path of the manifest whose `[package].name ==
 /// package_name`, together with the parsed workspace-root TOML value
-/// (so the materializer's [`apply_workspace_member_inheritance`] carry-
-/// down does not re-parse the file).
+/// (so the materializer's carry-down does not re-parse the file).
 ///
 /// # Algorithm (plan §4.3)
 ///
 /// 1. Read + parse `workspace_root_manifest`. I/O / TOML errors map
-///    to [`Error::Io`] / [`Error::TomlParse`].
-/// 2. Verify the manifest is a workspace root (the [`is_workspace_root_manifest`]
-///    predicate: declares `[workspace]` AND does NOT declare
-///    `[package]`). Other shapes — single-crate (`[package]` only),
-///    workspace-member (no local `[workspace]`), package+workspace
-///    (both `[package]` AND `[workspace]`) — REJECT with a directed
-///    diagnostic per §4.3 step 2 / step 2.5. The package+workspace
-///    shape is out of scope for v0.1.0 (see plan §1 / §11.11).
+///    to `Error::Io` / `Error::TomlParse`.
+/// 2. Verify the manifest is a workspace root (declares `[workspace]`
+///    AND does NOT declare `[package]`). Other shapes — single-crate
+///    (`[package]` only), workspace-member (no local `[workspace]`),
+///    package+workspace (both `[package]` AND `[workspace]`) — REJECT
+///    with a directed diagnostic per §4.3 step 2 / step 2.5. The
+///    package+workspace shape is out of scope for v0.1.0 (see plan
+///    §1 / §11.11).
 /// 3. Read `[workspace.members]` (REJECT if absent / non-array).
 /// 4. Read `[workspace.exclude]` (optional); each entry is parsed by
 ///    the same string-or-glob rules as step 5 and subtracted from the
@@ -1386,24 +1407,25 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
 ///
 /// `Ok((member_manifest_path, workspace_root_value))` on a single
 /// unambiguous match. The caller wraps this into a
-/// [`WorkspaceMemberContext`] inside a [`DualRoot`].
+/// [`WorkspaceMemberContext`] inside a `DualRoot` (the internal
+/// dual-root vocabulary struct).
 ///
 /// `Err(Error::Cli)` on no-match / multiple-match / unparseable-
 /// workspace-root / unparseable-member-manifest / workspace-root-not-
 /// a-workspace-root / `**`-deep-glob / absolute-path member /
 /// parent-traversal member / glob-in-non-final-segment / member-local
 /// `[patch.crates-io]` (the last is enforced inside the materializer's
-/// [`apply_self_patch_policy`], not here — the resolver does not read
-/// the member's `[patch]` table).
+/// self-patch policy, not here — the resolver does not read the
+/// member's `[patch]` table).
 ///
 /// `Err(Error::Io)` on filesystem failures (workspace-root read
 /// failure; permissions errors on a candidate's `Cargo.toml`).
 ///
 /// `Err(Error::TomlParse)` on TOML parse failures of the workspace-
 /// root manifest. Per-candidate parse failures are logged via the
-/// non-fatal `eprintln!` path (mirroring [`detect_implicit_ancestor_workspace`])
-/// and the candidate is skipped as a non-match.
-pub(crate) fn resolve_workspace_member_manifest(
+/// non-fatal `eprintln!` path and the candidate is skipped as a
+/// non-match.
+pub fn resolve_workspace_member_manifest(
     workspace_root_manifest: &Path,
     package_name: &str,
 ) -> Result<(PathBuf, toml::Value), Error> {

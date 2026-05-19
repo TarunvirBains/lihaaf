@@ -95,7 +95,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use lihaaf::CompatWorkspaceMemberContext as WorkspaceMemberContext;
 use lihaaf::compat_overlay_materialize as materialize_overlay;
+use lihaaf::compat_overlay_materialize_with_metadata_and_workspace_member_context as materialize_overlay_with_metadata_and_ctx;
 
 /// Helper: drop an input `Cargo.toml` in a fresh tempdir and return
 /// the directory handle plus the path to the new manifest.
@@ -278,8 +280,12 @@ fn workspace_root_manifest_is_rejected_with_directed_diagnostic() {
     // `[workspace]` without `[package]` is a workspace root — cargo
     // cannot build it as a library and the lihaaf stage-3 dylib pass
     // would fail with an opaque error. Phase 2 overlay rejects this
-    // upfront with a directed diagnostic pointing the adopter at a
-    // member crate's Cargo.toml.
+    // upfront with a directed diagnostic.
+    //
+    // Issue #53 augments the diagnostic to recommend `--package
+    // <pkg>` as the actionable workspace-member entry shape, so the
+    // assertions below check for the augmented text shape ("workspace
+    // member" + "--package").
     let input = r#"[workspace]
 members = ["crate-a", "crate-b"]
 "#;
@@ -299,9 +305,17 @@ members = ["crate-a", "crate-b"]
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
+            // Issue #53 — diagnostic now recommends `--package` so
+            // the adopter has an actionable workspace-member entry
+            // shape. The legacy "member crate" wording is replaced
+            // with "workspace member" + "--package".
             assert!(
-                message.contains("member crate"),
-                "diagnostic must direct adopter to a member crate; got: {message}"
+                message.contains("--package"),
+                "diagnostic must recommend `--package` per #53; got: {message}"
+            );
+            assert!(
+                message.contains("workspace member") || message.contains("Cargo.toml"),
+                "diagnostic must direct the adopter; got: {message}"
             );
         }
         other => panic!("expected Error::Cli, got {other:?}"),
@@ -343,9 +357,12 @@ edition = "2021"
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
+            // Issue #53 — diagnostic now recommends `--package`
+            // (see workspace_root_manifest_is_rejected_with_directed_diagnostic
+            // above for the rationale).
             assert!(
-                message.contains("member crate"),
-                "diagnostic must direct adopter to a member crate; got: {message}"
+                message.contains("--package"),
+                "diagnostic must recommend `--package` per #53; got: {message}"
             );
         }
         other => panic!("expected Error::Cli, got {other:?}"),
@@ -471,6 +488,15 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         // distinction is in the INPUT.
         "with_self_patch_injected",
         "with_self_patch_remapped",
+        // Issue #53 — workspace-member entry via `--package`. The
+        // fixture exercises the workspace-root carry-down +
+        // `apply_workspace_member_inheritance` + Option H Rule 1
+        // INJECT on a member-shaped input (`{ workspace = true }`
+        // inheritance refs, no `[workspace]` of its own). The
+        // corpus-iteration loop runs a special path for this name
+        // (synthesizes a workspace root + ctx alongside the member
+        // input) — see the per-fixture conditional below.
+        "workspace_member_with_package",
     ];
     let mut checked = 0usize;
     for name in &names {
@@ -481,19 +507,79 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         let expected_template = std::fs::read_to_string(&expected_path)
             .unwrap_or_else(|e| panic!("reading corpus expected {expected_path:?}: {e}"));
 
-        let (_tmp, upstream) = write_upstream(&input);
-        let plan = materialize_overlay(&upstream).expect("overlay must succeed");
-        let actual = read_overlay(&plan.sibling_manifest);
+        // Issue #53 — the workspace-member fixture requires a
+        // synthesized workspace-root context. The `--package`
+        // resolver's natural shape is `<ws-root>/Cargo.toml` carrying
+        // `[workspace.*]` carry-down tables + `<ws-root>/<member>/Cargo.toml`
+        // as the input. We materialize with
+        // `materialize_overlay_with_metadata_and_workspace_member_context`,
+        // passing a populated `WorkspaceMemberContext` so the
+        // carry-down + Option H apply. The tempdir owner is bound
+        // OUTSIDE the if-branch so it lives until the assertion below
+        // (mem::forget would leak; an early drop would invalidate
+        // file references inside the overlay during assert_eq).
+        let mut _wm_tmp: Option<tempfile::TempDir> = None;
+        let (actual, upstream_dir) = if *name == "workspace_member_with_package" {
+            let tmp = tempfile::tempdir().expect("tempdir for workspace_member fixture");
+            std::fs::create_dir(tmp.path().join("mem")).expect("create member subdir");
+            let ws_root_text = r#"[workspace]
+members = ["mem"]
+
+[workspace.package]
+edition = "2021"
+
+[workspace.dependencies]
+serde = "1.0"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+"#;
+            let ws_root_manifest = tmp.path().join("Cargo.toml");
+            std::fs::write(&ws_root_manifest, ws_root_text).expect("write workspace-root manifest");
+            let member_manifest = tmp.path().join("mem").join("Cargo.toml");
+            std::fs::write(&member_manifest, &input).expect("write member manifest");
+            let ws_root_value: toml::Value =
+                toml::from_str(ws_root_text).expect("workspace-root TOML parses");
+            let ctx = WorkspaceMemberContext {
+                workspace_root_manifest: ws_root_manifest.clone(),
+                workspace_root_value: ws_root_value,
+            };
+            let plan =
+                materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+                    .expect("workspace-member overlay must succeed");
+            let actual = read_overlay(&plan.sibling_manifest);
+            // The overlay's `[lib].path` and Rule-1-INJECTed
+            // self-patch path are anchored against the MEMBER root
+            // (per §3.1.bis routing table — overlay materialization
+            // anchors on `member_root`), so the `__UPSTREAM_DIR__`
+            // placeholder substitutes for the member dir.
+            let member_dir = member_manifest
+                .parent()
+                .expect("member manifest has parent")
+                .to_string_lossy()
+                .replace('\\', "/");
+            _wm_tmp = Some(tmp);
+            (actual, member_dir)
+        } else {
+            let (_tmp, upstream) = write_upstream(&input);
+            let plan = materialize_overlay(&upstream).expect("overlay must succeed");
+            let actual = read_overlay(&plan.sibling_manifest);
+            let upstream_dir = upstream
+                .parent()
+                .expect("upstream manifest has a parent dir")
+                .to_string_lossy()
+                .replace('\\', "/");
+            // For the non-workspace-member fixtures, `_tmp` was bound
+            // inside `write_upstream` and went out of scope already
+            // (the original test code accepts that — the overlay
+            // bytes were captured above by `read_overlay`).
+            (actual, upstream_dir)
+        };
 
         // Substitute the `__UPSTREAM_DIR__` placeholder in the expected
         // template with the real tempdir (forward-slash form, matching
         // the overlay code's `to_forward_slash` call). The placeholder
         // is a fixed-string substitution — no regex, per spec §6.1.
-        let upstream_dir = upstream
-            .parent()
-            .expect("upstream manifest has a parent dir")
-            .to_string_lossy()
-            .replace('\\', "/");
         let expected = expected_template.replace("__UPSTREAM_DIR__", &upstream_dir);
 
         assert_eq!(
@@ -507,10 +593,10 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         checked += 1;
     }
     assert_eq!(
-        checked, 8,
-        "corpus must include all 8 representative fixtures \
-         (6 existing + 2 new for the issue #40/#47 Option H \
-         Rule 1 INJECT and Rule 2 REMAP policy)"
+        checked, 9,
+        "corpus must include all 9 representative fixtures \
+         (6 baseline + 2 issue #40/#47 Option H + 1 issue #53 \
+         workspace-member-with-package)"
     );
 }
 
