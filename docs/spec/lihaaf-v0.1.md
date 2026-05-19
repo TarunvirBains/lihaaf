@@ -1257,6 +1257,52 @@ headroom should raise `per_fixture_memory_mb`, which lifts the cap.
 Force a fresh dylib build, ignoring any existing manifest. Equivalent
 to deleting `target/lihaaf/manifest.json` before invocation.
 
+#### `-p <package>`, `--package <package>` (compat mode only)
+
+Workspace-member package selector. When `--compat` is set and
+`--compat-root` points at a workspace ROOT manifest (declares
+`[workspace]` without `[package]`), `--package <pkg>` resolves the
+upstream manifest to the workspace member whose `[package].name`
+equals `<pkg>`. The member is located by expanding the
+`[workspace.members]` array against the workspace-root directory and
+matching candidate manifests by their declared package name (cargo's
+`[package].name` is not workspace-inheritable, so the match is on the
+member's own field).
+
+The workspace's `[workspace.dependencies]`, `[workspace.package]`,
+`[workspace.lints]`, `[workspace.metadata]`, `[workspace.resolver]`,
+`[patch.crates-io]`, `[replace]`, and `[profile.*]` tables are carried
+down into the staged overlay so the member's
+`{ workspace = true }` references and patch resolution match baseline
+cargo's behavior at the workspace-root level.
+
+Required when `--compat-root` points at a workspace root; rejected
+otherwise (the resolver verifies the shape and surfaces a directed
+diagnostic). Mutually exclusive with `--compat-manifest` (which
+supplies an explicit manifest path, bypassing the resolver). Mirrors
+cargo's `-p` convention; multi-valued is rejected at parse time
+(single package per invocation).
+
+**v0.1.0 scope.** Only virtual workspaces are supported (workspace
+root declares `[workspace]` WITHOUT `[package]`). The package+workspace
+shape (root declares both `[package]` and `[workspace]`, treating the
+root as both a workspace coordinator AND a publishable package) is
+left to v0.2 / v1.0; the resolver REJECTs that shape with a directed
+diagnostic.
+
+Example invocation for axum-macros:
+
+```bash
+cargo lihaaf --compat \
+  --compat-root /path/to/tokio-rs/axum \
+  --package axum-macros \
+  --compat-report /tmp/report.json
+```
+
+The baseline runner argv must also include `-p <pkg>` so cargo runs
+only the target member's tests; pass it via
+`--compat-cargo-test-argv '["cargo","test","-p","axum-macros"]'`.
+
 #### `--manifest-path <path>`
 
 Override the consumer `Cargo.toml` location. Default is cargo's

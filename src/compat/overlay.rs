@@ -232,6 +232,34 @@
 //! invoking lihaaf from a workspace-member sub-crate or a crate inside
 //! a parent workspace tree: they get a clean diagnostic instead of a
 //! cryptic cargo parse error OR a silent false compat verdict.
+//!
+//! **Workspace-member entry via `--package` (issue #53).** When the
+//! adopter supplies `--package <pkg>` and `--compat-root` is a virtual
+//! workspace root (per the v0.1.0 scope; see compat plan §3.2.3), the
+//! resolver ([`resolve_workspace_member_manifest`]) maps `<pkg>` to
+//! the member's manifest path. The materializer takes a
+//! [`WorkspaceMemberContext`] parameter and:
+//!
+//! - Skips Branch 2 (implicit-ancestor REJECT) of the workspace-
+//!   inheritance override.
+//! - Skips Branch 3 (inheritance-refs REJECT) of the same.
+//! - Carries the WORKSPACE ROOT's `[workspace.dependencies]` /
+//!   `[workspace.package]` / `[workspace.lints]` / `[workspace.metadata]`
+//!   / `[workspace.resolver]` / `[replace]` / `[profile.*]` tables
+//!   down into the staged overlay; the workspace root's
+//!   `[patch.crates-io]` flows through the Option H 4-rule policy
+//!   in root-first composition order.
+//!
+//! Branch 1 (explicit `[package].workspace = "<path>"`) still REJECTs
+//! even with `--package` — the explicit declaration is incompatible
+//! with the resolver-determined workspace.
+//!
+//! The carry-down ensures the overlay's dependency graph CONVERGES
+//! with baseline cargo's: cargo applies the workspace root's
+//! `[workspace.*]` and `[patch]` tables when building any member, and
+//! the overlay now does the same. v0.1.0 scope is virtual workspaces
+//! only (workspace root declares `[workspace]` without `[package]`);
+//! the package+workspace shape is deferred to v0.2 / v1.0.
 
 use std::path::{Path, PathBuf};
 

@@ -8,6 +8,10 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Compat-mode `--package <pkg>` / `-p <pkg>` flag for workspace-member entry. When `--compat-root` points at a workspace root, `--package` resolves the upstream manifest to the named workspace member. The workspace's `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and `[profile.*]` tables are carried down into the staged overlay so the member's `{ workspace = true }` references and patch resolution match baseline cargo's behavior. Closes #53 — unblocks Round-2 enrollment of axum-macros and similar workspace-member-shape pilots.
+
+  See `docs/compatibility-plan.md` §3.2.3 ("Workspace-member entry via `--package`") and `docs/spec/lihaaf-v0.1.md` §8.2 for the adopter-facing surface. v0.1.0 scope is virtual workspaces only (workspace root declares `[workspace]` without `[package]`); the package+workspace shape is deferred to v0.2 / v1.0 with a directed REJECT diagnostic.
+
 ### Changed
 
 ### Fixed
