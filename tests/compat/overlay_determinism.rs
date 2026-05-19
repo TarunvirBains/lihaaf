@@ -3428,3 +3428,206 @@ demo = { path = "." }
     );
     drop(tmp2);
 }
+
+/// **Issue #53 §7.3 integration test: axum-macros workspace-member shape.**
+///
+/// Synthesizes a workspace that mirrors `tokio-rs/axum`'s shape (virtual
+/// workspace with `members = ["pkg-a", "pkg-*"]`, `[workspace.package]
+/// edition = "2021"`, `[workspace.dependencies] serde = "1.0"`) and a
+/// member `pkg-macros` with `{ workspace = true }` inheritance refs
+/// (`rust-version`, `[lints] workspace = true`, `[dependencies] serde =
+/// { workspace = true }`). Resolves via `resolve_workspace_member_manifest`,
+/// then materializes via `materialize_overlay_with_metadata_and_workspace_member_context`
+/// with a populated `WorkspaceMemberContext`. Asserts:
+///
+/// 1. The resolver returns the member manifest at
+///    `<ws>/pkg-macros/Cargo.toml`.
+/// 2. The overlay is staged at
+///    `<ws>/pkg-macros/target/lihaaf-overlay/Cargo.toml` per §3.1.bis
+///    (the staging dir is `<member_root>/target/lihaaf-overlay/`, NOT
+///    `<workspace_root>/target/lihaaf-overlay/`).
+/// 3. The overlay's `[workspace.dependencies.serde]` carries the
+///    workspace-root value (carry-down from §5.3).
+/// 4. The overlay's `[workspace.package.edition]` carries the
+///    workspace-root value.
+/// 5. The overlay's `[workspace]` table does NOT carry `members`,
+///    `exclude`, or `default-members` (stripped per
+///    `override_workspace_inheritance` Branch 4).
+/// 6. The materialization does NOT hit any REJECT branch — the
+///    workspace-member context suppresses Branches 2 + 3 of
+///    `override_workspace_inheritance`.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` per
+/// [[lihaaf-no-local-binary-builds]] — although this test does not
+/// spawn `cargo`, it stays under the same gate as the other compat-
+/// pipeline integration tests so adopters running `cargo test --lib`
+/// on RAM-limited boxes can opt in once for the whole compat-pipeline
+/// surface.
+#[test]
+fn cargo_lihaaf_resolves_axum_macros_shape_workspace_member() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_lihaaf_resolves_axum_macros_shape_workspace_member: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for axum-macros shape test");
+    let ws_root = tmp.path();
+    let ws_root_manifest = ws_root.join("Cargo.toml");
+
+    // Synthesize the workspace root (axum-macros shape: virtual
+    // workspace with `[workspace.package]` carry-down +
+    // `[workspace.dependencies]` carry-down + glob members).
+    let ws_root_toml = r#"[workspace]
+members = ["pkg-a", "pkg-*"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.65"
+
+[workspace.dependencies]
+serde = "1.0"
+"#;
+    std::fs::write(&ws_root_manifest, ws_root_toml).expect("write workspace-root manifest");
+
+    // Synthesize pkg-a (non-target member; the glob `pkg-*` will also
+    // match pkg-macros, but pkg-a needs to exist as a non-target to
+    // verify the resolver picks pkg-macros by name not by directory
+    // enumeration order).
+    let pkg_a_dir = ws_root.join("pkg-a");
+    std::fs::create_dir_all(pkg_a_dir.join("src")).expect("create pkg-a/src");
+    std::fs::write(
+        pkg_a_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-a"
+version = "0.1.0"
+rust-version = { workspace = true }
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-a Cargo.toml");
+    std::fs::write(
+        pkg_a_dir.join("src").join("lib.rs"),
+        "pub fn _stub_a() {}\n",
+    )
+    .expect("write pkg-a src/lib.rs");
+
+    // Synthesize pkg-macros (the target member).
+    let pkg_macros_dir = ws_root.join("pkg-macros");
+    std::fs::create_dir_all(pkg_macros_dir.join("src")).expect("create pkg-macros/src");
+    std::fs::write(
+        pkg_macros_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-macros"
+version = "0.1.0"
+rust-version = { workspace = true }
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+
+[dependencies]
+serde = { workspace = true }
+"#,
+    )
+    .expect("write pkg-macros Cargo.toml");
+    std::fs::write(
+        pkg_macros_dir.join("src").join("lib.rs"),
+        "// minimal proc-macro lib stub for #53 integration test\n",
+    )
+    .expect("write pkg-macros src/lib.rs");
+
+    // 1. Resolver step.
+    let (member_manifest, ws_root_value) =
+        lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-macros")
+            .expect("resolver must find pkg-macros via glob match");
+    assert_eq!(
+        member_manifest,
+        pkg_macros_dir.join("Cargo.toml"),
+        "resolver must return the pkg-macros manifest path"
+    );
+
+    // 2. Materializer step.
+    let ctx = WorkspaceMemberContext {
+        workspace_root_manifest: ws_root_manifest.clone(),
+        workspace_root_value: ws_root_value,
+    };
+    let plan = materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+        .expect("materialization must succeed under workspace-member context");
+
+    // Overlay is staged at <member>/target/lihaaf-overlay/Cargo.toml.
+    let expected_overlay_path = pkg_macros_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_overlay_path,
+        "overlay must be staged under <member_root>/target/lihaaf-overlay/ per §3.1.bis"
+    );
+
+    // 3-5. Read the overlay and assert the carry-down + strip
+    // contracts.
+    let overlay_text = read_overlay(&plan.sibling_manifest);
+    let overlay_value: toml::Value =
+        toml::from_str(&overlay_text).expect("overlay TOML must parse");
+    let overlay_table = overlay_value.as_table().expect("overlay is a table");
+
+    let workspace_table = overlay_table
+        .get("workspace")
+        .and_then(|v| v.as_table())
+        .expect("overlay must have [workspace]");
+    // [workspace.dependencies.serde] carried from workspace root.
+    let ws_deps = workspace_table
+        .get("dependencies")
+        .and_then(|v| v.as_table())
+        .expect("[workspace.dependencies] must be carried");
+    assert!(
+        ws_deps.contains_key("serde"),
+        "[workspace.dependencies.serde] must be carried from workspace root"
+    );
+    // [workspace.package.edition] carried.
+    let ws_pkg = workspace_table
+        .get("package")
+        .and_then(|v| v.as_table())
+        .expect("[workspace.package] must be carried");
+    assert_eq!(
+        ws_pkg.get("edition").and_then(|v| v.as_str()),
+        Some("2021"),
+        "[workspace.package.edition] must be carried verbatim"
+    );
+
+    // Membership keys must be stripped.
+    assert!(
+        !workspace_table.contains_key("members"),
+        "[workspace.members] must be stripped from overlay"
+    );
+    assert!(
+        !workspace_table.contains_key("exclude"),
+        "[workspace.exclude] must be stripped from overlay"
+    );
+    assert!(
+        !workspace_table.contains_key("default-members"),
+        "[workspace.default-members] must be stripped from overlay"
+    );
+
+    // 6. Option H Rule 1 INJECT: the workspace root did not declare a
+    // self-patch for pkg-macros, so an injected self-patch points at
+    // the staged-overlay dir.
+    let patch_self = overlay_table
+        .get("patch")
+        .and_then(|v| v.get("crates-io"))
+        .and_then(|v| v.get("pkg-macros"))
+        .and_then(|v| v.get("path"))
+        .and_then(|v| v.as_str())
+        .expect("[patch.crates-io.pkg-macros].path must be INJECTed (Option H Rule 1)");
+    assert!(
+        patch_self.ends_with("lihaaf-overlay"),
+        "Rule 1 INJECT must target the staged-overlay dir; got `{patch_self}`"
+    );
+
+    drop(tmp);
+}
