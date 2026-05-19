@@ -714,7 +714,7 @@ where
         // with an opaque "can't find library" / "no targets" error). See
         // `absolutize_path_bearing_keys` for the full key inventory and
         // the workspace-members handling rationale.
-        absolutize_path_bearing_keys(top, &upstream_dir);
+        absolutize_path_bearing_keys(top, &upstream_dir, upstream_manifest_path)?;
 
         // Option H intent-aware self-patch policy for
         // `[patch.crates-io.<upstream-package-name>]` (issues #40 + #47).
@@ -781,7 +781,7 @@ where
         )?;
 
         if let Some(meta) = synthetic.as_ref() {
-            inject_synthetic_metadata(top, meta);
+            inject_synthetic_metadata(top, meta, upstream_manifest_path)?;
         }
 
         // Override workspace inheritance: declare the overlay as its own
@@ -1110,7 +1110,7 @@ fn override_workspace_inheritance(
     //    workspace tables; inheritance references resolve cleanly.
     if workspace_member_ctx.is_none()
         && !has_local_workspace
-        && manifest_has_inheritance_reference(top)
+        && manifest_has_inheritance_reference(top, upstream_manifest_path)?
     {
         return Err(Error::Cli {
             clap_exit_code: 2,
@@ -1289,7 +1289,20 @@ fn detect_implicit_ancestor_workspace(
 /// the same shape: a sub-table at the named key whose `workspace`
 /// entry is the boolean `true`. We only need to check for that
 /// shape; the parser handles both surface syntaxes uniformly.
-fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>) -> bool {
+///
+/// # Errors (issue #53 FOLLOWUP-A)
+///
+/// Returns `Err(Error::TomlParse)` when a dep-style key
+/// (`dependencies`, `dev-dependencies`, `build-dependencies`,
+/// `target.<cfg>.<deps>`) or `[lints]` is PRESENT but NOT a table.
+/// Previously these cases silently returned `false`, masking
+/// malformed cargo grammar — silently saying "no inheritance" while
+/// the user had typed e.g. `dependencies = "oops"` would let the
+/// pipeline proceed against an incorrect model.
+fn manifest_has_inheritance_reference(
+    top: &toml::map::Map<String, toml::Value>,
+    manifest_path: &Path,
+) -> Result<bool, Error> {
     // Helper: a table-typed sub-value contains `workspace = true`.
     let is_inheritance_table = |v: &toml::Value| -> bool {
         v.as_table()
@@ -1300,13 +1313,27 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
 
     // Helper: scan every entry of a dep-style table (the value at
     // each key is a per-dep table) for an inheritance reference.
-    let deps_table_has_inheritance =
-        |top: &toml::map::Map<String, toml::Value>, key: &str| -> bool {
-            let Some(toml::Value::Table(t)) = top.get(key) else {
-                return false;
-            };
-            t.values().any(is_inheritance_table)
-        };
+    //
+    // **Non-table rejection (issue #53 FOLLOWUP-A).** A
+    // present-but-non-table dep section (`dependencies = "oops"`) is
+    // malformed cargo grammar. Previously this returned `false`
+    // (silent absence); now it returns a `TomlParse` error naming
+    // the section + manifest path so the operator sees the real
+    // shape problem instead of a downstream "missing workspace"
+    // false-positive.
+    let deps_table_has_inheritance = |scope: &toml::map::Map<String, toml::Value>,
+                                      key: &str,
+                                      scope_label: &str|
+     -> Result<bool, Error> {
+        match scope.get(key) {
+            None => Ok(false),
+            Some(toml::Value::Table(t)) => Ok(t.values().any(is_inheritance_table)),
+            Some(_) => Err(Error::TomlParse {
+                path: manifest_path.to_path_buf(),
+                message: format!("`{scope_label}{key}` must be a table; found a non-table value"),
+            }),
+        }
+    };
 
     // 1. `[package].<key>` — every sub-key of `[package]`. We scan
     //    all sub-keys (not just the cargo-documented inheritable
@@ -1324,30 +1351,37 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
                 continue;
             }
             if is_inheritance_table(v) {
-                return true;
+                return Ok(true);
             }
         }
     }
 
     // 2. Top-level dep tables.
     for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-        if deps_table_has_inheritance(top, section) {
-            return true;
+        if deps_table_has_inheritance(top, section, "[")? {
+            return Ok(true);
         }
     }
 
     // 3. Platform-conditional `[target.<cfg>.<deps>]`. The shape is
     //    a table-of-tables: each cfg key maps to a table that may
     //    contain `dependencies` / `dev-dependencies` /
-    //    `build-dependencies` sub-tables.
+    //    `build-dependencies` sub-tables. A cfg-value that is not a
+    //    table is malformed and reported via the helper.
     if let Some(toml::Value::Table(targets)) = top.get("target") {
-        for cfg_value in targets.values() {
+        for (cfg_name, cfg_value) in targets.iter() {
             let Some(cfg_table) = cfg_value.as_table() else {
-                continue;
+                return Err(Error::TomlParse {
+                    path: manifest_path.to_path_buf(),
+                    message: format!(
+                        "`[target.{cfg_name}]` must be a table; found a non-table value"
+                    ),
+                });
             };
+            let scope_label = format!("[target.{cfg_name}].");
             for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-                if deps_table_has_inheritance(cfg_table, section) {
-                    return true;
+                if deps_table_has_inheritance(cfg_table, section, &scope_label)? {
+                    return Ok(true);
                 }
             }
         }
@@ -1359,22 +1393,31 @@ fn manifest_has_inheritance_reference(top: &toml::map::Map<String, toml::Value>)
     //    `[lints.clippy].workspace`, etc.) for forward-compat: if
     //    cargo adds per-namespace inheritance, the existing form will
     //    keep being detected here.
-    if let Some(toml::Value::Table(lints)) = top.get("lints") {
+    //
+    //    **Non-table rejection (issue #53 FOLLOWUP-A).** `[lints]`
+    //    present-but-not-table → error.
+    if let Some(lints_value) = top.get("lints") {
+        let toml::Value::Table(lints) = lints_value else {
+            return Err(Error::TomlParse {
+                path: manifest_path.to_path_buf(),
+                message: "`[lints]` must be a table; found a non-table value".to_string(),
+            });
+        };
         // 4a. Top-level form: `[lints] workspace = true`.
         if lints
             .get("workspace")
             .and_then(|v| v.as_bool())
             .unwrap_or(false)
         {
-            return true;
+            return Ok(true);
         }
         // 4b. Forward-compat nested form: `[lints.<namespace>] workspace = true`.
         if lints.values().any(is_inheritance_table) {
-            return true;
+            return Ok(true);
         }
     }
 
-    false
+    Ok(false)
 }
 
 /// Resolve `<workspace_root>/Cargo.toml` + `<package_name>` to the
@@ -1936,21 +1979,44 @@ fn apply_workspace_member_inheritance(
     // carries down. A member with `[patch.crates-io]` would have
     // failed cargo's own baseline load anyway; we surface the
     // directed diagnostic eagerly.
-    if let Some(patch_table) = top
-        .get("patch")
-        .and_then(|p| p.get("crates-io"))
-        .and_then(|c| c.as_table())
-        && !patch_table.is_empty()
-    {
-        return Err(Error::Cli {
-            clap_exit_code: 2,
-            message: format!(
-                "error: `--package` resolver: workspace member `{}` declares `[patch.crates-io]`; \
-                 cargo does not permit `[patch]` in workspace members (only the workspace root). \
-                 Move the patch entries to the workspace root's `[patch.crates-io]` or remove them.",
-                member_manifest.display()
-            ),
-        });
+    //
+    // **Non-table rejection (issue #53 FOLLOWUP-B).** The previous
+    // chain `top.get("patch").and_then(|p| p.get("crates-io")).and_then(|c| c.as_table())`
+    // silently skipped when `[patch]` or `[patch.crates-io]` were
+    // present-but-not-table, BYPASSING the intended member-local
+    // rejection (a malformed `[patch] = "oops"` would let the member
+    // overlay slip through). Reject those shapes explicitly with the
+    // same diagnostic the overlay-side guards use (current ~lines
+    // 2802 / 2814) so member-local non-table maps to the same hard-
+    // reject as workspace-root non-table.
+    if let Some(patch_value) = top.get("patch") {
+        let toml::Value::Table(patch) = patch_value else {
+            return Err(Error::TomlParse {
+                path: member_manifest.to_path_buf(),
+                message: "`[patch]` must be a table; found a non-table value".to_string(),
+            });
+        };
+        if let Some(crates_io_value) = patch.get("crates-io") {
+            let toml::Value::Table(patch_table) = crates_io_value else {
+                return Err(Error::TomlParse {
+                    path: member_manifest.to_path_buf(),
+                    message: "`[patch.crates-io]` must be a table; found a non-table value"
+                        .to_string(),
+                });
+            };
+            if !patch_table.is_empty() {
+                return Err(Error::Cli {
+                    clap_exit_code: 2,
+                    message: format!(
+                        "error: `--package` resolver: workspace member `{}` declares \
+                         `[patch.crates-io]`; cargo does not permit `[patch]` in workspace \
+                         members (only the workspace root). Move the patch entries to the \
+                         workspace root's `[patch.crates-io]` or remove them.",
+                        member_manifest.display()
+                    ),
+                });
+            }
+        }
     }
 
     // Workspace-root dir for path absolutization.
@@ -2171,21 +2237,36 @@ fn apply_workspace_member_inheritance(
 /// The inserted values are typed: `dylib_crate` is a string,
 /// `extern_crates` is an array of strings, `fixture_dirs` is an array of
 /// strings. These match the v0.1 [`crate::config::RawMetadata`] schema.
+///
+/// # Errors (issue #53 FOLLOWUP-A)
+///
+/// Returns `Err(Error::TomlParse)` when `[package]` or
+/// `[package.metadata]` is PRESENT in `top` but NOT a table.
+/// Previously the function silently returned (`fall-through-no-op`),
+/// masking malformed cargo grammar. The error names the offending
+/// key + manifest path.
 fn inject_synthetic_metadata(
     top: &mut toml::map::Map<String, toml::Value>,
     meta: &SyntheticMetadata,
-) {
+    manifest_path: &Path,
+) -> Result<(), Error> {
     let package_entry = top
         .entry("package".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
     let toml::Value::Table(package) = package_entry else {
-        return;
+        return Err(Error::TomlParse {
+            path: manifest_path.to_path_buf(),
+            message: "`[package]` must be a table; found a non-table value".to_string(),
+        });
     };
     let metadata_entry = package
         .entry("metadata".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
     let toml::Value::Table(metadata) = metadata_entry else {
-        return;
+        return Err(Error::TomlParse {
+            path: manifest_path.to_path_buf(),
+            message: "`[package.metadata]` must be a table; found a non-table value".to_string(),
+        });
     };
 
     let mut lihaaf_table = toml::map::Map::new();
@@ -2225,6 +2306,7 @@ fn inject_synthetic_metadata(
     );
 
     metadata.insert("lihaaf".to_string(), toml::Value::Table(lihaaf_table));
+    Ok(())
 }
 
 /// Absolutize every path-bearing key in the parsed manifest against
@@ -2270,7 +2352,8 @@ fn inject_synthetic_metadata(
 fn absolutize_path_bearing_keys(
     top: &mut toml::map::Map<String, toml::Value>,
     upstream_dir: &Path,
-) {
+    manifest_path: &Path,
+) -> Result<(), Error> {
     // Helper: stringify an absolute path with forward-slash separators
     // so the overlay TOML stays cross-platform-stable (Windows
     // backslashes inside a TOML basic string are escape sequences;
@@ -2315,16 +2398,36 @@ fn absolutize_path_bearing_keys(
     // Helper: walk a deps table (`[dependencies]` etc.) and absolutize
     // any `path = "..."` sub-key of an inline-table or explicit-table
     // dependency.
-    let absolutize_deps_paths =
-        |top: &mut toml::map::Map<String, toml::Value>, section: &str, upstream_dir: &Path| {
-            if let Some(toml::Value::Table(deps)) = top.get_mut(section) {
+    //
+    // **Non-table rejection (issue #53 FOLLOWUP-A).** A
+    // present-but-non-table dep section (`dependencies = "oops"`) is
+    // malformed cargo grammar; previously the closure silently
+    // skipped, masking user error. Surface as `TomlParse` naming the
+    // section + manifest path.
+    let absolutize_deps_paths = |top: &mut toml::map::Map<String, toml::Value>,
+                                 section: &str,
+                                 scope_label: &str,
+                                 upstream_dir: &Path,
+                                 manifest_path: &Path|
+     -> Result<(), Error> {
+        match top.get_mut(section) {
+            None => Ok(()),
+            Some(toml::Value::Table(deps)) => {
                 for (_name, dep) in deps.iter_mut() {
                     if let toml::Value::Table(t) = dep {
                         absolutize_string_at(t, "path", upstream_dir);
                     }
                 }
+                Ok(())
             }
-        };
+            Some(_) => Err(Error::TomlParse {
+                path: manifest_path.to_path_buf(),
+                message: format!(
+                    "`{scope_label}{section}` must be a table; found a non-table value"
+                ),
+            }),
+        }
+    };
 
     // 1. `[lib] path`. The `[lib]` table is guaranteed to exist by the
     //    caller (`canonicalize_crate_type` ran before us and inserted
@@ -2399,21 +2502,47 @@ fn absolutize_path_bearing_keys(
     //    `thiserror-impl = { path = "impl" }`) reference sibling
     //    crates; without absolutization the overlay would point cargo
     //    at non-existent dirs under `target/lihaaf-overlay/`.
-    absolutize_deps_paths(top, "dependencies", upstream_dir);
-    absolutize_deps_paths(top, "dev-dependencies", upstream_dir);
-    absolutize_deps_paths(top, "build-dependencies", upstream_dir);
+    absolutize_deps_paths(top, "dependencies", "[", upstream_dir, manifest_path)?;
+    absolutize_deps_paths(top, "dev-dependencies", "[", upstream_dir, manifest_path)?;
+    absolutize_deps_paths(top, "build-dependencies", "[", upstream_dir, manifest_path)?;
 
     // 6. Same for the platform-conditional `[target.<cfg>.dependencies]`
     //    family. `target` is a table-of-tables; each inner table has
     //    its own `dependencies` / `dev-dependencies` / `build-dependencies`
-    //    sub-tables.
+    //    sub-tables. A cfg-value that is not a table is malformed and
+    //    rejected (FOLLOWUP-A).
     if let Some(toml::Value::Table(targets)) = top.get_mut("target") {
-        for (_cfg, cfg_value) in targets.iter_mut() {
-            if let toml::Value::Table(cfg_table) = cfg_value {
-                absolutize_deps_paths(cfg_table, "dependencies", upstream_dir);
-                absolutize_deps_paths(cfg_table, "dev-dependencies", upstream_dir);
-                absolutize_deps_paths(cfg_table, "build-dependencies", upstream_dir);
-            }
+        for (cfg_name, cfg_value) in targets.iter_mut() {
+            let toml::Value::Table(cfg_table) = cfg_value else {
+                return Err(Error::TomlParse {
+                    path: manifest_path.to_path_buf(),
+                    message: format!(
+                        "`[target.{cfg_name}]` must be a table; found a non-table value"
+                    ),
+                });
+            };
+            let scope_label = format!("[target.{cfg_name}].");
+            absolutize_deps_paths(
+                cfg_table,
+                "dependencies",
+                &scope_label,
+                upstream_dir,
+                manifest_path,
+            )?;
+            absolutize_deps_paths(
+                cfg_table,
+                "dev-dependencies",
+                &scope_label,
+                upstream_dir,
+                manifest_path,
+            )?;
+            absolutize_deps_paths(
+                cfg_table,
+                "build-dependencies",
+                &scope_label,
+                upstream_dir,
+                manifest_path,
+            )?;
         }
     }
 
@@ -2465,7 +2594,13 @@ fn absolutize_path_bearing_keys(
         //     dependency paths.  These have the same shape as the top-level
         //     `[dependencies.X] path` entries handled by `absolutize_deps_paths`,
         //     but live one table level deeper inside `[workspace]`.
-        absolutize_deps_paths(ws, "dependencies", upstream_dir);
+        absolutize_deps_paths(
+            ws,
+            "dependencies",
+            "[workspace.",
+            upstream_dir,
+            manifest_path,
+        )?;
     }
 
     // 8. `[package].workspace` — explicit workspace root pointer.  A single
@@ -2484,7 +2619,7 @@ fn absolutize_path_bearing_keys(
     //    self-reference (`path = "."`) or point at a nonexistent dir.
     //    Only the `path` sub-key is rewritten; `git`, `branch`, `tag`, and
     //    `rev` pass through verbatim per spec §3.2.3.
-    absolutize_patch_paths(top, upstream_dir);
+    absolutize_patch_paths(top, upstream_dir, manifest_path)?;
 
     // 10. `[replace."<source-id>"].path` — the older replacement form
     //     (`[patch]` superseded it but `[replace]` is still valid cargo
@@ -2495,7 +2630,9 @@ fn absolutize_path_bearing_keys(
     //     resolve against the staged manifest dir — the same failure mode
     //     `[patch]` had (Round-2 FIX class C). Only `path` is rewritten;
     //     `git`, `branch`, `tag`, and `rev` pass through verbatim.
-    absolutize_replace_paths(top, upstream_dir);
+    absolutize_replace_paths(top, upstream_dir, manifest_path)?;
+
+    Ok(())
 }
 
 /// Absolutize `[patch.<registry>.X].path` entries in the top-level manifest
@@ -2510,9 +2647,26 @@ fn absolutize_path_bearing_keys(
 ///
 /// Registry-agnostic: the same walk covers `[patch.crates-io]`,
 /// `[patch.https://my-registry.example.com/]`, or any other registry key.
-fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstream_dir: &Path) {
-    let Some(toml::Value::Table(patch)) = top.get_mut("patch") else {
-        return;
+///
+/// # Errors (issue #53 FOLLOWUP-A)
+///
+/// Returns `Err(Error::TomlParse)` when `[patch]` is PRESENT in `top`
+/// but NOT a table. Previously the function silently returned,
+/// masking malformed cargo grammar.
+fn absolutize_patch_paths(
+    top: &mut toml::map::Map<String, toml::Value>,
+    upstream_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), Error> {
+    let patch = match top.get_mut("patch") {
+        None => return Ok(()),
+        Some(toml::Value::Table(t)) => t,
+        Some(_) => {
+            return Err(Error::TomlParse {
+                path: manifest_path.to_path_buf(),
+                message: "`[patch]` must be a table; found a non-table value".to_string(),
+            });
+        }
     };
     for (_registry, registry_value) in patch.iter_mut() {
         if let toml::Value::Table(registry_table) = registry_value {
@@ -2537,6 +2691,7 @@ fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstrea
             }
         }
     }
+    Ok(())
 }
 
 /// Absolutize `[replace."<source-id>"].path` entries in the top-level manifest
@@ -2556,9 +2711,26 @@ fn absolutize_patch_paths(top: &mut toml::map::Map<String, toml::Value>, upstrea
 ///
 /// This is intentionally a mirror of [`absolutize_patch_paths`] for the
 /// simpler (one-level-deep) `[replace]` structure.
-fn absolutize_replace_paths(top: &mut toml::map::Map<String, toml::Value>, upstream_dir: &Path) {
-    let Some(toml::Value::Table(replace)) = top.get_mut("replace") else {
-        return;
+///
+/// # Errors (issue #53 FOLLOWUP-A)
+///
+/// Returns `Err(Error::TomlParse)` when `[replace]` is PRESENT in
+/// `top` but NOT a table. Previously the function silently returned,
+/// masking malformed cargo grammar.
+fn absolutize_replace_paths(
+    top: &mut toml::map::Map<String, toml::Value>,
+    upstream_dir: &Path,
+    manifest_path: &Path,
+) -> Result<(), Error> {
+    let replace = match top.get_mut("replace") {
+        None => return Ok(()),
+        Some(toml::Value::Table(t)) => t,
+        Some(_) => {
+            return Err(Error::TomlParse {
+                path: manifest_path.to_path_buf(),
+                message: "`[replace]` must be a table; found a non-table value".to_string(),
+            });
+        }
     };
     for (_source_id, entry_value) in replace.iter_mut() {
         if let toml::Value::Table(entry_table) = entry_value {
@@ -2578,6 +2750,7 @@ fn absolutize_replace_paths(top: &mut toml::map::Map<String, toml::Value>, upstr
             }
         }
     }
+    Ok(())
 }
 
 /// Lexically normalize a path: drop `Component::CurDir` (`.`) entries
@@ -4130,7 +4303,8 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("demo".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let lib = top.get("lib").and_then(|v| v.as_table()).unwrap();
         let path = lib.get("path").and_then(|v| v.as_str()).unwrap();
@@ -4163,7 +4337,8 @@ version = "0.1.0"
         );
         top.insert("lib".to_string(), toml::Value::Table(lib));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let lib = top.get("lib").and_then(|v| v.as_table()).unwrap();
         let path = lib.get("path").and_then(|v| v.as_str()).unwrap();
@@ -4189,7 +4364,8 @@ version = "0.1.0"
         );
         top.insert("lib".to_string(), toml::Value::Table(lib));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let lib = top.get("lib").and_then(|v| v.as_table()).unwrap();
         let path = lib.get("path").and_then(|v| v.as_str()).unwrap();
@@ -4216,7 +4392,8 @@ version = "0.1.0"
         deps.insert("inner-impl".to_string(), toml::Value::Table(inner));
         top.insert("dependencies".to_string(), toml::Value::Table(deps));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let deps = top.get("dependencies").and_then(|v| v.as_table()).unwrap();
         let inner = deps.get("inner-impl").and_then(|v| v.as_table()).unwrap();
@@ -4255,7 +4432,8 @@ version = "0.1.0"
         );
         top.insert("target".to_string(), toml::Value::Table(targets));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let targets = top.get("target").and_then(|v| v.as_table()).unwrap();
         let linux = targets
@@ -4308,7 +4486,8 @@ version = "0.1.0"
         );
         top.insert("workspace".to_string(), toml::Value::Table(ws));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let ws = top.get("workspace").and_then(|v| v.as_table()).unwrap();
         let members = ws.get("members").and_then(|v| v.as_array()).unwrap();
@@ -4343,7 +4522,8 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("demo".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let pkg = top.get("package").and_then(|v| v.as_table()).unwrap();
         assert!(
@@ -4376,7 +4556,8 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("demo".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let pkg = top.get("package").and_then(|v| v.as_table()).unwrap();
         for key in ["autobins", "autoexamples", "autotests", "autobenches"] {
@@ -4424,7 +4605,8 @@ version = "0.1.0"
             );
         }
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         for (section, original) in [
             ("bin", "src/bin/foo.rs"),
@@ -4467,7 +4649,8 @@ version = "0.1.0"
         pkg.insert("workspace".to_string(), toml::Value::String("../".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let pkg = top.get("package").and_then(|v| v.as_table()).unwrap();
         let ws_ptr = pkg.get("workspace").and_then(|v| v.as_str()).unwrap();
@@ -4509,7 +4692,8 @@ version = "0.1.0"
         );
         top.insert("workspace".to_string(), toml::Value::Table(ws));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let ws = top.get("workspace").and_then(|v| v.as_table()).unwrap();
         let dm = ws
@@ -4557,7 +4741,8 @@ version = "0.1.0"
         ws.insert("dependencies".to_string(), toml::Value::Table(ws_deps));
         top.insert("workspace".to_string(), toml::Value::Table(ws));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let ws = top.get("workspace").and_then(|v| v.as_table()).unwrap();
         let ws_deps = ws.get("dependencies").and_then(|v| v.as_table()).unwrap();
@@ -4628,7 +4813,8 @@ version = "0.1.0"
         patch.insert("crates-io".to_string(), toml::Value::Table(crates_io));
         top.insert("patch".to_string(), toml::Value::Table(patch));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let patch = top.get("patch").and_then(|v| v.as_table()).unwrap();
         let crates_io = patch.get("crates-io").and_then(|v| v.as_table()).unwrap();
@@ -4703,7 +4889,8 @@ version = "0.1.0"
         patch.insert("crates-io".to_string(), toml::Value::Table(crates_io));
         top.insert("patch".to_string(), toml::Value::Table(patch));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let path = top
             .get("patch")
@@ -4773,7 +4960,8 @@ version = "0.1.0"
         replace.insert("abs-dep:0.1.0".to_string(), toml::Value::Table(abs_entry));
         top.insert("replace".to_string(), toml::Value::Table(replace));
 
-        absolutize_path_bearing_keys(&mut top, upstream_dir);
+        absolutize_path_bearing_keys(&mut top, upstream_dir, Path::new("/test/Cargo.toml"))
+            .unwrap();
 
         let replace_out = top.get("replace").and_then(|v| v.as_table()).unwrap();
 
@@ -5412,7 +5600,7 @@ version = "0.1.0"
         // Empty manifest.
         let top = toml::map::Map::new();
         assert!(
-            !manifest_has_inheritance_reference(&top),
+            !manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "empty manifest has no inheritance references"
         );
 
@@ -5422,7 +5610,7 @@ version = "0.1.0"
         pkg.insert("name".to_string(), toml::Value::String("demo".into()));
         top.insert("package".to_string(), toml::Value::Table(pkg));
         assert!(
-            !manifest_has_inheritance_reference(&top),
+            !manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "manifest with `[package].name` only has no inheritance references"
         );
 
@@ -5433,7 +5621,7 @@ version = "0.1.0"
         deps.insert("foo".to_string(), toml::Value::Table(foo));
         top.insert("dependencies".to_string(), toml::Value::Table(deps));
         assert!(
-            !manifest_has_inheritance_reference(&top),
+            !manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "regular dep without `workspace = true` does not count as inheritance"
         );
 
@@ -5446,7 +5634,7 @@ version = "0.1.0"
         let mut top2 = toml::map::Map::new();
         top2.insert("package".to_string(), toml::Value::Table(pkg2));
         assert!(
-            !manifest_has_inheritance_reference(&top2),
+            !manifest_has_inheritance_reference(&top2, Path::new("/test/Cargo.toml")).unwrap(),
             "`[package].workspace = \"...\"` is the explicit-member pointer, not inheritance"
         );
     }
@@ -5466,7 +5654,7 @@ version = "0.1.0"
         pkg.insert("version".to_string(), toml::Value::Table(version));
         top.insert("package".to_string(), toml::Value::Table(pkg));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[package].version = {{ workspace = true }}` must be detected"
         );
 
@@ -5478,7 +5666,7 @@ version = "0.1.0"
         deps.insert("foo".to_string(), toml::Value::Table(foo));
         top.insert("dependencies".to_string(), toml::Value::Table(deps));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[dependencies] foo = {{ workspace = true }}` must be detected"
         );
 
@@ -5490,7 +5678,7 @@ version = "0.1.0"
         deps.insert("foo".to_string(), toml::Value::Table(foo));
         top.insert("dev-dependencies".to_string(), toml::Value::Table(deps));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[dev-dependencies] foo = {{ workspace = true }}` must be detected"
         );
 
@@ -5502,7 +5690,7 @@ version = "0.1.0"
         deps.insert("foo".to_string(), toml::Value::Table(foo));
         top.insert("build-dependencies".to_string(), toml::Value::Table(deps));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[build-dependencies] foo = {{ workspace = true }}` must be detected"
         );
 
@@ -5518,7 +5706,7 @@ version = "0.1.0"
         targets.insert("cfg(unix)".to_string(), toml::Value::Table(cfg));
         top.insert("target".to_string(), toml::Value::Table(targets));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[target.<cfg>.dependencies]` inheritance must be detected"
         );
 
@@ -5534,7 +5722,7 @@ version = "0.1.0"
         targets.insert("cfg(windows)".to_string(), toml::Value::Table(cfg));
         top.insert("target".to_string(), toml::Value::Table(targets));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[target.<cfg>.dev-dependencies]` inheritance must be detected"
         );
 
@@ -5553,7 +5741,7 @@ version = "0.1.0"
         );
         top.insert("target".to_string(), toml::Value::Table(targets));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[target.<cfg>.build-dependencies]` inheritance must be detected"
         );
 
@@ -5564,7 +5752,7 @@ version = "0.1.0"
         lints.insert("workspace".to_string(), toml::Value::Boolean(true));
         top.insert("lints".to_string(), toml::Value::Table(lints));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[lints] workspace = true` (top-level form) must be detected"
         );
 
@@ -5579,7 +5767,7 @@ version = "0.1.0"
         lints.insert("rust".to_string(), toml::Value::Table(rust));
         top.insert("lints".to_string(), toml::Value::Table(lints));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "`[lints.rust] workspace = true` (forward-compat nested form) must be detected"
         );
 
@@ -5598,7 +5786,7 @@ version = "0.1.0"
         );
         top.insert("package".to_string(), toml::Value::Table(pkg));
         assert!(
-            manifest_has_inheritance_reference(&top),
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap(),
             "unknown `[package].<future-key>` inheritance must be detected (forward-compat)"
         );
     }
@@ -5713,7 +5901,7 @@ version = "0.1.0"
             fixture_dirs: vec!["/abs/pass".into(), "/abs/fail".into()],
             allow_lints: vec!["unexpected_cfgs".to_string()],
         };
-        inject_synthetic_metadata(&mut top, &meta);
+        inject_synthetic_metadata(&mut top, &meta, Path::new("/test/Cargo.toml")).unwrap();
 
         let lihaaf = extract_lihaaf_table(&top);
         let lints = lihaaf["allow_lints"]
@@ -5778,7 +5966,7 @@ version = "0.1.0"
             fixture_dirs: vec!["/abs/pass".into()],
             allow_lints: vec!["unexpected_cfgs".to_string()],
         };
-        inject_synthetic_metadata(&mut top, &meta);
+        inject_synthetic_metadata(&mut top, &meta, Path::new("/test/Cargo.toml")).unwrap();
 
         let lihaaf = extract_lihaaf_table(&top);
         let lints = lihaaf["allow_lints"]
@@ -7907,6 +8095,276 @@ demo = { path = "." }
                 assert!(
                     message.contains("workspace-root `[patch.crates-io]` must be a table"),
                     "diagnostic must name workspace-root `[patch.crates-io]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 FOLLOWUP-A (issue #53 post-review): broader non-table
+    //    tolerance → hard rejection ─────────────────────────────────
+    //
+    // Same silent-absence pattern as BLOCK-2, but in sites that
+    // affect error surfacing rather than silent policy misapplication.
+    // Each previously "silently skip on non-table"; now each rejects
+    // with a `TomlParse` error.
+
+    /// `manifest_has_inheritance_reference`: a present-but-non-table
+    /// top-level `dependencies` value is rejected with a directed
+    /// `TomlParse` error. Previously the closure silently returned
+    /// `false` (no inheritance detected), masking the malformed
+    /// shape.
+    #[test]
+    fn inheritance_reference_scan_rejects_non_table_dependencies() {
+        let mut top = toml::map::Map::new();
+        top.insert(
+            "dependencies".to_string(),
+            toml::Value::String("oops".into()),
+        );
+        let err =
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap_err();
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/test/Cargo.toml"));
+                assert!(
+                    message.contains("`[dependencies` must be a table"),
+                    "diagnostic must name `[dependencies`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `manifest_has_inheritance_reference`: a present-but-non-table
+    /// `[lints]` is rejected with a directed `TomlParse` error.
+    #[test]
+    fn inheritance_reference_scan_rejects_non_table_lints() {
+        let mut top = toml::map::Map::new();
+        top.insert("lints".to_string(), toml::Value::Integer(42));
+        let err =
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[lints]` must be a table"),
+                    "diagnostic must name `[lints]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `manifest_has_inheritance_reference`: a present-but-non-table
+    /// `[target.<cfg>]` value is rejected.
+    #[test]
+    fn inheritance_reference_scan_rejects_non_table_target_cfg() {
+        let mut top = toml::map::Map::new();
+        let mut targets = toml::map::Map::new();
+        targets.insert(
+            "cfg(unix)".to_string(),
+            toml::Value::String("not-a-table".into()),
+        );
+        top.insert("target".to_string(), toml::Value::Table(targets));
+        let err =
+            manifest_has_inheritance_reference(&top, Path::new("/test/Cargo.toml")).unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[target.cfg(unix)]` must be a table"),
+                    "diagnostic must name `[target.cfg(unix)]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `inject_synthetic_metadata`: a present-but-non-table
+    /// `[package]` is rejected with a directed `TomlParse` error.
+    /// Previously the function silently no-opped.
+    #[test]
+    fn inject_synthetic_metadata_rejects_non_table_package() {
+        let mut top = toml::map::Map::new();
+        top.insert("package".to_string(), toml::Value::Boolean(true));
+        let meta = SyntheticMetadata {
+            dylib_crate: "stub".to_string(),
+            extern_crates: vec![],
+            fixture_dirs: vec![],
+            allow_lints: vec![],
+        };
+        let err =
+            inject_synthetic_metadata(&mut top, &meta, Path::new("/test/Cargo.toml")).unwrap_err();
+        match err {
+            Error::TomlParse { message, path } => {
+                assert_eq!(path, PathBuf::from("/test/Cargo.toml"));
+                assert!(
+                    message.contains("`[package]` must be a table"),
+                    "diagnostic must name `[package]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `inject_synthetic_metadata`: a present-but-non-table
+    /// `[package.metadata]` is rejected with a directed `TomlParse`
+    /// error.
+    #[test]
+    fn inject_synthetic_metadata_rejects_non_table_package_metadata() {
+        let mut top = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("demo".into()));
+        pkg.insert("metadata".to_string(), toml::Value::Integer(0));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let meta = SyntheticMetadata {
+            dylib_crate: "stub".to_string(),
+            extern_crates: vec![],
+            fixture_dirs: vec![],
+            allow_lints: vec![],
+        };
+        let err =
+            inject_synthetic_metadata(&mut top, &meta, Path::new("/test/Cargo.toml")).unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[package.metadata]` must be a table"),
+                    "diagnostic must name `[package.metadata]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `absolutize_path_bearing_keys`: a present-but-non-table
+    /// top-level `dependencies` is rejected.
+    #[test]
+    fn absolutize_path_bearing_keys_rejects_non_table_dependencies() {
+        let mut top = toml::map::Map::new();
+        top.insert("dependencies".to_string(), toml::Value::Array(vec![]));
+        let err = absolutize_path_bearing_keys(
+            &mut top,
+            Path::new("/upstream"),
+            Path::new("/upstream/Cargo.toml"),
+        )
+        .unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[dependencies` must be a table"),
+                    "diagnostic must name `[dependencies`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `absolutize_patch_paths`: a present-but-non-table `[patch]` is
+    /// rejected with a directed `TomlParse` error.
+    #[test]
+    fn absolutize_patch_paths_rejects_non_table_patch() {
+        let mut top = toml::map::Map::new();
+        top.insert("patch".to_string(), toml::Value::String("oops".into()));
+        let err = absolutize_patch_paths(
+            &mut top,
+            Path::new("/upstream"),
+            Path::new("/upstream/Cargo.toml"),
+        )
+        .unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[patch]` must be a table"),
+                    "diagnostic must name `[patch]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// `absolutize_replace_paths`: a present-but-non-table
+    /// `[replace]` is rejected with a directed `TomlParse` error.
+    #[test]
+    fn absolutize_replace_paths_rejects_non_table_replace() {
+        let mut top = toml::map::Map::new();
+        top.insert("replace".to_string(), toml::Value::Integer(7));
+        let err = absolutize_replace_paths(
+            &mut top,
+            Path::new("/upstream"),
+            Path::new("/upstream/Cargo.toml"),
+        )
+        .unwrap_err();
+        match err {
+            Error::TomlParse { message, .. } => {
+                assert!(
+                    message.contains("`[replace]` must be a table"),
+                    "diagnostic must name `[replace]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 FOLLOWUP-B (issue #53 post-review): member-local patch
+    //    bypass ─────────────────────────────────────────────────────
+    //
+    // The member-local `[patch.crates-io]` rejection at
+    // `apply_workspace_member_inheritance` Step 2 previously walked
+    // the patch chain via `.and_then(|p| p.as_table())`, silently
+    // skipping the rejection if `[patch]` or `[patch.crates-io]`
+    // were present but non-table. Now each layer hard-rejects.
+
+    /// Member-local `patch = "oops"` (non-table) is rejected.
+    #[test]
+    fn member_local_patch_non_table_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        top.insert("patch".to_string(), toml::Value::String("oops".into()));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
+            .expect_err("member-local non-table `[patch]` must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/m/Cargo.toml"));
+                assert!(
+                    message.contains("`[patch]` must be a table"),
+                    "diagnostic must name `[patch]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// Member-local `[patch] crates-io = "oops"` (non-table inner) is
+    /// rejected.
+    #[test]
+    fn member_local_patch_crates_io_non_table_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut patch = toml::map::Map::new();
+        patch.insert("crates-io".to_string(), toml::Value::String("oops".into()));
+        top.insert("patch".to_string(), toml::Value::Table(patch));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
+            .expect_err("member-local non-table `[patch.crates-io]` must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/m/Cargo.toml"));
+                assert!(
+                    message.contains("`[patch.crates-io]` must be a table"),
+                    "diagnostic must name `[patch.crates-io]`; got: {message}"
                 );
             }
             other => panic!("expected TomlParse, got {other:?}"),
