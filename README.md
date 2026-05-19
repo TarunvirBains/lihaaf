@@ -43,6 +43,8 @@ timings depend on hardware, target-dir state, and fixture shape; the
 important result is that lihaaf preserves the compile-fail/compile-pass
 workflow while making local iteration practical on large proc-macro suites.
 
+> **Migrating an existing trybuild suite?** See [`docs/migrating-from-trybuild.md`](docs/migrating-from-trybuild.md) for the step-by-step playbook.
+
 ## Compile-fail tests
 
 Place fixtures in `tests/lihaaf/compile_fail/`. Each `.rs` file is a
