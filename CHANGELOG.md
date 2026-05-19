@@ -6,15 +6,20 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] — 2026-05-18
+
+Delivers workspace-member entry via `--package` / `-p` flag (issue #53, PR #61),
+unblocking Round-2 enrollment of axum-macros and similar workspace-member-shape
+pilots. PR #61 also closes a 26-item post-merge punch list across four classes:
+resolver path normalization (BLOCK-1, 12 sites), workspace-root non-table hard
+rejection (BLOCK-2, 8 sites), multi-registry `[patch.<registry>]` carry-down
+(BLOCK-3 / COUNTER_SIGNAL), and non-table member-local patch rejection.
+
 ### Added
 
 - Compat-mode `--package <pkg>` / `-p <pkg>` flag for workspace-member entry (PR #61). When `--compat-root` points at a workspace root, `--package` resolves the upstream manifest to the named workspace member. The workspace's `[workspace.*]`, ALL `[patch.<registry>]` subtables (crates-io and alt registries), `[replace]`, and `[profile.*]` tables are carried down into the staged overlay so the member's `{ workspace = true }` references and patch resolution match baseline cargo's behavior. Closes #53 — unblocks Round-2 enrollment of axum-macros and similar workspace-member-shape pilots. PR #61 also includes: 12-site resolver path normalization (BLOCK-1), workspace-root non-table `[patch.<registry>]` hard rejection at 8 sites (BLOCK-2), multi-registry carry-down for all `[patch.<registry>]` subtables (BLOCK-3 / COUNTER_SIGNAL), and non-table member-local patch rejection for all registries.
 
   See `docs/compatibility-plan.md` §3.2.3 ("Workspace-member entry via `--package`") and `docs/spec/lihaaf-v0.1.md` §8.2 for the adopter-facing surface. v0.1.0 scope is virtual workspaces only (workspace root declares `[workspace]` without `[package]`); the package+workspace shape is deferred to v0.2 / v1.0 with a directed REJECT diagnostic.
-
-### Changed
-
-### Fixed
 
 ## [0.1.0-beta.8] — 2026-05-18
 
