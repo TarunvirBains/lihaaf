@@ -246,9 +246,10 @@
 //! - Carries the WORKSPACE ROOT's `[workspace.dependencies]` /
 //!   `[workspace.package]` / `[workspace.lints]` / `[workspace.metadata]`
 //!   / `[workspace.resolver]` / `[replace]` / `[profile.*]` tables
-//!   down into the staged overlay; the workspace root's
-//!   `[patch.crates-io]` flows through the Option H 4-rule policy
-//!   in root-first composition order.
+//!   down into the staged overlay; ALL `[patch.<registry>]` subtables
+//!   (crates-io and alt registries) are carried down. The Option H 4-rule
+//!   self-patch policy applies only to `[patch.crates-io]`; non-crates-io
+//!   registry tables pass through verbatim (path-absolutized).
 //!
 //! Branch 1 (explicit `[package].workspace = "<path>"`) still REJECTs
 //! even with `--package` — the explicit declaration is incompatible
@@ -333,9 +334,11 @@ pub(crate) struct DualRoot {
 /// see plan §5.4). When the materializer is invoked with a populated
 /// `WorkspaceMemberContext`, it (a) skips the implicit-ancestor REJECT
 /// branches of the workspace-inheritance override and (b) carries the
-/// workspace root's `[workspace.*]`, `[patch.crates-io]`, `[replace]`,
-/// and `[profile.*]` tables down into the staged overlay per §5.3 /
-/// §5.3.bis.
+/// workspace root's `[workspace.*]`, ALL `[patch.<registry>]` subtables
+/// (crates-io and alt registries), `[replace]`, and `[profile.*]` tables
+/// down into the staged overlay per §5.3 / §5.3.bis. The Option H 4-rule
+/// self-patch policy applies only to `[patch.crates-io]`; non-crates-io
+/// registry tables are carried verbatim (path-absolutized).
 ///
 /// `workspace_root_value` is the parsed workspace-root TOML, captured
 /// once by [`resolve_workspace_member_manifest`] so the materializer
@@ -351,8 +354,8 @@ pub struct WorkspaceMemberContext {
     /// --compat`; adopters should not construct this struct directly.
     pub workspace_root_manifest: PathBuf,
     /// Parsed workspace-root TOML value. The carry-down reads
-    /// `[workspace.*]`, `[patch.crates-io]`, `[replace]`, and
-    /// `[profile.*]` from this value.
+    /// `[workspace.*]`, ALL `[patch.<registry>]` subtables, `[replace]`,
+    /// and `[profile.*]` from this value.
     pub workspace_root_value: toml::Value,
 }
 
@@ -1972,12 +1975,13 @@ fn apply_workspace_member_inheritance(
     ctx: &WorkspaceMemberContext,
     member_manifest: &Path,
 ) -> Result<(), Error> {
-    // Step 2 (§5.3.bis) — reject member-local `[patch.crates-io]`. The
-    // resolver did not read the member's `[patch]` table (it does not
-    // see member manifests). The check lives here because this is the
-    // point where we decide what `[patch.crates-io]` the overlay
-    // carries down. A member with `[patch.crates-io]` would have
-    // failed cargo's own baseline load anyway; we surface the
+    // Step 2 (§5.3.bis) — reject member-local `[patch.<registry>]` for
+    // ALL registries. The resolver did not read the member's `[patch]`
+    // table (it does not see member manifests). The check lives here
+    // because this is the point where we decide which `[patch]` tables
+    // the overlay carries down — those come from the workspace root,
+    // not from the member. A member with any `[patch.<registry>]` would
+    // have failed cargo's own baseline load anyway; we surface the
     // directed diagnostic eagerly.
     //
     // **Non-table rejection (issue #53 FOLLOWUP-B).** The previous
@@ -1989,6 +1993,15 @@ fn apply_workspace_member_inheritance(
     // same diagnostic the overlay-side guards use (current ~lines
     // 2802 / 2814) so member-local non-table maps to the same hard-
     // reject as workspace-root non-table.
+    //
+    // **Multi-registry rejection (issue #53 BLOCK-3).** The previous
+    // check only inspected `[patch.crates-io]`; a member-local
+    // `[patch.my-vendor]` (or any other registry key) slipped through
+    // silently and would have been incorporated by the workspace-root
+    // merge path in `apply_self_patch_policy`, contradicting the
+    // downstream comment at overlay.rs:2994-2996 ("member-local
+    // `[patch]` was rejected … upstream"). Now we walk ALL registry
+    // keys and reject any non-empty subtable.
     if let Some(patch_value) = top.get("patch") {
         let toml::Value::Table(patch) = patch_value else {
             return Err(Error::TomlParse {
@@ -1996,22 +2009,23 @@ fn apply_workspace_member_inheritance(
                 message: "`[patch]` must be a table; found a non-table value".to_string(),
             });
         };
-        if let Some(crates_io_value) = patch.get("crates-io") {
-            let toml::Value::Table(patch_table) = crates_io_value else {
+        for (registry, registry_value) in patch.iter() {
+            let toml::Value::Table(registry_table) = registry_value else {
                 return Err(Error::TomlParse {
                     path: member_manifest.to_path_buf(),
-                    message: "`[patch.crates-io]` must be a table; found a non-table value"
-                        .to_string(),
+                    message: format!(
+                        "`[patch.{registry}]` must be a table; found a non-table value"
+                    ),
                 });
             };
-            if !patch_table.is_empty() {
+            if !registry_table.is_empty() {
                 return Err(Error::Cli {
                     clap_exit_code: 2,
                     message: format!(
                         "error: `--package` resolver: workspace member `{}` declares \
-                         `[patch.crates-io]`; cargo does not permit `[patch]` in workspace \
+                         `[patch.{registry}]`; cargo does not permit `[patch]` in workspace \
                          members (only the workspace root). Move the patch entries to the \
-                         workspace root's `[patch.crates-io]` or remove them.",
+                         workspace root's `[patch.{registry}]` or remove them.",
                         member_manifest.display()
                     ),
                 });
@@ -2914,16 +2928,17 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 ///
 /// # Workspace-member case (issue #53)
 ///
-/// When `workspace_member_ctx` is `Some`, the effective `[patch.crates-io]`
-/// table is the WORKSPACE ROOT's (per §5.3.bis composition order:
-/// root-first, member-second). The function:
+/// When `workspace_member_ctx` is `Some`, ALL `[patch.<registry>]` subtables
+/// come from the WORKSPACE ROOT (per §5.3.bis composition order: root-first,
+/// member-second). The function:
 ///
-/// 1. Absolutizes path entries in the workspace-root's `[patch.crates-io]`
-///    against `workspace_root_dir` (NOT against `upstream_dir`).
-/// 2. INSERTS the workspace-root entries into `top["patch"]["crates-io"]`,
-///    replacing any member-local entries (member-local `[patch.crates-io]`
-///    is rejected upstream by [`apply_workspace_member_inheritance`] step
-///    2, so a non-empty member table here would already have errored).
+/// 1. Absolutizes path entries in each workspace-root `[patch.<registry>]`
+///    subtable against `workspace_root_dir` (NOT against `upstream_dir`).
+/// 2. INSERTS the workspace-root entries into `top["patch"][<registry>]`
+///    for every registry, replacing any pre-existing member-local entries
+///    (member-local `[patch.<registry>]` of any registry is rejected upstream
+///    by [`apply_workspace_member_inheritance`] step 2, so a non-empty member
+///    table here would already have errored).
 /// 3. Runs the simplified workspace-member dispatch on the merged
 ///    table:
 ///    - Self-entry absent → Rule 1 INJECT (synthetic self-patch).
@@ -8422,6 +8437,134 @@ demo = { path = "." }
                 );
             }
             other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 BLOCK-3 (issue #53 post-review): member-local non-crates-io
+    //    `[patch.<registry>]` rejection ─────────────────────────────────
+    //
+    // BLOCK-3 extends the member-local patch rejection to ALL registries.
+    // Prior to this fix, only `[patch.crates-io]` was checked; a member
+    // declaring `[patch.my-vendor]` (or any other registry) would slip
+    // through and be silently incorporated by `apply_self_patch_policy`'s
+    // workspace-root merge path, contradicting the downstream invariant
+    // that all member-local `[patch]` was rejected before that point.
+
+    /// Member-local `[patch.my-vendor] = "oops"` (non-table inner value)
+    /// is rejected with `TomlParse` naming the offending registry.
+    #[test]
+    fn member_local_patch_my_vendor_non_table_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut patch = toml::map::Map::new();
+        patch.insert("my-vendor".to_string(), toml::Value::String("oops".into()));
+        top.insert("patch".to_string(), toml::Value::Table(patch));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
+            .expect_err("member-local non-table `[patch.my-vendor]` must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/m/Cargo.toml"));
+                assert!(
+                    message.contains("`[patch.my-vendor]` must be a table"),
+                    "diagnostic must name `[patch.my-vendor]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    /// Member-local `[patch.my-vendor] my-crate = { path = "..." }` is
+    /// well-formed TOML but is unconditionally rejected — member-local
+    /// `[patch]` of any registry is forbidden (cargo itself errors on
+    /// this shape; lihaaf matches with a directed diagnostic).
+    #[test]
+    fn member_local_patch_my_vendor_is_rejected() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut patch_table = toml::map::Map::new();
+        let mut my_vendor = toml::map::Map::new();
+        let mut entry = toml::map::Map::new();
+        entry.insert("path".to_string(), toml::Value::String("./vendored".into()));
+        my_vendor.insert("my-crate".to_string(), toml::Value::Table(entry));
+        patch_table.insert("my-vendor".to_string(), toml::Value::Table(my_vendor));
+        top.insert("patch".to_string(), toml::Value::Table(patch_table));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
+            .expect_err("member-local `[patch.my-vendor]` must be rejected");
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(
+                    message.contains("cargo does not permit `[patch]` in workspace members"),
+                    "diagnostic must name the rejection rationale: {message}"
+                );
+                assert!(
+                    message.contains("my-vendor"),
+                    "diagnostic must name the offending registry key: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
+        }
+    }
+
+    /// Member-local manifest with BOTH `[patch.crates-io]` and
+    /// `[patch.vendored]` is rejected. The error identifies whichever
+    /// registry is encountered first during the iteration (both are
+    /// forbidden; the rejection stops at the first non-empty table).
+    #[test]
+    fn member_local_multi_registry_patch_rejection_includes_all() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let mut pkg = toml::map::Map::new();
+        pkg.insert("name".to_string(), toml::Value::String("m".into()));
+        top.insert("package".to_string(), toml::Value::Table(pkg));
+        let mut patch_table = toml::map::Map::new();
+        // crates-io entry
+        let mut crates_io = toml::map::Map::new();
+        let mut ci_entry = toml::map::Map::new();
+        ci_entry.insert("path".to_string(), toml::Value::String("./ci-local".into()));
+        crates_io.insert("some-dep".to_string(), toml::Value::Table(ci_entry));
+        patch_table.insert("crates-io".to_string(), toml::Value::Table(crates_io));
+        // vendored registry entry
+        let mut vendored = toml::map::Map::new();
+        let mut v_entry = toml::map::Map::new();
+        v_entry.insert("path".to_string(), toml::Value::String("./vendored".into()));
+        vendored.insert("other-crate".to_string(), toml::Value::Table(v_entry));
+        patch_table.insert("vendored".to_string(), toml::Value::Table(vendored));
+        top.insert("patch".to_string(), toml::Value::Table(patch_table));
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n").expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_workspace_member_inheritance(&mut top, &ctx, Path::new("/ws/m/Cargo.toml"))
+            .expect_err("member-local multi-registry `[patch]` must be rejected");
+        // Either registry rejection is valid. `toml::map::Map` preserves
+        // insertion order, so "crates-io" is encountered first in this
+        // fixture. The important invariant is that SOME registry triggers
+        // the Cli rejection — both are forbidden.
+        match err {
+            Error::Cli { message, .. } => {
+                assert!(
+                    message.contains("cargo does not permit `[patch]` in workspace members"),
+                    "diagnostic must name the rejection rationale: {message}"
+                );
+            }
+            other => panic!("expected Cli error, got {other:?}"),
         }
     }
 
