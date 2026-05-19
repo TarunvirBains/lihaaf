@@ -1527,6 +1527,13 @@ pub fn resolve_workspace_member_manifest(
     // every exclude entry against the workspace-root dir using the
     // same rules as step 5. Path normalization (trailing slash,
     // forward-slash form) matches the candidate paths.
+    //
+    // **Path-key normalization (issue #53 BLOCK-1).** Every PathBuf
+    // inserted into `exclude_dirs` is lexically normalized via
+    // [`lexical_normalize_pathbuf`] so that `./pkg-a`, `pkg-a/`,
+    // `pkg-a/.`, and `pkg-a` all key the same set entry. The match
+    // against `candidate_dirs` at line 1579 (below) uses the same
+    // normalizer, so equal lexical-canonical paths intersect correctly.
     let mut exclude_dirs: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     if let Some(arr) = exclude_array {
         for entry in arr {
@@ -1546,16 +1553,25 @@ pub fn resolve_workspace_member_manifest(
                 continue;
             }
             // Expand globs in exclude entries the same way as members.
+            // `expand_workspace_member_entry` already returns
+            // lexically-normalized PathBufs; the normalize call here
+            // is a defense-in-depth idempotent re-normalization.
             let expanded =
                 expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
             for path in expanded {
-                exclude_dirs.insert(path);
+                exclude_dirs.insert(lexical_normalize_pathbuf(&path));
             }
         }
     }
 
     // Step 5 + 8 — iterate members, expand, deduplicate by
     // canonicalized directory path.
+    //
+    // **Path-key normalization (issue #53 BLOCK-1).** Every candidate
+    // PathBuf is lexically normalized via [`lexical_normalize_pathbuf`]
+    // before insertion / exclude lookup, so that overlapping shapes
+    // (`pkg-a`, `./pkg-a`, `pkg-a/`, `pkg-a/.`) all collapse to ONE
+    // candidate dir and ONE manifest read.
     let mut candidate_dirs: std::collections::BTreeMap<PathBuf, ()> =
         std::collections::BTreeMap::new();
     let mut scanned_member_names: Vec<String> = Vec::new();
@@ -1575,11 +1591,16 @@ pub fn resolve_workspace_member_manifest(
         let expanded =
             expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
         for path in expanded {
+            // Lexically normalize for stable map-key + exclude
+            // intersection. `expand_workspace_member_entry` already
+            // normalizes; the call here is the canonical comparison
+            // shape and is idempotent.
+            let canonical = lexical_normalize_pathbuf(&path);
             // Apply exclude subtraction here (step 4 / §4.3 step 3.5).
-            if exclude_dirs.contains(&path) {
+            if exclude_dirs.contains(&canonical) {
                 continue;
             }
-            candidate_dirs.insert(path, ());
+            candidate_dirs.insert(canonical, ());
         }
     }
 
@@ -1773,7 +1794,16 @@ fn expand_workspace_member_entry(
     workspace_root_dir: &Path,
     package_name: &str,
 ) -> Result<Vec<PathBuf>, Error> {
-    let segments: Vec<&str> = entry.split('/').filter(|s| !s.is_empty()).collect();
+    // **Segment filter (issue #53 BLOCK-1).** Strip both empty segments
+    // (`"a//b"`) AND `Component::CurDir` segments (`"./a"`, `"a/./b"`)
+    // at the SOURCE — the segment vector then carries only meaningful
+    // path components. This is symmetric with [`lexical_normalize_pathbuf`]'s
+    // CurDir-filter contract and means parent-dir construction below
+    // does not push `.` segments verbatim.
+    let segments: Vec<&str> = entry
+        .split('/')
+        .filter(|s| !s.is_empty() && *s != ".")
+        .collect();
     if segments.is_empty() {
         return Ok(Vec::new());
     }
@@ -1784,6 +1814,9 @@ fn expand_workspace_member_entry(
 
     // Compute the parent directory (the dir we enumerate when the LAST
     // segment is a glob, or the dir we anchor a literal join against).
+    // Parent segments cannot be `.` (filtered above) and have been
+    // glob-validated by `validate_workspace_member_entry` — the join
+    // produces a path without verbatim-preserved `./` artifacts.
     let mut parent_dir = workspace_root_dir.to_path_buf();
     for seg in &parent_segments {
         parent_dir.push(seg);
@@ -1825,7 +1858,11 @@ fn expand_workspace_member_entry(
                 continue;
             }
             if super::discovery::glob_segment_matches(pattern_bytes, name_str.as_bytes()) {
-                matches.push(child.path());
+                // Normalize the matched child path before returning so
+                // any `./` artifact inherited from `workspace_root_dir`
+                // (e.g. when the workspace root was itself supplied as
+                // `./Cargo.toml`'s parent dir) is filtered out.
+                matches.push(lexical_normalize_pathbuf(&child.path()));
             }
         }
         // Stable order for deterministic diagnostics + de-duplication.
@@ -1839,11 +1876,13 @@ fn expand_workspace_member_entry(
         // Literal entry — join against the parent dir (which is the
         // workspace root when there are no parent segments). The
         // caller's downstream `read_to_string` returns NotFound on a
-        // missing manifest, which we skip silently.
+        // missing manifest, which we skip silently. The returned
+        // PathBuf is lexically normalized so downstream key / exclude
+        // comparisons see a canonical shape.
         let mut joined = parent_dir;
         joined.push(last);
         let _ = package_name;
-        Ok(vec![joined])
+        Ok(vec![lexical_normalize_pathbuf(&joined)])
     }
 }
 
@@ -2341,6 +2380,13 @@ fn absolutize_path_bearing_keys(
     //    string arrays; each entry is a glob or a sub-directory name
     //    relative to the manifest dir. Absolutize each so cargo can
     //    locate workspace members from the staged manifest.
+    //
+    //    **Lexical normalization (issue #53 BLOCK-1).** Each joined
+    //    absolutized path is lexically normalized via
+    //    [`lexical_normalize_pathbuf`] so `./pkg-a`, `pkg-a/.`, and
+    //    trailing-slash forms emit a CANONICAL absolute path string in
+    //    the overlay. This keeps overlay byte-shape deterministic
+    //    across equivalent input forms.
     if let Some(toml::Value::Table(ws)) = top.get_mut("workspace") {
         for key in ["members", "exclude"] {
             if let Some(toml::Value::Array(arr)) = ws.get_mut(key) {
@@ -2348,9 +2394,9 @@ fn absolutize_path_bearing_keys(
                     if let toml::Value::String(s) = entry {
                         let p = Path::new(s.as_str());
                         if !p.is_absolute() {
-                            let abs = crate::util::to_forward_slash(
-                                &upstream_dir.join(p).to_string_lossy(),
-                            );
+                            let joined = upstream_dir.join(p);
+                            let canonical = lexical_normalize_pathbuf(&joined);
+                            let abs = crate::util::to_forward_slash(&canonical.to_string_lossy());
                             *entry = toml::Value::String(abs);
                         }
                     }
@@ -2359,14 +2405,15 @@ fn absolutize_path_bearing_keys(
         }
 
         // 7b. `[workspace].default-members` — another string array, same
-        //     absolutization semantics as `members`.
+        //     absolutization + lexical-normalize semantics as `members`.
         if let Some(toml::Value::Array(arr)) = ws.get_mut("default-members") {
             for entry in arr.iter_mut() {
                 if let toml::Value::String(s) = entry {
                     let p = Path::new(s.as_str());
                     if !p.is_absolute() {
-                        let abs =
-                            crate::util::to_forward_slash(&upstream_dir.join(p).to_string_lossy());
+                        let joined = upstream_dir.join(p);
+                        let canonical = lexical_normalize_pathbuf(&joined);
+                        let abs = crate::util::to_forward_slash(&canonical.to_string_lossy());
                         *entry = toml::Value::String(abs);
                     }
                 }
@@ -2519,6 +2566,43 @@ fn lexical_path_normalize_path(p: &Path) -> Vec<std::path::Component<'_>> {
     p.components()
         .filter(|c| !matches!(c, std::path::Component::CurDir))
         .collect()
+}
+
+/// PathBuf adapter for [`lexical_path_normalize_path`]: reconstruct a
+/// `PathBuf` from the filtered component vector, suitable for use as a
+/// `BTreeMap` / `BTreeSet` key or for `PathBuf == PathBuf` comparison.
+///
+/// **Why this exists (issue #53 post-review BLOCK-1).** The `--package`
+/// resolver and overlay path absolutization compare and deduplicate
+/// `[workspace.members]` / `[workspace.exclude]` / `[workspace.default-members]`
+/// path strings by raw `PathBuf` form. Without lexical normalization,
+/// `./pkg-a`, `pkg-a/`, `pkg-a/.`, and `pkg-a` are DISTINCT keys in the
+/// candidate / exclude maps — silently breaking `exclude` subtraction
+/// (`./pkg-a` survives an `exclude = ["pkg-a"]`), allowing duplicate
+/// package matches for the same on-disk manifest, and producing
+/// non-canonical absolutized paths in the staged overlay.
+///
+/// **Semantics:** strictly lexical, matching [`lexical_path_normalize_path`]:
+/// `Component::CurDir` is dropped, `Component::ParentDir` is preserved
+/// (never collapsed — collapsing `..` lexically is unsound on filesystems
+/// with symlinks, per plan §6.11). An all-`CurDir` input (e.g. `.`,
+/// `./.`) normalizes to `.` so downstream callers see a non-empty path.
+///
+/// **Forward-slash representation:** callers that need a forward-slash
+/// string representation (for cross-platform overlay TOML emission) must
+/// apply [`crate::util::to_forward_slash`] AFTER calling this function —
+/// the normalizer operates on `PathBuf` (native OS separators); the
+/// forward-slash conversion is a separate, downstream concern.
+fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in lexical_path_normalize_path(p) {
+        out.push(c.as_os_str());
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 /// Apply the Option H intent-aware self-patch policy to
@@ -7420,6 +7504,180 @@ demo = { path = "." }
             ),
             other => panic!("expected Cli error, got {other:?}"),
         }
+        drop(tmp);
+    }
+
+    // ── §7.2 BLOCK-1 (issue #53 post-review): resolver path
+    //    normalization ───────────────────────────────────────────────
+    //
+    // The `--package` resolver compares `[workspace.members]` /
+    // `[workspace.exclude]` path strings by PathBuf form. Without
+    // lexical normalization, `./pkg-a`, `pkg-a`, `pkg-a/`, and
+    // `pkg-a/.` are DISTINCT keys — exclude subtraction misses,
+    // duplicate package matches survive, and the resolver's
+    // dedup/exclude/entry-matching contracts silently break.
+    //
+    // The fix is centered on [`lexical_normalize_pathbuf`] applied at
+    // every PathBuf insertion / comparison site. These tests pin the
+    // observed behavior.
+
+    /// [`lexical_normalize_pathbuf`] equivalences: `./pkg-a` ≡ `pkg-a`,
+    /// `pkg-a/.` ≡ `pkg-a`, `pkg-a/` ≡ `pkg-a` (the four shapes named
+    /// in the BLOCK-1 enumeration), under joining with a workspace-root
+    /// dir. `..` is preserved (lexical-only, no symlink resolution).
+    #[test]
+    fn lexical_normalize_pathbuf_collapses_dot_and_trailing_slash_forms() {
+        let root = Path::new("/work/ws");
+        let raw = [
+            "pkg-a", "./pkg-a", "pkg-a/", "pkg-a/.", ".//pkg-a", "./pkg-a/",
+        ];
+        let canonical: Vec<PathBuf> = raw
+            .iter()
+            .map(|s| lexical_normalize_pathbuf(&root.join(s)))
+            .collect();
+        let first = canonical[0].clone();
+        for (idx, p) in canonical.iter().enumerate() {
+            assert_eq!(
+                p,
+                &first,
+                "shape {} (`{}`) must lexically-normalize to the same PathBuf as `pkg-a`; \
+                 got `{}`",
+                idx,
+                raw[idx],
+                p.display()
+            );
+        }
+
+        // `..` is NOT collapsed — matches the `lexical_path_normalize_path`
+        // contract (plan §6.11: no canonicalize).
+        let with_parent = lexical_normalize_pathbuf(&root.join("pkg-a/.."));
+        assert_ne!(
+            with_parent, first,
+            "`pkg-a/..` must NOT collapse to `pkg-a` (ParentDir preserved per plan §6.11)"
+        );
+    }
+
+    /// [`lexical_normalize_pathbuf`] empty-result fallback: a path made
+    /// entirely of `CurDir` components must return `"."` (non-empty),
+    /// so downstream callers do not encounter an empty PathBuf in a
+    /// map key or comparison.
+    #[test]
+    fn lexical_normalize_pathbuf_returns_dot_for_all_curdir_input() {
+        let a = lexical_normalize_pathbuf(Path::new("."));
+        let b = lexical_normalize_pathbuf(Path::new("./."));
+        let c = lexical_normalize_pathbuf(Path::new("././"));
+        assert_eq!(a, PathBuf::from("."));
+        assert_eq!(b, PathBuf::from("."));
+        assert_eq!(c, PathBuf::from("."));
+    }
+
+    /// Resolver: `members = ["./pkg-a"]` resolves the same as
+    /// `members = ["pkg-a"]` — the dot-prefix MUST not produce a
+    /// duplicate or a miss.
+    #[test]
+    fn resolver_dot_prefix_member_resolves_same_as_bare() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["./pkg-a"]"#, None, "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("`./pkg-a` member shape must resolve identically to `pkg-a`");
+        assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
+        drop(tmp);
+    }
+
+    /// Resolver: trailing-slash member entry (`pkg-a/`) resolves the
+    /// same as bare (`pkg-a`).
+    #[test]
+    fn resolver_trailing_slash_member_resolves_same_as_bare() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["pkg-a/"]"#, None, "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("`pkg-a/` member shape must resolve identically to `pkg-a`");
+        assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
+        drop(tmp);
+    }
+
+    /// Resolver: `pkg-a/.` (explicit CurDir tail) resolves the same as
+    /// bare (`pkg-a`).
+    #[test]
+    fn resolver_curdir_tail_member_resolves_same_as_bare() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["pkg-a/."]"#, None, "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("`pkg-a/.` member shape must resolve identically to `pkg-a`");
+        assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
+        drop(tmp);
+    }
+
+    /// Resolver exclude/member interaction: `members = ["./pkg-a"]` +
+    /// `exclude = ["pkg-a"]` MUST produce empty membership (no match,
+    /// no-match diagnostic). Without lexical normalization, the
+    /// `./pkg-a` member survives the `pkg-a` exclude and the resolver
+    /// would incorrectly find it.
+    #[test]
+    fn resolver_dot_prefix_member_excluded_by_bare_exclude() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["./pkg-a"]"#, Some(r#"["pkg-a"]"#), "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "pkg-a").expect_err(
+            "`./pkg-a` member must be subtracted by `pkg-a` exclude — no resolver match",
+        );
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no member") || message.contains("subtracted"),
+                "diagnostic must indicate no member matched: {message}"
+            ),
+            other => panic!("expected Cli no-match error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// Resolver exclude/member interaction (inverse): `members = ["pkg-a"]` +
+    /// `exclude = ["./pkg-a"]` MUST also subtract — exclude can also
+    /// carry the `./` prefix and the comparison must still match.
+    #[test]
+    fn resolver_bare_member_excluded_by_dot_prefix_exclude() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["pkg-a"]"#, Some(r#"["./pkg-a"]"#), "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let err = resolve_workspace_member_manifest(&ws_manifest, "pkg-a").expect_err(
+            "`pkg-a` member must be subtracted by `./pkg-a` exclude — no resolver match",
+        );
+        match err {
+            Error::Cli { message, .. } => assert!(
+                message.contains("no member") || message.contains("subtracted"),
+                "diagnostic must indicate no member matched: {message}"
+            ),
+            other => panic!("expected Cli no-match error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// Resolver glob + dot-prefix interaction: `members = ["./pkg-*"]`
+    /// resolves to `pkg-a` (`./` on the glob parent must not produce
+    /// duplicate matches or a path-shape mismatch). This is the
+    /// axum-macros + dot-prefix variant.
+    #[test]
+    fn resolver_dot_prefix_glob_member_resolves() {
+        let (tmp, ws_manifest) = synthesize_workspace_root(r#"["./pkg-*"]"#, None, "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("`./pkg-*` glob shape must resolve identically to `pkg-*`");
+        assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
+        drop(tmp);
+    }
+
+    /// Resolver dedup: `members = ["./pkg-a", "pkg-a", "pkg-a/"]`
+    /// MUST resolve to a single match for `pkg-a` — the overlapping
+    /// shapes collapse to one candidate dir, one manifest read, and
+    /// one match (NOT the multiple-match diagnostic).
+    #[test]
+    fn resolver_overlapping_shapes_dedup_to_single_match() {
+        let (tmp, ws_manifest) =
+            synthesize_workspace_root(r#"["./pkg-a", "pkg-a", "pkg-a/"]"#, None, "");
+        write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
+        let (member_manifest, _ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
+            .expect("overlapping `./pkg-a`/`pkg-a`/`pkg-a/` must dedup to one match");
+        assert_eq!(member_manifest, tmp.path().join("pkg-a").join("Cargo.toml"));
         drop(tmp);
     }
 }

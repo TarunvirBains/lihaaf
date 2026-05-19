@@ -23,10 +23,13 @@
 //!    (`idempotent_rerun_no_byte_change` — second run does not touch
 //!    mtime).
 //! 5. The cross-binary determinism corpus
-//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — eight
+//!    (`byte_identical_across_two_lihaaf_binaries_on_corpus` — nine
 //!    representative `Cargo.toml` shapes under
 //!    `tests/compat/overlay_corpus/`, each checked against a
-//!    pre-committed `*.expected.toml`).
+//!    pre-committed `*.expected.toml`). The ninth fixture
+//!    (`workspace_member_with_package`) was added in issue #53 and
+//!    materializes through the `--package`-resolver shape with a
+//!    populated `WorkspaceMemberContext`.
 //! 6. The §3.2.3 risk section's invariant
 //!    (`patch_tables_preserved_verbatim` — `[patch.crates-io]`
 //!    `git`/`branch`/`tag`/`rev` fields pass through verbatim;
@@ -3627,6 +3630,128 @@ serde = { workspace = true }
     assert!(
         patch_self.ends_with("lihaaf-overlay"),
         "Rule 1 INJECT must target the staged-overlay dir; got `{patch_self}`"
+    );
+
+    drop(tmp);
+}
+
+/// **Issue #53 BLOCK-1 §7.3 extension: dot-prefix + exclude integration test.**
+///
+/// Variant of `cargo_lihaaf_resolves_axum_macros_shape_workspace_member` that
+/// exercises the BLOCK-1 path-normalization contract end-to-end:
+///
+/// - `members = ["./pkg-a", "./pkg-*"]` (dot-prefixed literal + glob),
+/// - `exclude = ["pkg-a"]` (bare exclude, no dot prefix),
+///
+/// **Expected:** `pkg-a` is excluded (proving `./pkg-a` member lexically
+/// matches `pkg-a` exclude), `./pkg-*` glob matches `pkg-macros` as the
+/// target — the resolver succeeds and materialization proceeds.
+///
+/// **What this pins:** the resolver and the overlay absolutization
+/// agree on the canonical lexical form. A regression where the
+/// resolver normalized one side and the absolutizer normalized the
+/// other (or neither) would show up here as either a no-match error
+/// or a duplicate-match error.
+///
+/// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1` for parity with the
+/// sibling axum-macros test.
+#[test]
+fn cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude() {
+    if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
+        eprintln!(
+            "skipping cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude: \
+             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+        );
+        return;
+    }
+
+    let tmp = tempfile::tempdir().expect("creating tempdir for dot-prefix + exclude test");
+    let ws_root = tmp.path();
+    let ws_root_manifest = ws_root.join("Cargo.toml");
+
+    // Members carry dot-prefix; exclude is bare. Without BLOCK-1
+    // normalization the `pkg-a` exclude would not subtract the
+    // `./pkg-a` member, breaking the resolver's intent.
+    let ws_root_toml = r#"[workspace]
+members = ["./pkg-a", "./pkg-*"]
+exclude = ["pkg-a"]
+
+[workspace.package]
+edition = "2021"
+"#;
+    std::fs::write(&ws_root_manifest, ws_root_toml).expect("write workspace-root manifest");
+
+    let pkg_a_dir = ws_root.join("pkg-a");
+    std::fs::create_dir_all(pkg_a_dir.join("src")).expect("create pkg-a/src");
+    std::fs::write(
+        pkg_a_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-a"
+version = "0.1.0"
+
+[lib]
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-a Cargo.toml");
+    std::fs::write(
+        pkg_a_dir.join("src").join("lib.rs"),
+        "pub fn _stub_a() {}\n",
+    )
+    .expect("write pkg-a src/lib.rs");
+
+    let pkg_macros_dir = ws_root.join("pkg-macros");
+    std::fs::create_dir_all(pkg_macros_dir.join("src")).expect("create pkg-macros/src");
+    std::fs::write(
+        pkg_macros_dir.join("Cargo.toml"),
+        r#"[package]
+name = "pkg-macros"
+version = "0.1.0"
+
+[lib]
+proc-macro = true
+path = "src/lib.rs"
+"#,
+    )
+    .expect("write pkg-macros Cargo.toml");
+    std::fs::write(
+        pkg_macros_dir.join("src").join("lib.rs"),
+        "// minimal proc-macro lib stub for BLOCK-1 integration test\n",
+    )
+    .expect("write pkg-macros src/lib.rs");
+
+    // pkg-a should be EXCLUDED (proving `./pkg-a` member ≡ `pkg-a`
+    // exclude). pkg-macros must still resolve via `./pkg-*` glob.
+    let pkg_a_result = lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-a");
+    assert!(
+        pkg_a_result.is_err(),
+        "`./pkg-a` member must be subtracted by `pkg-a` exclude; \
+         resolving `pkg-a` must error (BLOCK-1: lexical normalization)"
+    );
+
+    let (member_manifest, ws_root_value) =
+        lihaaf::compat_resolve_workspace_member_manifest(&ws_root_manifest, "pkg-macros")
+            .expect("resolver must find pkg-macros via `./pkg-*` glob match");
+    assert_eq!(
+        member_manifest,
+        pkg_macros_dir.join("Cargo.toml"),
+        "resolver must return the pkg-macros manifest path"
+    );
+
+    let ctx = WorkspaceMemberContext {
+        workspace_root_manifest: ws_root_manifest.clone(),
+        workspace_root_value: ws_root_value,
+    };
+    let plan = materialize_overlay_with_metadata_and_ctx(&member_manifest, None, Some(&ctx))
+        .expect("materialization must succeed under workspace-member context");
+
+    let expected_overlay_path = pkg_macros_dir
+        .join("target")
+        .join("lihaaf-overlay")
+        .join("Cargo.toml");
+    assert_eq!(
+        plan.sibling_manifest, expected_overlay_path,
+        "overlay must be staged under <member_root>/target/lihaaf-overlay/"
     );
 
     drop(tmp);
