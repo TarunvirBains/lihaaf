@@ -352,6 +352,33 @@ per_fixture_memory_mb = 1024
 # quotes, or backslashes. Unknown lint names are NOT pre-validated —
 # rustc surfaces `warning: unknown lint: X` on the per-fixture stderr.
 allow_lints = ["unexpected_cfgs", "dead_code"]
+
+# DEFAULT: []. Adopter-defined literal-substring substitutions applied
+# to normalized stderr AFTER built-in path placeholders and BEFORE
+# TypeId collapse. Each entry's `from` must be path-shaped (contain
+# `/`, `\`, or be a bare `$X` placeholder where `X` is an ASCII
+# uppercase letter); `to` must not contain a newline. See §6.6 for
+# the full validation rules and worked examples.
+extra_substitutions = [
+    { from = "/nix/store/abc123-rust-1.95.0/lib/rustlib", to = "$RUST/lib/rustlib" },
+]
+
+# DEFAULT: []. Adopter-defined full-line exact-match drops applied to
+# normalized stderr after per-line trim-trailing-whitespace and before
+# blank-line collapse. Each entry must be path-shaped OR banner-shaped
+# (see §6.6).
+strip_lines = [
+    "/build/sandbox/internal/wrappers/cc-wrapper-1.0",
+    "error: aborting due to 1 previous error",
+]
+
+# DEFAULT: []. Adopter-defined prefix-match drops applied after the
+# same trim, before the same collapse. Same shape constraints as
+# strip_lines.
+strip_line_prefixes = [
+    "$WORKSPACE/.cargo-cache/",
+    "For more information about this error",
+]
 ```
 
 ### 3.3 Worked example
@@ -408,6 +435,15 @@ doing any work. Any of these conditions hard-error with a non-zero exit:
   `-A` prefix; lihaaf supplies it).
 - An entry in `allow_lints` contains whitespace, double quotes, single
   quotes, or backslashes (would break argv tokenization).
+- An entry in `extra_substitutions` has a `from` value that is not
+  path-shaped (must contain `/`, `\`, or be a bare `$X` placeholder
+  token where `X` is an ASCII uppercase letter — see §6.6 for the
+  `is_path_like` definition).
+- An entry in `extra_substitutions` has a `to` value containing a
+  newline (replacements must be single-line).
+- An entry in `strip_lines` or `strip_line_prefixes` is neither
+  path-shaped nor banner-shaped (see §6.6 for the
+  `is_path_like || is_banner_shape` disjunction).
 
 Unknown lint names are NOT pre-validated — rustc surfaces
 `warning: unknown lint: X` on the per-fixture stderr.
@@ -489,6 +525,10 @@ at session startup with the list of valid names.
   gets `[]`, not the default suite's features. The explicit-replacement
   rule keeps a "spatial only" suite from accidentally pulling in a
   sibling `testing` feature.
+- `extra_substitutions`, `strip_lines`, and `strip_line_prefixes` DO
+  NOT inherit. Per-suite REPLACE semantics match the `features`
+  precedent: a named suite that omits these keys gets `[]`, not the
+  default suite's value. See §6.6 for the rationale.
 - `extern_crates`, `dev_deps`, `edition`, `compile_fail_marker`,
   `fixture_timeout_secs`, `per_fixture_memory_mb`, and `allow_lints`
   DO inherit from the default suite when omitted.
@@ -1036,6 +1076,13 @@ The categories the harness handles in v0.1:
   `$TYPEID`.
 - **Trailing whitespace** on each line → stripped.
 - **Multiple blank lines** → collapsed to one.
+- **Adopter-defined `extra_substitutions`** (see §6.6) — applied AFTER
+  the built-in placeholders above and BEFORE TypeId collapse. Empty
+  by default; opt-in only.
+- **Adopter-defined `strip_lines` / `strip_line_prefixes`** (see §6.6)
+  — full-line exact-match and prefix-match drops applied after
+  per-line trim-trailing-whitespace and before blank-line collapse.
+  Empty by default; opt-in only.
 
 ### 6.3 What does NOT get normalized
 
@@ -1074,11 +1121,17 @@ traversal.
 
 ### 6.5 Determinism contract
 
-For a `(fixture, dylib SHA-256, rustc release, OS)` tuple, the
-normalized stderr is byte-deterministic. The normalizer has no
-hidden state, no env-dependent paths it doesn't capture, and no
-wall-clock dependency. Snapshots survive cross-machine reruns when
-the toolchain matches.
+For a `(fixture, dylib SHA-256, rustc release, OS, extra_substitutions,
+strip_lines, strip_line_prefixes)` tuple, the normalized stderr is
+byte-deterministic. The normalizer has no hidden state, no
+env-dependent paths it doesn't capture, and no wall-clock dependency.
+Snapshots survive cross-machine reruns when the toolchain matches and
+the adopter-defined override vectors are stable. The three adopter
+override vectors enter the determinism tuple as the validated, typed
+contents of the resolved `Suite` (per-suite REPLACE semantics — see
+§3.6 and §6.6); two adopters with identical override TOML produce
+identical normalized output for the same fixture, dylib, and
+toolchain.
 
 The OS qualifier is honest: rustc messages can mention `\\` inside
 strings (a fixture containing `\\` in source) and the normalizer
@@ -1087,6 +1140,196 @@ does NOT rewrite those — only path-shaped substrings on `--> ` /
 files (`.stderr.linux`, `.stderr.macos`, `.stderr.windows`) if
 adopters need true cross-OS portability for fixtures that lean on
 paths inside strings.
+
+### 6.6 Adopter-extensible normalization (issue #45 / v0.1.0-beta.10)
+
+The §6.2 categories cover environment-independent substring rewriting
+that lihaaf can derive from session-startup state (workspace root,
+sysroot, cargo registry, fixture directory). Some adopter environments
+have additional environment-specific noise that lihaaf cannot capture
+generically: NixOS sysroot layouts, Bazel sandboxes, vendored
+toolchains with non-standard prefixes, CI runner banners, rustc
+trailer lines that adopters in some environments want stripped for
+toolchain-agnostic snapshots.
+
+The three opt-in keys — `extra_substitutions`, `strip_lines`,
+`strip_line_prefixes` — extend the normalizer with adopter-defined
+substitution and line-drop rules.
+
+**Composition order.** The normalizer applies categories in this order
+per line: (1) line endings unified to `\n`; (2) backslash→slash on
+path-marker lines; (3) `$LONGTYPE_FILE` placeholder; (4) built-in
+path substitutions (`$DIR`, `$WORKSPACE`, `$RUST`, `$CARGO/registry`)
+length-sorted longest-first; (5) compat-mode short-CARGO post-pass
+(when compat mode is on); (6) `extra_substitutions` in declared
+order; (7) TypeId collapse; (8) trim trailing whitespace. After the
+per-line loop: (9) line-drop by `strip_lines` exact match OR
+`strip_line_prefixes` prefix match; (10) collapse runs of blank
+lines; (11) trim trailing blank lines. Extras run AFTER built-ins so
+adopter rules can refer to the placeholders (e.g.,
+`from = "$RUST/lib/rust-1.95.0"` operates on the already-substituted
+`$RUST` prefix). Extras run BEFORE TypeId so an extras-introduced
+`#<digits>` sequence collapses to `$TYPEID`. Line-drop runs after
+per-line trim so strip patterns match logical content, and BEFORE
+blank-line collapse so a stripped line participates in the collapse.
+
+**Per-suite REPLACE.** The three keys do NOT inherit on named
+suites — a named suite that omits any of them gets `[]`, NOT the
+default suite's value. This matches the `features` precedent (§3.6).
+The sharp edge: a named suite that adds even one entry to
+`extra_substitutions` must list every adopter substitution it
+wants (no merge). The default-on-omit rule keeps "feature-isolated"
+suites from accidentally pulling in unrelated overrides.
+
+**Default invariant.** An adopter who does not set any of the three
+keys observes byte-identical output vs v0.1.0-beta.9. The feature is
+additive and opt-in.
+
+**`extra_substitutions` validation — `is_path_like` predicate.**
+Each entry's `from` field must satisfy `is_path_like`:
+
+1. `from.len() >= 2`.
+2. `from` contains no `\n` byte.
+3. **Leading-`$` guard.** If the first byte is `$`, the second byte
+   must be ASCII uppercase. This rule fires BEFORE the disjunction
+   below and is unconditional: `$lowercase/path` is REJECTED even
+   though it contains `/`.
+4. At least one of:
+   - (a) contains `/`,
+   - (b) contains `\`,
+   - (c) matches `^\$[A-Z][A-Za-z0-9_]*$` (full-string anchored — the
+     ENTIRE string is a bare placeholder token, no trailing characters
+     after the placeholder tail).
+
+The `to` field must not contain a newline; otherwise it is
+unconstrained (adopters legitimately need `to = ""` for
+strip-via-substitute, `to = "$RUST"`, and compound replacements).
+
+**Why `is_path_like` is a positive allowlist.** Earlier drafts used a
+substring blocklist on diagnostic markers (`error`, `warning`, `note`,
+…) but the blocklist could not be closed: every closed marker list
+admitted some path-bearing diagnostic or rustc trailer the allowlist
+catches structurally. Positive shape gating means strip and substitute
+patterns target paths and placeholders, not diagnostic text.
+
+**Adopter `$X` placeholder convention — uppercase-only.** When an
+adopter pattern's FIRST byte is `$`, lihaaf expects the next byte to
+be an ASCII uppercase letter (the recognized placeholder shape is
+`$[A-Z][A-Za-z0-9_]*`), e.g., `$NIX_STORE`, `$SANDBOX_ROOT`. Patterns
+with leading `$lowercase` (`$nix`, `$sandbox`) are rejected at config
+parse time. The leading-`$` uppercase requirement applies even when
+the pattern also contains a path separator: `$nix/path` is REJECTED
+(the `is_path_like` predicate's leading-`$` guard fires before the
+path-separator disjunction). Interior `$lowercase` substrings WITHIN
+paths (e.g., `/path/$nix/sub`, `/some/$cache/dir`) are path text, not
+placeholder references, and are ACCEPTED via the path-separator
+branch — the recognized-placeholder convention governs LEADING
+placeholder tokens, not arbitrary `$` occurrences inside path text.
+This convention matches lihaaf's built-in placeholders (`$DIR`,
+`$WORKSPACE`, `$RUST`, `$CARGO`, `$TYPEID`, `$LONGTYPE_FILE`) and
+keeps placeholder tokens visually distinct from environment variable
+expansions or shell variable references in surrounding documentation.
+
+**Bare placeholder patterns are full-string anchored.** A pattern
+like `$DIR` is accepted because the entire string matches the
+recognized placeholder shape — `$` + ASCII uppercase letter + zero
+or more `[A-Za-z0-9_]` characters, with NO additional characters
+after the tail. Patterns with trailing non-placeholder characters —
+`$DIR-`, `$DIR.`, `$A!`, `$RUST extra`, `$WORKSPACE,` — are REJECTED
+by the `is_path_like` predicate even though they start with a valid
+placeholder prefix. Adopters who want a placeholder followed by
+additional path content (e.g., `$DIR/x`, `$RUST/lib/rustlib`) must
+use the path-separator branch: the pattern is accepted because it
+contains `/` (or `\` on Windows), not because it starts with a
+valid placeholder prefix. If you need to substitute a value that
+follows a placeholder without a path separator, write the full
+string in `from`: `from = "$VENDOR-extra-suffix"` is REJECTED at
+config parse time because no separator is present and the bare-
+placeholder branch is full-string anchored.
+
+**`strip_lines` / `strip_line_prefixes` validation —
+`is_path_like || is_banner_shape`.** Strip patterns may also target
+known banner shapes. The `is_banner_shape` predicate accepts (case-
+sensitive):
+
+- The enumerated rustc trailers and tool-version banner prefixes:
+  - `For more information about this error...`
+  - `error: aborting due to ...`
+  - `note: this error originates from ...`
+  - `info: ...`
+  - `linker version: ...`
+- Structural banner shape — uppercase-leading lines that are 40+
+  bytes long, contain a space, and include one of: `deprecated`,
+  `deprecation`, `Please update`, `actions to use`, `EOL`,
+  `end-of-life`.
+
+`is_banner_shape` rejects (regardless of length): whitespace-leading
+or span-context-first-byte lines (rustc span context `  |`, `^^^^^`,
+`= note:`, `| trait bound`); diagnostic-body anti-prefixes
+(`expected `, `found `, `the trait `, `the type `, `cannot find `,
+`mismatched types`, `consider `, `help: `, `warning: `, `error[`);
+and any line shorter than 20 bytes (`error`, `note`, `: ` — too
+short to be a banner). Together these rules ensure span context,
+diagnostic message bodies WITHOUT a path-shaped substring, and
+diagnostic-keyword bare patterns are unreachable as strip patterns.
+
+**Structural-banner-shape use cases.** The (C.2) structural-banner
+alternative admits any uppercase-leading, 40+ byte, deprecation-
+marker-bearing line — covering more than just CI-runner banners.
+Worked examples in each subfamily:
+
+- CI-runner deprecation: `Node.js 16 actions are deprecated. Please
+  update the following actions to use Node.js 20: ...`,
+  `GitHub Actions deprecation: please migrate by end-of-life date
+  2026-06-01`.
+- Proc-macro / code-gen deprecation: `Deprecated generator output:
+  Please update the generated API before release`.
+- Build-system migration: `Vendored toolchain deprecated: Please
+  update to the supported version`.
+
+The uppercase-first-byte requirement is a deliberate carve-out from
+rustc's lowercase-first-byte convention (`error`, `warning`, `note`,
+`help`) — that boundary, not "produced by a CI runner," is what
+makes (C.2) safe to add to the strip allowlist. The enumerated
+banner-prefix list (the rustc trailers + `info:` + `linker version:`
+above) is closed for v0.1.0-beta.10; a future lihaaf release may
+extend it.
+
+**Path-bearing diagnostic stripping caveat.** Strip patterns are
+validated for SHAPE (path-shaped or banner-shaped), not for whether
+the line they will match contains rustc diagnostic content. A
+path-shaped strip pattern that overlaps with a path-bearing
+diagnostic line (e.g.,
+`strip_line_prefixes = ["error: couldn't read /build/"]` matching
+`error: couldn't read /build/generated.rs`) WILL drop that line.
+This is by design — the adopter has explicitly opted into dropping
+lines matching the pattern. Adopters who want to preserve all
+rustc-emitted error diagnostics should not write strip patterns
+whose path component appears in rustc's `error: couldn't read`,
+`error: linking with`, or similar path-bearing error families. The
+two-key split (`strip_lines` exact-match vs `strip_line_prefixes`
+prefix-match) gives adopters precise targeting: exact match for
+single-instance line targeting, prefix match for line-family
+targeting.
+
+**Built-in placeholders are not reserved.** Adopters may write
+`from` patterns containing `$DIR`, `$WORKSPACE`, `$RUST`,
+`$CARGO/registry`, `$TYPEID` — the built-in substitution pass runs
+first, so the adopter rule sees the placeholder literal in the
+intermediate output and can rewrite it further (e.g.,
+`{ from = "$RUST/lib/rust-1.95.0", to = "$RUST" }` collapses an
+inner version-stamped sub-tree to bare `$RUST`).
+
+**Compat-mode deferral (OQ-4).** The three keys are *unsupported in
+compat mode* for v0.1.0-beta.10. The compat driver
+(`cargo lihaaf --compat`) synthesizes `[package.metadata.lihaaf]`
+entirely and does not surface adopter TOML into the inner session,
+so the three keys carry no value through compat-mode runs. This is
+not a future-extension placeholder; it is a deliberate scope
+boundary for the beta.10 release. Adopters who need
+extra-substitution / strip behavior must run in v0.1 stable mode
+(without `--compat`). Compat-mode adopter extras may land in
+beta.11+.
 
 ---
 
