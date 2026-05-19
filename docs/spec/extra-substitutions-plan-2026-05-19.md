@@ -1,6 +1,6 @@
 # `extra_substitutions` design + implementation plan — v0.1.0-beta.10
 
-Status: FINAL DRAFT (round 6 — post Codex round-5 ALLOW + DOC cleanup). Round-6 addresses the two Codex round-5 DOC_BEFORE_BETA findings (Finding A field-level test matrix gap propagating Class 9 + F'' through the wiring layer, Finding B §5/§6.6 silent on full-string anchor rule for bare placeholder patterns). No predicate-behavior changes; surgical Edit-tool amendments only. Previous round status was AMENDED DRAFT round 5 — post Codex round-4 ALLOW + DOC cleanup, which addressed the five Codex round-4 DOC_BEFORE_BETA findings (Finding 1 §12 stale "unreachable" claim, Finding 2 OQ-B interior-dollar ambiguity, Finding 3 rule 4(c) anchor ambiguity, Finding 4 stale CI-banner wording, Finding 5 byte/char count corrections).
+Status: IMPLEMENTED (post Codex PR #68 final-review FIX_BEFORE_BETA-1 fix). Round-6 + PR #68 fix: serde `Deserialize` bypass on `Substitution` and strip-pattern keys closed via `#[serde(try_from = …)]`; `StripPattern` newtype wraps `Suite.strip_lines` / `Suite.strip_line_prefixes`; 6 regression tests added; §3.3.4 + §14 updated. All four verification gates pass (fmt / clippy / test --lib / doc). Previous round status was FINAL DRAFT round 6 — post Codex round-5 ALLOW + DOC cleanup, addressing two DOC_BEFORE_BETA findings (Finding A field-level test matrix gap, Finding B §5/§6.6 silent on full-string anchor).
 Author: strict-swe PLANNER (Opus, 2026-05-19, round 6 surgical amendment).
 Implementation target: v0.1.0-beta.10.
 Implementer: `careful-coder` (Opus, max effort) after user OK on this final draft.
@@ -768,6 +768,42 @@ OQ-B contract: the uppercase-only $-placeholder rule is now enforced
 unconditionally for any leading-`$` pattern, regardless of whether
 the pattern also contains a path separator.
 
+#### 3.3.4 Serde `Deserialize` paths route through validation (Codex final-review FIX-1)
+
+`Config`, `Suite`, `Substitution`, and the strip-key element type all implement
+`serde::Deserialize`. Without an explicit mechanism, a caller using
+`serde_json::from_value::<Config>(…)` (or any other serde-supported format) would
+bypass `validate_extra_substitutions` and `validate_strip_patterns`, because serde
+calls each type's `Deserialize` impl directly — not the TOML parse path.
+
+**Fix (v0.1.0-beta.10, Codex PR #68 FIX_BEFORE_BETA-1):**
+
+- `Substitution` uses `#[serde(try_from = "RawSubstitution")]`. serde deserializes
+  the wire value as `RawSubstitution` (Option-field struct) and then calls
+  `TryFrom<RawSubstitution> for Substitution`, which enforces the same `from`
+  presence + `is_path_like` + `to` presence + no-newline rules as the TOML
+  parse path. This is implemented in `src/config.rs` (where `RawSubstitution` and
+  `is_path_like` are defined) so the predicate is shared, not duplicated.
+
+- A `StripPattern(String)` newtype replaces `String` in `Suite.strip_lines` and
+  `Suite.strip_line_prefixes`. `StripPattern` uses
+  `#[serde(try_from = "String", into = "String")]`. Its `TryFrom<String>` impl
+  enforces the `is_path_like(s) || is_banner_shape(s)` disjunction (plus the
+  no-newline rule). The TOML parse path still validates first via
+  `validate_strip_patterns`, then promotes the validated strings to `StripPattern`
+  values using the internal tuple-struct constructor (no double-validation).
+
+Both mechanisms close the same class of bypass: any external-format deserialization
+that constructs a `Config` now undergoes the same validation as TOML manifest
+parsing. The safety argument from §3.3 is preserved end-to-end.
+
+**Regression tests:** `serde_deserialize_rejects_invalid_substitution_from`,
+`serde_deserialize_rejects_invalid_substitution_to_newline`,
+`serde_deserialize_rejects_invalid_strip_lines`,
+`serde_deserialize_rejects_invalid_strip_line_prefixes`,
+`serde_deserialize_accepts_valid_substitution`,
+`serde_deserialize_accepts_valid_strip_pattern` in `src/config.rs`.
+
 ### 3.4 Key-by-key decisions
 
 **Why a table (`{ from, to }`) and not a delimited string?** Two-field
@@ -1513,6 +1549,10 @@ round-3 critique are about the planner's `is_banner_shape` design.
 |---|---|
 | Codex round-5 DOC_BEFORE_BETA Finding A (field-level test descriptions still reference "Classes 1-8" / Class F-only enumerations after round-5 added predicate-level Class 9 acceptance + Class F'' rejection) | §7.3.3 — test 43 (`validate_extra_substitutions_rejects_non_path_from`) rejection-class list extended `A/B/C/E/F/F'/H/I/J` → `A/B/C/E/F/F'/F''/H/I/J` with F'' annotated as round-5 DOC Finding 3 field-level regression guard pinning rule (4c) full-string-anchoring propagation through the wiring layer; test 44 (`validate_extra_substitutions_accepts_path_from`) acceptance list extended `Classes 1-8` → `Classes 1-9` with Class 9 annotated as round-5 DOC Finding 2 field-level acceptance guard pinning rule 4(a) interior-`$lowercase` path-text propagation; test 47 (`validate_strip_patterns_accepts_path`, strip-key mirror of test 44) similarly extended `Classes 1-8` → `Classes 1-9`; test 53 (`validate_strip_patterns_rejects_short_and_dollar`, strip-key mirror of test 43 for the `$` family) rejection-class list extended `D/E/F/F'/G/H` → `D/E/F/F'/F''/G/H`. No new field-level tests added — round-5 test bodies already cover the disjunction via predicate calls; description-only propagation. |
 | Codex round-5 DOC_BEFORE_BETA Finding B (§5/§6.6 silent on rule (4c) full-string anchor; adopter reading the spec amendment cannot tell that `$DIR-`, `$RUST.`, `$WORKSPACE,` are rejected) | §5/§6.6 — new `bare-placeholder full-string-anchor prose` paragraph inserted between the existing uppercase-only Decision #3 / OQ-B paragraph (round-4) and the structural-banner-shape paragraph (round-4 DOC_BEFORE_BETA-2 rename). Surface-ups the implementer-prose constraint already documented at §3.3.1 lines 421-426 (`^\$[A-Z][A-Za-z0-9_]*$`). Walks adopters through (1) what "bare placeholder" means and why `$DIR` is accepted, (2) the trailing-junk rejection family (`$DIR-`, `$DIR.`, `$A!`, `$RUST extra`, `$WORKSPACE,`), (3) the path-separator branch as the route for placeholder + path content (`$DIR/x`, `$RUST/lib/rustlib`), and (4) the implication for adopters who need substring-like substitution without a separator (write the full string; (4c)'s full-string anchor means partial-token patterns are config-parse rejected). No predicate behavior change. |
+
+| Codex PR #68 final-review finding (post-implementation fix) | Resolution location |
+|---|---|
+| Codex xhigh FIX_BEFORE_BETA-1 (serde `Deserialize` bypass: `Config`/`Suite`/`Substitution`/strip-keys all derive `Deserialize` directly, allowing `serde_json::from_value::<Config>` to construct invalid state without triggering `is_path_like` or `validate_strip_patterns`) | §3.3.4 (new sub-section) — `Substitution` uses `#[serde(try_from = "RawSubstitution")]`; strip keys wrapped in `StripPattern` newtype with `#[serde(try_from = "String")]`; `TryFrom` impls share the same predicates as the TOML parse path; 6 regression tests added to `src/config.rs`. |
 
 | Round-1 finding (re-confirmed) | Resolution location |
 |---|---|

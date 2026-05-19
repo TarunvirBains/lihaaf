@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::RawSubstitution;
 use crate::util;
 
 /// One adopter-defined `extra_substitutions` entry.
@@ -41,7 +42,17 @@ use crate::util;
 ///
 /// Validation rules are in [`crate::config`]; this struct is the
 /// validated typed shape passed into the normalizer.
+///
+/// # Serde validation
+///
+/// Deserialization routes through [`crate::config::RawSubstitution`]
+/// via `#[serde(try_from = "RawSubstitution")]`. The `TryFrom` impl
+/// (in `crate::config`) enforces the `is_path_like` + no-newline rules
+/// identically to the TOML parse path, so any external format
+/// (JSON, TOML, etc.) that constructs a `Substitution` cannot bypass
+/// validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSubstitution")]
 pub struct Substitution {
     /// Literal-substring needle. Allowlist-gated to be path-shaped
     /// (`is_path_like`) at config-parse time so `from` cannot rewrite

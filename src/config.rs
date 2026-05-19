@@ -193,7 +193,10 @@ pub struct Suite {
     /// [`Self::extra_substitutions`]. Each entry must pass
     /// `is_path_like` OR `is_banner_shape` per config-parse validation
     /// (see `docs/spec/lihaaf-v0.1.md` §6.6).
-    pub strip_lines: Vec<String>,
+    ///
+    /// The [`StripPattern`] wrapper guarantees this invariant holds on
+    /// every construction path, including direct serde deserialization.
+    pub strip_lines: Vec<StripPattern>,
 
     /// Adopter-defined prefix-match drops applied to normalized
     /// stderr after trim-trailing-whitespace and BEFORE blank-line
@@ -202,7 +205,10 @@ pub struct Suite {
     /// **Per-suite REPLACE semantics** — same as
     /// [`Self::extra_substitutions`]. Each entry must pass
     /// `is_path_like` OR `is_banner_shape` per config-parse validation.
-    pub strip_line_prefixes: Vec<String>,
+    ///
+    /// The [`StripPattern`] wrapper guarantees this invariant holds on
+    /// every construction path, including direct serde deserialization.
+    pub strip_line_prefixes: Vec<StripPattern>,
 }
 
 impl Suite {
@@ -212,6 +218,73 @@ impl Suite {
     /// a named suite.
     pub fn is_default(&self) -> bool {
         self.name == DEFAULT_SUITE_NAME
+    }
+}
+
+/// A validated strip-pattern string. Wraps a `String` that has already
+/// passed the `is_path_like(s) || is_banner_shape(s)` predicate.
+///
+/// Used for [`Suite::strip_lines`] and [`Suite::strip_line_prefixes`].
+/// The `#[serde(try_from = "String")]` attribute ensures that ANY
+/// deserialization path — TOML manifest, serde-JSON direct construction,
+/// or any other format — routes through [`TryFrom<String>`], closing the
+/// bypass that would otherwise let `serde_json::from_value::<Config>`
+/// skip `validate_strip_patterns`.
+///
+/// # Invariant
+///
+/// Every `StripPattern` instance satisfies
+/// `is_path_like(s) || is_banner_shape(s)` by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct StripPattern(String);
+
+impl StripPattern {
+    /// Borrow the inner validated string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for StripPattern {
+    type Error = String;
+
+    /// Validate `s` against `is_path_like(s) || is_banner_shape(s)`.
+    ///
+    /// Called automatically by serde when deserializing `Suite.strip_lines`
+    /// or `Suite.strip_line_prefixes` via any format (TOML, JSON, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `s` fails both predicates. The string
+    /// is surfaced by serde as a deserialization error.
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.contains('\n') {
+            return Err(format!(
+                "\"{s}\" contains a newline character; strip patterns must be single-line."
+            ));
+        }
+        if !is_path_like(&s) && !is_banner_shape(&s) {
+            return Err(format!(
+                "\"{s}\" is neither path-shaped nor banner-shaped \
+                 (must contain '/', '\\\\', start with a $X placeholder token where X is an \
+                 ASCII uppercase letter, OR match the banner allowlist — \
+                 see docs/spec/lihaaf-v0.1.md §6.6). \
+                 Patterns starting with '$' must have an ASCII uppercase letter immediately after, \
+                 regardless of path separators — '$lowercase/path' is rejected. \
+                 Bare placeholder patterns are full-string anchored: \
+                 '$DIR-', '$RUST.', '$A!' are rejected; '$DIR/x' is accepted \
+                 via the path-separator branch. \
+                 Strip patterns target path-shaped environment noise OR known banner shapes only."
+            ));
+        }
+        Ok(StripPattern(s))
+    }
+}
+
+impl From<StripPattern> for String {
+    fn from(p: StripPattern) -> String {
+        p.0
     }
 }
 
@@ -279,10 +352,81 @@ struct RawSuite {
 /// the validated [`Substitution`] in [`build_default_suite`] /
 /// [`finalize_named_suite`] after [`validate_extra_substitutions`]
 /// passes.
+///
+/// Exposed as `pub(crate)` so that [`crate::normalize::Substitution`]'s
+/// `#[serde(try_from = "RawSubstitution")]` impl can reference this type
+/// and route all external-format deserialization through the same
+/// `is_path_like` + no-newline validation that the TOML parse path uses.
 #[derive(Debug, Default, Deserialize, Clone)]
-struct RawSubstitution {
-    from: Option<String>,
-    to: Option<String>,
+pub(crate) struct RawSubstitution {
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+}
+
+impl TryFrom<RawSubstitution> for Substitution {
+    type Error = String;
+
+    /// Validate a raw deserialized `extra_substitutions` entry and
+    /// promote it to the typed [`Substitution`] value.
+    ///
+    /// Enforces exactly the rules that [`validate_extra_substitutions`]
+    /// applies on the TOML parse path, so every construction route —
+    /// TOML manifest, direct serde JSON, or any other format — goes
+    /// through the same guards:
+    ///
+    /// - `from` must be present and non-empty.
+    /// - `from` must pass [`is_path_like`].
+    /// - `to` must be present (may be empty string).
+    /// - `to` must not contain a newline character.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when any of the above rules are violated.
+    /// The string is surfaced by serde as a deserialization error so
+    /// adopters who construct `Config` / `Suite` from JSON or other
+    /// formats see an actionable message.
+    fn try_from(raw: RawSubstitution) -> Result<Self, Self::Error> {
+        let from = raw.from.ok_or_else(|| {
+            "extra_substitutions entry is missing the required `from` key. \
+             Every entry must specify which substring to match."
+                .to_string()
+        })?;
+        if from.is_empty() {
+            return Err("extra_substitutions entry `from` is empty. \
+                 An empty `from` would match the start of every byte and rewrite arbitrary \
+                 content. extra_substitutions is for path-shaped substitution only. \
+                 See docs/spec/lihaaf-v0.1.md §6.6."
+                .to_string());
+        }
+        if !is_path_like(&from) {
+            return Err(format!(
+                "extra_substitutions `from` = \"{from}\" is not path-like \
+                 (must contain '/', '\\\\', or be a bare $X placeholder token \
+                 where X is an ASCII uppercase letter). \
+                 Patterns starting with '$' must have an ASCII uppercase letter \
+                 immediately after, regardless of path separators — \
+                 '$lowercase/path' is rejected. \
+                 Bare placeholder patterns are full-string anchored: \
+                 '$DIR-', '$RUST.', '$A!' are rejected; '$DIR/x' is accepted \
+                 via the path-separator branch. \
+                 extra_substitutions is for path-shaped substitution only, \
+                 not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
+            ));
+        }
+        let to = raw.to.ok_or_else(|| {
+            "extra_substitutions entry is missing the required `to` key. \
+             Use an empty string `to = \"\"` to strip the match."
+                .to_string()
+        })?;
+        if to.contains('\n') {
+            return Err("extra_substitutions `to` contains a newline character; \
+                 replacements must be single-line. \
+                 A multi-line `to` would inject blank lines into normalized \
+                 stderr and break snapshot determinism."
+                .to_string());
+        }
+        Ok(Substitution { from, to })
+    }
 }
 
 /// Load the consumer crate's `Cargo.toml`, extract
@@ -453,14 +597,24 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
     )?;
     validate_extra_substitutions(DEFAULT_SUITE_NAME, &extra_substitutions)?;
 
-    let strip_lines = raw.strip_lines.clone().unwrap_or_default();
-    validate_strip_patterns(DEFAULT_SUITE_NAME, "strip_lines", &strip_lines)?;
-    let strip_line_prefixes = raw.strip_line_prefixes.clone().unwrap_or_default();
+    let strip_lines_raw = raw.strip_lines.clone().unwrap_or_default();
+    validate_strip_patterns(DEFAULT_SUITE_NAME, "strip_lines", &strip_lines_raw)?;
+    // SAFETY: validate_strip_patterns just confirmed every entry passes
+    // `is_path_like || is_banner_shape`; construct StripPattern values
+    // directly to avoid re-running the predicate.
+    let strip_lines: Vec<StripPattern> = strip_lines_raw.into_iter().map(StripPattern).collect();
+
+    let strip_line_prefixes_raw = raw.strip_line_prefixes.clone().unwrap_or_default();
     validate_strip_patterns(
         DEFAULT_SUITE_NAME,
         "strip_line_prefixes",
-        &strip_line_prefixes,
+        &strip_line_prefixes_raw,
     )?;
+    // SAFETY: same rationale as strip_lines above.
+    let strip_line_prefixes: Vec<StripPattern> = strip_line_prefixes_raw
+        .into_iter()
+        .map(StripPattern)
+        .collect();
 
     Ok(Suite {
         name: DEFAULT_SUITE_NAME.to_string(),
@@ -582,10 +736,21 @@ fn finalize_named_suite(
     let extra_substitutions =
         finalize_substitutions(&name, raw.extra_substitutions.unwrap_or_default())?;
     validate_extra_substitutions(&name, &extra_substitutions)?;
-    let strip_lines = raw.strip_lines.unwrap_or_default();
-    validate_strip_patterns(&name, "strip_lines", &strip_lines)?;
-    let strip_line_prefixes = raw.strip_line_prefixes.unwrap_or_default();
-    validate_strip_patterns(&name, "strip_line_prefixes", &strip_line_prefixes)?;
+
+    let strip_lines_raw = raw.strip_lines.unwrap_or_default();
+    validate_strip_patterns(&name, "strip_lines", &strip_lines_raw)?;
+    // SAFETY: validate_strip_patterns just confirmed every entry passes
+    // `is_path_like || is_banner_shape`; construct StripPattern values
+    // directly to avoid re-running the predicate.
+    let strip_lines: Vec<StripPattern> = strip_lines_raw.into_iter().map(StripPattern).collect();
+
+    let strip_line_prefixes_raw = raw.strip_line_prefixes.unwrap_or_default();
+    validate_strip_patterns(&name, "strip_line_prefixes", &strip_line_prefixes_raw)?;
+    // SAFETY: same rationale as strip_lines above.
+    let strip_line_prefixes: Vec<StripPattern> = strip_line_prefixes_raw
+        .into_iter()
+        .map(StripPattern)
+        .collect();
 
     Ok(Suite {
         name,
@@ -2007,17 +2172,36 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            cfg.suites[0].strip_lines,
-            vec!["/default/strip".to_string()]
+            cfg.suites[0]
+                .strip_lines
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/default/strip"]
         );
         assert_eq!(
-            cfg.suites[0].strip_line_prefixes,
-            vec!["/default/prefix/".to_string()]
+            cfg.suites[0]
+                .strip_line_prefixes
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/default/prefix/"]
         );
-        assert_eq!(cfg.suites[1].strip_lines, vec!["/named/strip".to_string()]);
         assert_eq!(
-            cfg.suites[1].strip_line_prefixes,
-            vec!["/named/prefix/".to_string()]
+            cfg.suites[1]
+                .strip_lines
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/named/strip"]
+        );
+        assert_eq!(
+            cfg.suites[1]
+                .strip_line_prefixes
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/named/prefix/"]
         );
     }
 
@@ -2922,6 +3106,222 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.suites[0].strip_lines.len(), 2);
         assert_eq!(cfg.suites[1].strip_lines.len(), 1);
-        assert_eq!(cfg.suites[1].strip_lines[0], "/named/path");
+        assert_eq!(cfg.suites[1].strip_lines[0].as_str(), "/named/path");
+    }
+
+    // ── §FIX-1 Serde Deserialize bypass regression tests ──────────────────
+    //
+    // These tests prove that the serde Deserialize path for Config/Suite/
+    // Substitution/StripPattern routes through the same validation guards
+    // as the TOML parse path. Without the `try_from` attribute, an adopter
+    // could call `serde_json::from_value::<Config>(…)` and obtain a Config
+    // with invalid state (non-path-like `from`, newline in `to`, invalid
+    // strip patterns) without triggering any validation error.
+    //
+    // Codex xhigh final-review FIX_BEFORE_BETA-1 finding (PR #68).
+
+    /// Helper that builds the minimal JSON value for a Config with a single
+    /// default suite carrying `extra_substitutions = [{ from, to }]`.
+    fn serde_json_config_with_sub(from: &str, to: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [{ "from": from, "to": to }],
+                "strip_lines": [],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    /// Helper that builds the minimal JSON value for a Config with
+    /// `strip_lines = [pattern]` in the default suite.
+    fn serde_json_config_with_strip_lines(pattern: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [pattern],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    /// Helper that builds the minimal JSON value for a Config with
+    /// `strip_line_prefixes = [pattern]` in the default suite.
+    fn serde_json_config_with_strip_line_prefixes(pattern: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [],
+                "strip_line_prefixes": [pattern]
+            }]
+        })
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_substitution_from() {
+        // FIX-1 regression guard: serde_json::from_value::<Config> with a
+        // non-path-like `from` must fail.  Before the fix, `Substitution`
+        // derived `Deserialize` directly and bypassed `is_path_like`.
+        let bad_from_values = [
+            "error",
+            "error:",
+            "expected due to this",
+            "  |",
+            "warning: x",
+        ];
+        for bad_from in &bad_from_values {
+            let v = serde_json_config_with_sub(bad_from, "x");
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject from={bad_from:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("not path-like")
+                    || msg.contains("path-shaped")
+                    || msg.contains("is_path_like")
+                    || msg.contains("extra_substitutions"),
+                "error for from={bad_from:?} should mention path validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_substitution_to_newline() {
+        // FIX-1 regression guard: `to` containing a newline must be rejected
+        // via the serde path.
+        let v = serde_json_config_with_sub("/valid/path", "alpha\nbeta");
+        let result = serde_json::from_value::<Config>(v);
+        assert!(
+            result.is_err(),
+            "serde_json::from_value should reject to with newline but succeeded",
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("newline") || msg.contains("single-line"),
+            "error for newline-in-to should mention newline: {msg}",
+        );
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_strip_lines() {
+        // FIX-1 regression guard: strip_lines entry that is neither
+        // path-like nor banner-shaped must be rejected via the serde path.
+        let bad_patterns = ["error", "  |", "expected due to this", "warning: x", "foo"];
+        for bad_pat in &bad_patterns {
+            let v = serde_json_config_with_strip_lines(bad_pat);
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject strip_lines={bad_pat:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path-shaped")
+                    || msg.contains("banner-shaped")
+                    || msg.contains("neither")
+                    || msg.contains("not path-like"),
+                "error for strip_lines={bad_pat:?} should mention validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_strip_line_prefixes() {
+        // FIX-1 regression guard: strip_line_prefixes entry that is neither
+        // path-like nor banner-shaped must be rejected via the serde path.
+        let bad_patterns = ["error", "  |", "expected due to this", "mismatched types"];
+        for bad_pat in &bad_patterns {
+            let v = serde_json_config_with_strip_line_prefixes(bad_pat);
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject strip_line_prefixes={bad_pat:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path-shaped")
+                    || msg.contains("banner-shaped")
+                    || msg.contains("neither")
+                    || msg.contains("not path-like"),
+                "error for strip_line_prefixes={bad_pat:?} should mention validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_accepts_valid_substitution() {
+        // FIX-1 happy path: valid path-shaped `from` and single-line `to`
+        // must deserialize successfully and preserve the values.
+        let v = serde_json_config_with_sub("/path/$DIR", "$RUST/lib");
+        let cfg = serde_json::from_value::<Config>(v).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid substitution but failed: {e}")
+        });
+        assert_eq!(cfg.suites[0].extra_substitutions.len(), 1);
+        assert_eq!(cfg.suites[0].extra_substitutions[0].from, "/path/$DIR");
+        assert_eq!(cfg.suites[0].extra_substitutions[0].to, "$RUST/lib");
+    }
+
+    #[test]
+    fn serde_deserialize_accepts_valid_strip_pattern() {
+        // FIX-1 happy path: path-shaped and banner-shaped strip patterns
+        // must deserialize successfully via the serde path and preserve values.
+        let path_pattern = "/build/sandbox/cc-wrapper";
+        let v = serde_json_config_with_strip_lines(path_pattern);
+        let cfg = serde_json::from_value::<Config>(v).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid strip_lines but failed: {e}")
+        });
+        assert_eq!(cfg.suites[0].strip_lines.len(), 1);
+        assert_eq!(cfg.suites[0].strip_lines[0].as_str(), path_pattern);
+
+        let banner_pattern = "error: aborting due to 1 previous error";
+        let v2 = serde_json_config_with_strip_line_prefixes(banner_pattern);
+        let cfg2 = serde_json::from_value::<Config>(v2).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid strip_line_prefixes but failed: {e}")
+        });
+        assert_eq!(cfg2.suites[0].strip_line_prefixes.len(), 1);
+        assert_eq!(
+            cfg2.suites[0].strip_line_prefixes[0].as_str(),
+            banner_pattern
+        );
     }
 }

@@ -143,8 +143,20 @@ impl WorkerContext {
             .collect::<Vec<_>>();
         let norm_ctx = norm_ctx
             .with_extra_substitutions(suite.extra_substitutions.clone())
-            .with_strip_lines(suite.strip_lines.clone())
-            .with_strip_line_prefixes(suite.strip_line_prefixes.clone());
+            .with_strip_lines(
+                suite
+                    .strip_lines
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect(),
+            )
+            .with_strip_line_prefixes(
+                suite
+                    .strip_line_prefixes
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect(),
+            );
         Self {
             crate_root,
             managed_dylib,
