@@ -372,11 +372,17 @@ impl TryFrom<RawSubstitution> for Substitution {
     /// Enforces exactly the rules that [`validate_extra_substitutions`]
     /// applies on the TOML parse path, so every construction route —
     /// TOML manifest, direct serde JSON, or any other format — goes
-    /// through the same guards:
+    /// through the same guards.
     ///
-    /// - `from` must be present and non-empty.
-    /// - `from` must pass [`is_path_like`].
+    /// Validation order mirrors [`finalize_substitutions`] →
+    /// [`validate_extra_substitutions`]: both presence checks fire first,
+    /// then shape checks, so multiply-invalid inputs produce the same
+    /// first-error message on both paths.
+    ///
+    /// - `from` must be present.
     /// - `to` must be present (may be empty string).
+    /// - `from` must be non-empty.
+    /// - `from` must pass [`is_path_like`].
     /// - `to` must not contain a newline character.
     ///
     /// # Errors
@@ -386,9 +392,19 @@ impl TryFrom<RawSubstitution> for Substitution {
     /// adopters who construct `Config` / `Suite` from JSON or other
     /// formats see an actionable message.
     fn try_from(raw: RawSubstitution) -> Result<Self, Self::Error> {
+        // Ordering mirrors the TOML path (finalize_substitutions →
+        // validate_extra_substitutions): both presence checks fire before
+        // either shape check, so multiply-invalid inputs produce the same
+        // first error regardless of which deserialization path is taken.
+        // Codex round-2 FIX_BEFORE_BETA-1 (PR #68).
         let from = raw.from.ok_or_else(|| {
             "extra_substitutions entry is missing the required `from` key. \
              Every entry must specify which substring to match."
+                .to_string()
+        })?;
+        let to = raw.to.ok_or_else(|| {
+            "extra_substitutions entry is missing the required `to` key. \
+             Use an empty string `to = \"\"` to strip the match."
                 .to_string()
         })?;
         if from.is_empty() {
@@ -413,11 +429,6 @@ impl TryFrom<RawSubstitution> for Substitution {
                  not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
             ));
         }
-        let to = raw.to.ok_or_else(|| {
-            "extra_substitutions entry is missing the required `to` key. \
-             Use an empty string `to = \"\"` to strip the match."
-                .to_string()
-        })?;
         if to.contains('\n') {
             return Err("extra_substitutions `to` contains a newline character; \
                  replacements must be single-line. \
@@ -3322,6 +3333,90 @@ mod tests {
         assert_eq!(
             cfg2.suites[0].strip_line_prefixes[0].as_str(),
             banner_pattern
+        );
+    }
+
+    /// Helper that builds the minimal JSON value for a Config whose default
+    /// suite has a single `extra_substitutions` entry with only a `from`
+    /// field — `to` is absent — so we can exercise the "to missing" error
+    /// path in `TryFrom<RawSubstitution>`.
+    fn serde_json_config_with_sub_from_only(from: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [{ "from": from }],
+                "strip_lines": [],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    #[test]
+    fn serde_and_toml_paths_agree_on_first_error_for_multiply_invalid() {
+        // Codex round-2 FIX_BEFORE_BETA-1 ordering-parity test.
+        //
+        // Input: from = "error" (not path-like) with `to` absent.  This is
+        // multiply-invalid: the `from` shape is bad AND `to` is missing.
+        // After the fix the TryFrom impl checks presence of both keys before
+        // running shape validation, so both paths report "to is missing" as
+        // the first error rather than one reporting shape and the other
+        // reporting presence.
+
+        // TOML path — via parse_str (finalize_substitutions →
+        // validate_extra_substitutions).
+        let toml_err = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [{ from = "error" }]
+        "#,
+        )
+        .unwrap_err();
+        let toml_msg = unwrap_invalid(toml_err);
+
+        // serde path — via serde_json::from_value::<Config>.
+        let v = serde_json_config_with_sub_from_only("error");
+        let serde_result = serde_json::from_value::<Config>(v);
+        assert!(
+            serde_result.is_err(),
+            "serde_json::from_value should reject missing `to` but succeeded",
+        );
+        let serde_msg = serde_result.unwrap_err().to_string();
+
+        // Both paths must agree that the first-reported failure is the
+        // missing `to` key, not the non-path-like `from`.  The exact
+        // wording differs between paths, so we assert on shared substrings.
+        let to_missing_markers = ["to", "missing"];
+        for marker in &to_missing_markers {
+            assert!(
+                toml_msg.contains(marker),
+                "TOML-path error should reference `{marker}` but got: {toml_msg}",
+            );
+            assert!(
+                serde_msg.contains(marker),
+                "serde-path error should reference `{marker}` but got: {serde_msg}",
+            );
+        }
+        // Neither path should fire the is_path_like guard as the first error.
+        assert!(
+            !toml_msg.contains("not path-like"),
+            "TOML path fired is_path_like before reporting missing `to`: {toml_msg}",
+        );
+        assert!(
+            !serde_msg.contains("not path-like"),
+            "serde path fired is_path_like before reporting missing `to`: {serde_msg}",
         );
     }
 }
