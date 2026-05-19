@@ -30,14 +30,14 @@ name: refresh pilots (stage-2 cross-repo)
 #   gated to maintainers.
 # - `permissions: contents: read` at workflow level. No issue / PR /
 #   checks-API writes.
-# - The four pilot jobs are HARDCODED here. Adding a new pilot
+# - The six pilot jobs are HARDCODED here. Adding a new pilot
 #   requires a PR to this file; this is intentional — pilot
 #   enrollment is a review-gated event, not a config-file dynamic.
 # - Each `uses:` line is SHA-pinned per the SHA-rotation workflow in
 #   `compat/PILOTS.md`. Matrix expressions are documented as forbidden
 #   in `jobs.<job_id>.uses` per
 #   https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax#jobsjob_iduses,
-#   hence the four duplicated job blocks.
+#   hence the six duplicated job blocks.
 #
 # v0.2 may add a scheduled trigger:
 #   schedule:
@@ -54,17 +54,25 @@ on:
         description: 'lihaaf version each pilot installs via `cargo install` (published crates.io version)'
         required: false
         type: string
-        default: '0.1.0-beta.4'
+        default: '0.1.0-beta.9'
 
 permissions:
   contents: read
 
-# Four explicit jobs — one per enrolled pilot fork — because contexts
+# Six explicit jobs — one per enrolled pilot fork — because contexts
 # and expressions (including matrix expressions) are forbidden in
 # `jobs.<job_id>.uses` per GitHub Actions workflow syntax. The jobs
 # run in parallel (no `needs:`); a fork failure does not cancel the
-# other three (the `fail-fast: false` matrix idiom is satisfied here
+# others (the `fail-fast: false` matrix idiom is satisfied here
 # by independent jobs).
+#
+# Round 1 (v0.1.0-beta.4 era): cxx, serde-json, anyhow, thiserror.
+# Round 2 (v0.1.0-beta.9 + #53 workspace-member entry): derive_more,
+# axum-macros. The axum-macros job sets `package: axum-macros` so the
+# lihaaf compat driver enters the tokio-rs/axum workspace via that
+# member; see `docs/compatibility-plan.md` §4.3 for the
+# coverage-matrix rationale (derive macros + attribute proc-macros +
+# `#[test]`-wrapped Trybuild).
 jobs:
   refresh-cxx:
     name: refresh cxx
@@ -106,6 +114,37 @@ jobs:
       fork_repo: TarunvirBains/thiserror-lihaaf-pilot
       pilot_name: thiserror
       fork_ref: master
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
+
+  refresh-derive_more:
+    name: refresh derive_more
+    uses: TarunvirBains/derive_more-lihaaf-pilot/.github/workflows/pilot-stage2.yml@a96c48efa838af95ea07a40397521296e1f99dde
+    with:
+      fork_repo: TarunvirBains/derive_more-lihaaf-pilot
+      pilot_name: derive_more
+      fork_ref: master
+      lihaaf_version: ${{ inputs.lihaaf_version }}
+    permissions:
+      contents: read
+
+  refresh-axum-macros:
+    name: refresh axum-macros
+    # Workspace-member entry: tokio-rs/axum is a multi-crate workspace
+    # and axum-macros lives at `axum-macros/`. The orchestrator passes
+    # `package: axum-macros` so the lihaaf compat driver resolves the
+    # entry shape via `--compat-root <workspace-root>` + `--package
+    # axum-macros` (see compatibility-plan.md §3.2 "Workspace-member
+    # entry via `--package`"). This depends on lihaaf >= 0.1.0-beta.9
+    # (issue #53). For Round 1 single-crate forks `package` stays
+    # empty (template default).
+    uses: TarunvirBains/axum-lihaaf-pilot/.github/workflows/pilot-stage2.yml@383a724dc3a11122a5987463c96b624d5c0f9541
+    with:
+      fork_repo: TarunvirBains/axum-lihaaf-pilot
+      pilot_name: axum-macros
+      fork_ref: main
+      package: axum-macros
       lihaaf_version: ${{ inputs.lihaaf_version }}
     permissions:
       contents: read
