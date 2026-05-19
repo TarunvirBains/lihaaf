@@ -151,7 +151,7 @@
 //!    `[workspace]`): REJECTED with a directed diagnostic naming the
 //!    offending ancestor manifest path. This catches the case Codex
 //!    flagged in PR #37 R3 review: an ancestor workspace carrying
-//!    `[patch.crates-io]` / `[replace]` / `[profile]` / `resolver` /
+//!    `[patch.<registry>]` / `[replace]` / `[profile]` / `resolver` /
 //!    `[workspace.dependencies]` would change cargo's baseline
 //!    resolution but the lihaaf overlay (which terminates cargo's
 //!    walk-up at the staged manifest) would resolve against the
@@ -208,7 +208,7 @@
 //! **Why a CONSERVATIVE ancestor-rejection (any ancestor `[workspace]`,
 //! not just one whose `members` claims the manifest).** Even when the
 //! ancestor `[workspace]` does not name the descendant explicitly,
-//! it can still carry `[patch.crates-io]`, `[replace]`, `[profile]`,
+//! it can still carry `[patch.<registry>]`, `[replace]`, `[profile]`,
 //! `resolver`, or `[workspace.dependencies]` tables that cargo applies
 //! during dependency resolution from the descendant. The lihaaf overlay
 //! at `<descendant>/target/lihaaf-overlay/Cargo.toml` declares
@@ -287,7 +287,8 @@ use crate::util;
 /// TOML value (consumed by [`apply_workspace_member_inheritance`] for
 /// the §5.3 carry-down) and the workspace-root manifest path (consumed
 /// by [`apply_self_patch_policy`] when computing the workspace-root
-/// `[patch.crates-io]` effective table per §5.3.bis).
+/// `[patch.<registry>]` effective tables per §5.3.bis — all registries,
+/// not just crates-io).
 ///
 /// **Invariant.** When `workspace_member_context.is_none()`:
 /// - `workspace_root == member_root`
@@ -915,7 +916,7 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 ///    upstream has NO local `[workspace]` and an ancestor `Cargo.toml`
 ///    on the filesystem walk-up carries `[workspace]`, REJECT with a
 ///    directed diagnostic naming the offending ancestor manifest path.
-///    The ancestor workspace may carry `[patch.crates-io]`, `[replace]`,
+///    The ancestor workspace may carry `[patch.<registry>]`, `[replace]`,
 ///    `[profile]`, `resolver`, or `[workspace.dependencies]` tables
 ///    that affect baseline cargo's dependency resolution; the lihaaf
 ///    overlay terminates cargo's walk-up at the staged manifest and
@@ -1940,12 +1941,13 @@ fn expand_workspace_member_entry(
 /// into the staged overlay's matching top-level / `[workspace.*]`
 /// tables (issue #53 — see plan §5.3 / §5.3.bis).
 ///
-/// `[patch.crates-io]` is NOT handled by this function — it is the
-/// concern of the Option H 4-rule policy implemented in
-/// [`apply_self_patch_policy`], which is extended in #53 to accept an
-/// optional `workspace_root_patch_table` parameter for the workspace-
-/// member case (per §5.3.bis composition order: root-first, member-
-/// second).
+/// `[patch.<registry>]` carry-down is NOT handled by this function —
+/// it is the concern of the Option H 4-rule policy implemented in
+/// [`apply_self_patch_policy`], which receives the workspace-root
+/// context via the `workspace_member_ctx` parameter and reads all
+/// `[patch.<registry>]` subtables from `ctx.workspace_root_value`
+/// for the workspace-member case (per §5.3.bis composition order:
+/// root-first, member-second).
 ///
 /// # Path policy
 ///
