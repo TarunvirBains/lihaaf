@@ -2967,8 +2967,11 @@ fn apply_self_patch_policy(
     // path-bearing key (forward-slash form via `to_forward_slash`).
     let staged_overlay_abs = crate::util::to_forward_slash(&staged_overlay_dir.to_string_lossy());
 
-    // Step 3-4: ensure `top["patch"]` and `top["patch"]["crates-io"]`
-    // exist as tables.
+    // Step 3-4: ensure `top["patch"]` exists as a table. The
+    // `crates-io` sub-table is established AFTER the workspace-root
+    // carry-down (Step 4.5 below) so the multi-registry walk can
+    // freely insert / mutate any registry table without aliasing the
+    // long-lived `crates_io` borrow.
     let patch_entry = top
         .entry("patch".to_string())
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
@@ -2981,33 +2984,36 @@ fn apply_self_patch_policy(
             message: "`[patch]` must be a table".to_string(),
         });
     };
-    let crates_io_entry = patch
-        .entry("crates-io".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
-    let toml::Value::Table(crates_io) = crates_io_entry else {
-        return Err(Error::TomlParse {
-            path: PathBuf::from("<overlay>"),
-            message: "`[patch.crates-io]` must be a table".to_string(),
-        });
-    };
 
-    // Issue #53 — workspace-member case: merge the workspace-root's
-    // `[patch.crates-io]` into the overlay's table BEFORE the 4-rule
-    // dispatch (per §5.3.bis Step 1 composition order).
+    // Step 4.5 — Issue #53 workspace-member case: merge the
+    // workspace-root's `[patch]` registries into the overlay's table
+    // BEFORE the 4-rule dispatch (per §5.3.bis Step 1 composition
+    // order). This runs FIRST so the `crates_io` long-lived borrow
+    // below covers only the dispatch, not the multi-registry walk.
     //
-    // The merge is a SIMPLE INSERT: member-local `[patch.crates-io]`
-    // was rejected by `apply_workspace_member_inheritance` (Step 2)
+    // The merge is a SIMPLE INSERT: member-local `[patch]` was
+    // rejected by `apply_workspace_member_inheritance` (Step 2)
     // before we reached this function, so any pre-existing entries in
-    // `top["patch"]["crates-io"]` are spurious or empty. Path entries
-    // in the workspace-root table are absolutized against
-    // `workspace_root_dir` (NOT against `upstream_dir`/`member_root`).
+    // `top["patch"]` are spurious or empty. Path entries in the
+    // workspace-root table are absolutized against `workspace_root_dir`
+    // (NOT against `upstream_dir`/`member_root`).
     //
     // **Non-table rejection (issue #53 BLOCK-2).** Each layer of the
-    // workspace-root patch table (`[patch]` and `[patch.crates-io]`)
-    // is validated to be a TABLE when present. Silently skipping the
-    // carry-down on a non-table value would mask a malformed upstream
-    // manifest the operator should fix. Errors carry the workspace-
-    // root manifest path so the operator can locate the file.
+    // workspace-root patch table (`[patch]` and each
+    // `[patch.<registry>]`) is validated to be a TABLE when present.
+    // Silently skipping the carry-down on a non-table value would
+    // mask a malformed upstream manifest the operator should fix.
+    // Errors carry the workspace-root manifest path so the operator
+    // can locate the file.
+    //
+    // **Multi-registry carry-down (issue #53 COUNTER_SIGNAL).** ALL
+    // `[patch.<registry>]` subtables are carried down, not just
+    // `[patch.crates-io]`. Adopters using a vendored registry alias
+    // (e.g. `[patch.my-vendor]`) get the same carry-down semantics as
+    // crates-io users. The 4-rule self-patch policy applies only to
+    // `[patch.crates-io.<self>]` (the upstream's `<self>` is keyed
+    // under crates-io by convention); non-crates-io registry entries
+    // are carried verbatim (path-absolutized).
     if let Some(ctx) = workspace_member_ctx {
         let workspace_root_dir = ctx
             .workspace_root_manifest
@@ -3033,45 +3039,93 @@ fn apply_self_patch_policy(
                 });
             }
         };
-        let ws_patch_crates_io_opt = match ws_patch_opt.and_then(|p| p.get("crates-io")) {
-            Some(toml::Value::Table(t)) => Some(t),
-            None => None,
-            Some(_) => {
-                return Err(Error::TomlParse {
-                    path: ctx.workspace_root_manifest.clone(),
-                    message: "workspace-root `[patch.crates-io]` must be a table; found a \
-                              non-table value"
-                        .to_string(),
-                });
+        if let Some(ws_patch) = ws_patch_opt {
+            // Collect a snapshot of (registry, name, carried_table)
+            // tuples FIRST so we can release the `ws_patch` borrow
+            // before mutating `patch`. The snapshot is small (a few
+            // patch entries per registry); cloning avoids the
+            // borrow-checker dance of holding `&ws_patch` while also
+            // writing to `&mut patch`.
+            #[allow(clippy::type_complexity)]
+            let mut carry: Vec<(String, String, toml::Value)> = Vec::new();
+            for (registry, registry_value) in ws_patch.iter() {
+                let toml::Value::Table(ws_registry_table) = registry_value else {
+                    return Err(Error::TomlParse {
+                        path: ctx.workspace_root_manifest.clone(),
+                        message: format!(
+                            "workspace-root `[patch.{registry}]` must be a table; found a \
+                             non-table value"
+                        ),
+                    });
+                };
+                for (name, value) in ws_registry_table.iter() {
+                    let absolutized = match value {
+                        toml::Value::Table(t) => {
+                            let mut carried = t.clone();
+                            if let Some(s) = carried.get("path").and_then(|v| v.as_str()) {
+                                let p = Path::new(s);
+                                let abs = if p.is_absolute() {
+                                    crate::util::to_forward_slash(&p.to_string_lossy())
+                                } else {
+                                    crate::util::to_forward_slash(
+                                        &workspace_root_dir.join(p).to_string_lossy(),
+                                    )
+                                };
+                                carried.insert("path".to_string(), toml::Value::String(abs));
+                            }
+                            toml::Value::Table(carried)
+                        }
+                        other => {
+                            // Defensive: a non-table individual patch
+                            // entry is invalid cargo grammar but we
+                            // don't silently drop it — let cargo
+                            // diagnose the shape if it ever loads
+                            // this overlay.
+                            other.clone()
+                        }
+                    };
+                    carry.push((registry.clone(), name.clone(), absolutized));
+                }
             }
-        };
-        if let Some(ws_patch_crates_io) = ws_patch_crates_io_opt {
-            for (name, value) in ws_patch_crates_io.iter() {
-                let mut carried = match value {
-                    toml::Value::Table(t) => t.clone(),
+            // Apply the snapshot. Each (registry, name, value) lands
+            // at `top["patch"][registry][name]`.
+            for (registry, name, value) in carry {
+                let registry_entry = patch
+                    .entry(registry)
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                let registry_table = match registry_entry {
+                    toml::Value::Table(t) => t,
                     other => {
-                        // Defensive: non-table entries are invalid
-                        // cargo grammar but we don't want to silently
-                        // drop them. Wrap into an entry — cargo will
-                        // diagnose the bad shape if it ever loads
-                        // this overlay.
-                        crates_io.insert(name.clone(), other.clone());
-                        continue;
+                        // Defensive: a pre-existing non-table
+                        // overlay-side registry value. Replace with
+                        // an empty table to honor the carry-down
+                        // intent (member-local non-table is already
+                        // rejected by FOLLOWUP-B).
+                        *other = toml::Value::Table(toml::map::Map::new());
+                        match other {
+                            toml::Value::Table(t) => t,
+                            _ => unreachable!("just wrote a Table above"),
+                        }
                     }
                 };
-                if let Some(s) = carried.get("path").and_then(|v| v.as_str()) {
-                    let p = Path::new(s);
-                    let abs = if p.is_absolute() {
-                        crate::util::to_forward_slash(&p.to_string_lossy())
-                    } else {
-                        crate::util::to_forward_slash(&workspace_root_dir.join(p).to_string_lossy())
-                    };
-                    carried.insert("path".to_string(), toml::Value::String(abs));
-                }
-                crates_io.insert(name.clone(), toml::Value::Table(carried));
+                registry_table.insert(name, value);
             }
         }
     }
+
+    // Step 4.6: Now establish `top["patch"]["crates-io"]` as a table
+    // for the 4-rule dispatch. After the multi-registry merge above,
+    // the crates-io entry may already exist (carried down) or be
+    // absent (clean case); entry/or_insert handles both.
+    let crates_io_entry = patch
+        .entry("crates-io".to_string())
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+    let toml::Value::Table(crates_io) = crates_io_entry else {
+        return Err(Error::TomlParse {
+            path: PathBuf::from("<overlay>"),
+            message: "`[patch.crates-io]` must be a table".to_string(),
+        });
+    };
 
     // Step 5: Option H 4-rule dispatch on
     // `top["patch"]["crates-io"][<self>]`. In the workspace-member case
@@ -8365,6 +8419,177 @@ demo = { path = "." }
                 assert!(
                     message.contains("`[patch.crates-io]` must be a table"),
                     "diagnostic must name `[patch.crates-io]`; got: {message}"
+                );
+            }
+            other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    // ── §7.2 COUNTER_SIGNAL (issue #53 post-review): multi-registry
+    //    `[patch]` carry-down ────────────────────────────────────────
+    //
+    // The workspace-member `[patch]` carry-down (introduced in PR
+    // #61) previously walked `[patch.crates-io]` only — adopters
+    // using a vendored registry alias (e.g. `[patch.my-vendor]`)
+    // had their non-crates-io patch entries silently dropped during
+    // Option H self-patch carry-down. The COUNTER_SIGNAL extension
+    // walks ALL `[patch.<registry>]` subtables, preserving each one
+    // verbatim (path-absolutized) into `top["patch"][<registry>]`.
+    //
+    // The 4-rule self-patch policy continues to operate only on
+    // `[patch.crates-io.<self>]` (the upstream's `<self>` is keyed
+    // under crates-io by convention); non-crates-io entries are
+    // carry-down-only.
+
+    /// Workspace-root `[patch.my-vendor]` is carried into the
+    /// overlay's `[patch.my-vendor]` table, preserving the registry
+    /// key + every entry. Path entries are absolutized against the
+    /// workspace-root dir.
+    #[test]
+    fn apply_self_patch_policy_carries_workspace_root_non_crates_io_registry() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [patch.my-vendor]\n\
+             my-dep = { path = \"vendored/my-dep\" }\n",
+        )
+        .expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_self_patch_policy(
+            &mut top,
+            Some("m"),
+            Path::new("/ws/m"),
+            Path::new("/ws/m/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect("non-crates-io registry must carry down successfully");
+        let patch = top
+            .get("patch")
+            .and_then(|v| v.as_table())
+            .expect("[patch] must exist after carry-down");
+        let my_vendor = patch
+            .get("my-vendor")
+            .and_then(|v| v.as_table())
+            .expect("[patch.my-vendor] must be carried into overlay");
+        let entry = my_vendor
+            .get("my-dep")
+            .and_then(|v| v.as_table())
+            .expect("[patch.my-vendor.my-dep] must be carried");
+        let path = entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("path field must be present");
+        assert!(
+            path.contains("/ws/vendored/my-dep"),
+            "path must be absolutized against workspace-root dir; got `{path}`"
+        );
+        // The crates-io self-patch (Rule 1 INJECT) STILL fires —
+        // the carry-down preserves non-crates-io entries WITHOUT
+        // suppressing the standard self-patch logic for crates-io.
+        let crates_io = patch
+            .get("crates-io")
+            .and_then(|v| v.as_table())
+            .expect("[patch.crates-io] must exist after Rule 1 INJECT");
+        let self_entry = crates_io
+            .get("m")
+            .and_then(|v| v.as_table())
+            .expect("Rule 1 INJECT must produce [patch.crates-io.m]");
+        let self_path = self_entry
+            .get("path")
+            .and_then(|v| v.as_str())
+            .expect("[patch.crates-io.m].path must be present");
+        assert!(
+            self_path.ends_with("target/lihaaf-overlay"),
+            "Rule 1 INJECT path must tail-match staged-overlay; got `{self_path}`"
+        );
+    }
+
+    /// Workspace-root `[patch.my-vendor]` AND `[patch.crates-io]`
+    /// coexist — both carry down. The crates-io self-patch (Rule 1
+    /// INJECT) still fires; the my-vendor entry passes through
+    /// verbatim (path-absolutized).
+    #[test]
+    fn apply_self_patch_policy_carries_multiple_registries_simultaneously() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value = toml::from_str(
+            "[workspace]\nmembers = [\"m\"]\n\
+             [patch.crates-io]\n\
+             other-crate = { path = \"vendored/other\" }\n\
+             [patch.my-vendor]\n\
+             my-dep = { path = \"vendored/my-dep\" }\n",
+        )
+        .expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        apply_self_patch_policy(
+            &mut top,
+            Some("m"),
+            Path::new("/ws/m"),
+            Path::new("/ws/m/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect("multi-registry carry-down must succeed");
+        let patch = top
+            .get("patch")
+            .and_then(|v| v.as_table())
+            .expect("[patch] must exist");
+        // crates-io: other-crate carried + self-patch m INJECTed.
+        let crates_io = patch
+            .get("crates-io")
+            .and_then(|v| v.as_table())
+            .expect("[patch.crates-io] must exist");
+        assert!(
+            crates_io.contains_key("other-crate"),
+            "[patch.crates-io.other-crate] must be carried"
+        );
+        assert!(
+            crates_io.contains_key("m"),
+            "[patch.crates-io.m] must be INJECTed (Rule 1)"
+        );
+        // my-vendor: my-dep carried.
+        let my_vendor = patch
+            .get("my-vendor")
+            .and_then(|v| v.as_table())
+            .expect("[patch.my-vendor] must exist");
+        assert!(
+            my_vendor.contains_key("my-dep"),
+            "[patch.my-vendor.my-dep] must be carried"
+        );
+    }
+
+    /// Workspace-root `[patch.my-vendor] = "oops"` (non-table
+    /// registry value) is rejected with a `TomlParse` error naming
+    /// the offending registry — the multi-registry walk applies
+    /// BLOCK-2 hard-rejection to every registry, not just crates-io.
+    #[test]
+    fn apply_self_patch_policy_rejects_non_table_non_crates_io_registry() {
+        let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
+        let ws_value: toml::Value =
+            toml::from_str("[workspace]\nmembers = [\"m\"]\n\n[patch]\nmy-vendor = \"oops\"\n")
+                .expect("ws-root parses");
+        let ctx = WorkspaceMemberContext {
+            workspace_root_manifest: PathBuf::from("/ws/Cargo.toml"),
+            workspace_root_value: ws_value,
+        };
+        let err = apply_self_patch_policy(
+            &mut top,
+            Some("m"),
+            Path::new("/ws/m"),
+            Path::new("/ws/m/target/lihaaf-overlay"),
+            Some(&ctx),
+        )
+        .expect_err("non-table `[patch.my-vendor]` must reject as TomlParse");
+        match err {
+            Error::TomlParse { path, message } => {
+                assert_eq!(path, PathBuf::from("/ws/Cargo.toml"));
+                assert!(
+                    message.contains("workspace-root `[patch.my-vendor]` must be a table"),
+                    "diagnostic must name `[patch.my-vendor]`; got: {message}"
                 );
             }
             other => panic!("expected TomlParse, got {other:?}"),
