@@ -1271,10 +1271,16 @@ member's own field).
 
 The workspace's `[workspace.dependencies]`, `[workspace.package]`,
 `[workspace.lints]`, `[workspace.metadata]`, `[workspace.resolver]`,
-`[patch.crates-io]`, `[replace]`, and `[profile.*]` tables are carried
-down into the staged overlay so the member's
+`[replace]`, and `[profile.*]` tables are carried down into the staged
+overlay, along with ALL `[patch.<registry>]` subtables from the workspace
+root (crates-io, vendored aliases, named alt registries), so the member's
 `{ workspace = true }` references and patch resolution match baseline
-cargo's behavior at the workspace-root level.
+cargo's behavior at the workspace-root level. The Option H 4-rule
+self-patch policy applies only to `[patch.crates-io]` specifically (the
+upstream's self-entry is keyed under crates-io by convention; alt-registry
+entries do not pose the trait-collision problem the policy addresses);
+non-crates-io registry tables are carried verbatim under standard
+key-collision discipline.
 
 Required when `--compat-root` points at a workspace root; rejected
 otherwise (the resolver verifies the shape and surfaces a directed
