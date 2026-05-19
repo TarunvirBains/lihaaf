@@ -107,7 +107,17 @@ impl WorkerContext {
     /// session), not the suite — see `config::Config` rustdoc for why
     /// `dylib_crate` is intentionally NOT a per-suite key. Everything
     /// else (`features`, `extern_crates`, `edition`, `dev_deps`,
-    /// timeout, memory ceiling, `allow_lints`) is per-suite and read from `suite`.
+    /// timeout, memory ceiling, `allow_lints`, `extra_substitutions`,
+    /// `strip_lines`, `strip_line_prefixes`) is per-suite and read
+    /// from `suite`.
+    ///
+    /// The three adopter-defined normalizer override fields
+    /// (`extra_substitutions`, `strip_lines`, `strip_line_prefixes`)
+    /// are forwarded into `norm_ctx` here via the dedicated builders
+    /// so the caller's `NormalizationContext` arrives carrying the
+    /// suite's per-suite override values. When the suite has all
+    /// three at default (empty), the builders are no-ops and the
+    /// normalizer output is byte-identical to v0.1.0-beta.9.
     ///
     /// [`Config`]: crate::config::Config
     #[allow(clippy::too_many_arguments)]
@@ -131,6 +141,22 @@ impl WorkerContext {
             .skip(1)
             .cloned()
             .collect::<Vec<_>>();
+        let norm_ctx = norm_ctx
+            .with_extra_substitutions(suite.extra_substitutions.clone())
+            .with_strip_lines(
+                suite
+                    .strip_lines
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect(),
+            )
+            .with_strip_line_prefixes(
+                suite
+                    .strip_line_prefixes
+                    .iter()
+                    .map(|p| p.as_str().to_owned())
+                    .collect(),
+            );
         Self {
             crate_root,
             managed_dylib,
@@ -1531,6 +1557,9 @@ plain text line
                 sysroot: PathBuf::from("/r"),
                 cargo_registry: None,
                 compat_short_cargo: false,
+                extra_substitutions: Vec::new(),
+                strip_lines: Vec::new(),
+                strip_line_prefixes: Vec::new(),
             },
             sysroot_lib_dir: PathBuf::from("/r/lib"),
             freshness_snapshot: FreshnessSnapshot {

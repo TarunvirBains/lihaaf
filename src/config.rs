@@ -36,6 +36,7 @@ use std::path::{Component, Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Outcome};
+use crate::normalize::Substitution;
 
 /// Default value for `fixture_dirs` when omitted. Callers with custom
 /// layouts should override this key.
@@ -164,6 +165,50 @@ pub struct Suite {
     /// and entries containing whitespace, double quotes, single quotes,
     /// or backslashes (would break argv tokenization).
     pub allow_lints: Vec<String>,
+
+    /// Adopter-defined extra substitutions applied to normalized stderr
+    /// AFTER built-in path placeholders and BEFORE TypeId collapse
+    /// (see `docs/spec/lihaaf-v0.1.md` §6.6). Empty by default.
+    /// Issue #45 / v0.1.0-beta.10.
+    ///
+    /// **Per-suite REPLACE semantics.** A named suite that omits
+    /// `extra_substitutions` does NOT inherit the default suite's
+    /// substitutions; it gets `[]`. This matches the `features`
+    /// precedent — see [`Self::features`].
+    ///
+    /// Validation runs at config-parse time:
+    /// - Each entry's `from` must pass `is_path_like` (path-shaped:
+    ///   contains `/`, `\`, or is a bare `$X` placeholder where `X`
+    ///   starts with ASCII uppercase). This forecloses the round-2
+    ///   BLOCK class — see `docs/spec/extra-substitutions-plan-2026-05-19.md`
+    ///   §3.3.
+    /// - Each entry's `to` must NOT contain a newline.
+    pub extra_substitutions: Vec<Substitution>,
+
+    /// Adopter-defined full-line exact-match drops applied to
+    /// normalized stderr after trim-trailing-whitespace and BEFORE
+    /// blank-line collapse. Empty by default. Issue #45 / v0.1.0-beta.10.
+    ///
+    /// **Per-suite REPLACE semantics** — same as
+    /// [`Self::extra_substitutions`]. Each entry must pass
+    /// `is_path_like` OR `is_banner_shape` per config-parse validation
+    /// (see `docs/spec/lihaaf-v0.1.md` §6.6).
+    ///
+    /// The [`StripPattern`] wrapper guarantees this invariant holds on
+    /// every construction path, including direct serde deserialization.
+    pub strip_lines: Vec<StripPattern>,
+
+    /// Adopter-defined prefix-match drops applied to normalized
+    /// stderr after trim-trailing-whitespace and BEFORE blank-line
+    /// collapse. Empty by default. Issue #45 / v0.1.0-beta.10.
+    ///
+    /// **Per-suite REPLACE semantics** — same as
+    /// [`Self::extra_substitutions`]. Each entry must pass
+    /// `is_path_like` OR `is_banner_shape` per config-parse validation.
+    ///
+    /// The [`StripPattern`] wrapper guarantees this invariant holds on
+    /// every construction path, including direct serde deserialization.
+    pub strip_line_prefixes: Vec<StripPattern>,
 }
 
 impl Suite {
@@ -173,6 +218,73 @@ impl Suite {
     /// a named suite.
     pub fn is_default(&self) -> bool {
         self.name == DEFAULT_SUITE_NAME
+    }
+}
+
+/// A validated strip-pattern string. Wraps a `String` that has already
+/// passed the `is_path_like(s) || is_banner_shape(s)` predicate.
+///
+/// Used for [`Suite::strip_lines`] and [`Suite::strip_line_prefixes`].
+/// The `#[serde(try_from = "String")]` attribute ensures that ANY
+/// deserialization path — TOML manifest, serde-JSON direct construction,
+/// or any other format — routes through [`TryFrom<String>`], closing the
+/// bypass that would otherwise let `serde_json::from_value::<Config>`
+/// skip `validate_strip_patterns`.
+///
+/// # Invariant
+///
+/// Every `StripPattern` instance satisfies
+/// `is_path_like(s) || is_banner_shape(s)` by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct StripPattern(String);
+
+impl StripPattern {
+    /// Borrow the inner validated string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for StripPattern {
+    type Error = String;
+
+    /// Validate `s` against `is_path_like(s) || is_banner_shape(s)`.
+    ///
+    /// Called automatically by serde when deserializing `Suite.strip_lines`
+    /// or `Suite.strip_line_prefixes` via any format (TOML, JSON, etc.).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when `s` fails both predicates. The string
+    /// is surfaced by serde as a deserialization error.
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        if s.contains('\n') {
+            return Err(format!(
+                "\"{s}\" contains a newline character; strip patterns must be single-line."
+            ));
+        }
+        if !is_path_like(&s) && !is_banner_shape(&s) {
+            return Err(format!(
+                "\"{s}\" is neither path-shaped nor banner-shaped \
+                 (must contain '/', '\\\\', start with a $X placeholder token where X is an \
+                 ASCII uppercase letter, OR match the banner allowlist — \
+                 see docs/spec/lihaaf-v0.1.md §6.6). \
+                 Patterns starting with '$' must have an ASCII uppercase letter immediately after, \
+                 regardless of path separators — '$lowercase/path' is rejected. \
+                 Bare placeholder patterns are full-string anchored: \
+                 '$DIR-', '$RUST.', '$A!' are rejected; '$DIR/x' is accepted \
+                 via the path-separator branch. \
+                 Strip patterns target path-shaped environment noise OR known banner shapes only."
+            ));
+        }
+        Ok(StripPattern(s))
+    }
+}
+
+impl From<StripPattern> for String {
+    fn from(p: StripPattern) -> String {
+        p.0
     }
 }
 
@@ -195,6 +307,13 @@ struct RawMetadata {
     fixture_timeout_secs: Option<u32>,
     per_fixture_memory_mb: Option<u32>,
     allow_lints: Option<Vec<String>>,
+    /// Adopter-defined extra substitutions. Issue #45 / v0.1.0-beta.10.
+    /// Per-suite REPLACE semantics; omission on a named suite gives `[]`.
+    extra_substitutions: Option<Vec<RawSubstitution>>,
+    /// Adopter-defined exact-match line drops. Issue #45 / v0.1.0-beta.10.
+    strip_lines: Option<Vec<String>>,
+    /// Adopter-defined prefix-match line drops. Issue #45 / v0.1.0-beta.10.
+    strip_line_prefixes: Option<Vec<String>>,
     /// `[[package.metadata.lihaaf.suite]]` array entries.
     #[serde(default)]
     suite: Vec<RawSuite>,
@@ -215,10 +334,110 @@ struct RawSuite {
     fixture_timeout_secs: Option<u32>,
     per_fixture_memory_mb: Option<u32>,
     allow_lints: Option<Vec<String>>,
+    /// Issue #45 / v0.1.0-beta.10. Per-suite REPLACE semantics; omission
+    /// on a named suite gives `[]` regardless of the default suite's
+    /// value (same precedent as `features`).
+    extra_substitutions: Option<Vec<RawSubstitution>>,
+    /// Issue #45 / v0.1.0-beta.10. Per-suite REPLACE semantics.
+    strip_lines: Option<Vec<String>>,
+    /// Issue #45 / v0.1.0-beta.10. Per-suite REPLACE semantics.
+    strip_line_prefixes: Option<Vec<String>>,
     /// `dylib_crate` is intentionally NOT a per-suite key. Reading any
     /// value here is rejected at validation time so a typo can't be
     /// silently dropped.
     dylib_crate: Option<String>,
+}
+
+/// As-parsed shape for one `extra_substitutions` entry. Promoted to
+/// the validated [`Substitution`] in [`build_default_suite`] /
+/// [`finalize_named_suite`] after [`validate_extra_substitutions`]
+/// passes.
+///
+/// Exposed as `pub(crate)` so that [`crate::normalize::Substitution`]'s
+/// `#[serde(try_from = "RawSubstitution")]` impl can reference this type
+/// and route all external-format deserialization through the same
+/// `is_path_like` + no-newline validation that the TOML parse path uses.
+#[derive(Debug, Default, Deserialize, Clone)]
+pub(crate) struct RawSubstitution {
+    pub(crate) from: Option<String>,
+    pub(crate) to: Option<String>,
+}
+
+impl TryFrom<RawSubstitution> for Substitution {
+    type Error = String;
+
+    /// Validate a raw deserialized `extra_substitutions` entry and
+    /// promote it to the typed [`Substitution`] value.
+    ///
+    /// Enforces exactly the rules that [`validate_extra_substitutions`]
+    /// applies on the TOML parse path, so every construction route —
+    /// TOML manifest, direct serde JSON, or any other format — goes
+    /// through the same guards.
+    ///
+    /// Validation order mirrors [`finalize_substitutions`] →
+    /// [`validate_extra_substitutions`]: both presence checks fire first,
+    /// then shape checks, so multiply-invalid inputs produce the same
+    /// first-error message on both paths.
+    ///
+    /// - `from` must be present.
+    /// - `to` must be present (may be empty string).
+    /// - `from` must be non-empty.
+    /// - `from` must pass [`is_path_like`].
+    /// - `to` must not contain a newline character.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error string when any of the above rules are violated.
+    /// The string is surfaced by serde as a deserialization error so
+    /// adopters who construct `Config` / `Suite` from JSON or other
+    /// formats see an actionable message.
+    fn try_from(raw: RawSubstitution) -> Result<Self, Self::Error> {
+        // Ordering mirrors the TOML path (finalize_substitutions →
+        // validate_extra_substitutions): both presence checks fire before
+        // either shape check, so multiply-invalid inputs produce the same
+        // first error regardless of which deserialization path is taken.
+        // Codex round-2 FIX_BEFORE_BETA-1 (PR #68).
+        let from = raw.from.ok_or_else(|| {
+            "extra_substitutions entry is missing the required `from` key. \
+             Every entry must specify which substring to match."
+                .to_string()
+        })?;
+        let to = raw.to.ok_or_else(|| {
+            "extra_substitutions entry is missing the required `to` key. \
+             Use an empty string `to = \"\"` to strip the match."
+                .to_string()
+        })?;
+        if from.is_empty() {
+            return Err("extra_substitutions entry `from` is empty. \
+                 An empty `from` would match the start of every byte and rewrite arbitrary \
+                 content. extra_substitutions is for path-shaped substitution only. \
+                 See docs/spec/lihaaf-v0.1.md §6.6."
+                .to_string());
+        }
+        if !is_path_like(&from) {
+            return Err(format!(
+                "extra_substitutions `from` = \"{from}\" is not path-like \
+                 (must contain '/', '\\\\', or be a bare $X placeholder token \
+                 where X is an ASCII uppercase letter). \
+                 Patterns starting with '$' must have an ASCII uppercase letter \
+                 immediately after, regardless of path separators — \
+                 '$lowercase/path' is rejected. \
+                 Bare placeholder patterns are full-string anchored: \
+                 '$DIR-', '$RUST.', '$A!' are rejected; '$DIR/x' is accepted \
+                 via the path-separator branch. \
+                 extra_substitutions is for path-shaped substitution only, \
+                 not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
+            ));
+        }
+        if to.contains('\n') {
+            return Err("extra_substitutions `to` contains a newline character; \
+                 replacements must be single-line. \
+                 A multi-line `to` would inject blank lines into normalized \
+                 stderr and break snapshot determinism."
+                .to_string());
+        }
+        Ok(Substitution { from, to })
+    }
 }
 
 /// Load the consumer crate's `Cargo.toml`, extract
@@ -383,6 +602,31 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
     let features = raw.features.clone().unwrap_or_default();
     validate_features(DEFAULT_SUITE_NAME, &features)?;
 
+    let extra_substitutions = finalize_substitutions(
+        DEFAULT_SUITE_NAME,
+        raw.extra_substitutions.clone().unwrap_or_default(),
+    )?;
+    validate_extra_substitutions(DEFAULT_SUITE_NAME, &extra_substitutions)?;
+
+    let strip_lines_raw = raw.strip_lines.clone().unwrap_or_default();
+    validate_strip_patterns(DEFAULT_SUITE_NAME, "strip_lines", &strip_lines_raw)?;
+    // SAFETY: validate_strip_patterns just confirmed every entry passes
+    // `is_path_like || is_banner_shape`; construct StripPattern values
+    // directly to avoid re-running the predicate.
+    let strip_lines: Vec<StripPattern> = strip_lines_raw.into_iter().map(StripPattern).collect();
+
+    let strip_line_prefixes_raw = raw.strip_line_prefixes.clone().unwrap_or_default();
+    validate_strip_patterns(
+        DEFAULT_SUITE_NAME,
+        "strip_line_prefixes",
+        &strip_line_prefixes_raw,
+    )?;
+    // SAFETY: same rationale as strip_lines above.
+    let strip_line_prefixes: Vec<StripPattern> = strip_line_prefixes_raw
+        .into_iter()
+        .map(StripPattern)
+        .collect();
+
     Ok(Suite {
         name: DEFAULT_SUITE_NAME.to_string(),
         extern_crates,
@@ -397,6 +641,9 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
         fixture_timeout_secs,
         per_fixture_memory_mb,
         allow_lints,
+        extra_substitutions,
+        strip_lines,
+        strip_line_prefixes,
     })
 }
 
@@ -489,6 +736,33 @@ fn finalize_named_suite(
     let features = raw.features.unwrap_or_default();
     validate_features(&name, &features)?;
 
+    // Per-suite REPLACE semantics for the three #45 / beta.10 keys
+    // (extra_substitutions / strip_lines / strip_line_prefixes) —
+    // matches the `features` precedent (see `Suite::features`
+    // rustdoc). A named suite that omits the key gets `[]`, not the
+    // default suite's value. This is documented in §3.6 of the spec
+    // and pinned by regression tests
+    // (`extra_substitutions_omitted_on_named_suite_is_empty`,
+    // `strip_patterns_omitted_on_named_suite_is_empty`).
+    let extra_substitutions =
+        finalize_substitutions(&name, raw.extra_substitutions.unwrap_or_default())?;
+    validate_extra_substitutions(&name, &extra_substitutions)?;
+
+    let strip_lines_raw = raw.strip_lines.unwrap_or_default();
+    validate_strip_patterns(&name, "strip_lines", &strip_lines_raw)?;
+    // SAFETY: validate_strip_patterns just confirmed every entry passes
+    // `is_path_like || is_banner_shape`; construct StripPattern values
+    // directly to avoid re-running the predicate.
+    let strip_lines: Vec<StripPattern> = strip_lines_raw.into_iter().map(StripPattern).collect();
+
+    let strip_line_prefixes_raw = raw.strip_line_prefixes.unwrap_or_default();
+    validate_strip_patterns(&name, "strip_line_prefixes", &strip_line_prefixes_raw)?;
+    // SAFETY: same rationale as strip_lines above.
+    let strip_line_prefixes: Vec<StripPattern> = strip_line_prefixes_raw
+        .into_iter()
+        .map(StripPattern)
+        .collect();
+
     Ok(Suite {
         name,
         extern_crates,
@@ -504,6 +778,9 @@ fn finalize_named_suite(
         fixture_timeout_secs,
         per_fixture_memory_mb,
         allow_lints,
+        extra_substitutions,
+        strip_lines,
+        strip_line_prefixes,
     })
 }
 
@@ -634,6 +911,337 @@ fn validate_features(suite_label: &str, features: &[String]) -> Result<(), Error
         }
     }
     Ok(())
+}
+
+/// True iff `s` is path-shaped per `docs/spec/lihaaf-v0.1.md` §6.6
+/// (round-3 + round-4 + round-5 design — see
+/// `docs/spec/extra-substitutions-plan-2026-05-19.md` §3.3.1):
+///
+/// 1. `s.len() >= 2` (bytes).
+/// 2. `s` contains no `\n` byte.
+/// 3. **Leading-`$` guard** (round-4 FIX_BEFORE_BETA-1): if
+///    `s.as_bytes()[0] == b'$'`, then `s.as_bytes()[1]` MUST be ASCII
+///    uppercase. Fires BEFORE the disjunction below and is
+///    unconditional — a leading-`$` pattern whose second byte is not
+///    ASCII uppercase is rejected even if the string also contains
+///    `/` or `\`. Closes the round-3 `$nix/path` gap that violated
+///    OQ-B's uppercase-only contract via the `/` branch. Rule 1
+///    already guarantees `s.len() >= 2`, so accessing
+///    `s.as_bytes()[1]` is safe.
+///
+///    **Round-5 clarification:** rule 3 only fires on the LEADING
+///    `$` byte. Interior `$lowercase` (e.g., `/path/$nix/sub`) is
+///    path text and passes via rule 4(a) — see Class 9 in the test
+///    matrix.
+/// 4. At least one of:
+///    - (a) `s.contains('/')`, OR
+///    - (b) `s.contains('\\')`, OR
+///    - (c) `s` matches `^\$[A-Z][A-Za-z0-9_]*$` (round-5 DOC
+///      Finding 3 — full-string-anchored, NOT a prefix match: `s`
+///      starts with `$`, second byte is `[A-Z]`, every byte after
+///      that is in `[A-Za-z0-9_]`, AND no extra bytes follow the
+///      placeholder tail). Admits `$DIR`, `$WORKSPACE`,
+///      `$NIX_STORE`; rejects `$DIR-`, `$A!`. (`$DIR/x` still passes
+///      via (4a) because it contains `/`.)
+///
+/// This predicate gates `extra_substitutions.from` and is one half
+/// of the strip-key disjunction (`is_path_like || is_banner_shape`).
+/// See the plan §3.3 for the safety argument: the round-2 BLOCK
+/// class is foreclosed by construction because diagnostic-text
+/// patterns (`error`, `error:`, `  |`, `expected due to this`) fail
+/// every disjunction alternative.
+fn is_path_like(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    if s.contains('\n') {
+        return false;
+    }
+    // Rule 3: leading-`$` guard. Unconditional; fires before the
+    // disjunction so a `$lowercase/path` shape is rejected even with
+    // a path separator present.
+    if bytes[0] == b'$' && !bytes[1].is_ascii_uppercase() {
+        return false;
+    }
+    // Disjunction.
+    if s.contains('/') || s.contains('\\') {
+        return true;
+    }
+    is_complete_placeholder_token(s)
+}
+
+/// True iff `s` matches the rule (4c) "complete placeholder token"
+/// shape: `^\$[A-Z][A-Za-z0-9_]*$` (full-string anchored).
+///
+/// Separate helper so the round-5 DOC Finding 3 regression guard
+/// (test 14b in the plan §7.3.1) can pin that `$DIR-`, `$A!`,
+/// `$RUST.`, `$DIR ` (trailing space), `$WORKSPACE,`, and `$DIR/x`
+/// all fail (4c) when isolated — proving rule (4c) is full-string
+/// anchored, not a prefix match. (`$DIR/x` still passes `is_path_like`
+/// overall because it contains `/` — see rule 4(a).)
+fn is_complete_placeholder_token(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    if bytes.len() < 2 {
+        return false;
+    }
+    if bytes[0] != b'$' {
+        return false;
+    }
+    if !bytes[1].is_ascii_uppercase() {
+        return false;
+    }
+    // Every byte after `$<uppercase>` must be in [A-Za-z0-9_]. No
+    // additional non-token characters allowed (`-`, `.`, ` `, `,`,
+    // `!`, `/`, `\`, etc.).
+    for &b in &bytes[2..] {
+        if !(b.is_ascii_alphanumeric() || b == b'_') {
+            return false;
+        }
+    }
+    true
+}
+
+/// Anti-prefix list for [`is_banner_shape`]. REJECT if `s` starts
+/// with any of these case-sensitive strings. Catches the
+/// diagnostic-message-body shape family rustc commonly emits.
+///
+/// `error[` blocks `error[E0277]`-style code lines without
+/// rejecting `error: aborting due to ...` (which uses a colon-space
+/// separator and is handled in the banner-prefix list below).
+const BANNER_ANTI_PREFIXES: &[&str] = &[
+    "expected ",
+    "found ",
+    "the trait ",
+    "the type ",
+    "cannot find ",
+    "mismatched types",
+    "consider ",
+    "help: ",
+    "warning: ",
+    "error[",
+    "  ", // two spaces — span context (also caught by (A.3); defense-in-depth)
+];
+
+/// Enumerated banner-prefix list for [`is_banner_shape`] rule (C.1).
+/// `s` is accepted via (C.1) when it starts with one of these
+/// case-sensitive strings.
+///
+/// Covers the rustc-emitted banner trailers (#1–3) and the non-rustc
+/// tool-version banner shape (`info:`, `linker version:`). Closed
+/// list; round-4 amendment dropped the shorter `"linker: "` prefix
+/// per BLOCK-1 (it admitted strings below the 20-byte length floor;
+/// see plan §3.3.2 (C.1)).
+///
+/// A v0.2 follow-up may add an adopter-extensible prefix list
+/// (plan §13 OQ-NEW-2); v0.1.0-beta.10 leaves this closed.
+const BANNER_PREFIXES: &[&str] = &[
+    "For more information about this error",
+    "error: aborting due to ",
+    "note: this error originates from ",
+    "info: ",
+    "linker version: ",
+];
+
+/// Structural-banner-shape marker set for [`is_banner_shape`] rule
+/// (C.2). `s` matches (C.2) only when it satisfies the shared
+/// preconditions, has uppercase first byte, is 40+ bytes long, has a
+/// space, AND contains one of these markers (case-sensitive).
+///
+/// (C.2) admits CI-runner deprecation banners, proc-macro / code-gen
+/// deprecation banners, and build-system migration banners. The
+/// uppercase-first-byte requirement carves the (C.2) alternative out
+/// from rustc's lowercase-first-byte convention (`error`, `warning`,
+/// `note`, `help`). See plan §3.3.2 (C.2) for the design rationale.
+const STRUCTURAL_BANNER_MARKERS: &[&str] = &[
+    "deprecated",
+    "deprecation",
+    "Please update",
+    "actions to use",
+    "EOL",
+    "end-of-life",
+];
+
+/// True iff `s` is banner-shaped per `docs/spec/lihaaf-v0.1.md` §6.6
+/// (planner design from `docs/spec/extra-substitutions-plan-2026-05-19.md`
+/// §3.3.2):
+///
+/// **(A) Shared preconditions — ALL must hold.**
+/// 1. `s.len() >= 20` (bytes).
+/// 2. `!s.contains('\n')`.
+/// 3. `s` does NOT start with whitespace (`' '` or `'\t'`).
+/// 4. `s` does NOT start with `'^'`, `'='`, or `'|'`.
+///
+/// **(B) Anti-prefix list** — REJECT if `s` starts with any entry in
+/// [`BANNER_ANTI_PREFIXES`].
+///
+/// **(C) Disjunction — at least ONE must hold:**
+/// - (C.1) `s` starts with any entry in [`BANNER_PREFIXES`].
+/// - (C.2) STRUCTURAL BANNER SHAPE — `s.len() >= 40` AND
+///   `s.as_bytes()[0].is_ascii_uppercase()` AND `s.contains(' ')`
+///   AND `s` contains at least one entry from
+///   [`STRUCTURAL_BANNER_MARKERS`].
+///
+/// This predicate gates strip patterns alongside [`is_path_like`]
+/// (the strip-key validator is the disjunction
+/// `is_path_like || is_banner_shape`). See the plan for the
+/// defense-in-depth argument: `error: cannot find type` passes (A)
+/// and (B) (no matching anti-prefix), then fails (C.1) (banner
+/// prefixes are anchored to specific tails) and (C.2) (lowercase
+/// first byte). Nothing resembling a rustc diagnostic message body
+/// can pass.
+fn is_banner_shape(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    // (A) Shared preconditions.
+    if bytes.len() < 20 {
+        return false;
+    }
+    if s.contains('\n') {
+        return false;
+    }
+    // (A.3) leading whitespace.
+    if bytes[0] == b' ' || bytes[0] == b'\t' {
+        return false;
+    }
+    // (A.4) span-context first byte.
+    if bytes[0] == b'^' || bytes[0] == b'=' || bytes[0] == b'|' {
+        return false;
+    }
+    // (B) Anti-prefix list — REJECT if any matches.
+    if BANNER_ANTI_PREFIXES.iter().any(|p| s.starts_with(*p)) {
+        return false;
+    }
+    // (C.1) ENUMERATED BANNER PREFIX.
+    if BANNER_PREFIXES.iter().any(|p| s.starts_with(*p)) {
+        return true;
+    }
+    // (C.2) STRUCTURAL BANNER SHAPE.
+    if bytes.len() >= 40
+        && bytes[0].is_ascii_uppercase()
+        && s.contains(' ')
+        && STRUCTURAL_BANNER_MARKERS.iter().any(|m| s.contains(*m))
+    {
+        return true;
+    }
+    false
+}
+
+/// Validate every entry in `extra_substitutions`:
+///
+/// - `from` is non-empty and `is_path_like`.
+/// - `to` is present (may be empty) and contains no newline.
+///
+/// Error messages name the offending index and the failing value so
+/// adopters can locate the offending entry in their `Cargo.toml`.
+fn validate_extra_substitutions(suite_label: &str, subs: &[Substitution]) -> Result<(), Error> {
+    for (i, sub) in subs.iter().enumerate() {
+        if sub.from.is_empty() {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.extra_substitutions[{i}].from is empty.\n\
+                     Why this matters: an empty `from` would match the start of every byte and rewrite arbitrary content.\n\
+                     extra_substitutions is for path-shaped substitution only. See docs/spec/lihaaf-v0.1.md §6.6."
+                ),
+            }));
+        }
+        if !is_path_like(&sub.from) {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.extra_substitutions[{i}].from = \"{from}\" is not path-like \
+                     (must contain '/', '\\\\', or be a bare $X placeholder token, \
+                     where X is an ASCII uppercase letter). \
+                     Patterns starting with '$' must have an ASCII uppercase letter \
+                     immediately after, regardless of path separators — '$lowercase/path' is rejected. \
+                     Bare placeholder patterns are full-string anchored: '$DIR-', '$RUST.', '$A!' \
+                     are rejected; '$DIR/x' is accepted via the path-separator branch. \
+                     extra_substitutions is for path-shaped substitution only, \
+                     not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
+                    from = sub.from,
+                ),
+            }));
+        }
+        if sub.to.contains('\n') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.extra_substitutions[{i}].to contains a newline character; \
+                     replacements must be single-line.\n\
+                     Why this matters: a multi-line `to` would inject blank lines into normalized stderr and break snapshot determinism."
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Validate every entry in `strip_lines` / `strip_line_prefixes`:
+/// each must pass `is_path_like(s) || is_banner_shape(s)`.
+///
+/// `key_label` is the literal config key name (`strip_lines` /
+/// `strip_line_prefixes`) interpolated into the error message so
+/// adopters know which key to edit.
+fn validate_strip_patterns(
+    suite_label: &str,
+    key_label: &str,
+    patterns: &[String],
+) -> Result<(), Error> {
+    for (i, pat) in patterns.iter().enumerate() {
+        if pat.contains('\n') {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.{key_label}[{i}] contains a newline character; \
+                     strip patterns must be single-line."
+                ),
+            }));
+        }
+        if !is_path_like(pat) && !is_banner_shape(pat) {
+            return Err(Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.{key_label}[{i}] = \"{pat}\" is neither path-shaped nor banner-shaped \
+                     (must contain '/', '\\\\', start with a $X placeholder token where X is an \
+                     ASCII uppercase letter, OR match the banner allowlist — see docs/spec/lihaaf-v0.1.md §6.6). \
+                     Patterns starting with '$' must have an ASCII uppercase letter immediately after, \
+                     regardless of path separators — '$lowercase/path' is rejected. \
+                     Bare placeholder patterns are full-string anchored: '$DIR-', '$RUST.', '$A!' \
+                     are rejected; '$DIR/x' is accepted via the path-separator branch. \
+                     Strip patterns target path-shaped environment noise OR known banner shapes only."
+                ),
+            }));
+        }
+    }
+    Ok(())
+}
+
+/// Promote raw substitution entries into validated [`Substitution`].
+/// Returns a `ConfigInvalid` outcome if any entry is missing `from`
+/// or `to`; otherwise passes the typed list through (validation of
+/// `from` shape and `to` no-newline lives in
+/// [`validate_extra_substitutions`]).
+fn finalize_substitutions(
+    suite_label: &str,
+    raw: Vec<RawSubstitution>,
+) -> Result<Vec<Substitution>, Error> {
+    let mut out = Vec::with_capacity(raw.len());
+    for (i, entry) in raw.into_iter().enumerate() {
+        let from = entry.from.ok_or_else(|| {
+            Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.extra_substitutions[{i}] is missing the required `from` key.\n\
+                     Why this matters: every entry must specify which substring to match."
+                ),
+            })
+        })?;
+        let to = entry.to.ok_or_else(|| {
+            Error::Session(Outcome::ConfigInvalid {
+                message: format!(
+                    "{suite_label}.extra_substitutions[{i}] is missing the required `to` key.\n\
+                     Why this matters: every entry must specify the replacement string \
+                     (use an empty string `to = \"\"` to strip the match)."
+                ),
+            })
+        })?;
+        out.push(Substitution { from, to });
+    }
+    Ok(out)
 }
 
 /// Validate the `dylib_crate` value after the empty-string check.
@@ -1462,5 +2070,1353 @@ mod tests {
         let lints = table["allow_lints"].as_array().unwrap();
         let lint_strs: Vec<&str> = lints.iter().filter_map(|v| v.as_str()).collect();
         assert_eq!(lint_strs, vec!["unused_imports", "dead_code"]);
+    }
+
+    // ====================================================================
+    // Issue #45 / v0.1.0-beta.10 — `extra_substitutions` framework
+    //
+    // Per plan §7.2 / §7.3 (`docs/spec/extra-substitutions-plan-2026-05-19.md`).
+    // ====================================================================
+
+    // ---- §7.2 Config parse + per-suite REPLACE semantics ----
+
+    #[test]
+    fn extra_substitutions_per_suite_replace_not_merge() {
+        // Named suite overrides extra_substitutions: REPLACE, not merge.
+        // Matches the `features` precedent. The default suite's entry
+        // does NOT leak into the named suite's vector.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "/default/path", to = "$WORKSPACE/d" },
+            ]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "extra"
+            fixture_dirs = ["tests/lihaaf/extra"]
+            extra_substitutions = [
+                { from = "/named/path", to = "$WORKSPACE/n" },
+            ]
+        "#,
+        )
+        .unwrap();
+        // Default suite has the default entry.
+        assert_eq!(cfg.suites[0].extra_substitutions.len(), 1);
+        assert_eq!(cfg.suites[0].extra_substitutions[0].from, "/default/path");
+        // Named suite REPLACED, did not merge.
+        assert_eq!(cfg.suites[1].extra_substitutions.len(), 1);
+        assert_eq!(cfg.suites[1].extra_substitutions[0].from, "/named/path");
+    }
+
+    #[test]
+    fn extra_substitutions_omitted_on_named_suite_is_empty() {
+        // OQ-1 pin: omission on a named suite gives `[]`, NOT the
+        // default suite's value. Mirrors `features` precedent.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "/default/path", to = "$WORKSPACE/d" },
+            ]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "isolated"
+            fixture_dirs = ["tests/lihaaf/iso"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.suites[0].extra_substitutions.len(), 1);
+        assert!(
+            cfg.suites[1].extra_substitutions.is_empty(),
+            "named suite that omits extra_substitutions must get [], not inherit",
+        );
+    }
+
+    #[test]
+    fn extra_substitutions_manifest_snapshot_round_trips() {
+        // raw_metadata round-trip: the manifest snapshot must preserve
+        // the adopter-typed shape verbatim so manifest-snapshot freshness
+        // tracking sees adopter overrides as part of the watched state.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "/nix/store/abc", to = "$RUST/lib" },
+            ]
+            strip_lines = ["error: aborting due to 1 previous error"]
+            strip_line_prefixes = ["For more information about this error"]
+        "#,
+        )
+        .unwrap();
+        let table = cfg.raw_metadata.as_table().unwrap();
+        assert!(
+            table.contains_key("extra_substitutions"),
+            "raw_metadata must preserve extra_substitutions verbatim",
+        );
+        assert!(table.contains_key("strip_lines"));
+        assert!(table.contains_key("strip_line_prefixes"));
+    }
+
+    #[test]
+    fn strip_patterns_per_suite_replace_not_merge() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_lines = ["/default/strip"]
+            strip_line_prefixes = ["/default/prefix/"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "extra"
+            fixture_dirs = ["tests/lihaaf/extra"]
+            strip_lines = ["/named/strip"]
+            strip_line_prefixes = ["/named/prefix/"]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(
+            cfg.suites[0]
+                .strip_lines
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/default/strip"]
+        );
+        assert_eq!(
+            cfg.suites[0]
+                .strip_line_prefixes
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/default/prefix/"]
+        );
+        assert_eq!(
+            cfg.suites[1]
+                .strip_lines
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/named/strip"]
+        );
+        assert_eq!(
+            cfg.suites[1]
+                .strip_line_prefixes
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/named/prefix/"]
+        );
+    }
+
+    #[test]
+    fn strip_patterns_omitted_on_named_suite_is_empty() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_lines = ["/default/strip"]
+            strip_line_prefixes = ["/default/prefix/"]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "isolated"
+            fixture_dirs = ["tests/lihaaf/iso"]
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.suites[1].strip_lines.is_empty());
+        assert!(cfg.suites[1].strip_line_prefixes.is_empty());
+    }
+
+    // ---- §7.3.1 `is_path_like` predicate-level tests ----
+    //
+    // Acceptance classes 1-9 + rejection classes A-K from plan §7.3.1.
+
+    #[test]
+    fn is_path_like_accepts_absolute_unix_path() {
+        // Class 1.
+        assert!(is_path_like("/nix/store/abc123"));
+        assert!(is_path_like("/build/sandbox"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_absolute_windows_path() {
+        // Class 2.
+        assert!(is_path_like(r"C:\Users\runner\.cargo"));
+        assert!(is_path_like(r"D:\build\target"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_relative_path_with_separator() {
+        // Class 3.
+        assert!(is_path_like("target/release"));
+        assert!(is_path_like(r"src\compat"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_path_segment() {
+        // Class 4.
+        assert!(is_path_like("nix/store"));
+        assert!(is_path_like("vendor/cargo-cache"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_builtin_placeholder_bare() {
+        // Class 5 — every built-in lihaaf placeholder.
+        for placeholder in &[
+            "$DIR",
+            "$WORKSPACE",
+            "$RUST",
+            "$CARGO",
+            "$TYPEID",
+            "$LONGTYPE_FILE",
+        ] {
+            assert!(
+                is_path_like(placeholder),
+                "expected built-in placeholder {placeholder} to pass is_path_like",
+            );
+        }
+    }
+
+    #[test]
+    fn is_path_like_accepts_builtin_placeholder_with_suffix() {
+        // Class 6.
+        assert!(is_path_like("$DIR/test.rs"));
+        assert!(is_path_like("$RUST/lib/rustlib"));
+        assert!(is_path_like("$CARGO/registry/src"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_adopter_placeholder() {
+        // Class 7 — adopter-introduced placeholder bare.
+        assert!(is_path_like("$NIX_STORE"));
+        assert!(is_path_like("$SANDBOX_ROOT"));
+        assert!(is_path_like("$VENDOR_CACHE_2026"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_adopter_placeholder_with_suffix() {
+        // Class 8.
+        assert!(is_path_like("$NIX_STORE/rust"));
+        assert!(is_path_like("$SANDBOX_ROOT/target/release"));
+    }
+
+    #[test]
+    fn is_path_like_accepts_interior_lowercase_dollar_within_path() {
+        // Class 9 (round-5 DOC Finding 2 acceptance guard). Interior
+        // `$lowercase` within paths is path text, not a placeholder
+        // reference. Rule 3 only fires on LEADING `$`; these strings
+        // pass via rule 4(a) because they contain `/`.
+        assert!(is_path_like("/path/$nix/sub"));
+        assert!(is_path_like("/some/$cache/dir"));
+        assert!(is_path_like("$WORKSPACE/$tmp/run"));
+        // Companion to test 14a — pins that leading-vs-interior is the
+        // boundary, not "$lowercase anywhere".
+    }
+
+    #[test]
+    fn is_path_like_rejects_diagnostic_text_plain() {
+        // Class A.
+        for s in &["error", "warning", "help", "note", "error:", "E0277", ":"] {
+            assert!(
+                !is_path_like(s),
+                "is_path_like must reject diagnostic-text plain pattern {s:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn is_path_like_rejects_round2_block1_surface() {
+        // Class B. BLOCK-1 regression guard.
+        for s in &[
+            "  |",
+            "For more information about this error",
+            "expected due to this",
+        ] {
+            assert!(!is_path_like(s), "BLOCK-1 surface {s:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_path_like_rejects_round2_block2_surface() {
+        // Class C. BLOCK-2 regression guard.
+        for s in &["error[", "warning[", "error: aborting due to"] {
+            assert!(!is_path_like(s), "BLOCK-2 surface {s:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn is_path_like_rejects_length_one_separator() {
+        // Class D.
+        assert!(!is_path_like("/"));
+        assert!(!is_path_like(r"\"));
+    }
+
+    #[test]
+    fn is_path_like_rejects_length_one_dollar() {
+        // Class E.
+        assert!(!is_path_like("$"));
+    }
+
+    #[test]
+    fn is_path_like_rejects_bare_dollar_patterns() {
+        // Class F — `$` not followed by `[A-Z]`.
+        for s in &["$ ", "$1", "$lowercase", "$ NAME", "$_"] {
+            assert!(
+                !is_path_like(s),
+                "bare `$` pattern {s:?} must be rejected by leading-`$` guard",
+            );
+        }
+    }
+
+    #[test]
+    fn is_path_like_rejects_lowercase_dollar_with_separator() {
+        // Class F' — round-4 FIX_BEFORE_BETA-1 regression guard.
+        // Leading-`$` guard (rule 3) catches `$lowercase/path` shapes
+        // that the round-3 design admitted via the `/` disjunction
+        // branch. Each sample must be rejected.
+        for s in &[
+            "$nix/path",
+            "$lowercase/anything",
+            "$_path/x",
+            "$1/path",
+            "$ /space-then-slash",
+            r"$nix\path",
+        ] {
+            assert!(
+                !is_path_like(s),
+                "lowercase `$` + separator {s:?} must be rejected by rule-3 leading-`$` guard \
+                 (would have passed via rule 4(a)/(b) before round-4 amendment)",
+            );
+        }
+    }
+
+    #[test]
+    fn is_path_like_rejects_placeholder_with_trailing_junk() {
+        // Class F'' — round-5 DOC Finding 3 regression guard.
+        // Rule (4c) is full-string anchored (`^\$[A-Z][A-Za-z0-9_]*$`);
+        // trailing chars outside `[A-Za-z0-9_]` make (4c) fail. None
+        // of (4a)/(4b) match because no `/` or `\` is present.
+        for s in &["$DIR-", "$A!", "$RUST.", "$DIR ", "$WORKSPACE,"] {
+            assert!(
+                !is_path_like(s),
+                "placeholder with trailing junk {s:?} must be rejected: \
+                 rule (4c) is full-string anchored",
+            );
+        }
+        // Companion assertion: `$DIR/x` passes overall (via rule 4(a))
+        // but the (4c)-isolation helper rejects it — proving (4c) is
+        // the "complete placeholder token" alternative, not a prefix
+        // of path content.
+        assert!(is_path_like("$DIR/x"));
+        assert!(
+            !is_complete_placeholder_token("$DIR/x"),
+            "(4c) alone must reject `$DIR/x`; that pattern passes is_path_like via rule 4(a)",
+        );
+    }
+
+    #[test]
+    fn is_path_like_rejects_empty_and_whitespace() {
+        // Classes G, H.
+        assert!(!is_path_like(""));
+        assert!(!is_path_like(" "));
+        assert!(!is_path_like("\t\t"));
+    }
+
+    #[test]
+    fn is_path_like_rejects_embedded_markers_no_path() {
+        // Class I.
+        assert!(!is_path_like("errored"));
+        assert!(!is_path_like("aborted"));
+    }
+
+    #[test]
+    fn is_path_like_rejects_markers_with_trailing_colon() {
+        // Class J.
+        assert!(!is_path_like("error:"));
+        assert!(!is_path_like("note:"));
+        assert!(!is_path_like("help:"));
+    }
+
+    #[test]
+    fn is_path_like_rejects_newline_bearing() {
+        // Class K.
+        assert!(!is_path_like("a\nb"));
+        assert!(!is_path_like("$DIR\n"));
+    }
+
+    // ---- §7.3.2 `is_banner_shape` predicate-level tests ----
+
+    #[test]
+    fn is_banner_shape_accepts_explain_footer() {
+        // Class α — multiple error codes + alternate phrasing variants
+        // that all start with the anchored prefix.
+        assert!(is_banner_shape(
+            "For more information about this error, try `rustc --explain E0277`.",
+        ));
+        assert!(is_banner_shape(
+            "For more information about this error, try `rustc --explain E0001`.",
+        ));
+        assert!(is_banner_shape(
+            "For more information about this error, try `rustc --explain E9999`.",
+        ));
+        // `--explain`-less variant — still passes via prefix-anchor
+        // (the prefix is shorter than the explain-clause).
+        assert!(is_banner_shape(
+            "For more information about this error in the documentation.",
+        ));
+    }
+
+    #[test]
+    fn is_banner_shape_accepts_macro_origin_trailer() {
+        // Class β — full + shorter variants.
+        assert!(is_banner_shape(
+            "note: this error originates from the macro `m` in the crate `c` \
+             (in Nightly builds, run with -Z macro-backtrace for more info)",
+        ));
+        assert!(is_banner_shape(
+            "note: this error originates from the attribute macro `derive_more::Display`",
+        ));
+    }
+
+    #[test]
+    fn is_banner_shape_accepts_error_count_summary() {
+        // Class γ.
+        assert!(is_banner_shape("error: aborting due to 1 previous error"));
+        assert!(is_banner_shape("error: aborting due to 42 previous errors"));
+        assert!(is_banner_shape(
+            "error: aborting due to 1 previous error; 2 warnings emitted",
+        ));
+    }
+
+    #[test]
+    fn is_banner_shape_accepts_vendored_toolchain_info() {
+        // Class δ.
+        assert!(is_banner_shape(
+            "info: using rustc from /opt/vendored/rust-1.95.0/bin/rustc",
+        ));
+        assert!(is_banner_shape(
+            "info: switching to nightly toolchain to satisfy unstable feature",
+        ));
+    }
+
+    #[test]
+    fn is_banner_shape_accepts_linker_version() {
+        // Class ε — long linker version forms only. The shorter
+        // `linker: lld-15.0.7` form is REJECTED (round-4 BLOCK-1
+        // resolution); see banner-rejection class α'.
+        assert!(is_banner_shape(
+            "linker version: GNU ld (GNU Binutils) 2.40",
+        ));
+        assert!(is_banner_shape("linker version: rust-lld 15.0.7"));
+    }
+
+    #[test]
+    fn is_banner_shape_accepts_structural_banner_shape() {
+        // Class ζ — round-4 DOC_BEFORE_BETA-2 rename, must cover both
+        // CI-runner deprecation banner AND non-CI structural banner
+        // subfamilies (proc-macro / code-gen deprecation banners,
+        // build-system migration banners).
+        //
+        // CI-runner deprecation variants.
+        assert!(is_banner_shape(
+            "Node.js 16 actions are deprecated. Please update the following actions to use \
+             Node.js 20: actions/checkout@v3",
+        ));
+        assert!(is_banner_shape(
+            "GitHub Actions deprecation: please migrate to Node.js 20 by end-of-life date",
+        ));
+        // Non-CI structural banner variants — demonstrate that (C.2)
+        // admits more than CI-runner banners.
+        assert!(is_banner_shape(
+            "Deprecated generator output: Please update the generated API before release",
+        ));
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_length_floor() {
+        // Class α' — round-2 BLOCK-2 regression guard, banner surface.
+        // Also includes the round-4 BLOCK-1 regression vector
+        // `linker: lld-15.0.7` (18 bytes).
+        for s in &["error", "note", ": ", "linker: lld-15.0.7"] {
+            assert!(
+                !is_banner_shape(s),
+                "banner-shape length-floor rejection: {s:?} (len={})",
+                s.len(),
+            );
+        }
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_whitespace_leading() {
+        // Class β' — round-2 BLOCK-1 regression guard, banner surface.
+        for s in &["  |", "   ^^^^^", "\t= note: ..."] {
+            assert!(
+                !is_banner_shape(s),
+                "whitespace-leading {s:?} must be rejected by (A.3)",
+            );
+        }
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_span_context_first_byte() {
+        // Class γ' — round-2 BLOCK-1 regression guard, banner surface.
+        // Span context whose first byte is `^`, `=`, or `|`.
+        for s in &[
+            "^^^^^^^^^^^^^^^^^^^^^",            // 21 chars to clear (A.1)
+            "= note: some content here for it", // long enough
+            "| trait bound goes in here too",
+        ] {
+            assert!(
+                !is_banner_shape(s),
+                "span-context-first-byte {s:?} must be rejected by (A.4)",
+            );
+        }
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_diagnostic_body_anti_prefix() {
+        // Class δ' — anti-prefix list (B) catches the diagnostic-body
+        // shape family.
+        for s in &[
+            "expected one of: cascade, set null",
+            "found type `u32` but wanted f64",
+            "the trait bound `X: Y` is not satisfied",
+            "the type `Foo` cannot be sent across threads",
+            "cannot find function `foo` in scope",
+            "mismatched types when expected was right",
+            "consider importing this trait for the call site",
+            "help: try adding `as_ref` for the call site",
+        ] {
+            assert!(
+                !is_banner_shape(s),
+                "anti-prefix diagnostic body {s:?} must be rejected by (B)",
+            );
+        }
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_diagnostic_keyword_with_colon() {
+        // Class ε' — critical carve-out test. `warning: use of
+        // deprecated function` MUST be rejected even though it
+        // contains `deprecated`: the lowercase-leading `warning:`
+        // anti-prefix fires before the (C.2) marker check.
+        assert!(
+            !is_banner_shape("warning: use of deprecated function `f`"),
+            "`warning: ...` MUST be rejected even though it contains `deprecated`",
+        );
+        // Other variants in this class.
+        assert!(!is_banner_shape(
+            "error[E0277]: trait not implemented for this type",
+        ));
+        // Length-floor failure first; either path is fine.
+        assert!(!is_banner_shape("error[E0277]"));
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_lowercase_leading_non_rustc() {
+        // Class ζ'.
+        assert!(!is_banner_shape("gitlab ci deprecation banner here"));
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_uppercase_leading_short() {
+        // Class η' — uppercase first byte but below (A.1) and/or (C.2)
+        // length floors.
+        assert!(!is_banner_shape("Node 16 deprecated"));
+    }
+
+    #[test]
+    fn is_banner_shape_rejects_diagnostic_looking_like_banner() {
+        // Class θ' — defense-in-depth test. The string passes (A) and
+        // (B) (no matching anti-prefix), then fails (C.1) (banner
+        // prefixes are anchored to specific tails) and (C.2)
+        // (lowercase first byte).
+        assert!(
+            !is_banner_shape("error: cannot find type `Foo` in scope"),
+            "diagnostic-looking-like-banner must be rejected (defense-in-depth)",
+        );
+    }
+
+    // ---- §7.3.3 Field-level wiring tests ----
+    //
+    // The strip-key validator is the disjunction
+    // `is_path_like || is_banner_shape`. These tests exercise that
+    // disjunction through the config-parse layer end-to-end.
+
+    /// Build a minimum-viable TOML with one entry on
+    /// `extra_substitutions.from` so we can isolate-test the validator
+    /// without triggering unrelated errors.
+    ///
+    /// `from` is interpolated into a TOML LITERAL string (single
+    /// quotes) so backslash-bearing patterns (Windows paths like
+    /// `C:\Users\runner\.cargo`) survive without TOML-level
+    /// escape-sequence reinterpretation. Adopters writing such
+    /// patterns in real `Cargo.toml` use the same mechanism.
+    fn extra_subs_toml(from: &str) -> String {
+        format!(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                {{ from = '{from}', to = "$WORKSPACE/x" }},
+            ]
+        "#,
+        )
+    }
+
+    #[test]
+    fn validate_extra_substitutions_rejects_non_path_from() {
+        // Rejection classes A/B/C/E/F/F'/F''/H/I/J on `from`. Round-5
+        // amendment: Class F'' (placeholder + trailing junk) included
+        // for full-string-anchor regression coverage at the wiring
+        // layer (round-6 DOC Finding A propagation).
+        let bad: Vec<&str> = vec![
+            // A. Diagnostic-text plain.
+            "error",
+            // B. Round-2 BLOCK-1 surface.
+            "expected due to this",
+            // C. Round-2 BLOCK-2 surface.
+            "error: aborting due to",
+            // E. Length-1 placeholder-start.
+            "$",
+            // F. Bare `$` patterns.
+            "$lowercase",
+            // F'. Lowercase `$` + separator.
+            "$nix/path",
+            // F''. Placeholder with trailing junk.
+            "$DIR-",
+            "$RUST.",
+            "$WORKSPACE,",
+            // H. Whitespace-only.
+            " ",
+            // I. Embedded marker no path.
+            "errored",
+            // J. Markers + colon.
+            "error:",
+        ];
+        for from in &bad {
+            let toml = extra_subs_toml(from);
+            let err = parse_str(&toml).unwrap_err();
+            let msg = unwrap_invalid(err);
+            assert!(
+                msg.contains("not path-like")
+                    || msg.contains("is_path_like")
+                    || msg.contains("extra_substitutions"),
+                "rejection of {from:?} should mention validator: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_extra_substitutions_accepts_path_from() {
+        // Acceptance classes 1-9 on `from`. Round-5 Class 9 (interior
+        // `$lowercase` within paths) included as the round-5
+        // field-level acceptance guard (round-6 DOC Finding A
+        // propagation).
+        let good: Vec<&str> = vec![
+            // 1. Absolute Unix path.
+            "/nix/store/abc123",
+            // 2. Absolute Windows path.
+            r"C:\Users\runner\.cargo",
+            // 3. Relative path with separator.
+            "target/release",
+            // 4. Path segment.
+            "nix/store",
+            // 5. Built-in placeholder bare.
+            "$DIR",
+            "$WORKSPACE",
+            "$RUST",
+            // 6. Placeholder + path suffix.
+            "$DIR/test.rs",
+            // 7. Adopter-defined placeholder.
+            "$NIX_STORE",
+            // 8. Adopter placeholder + suffix.
+            "$NIX_STORE/rust",
+            // 9. Interior `$lowercase` within paths.
+            "/path/$nix/sub",
+            "/some/$cache/dir",
+            "$WORKSPACE/$tmp/run",
+        ];
+        for from in &good {
+            let toml = extra_subs_toml(from);
+            let cfg = parse_str(&toml).unwrap_or_else(|e| {
+                panic!("expected {from:?} to pass is_path_like, but got error: {e:?}");
+            });
+            // Round-trip: validated config should contain the entry.
+            assert_eq!(cfg.suites[0].extra_substitutions.len(), 1);
+            assert_eq!(cfg.suites[0].extra_substitutions[0].from, *from);
+        }
+    }
+
+    #[test]
+    fn validate_extra_substitutions_rejects_newline_in_to() {
+        // `to` field gets the no-newline guard. Synthesize the bytes
+        // via TOML's escape rules — newline as `\n` in a basic string.
+        let toml = r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "/nix/store", to = "alpha\nbeta" },
+            ]
+        "#;
+        let err = parse_str(toml).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("newline") || msg.contains("single-line"),
+            "newline-in-to error should mention newline: {msg}",
+        );
+    }
+
+    #[test]
+    fn validate_extra_substitutions_accepts_compound_to() {
+        // OQ-D locked: `to` is unconstrained beyond no-newline.
+        // `to = ""`, `to = "$RUST"`, `to = "$RUST/lib/rustlib"` all pass.
+        for to_value in &["", "$RUST", "$RUST/lib/rustlib"] {
+            let toml = format!(
+                r#"
+                [package.metadata.lihaaf]
+                dylib_crate = "consumer"
+                extern_crates = ["consumer"]
+                extra_substitutions = [
+                    {{ from = "/nix/store", to = "{to_value}" }},
+                ]
+            "#,
+            );
+            let cfg = parse_str(&toml).unwrap_or_else(|e| {
+                panic!("expected to={to_value:?} to pass, got: {e:?}");
+            });
+            assert_eq!(cfg.suites[0].extra_substitutions[0].to, *to_value);
+        }
+    }
+
+    /// Build a TOML with one entry on `strip_lines` for isolation.
+    /// Interpolates `line` into a TOML literal-string so Windows
+    /// paths and other backslash-bearing patterns survive verbatim.
+    fn strip_lines_toml(line: &str) -> String {
+        format!(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_lines = ['{line}']
+        "#,
+        )
+    }
+
+    /// Build a TOML with one entry on `strip_line_prefixes` for
+    /// isolation. Same literal-string rationale as
+    /// [`strip_lines_toml`].
+    fn strip_prefixes_toml(prefix: &str) -> String {
+        format!(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_line_prefixes = ['{prefix}']
+        "#,
+        )
+    }
+
+    #[test]
+    fn validate_strip_patterns_accepts_path() {
+        // Classes 1-9 on both strip keys (path-shaped acceptance
+        // through `is_path_like`). Class 9 round-5 field-level
+        // acceptance guard.
+        let good: Vec<&str> = vec![
+            "/nix/store/abc123",
+            r"C:\Users\runner\.cargo",
+            "target/release",
+            "nix/store",
+            "$DIR",
+            "$DIR/test.rs",
+            "$NIX_STORE",
+            "$NIX_STORE/rust",
+            // Class 9 — interior `$lowercase` within paths.
+            "/path/$nix/sub",
+        ];
+        for pat in &good {
+            let toml_strip = strip_lines_toml(pat);
+            parse_str(&toml_strip).unwrap_or_else(|e| {
+                panic!("strip_lines accept {pat:?}: {e:?}");
+            });
+            let toml_prefix = strip_prefixes_toml(pat);
+            parse_str(&toml_prefix).unwrap_or_else(|e| {
+                panic!("strip_line_prefixes accept {pat:?}: {e:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_accepts_banner() {
+        // Classes α-ζ on both strip keys (banner-shaped acceptance
+        // through `is_banner_shape`).
+        let good: Vec<&str> = vec![
+            "For more information about this error, try x",
+            "note: this error originates from the macro `m` here",
+            "error: aborting due to 1 previous error",
+            "info: using rustc from /opt/vendored/rust-1.95.0/bin/rustc",
+            "linker version: GNU ld (GNU Binutils) 2.40",
+            // ζ — structural banner (CI deprecation variant).
+            "Node.js 16 actions are deprecated. Please update the actions",
+        ];
+        for pat in &good {
+            let toml_strip = strip_lines_toml(pat);
+            parse_str(&toml_strip).unwrap_or_else(|e| {
+                panic!("strip_lines accept banner {pat:?}: {e:?}");
+            });
+            let toml_prefix = strip_prefixes_toml(pat);
+            parse_str(&toml_prefix).unwrap_or_else(|e| {
+                panic!("strip_line_prefixes accept banner {pat:?}: {e:?}");
+            });
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_span_context() {
+        // Classes β', γ' on both strip keys. Round-2 BLOCK-1
+        // regression guard at the field level.
+        let bad: Vec<&str> = vec![
+            "  |",
+            "   ^^^^^",
+            "^^^^^^^^^^^^^^^^^^^^^",
+            "= note: some content here for it",
+        ];
+        for pat in &bad {
+            let toml_strip = strip_lines_toml(pat);
+            assert!(
+                parse_str(&toml_strip).is_err(),
+                "strip_lines must reject span-context {pat:?}",
+            );
+            let toml_prefix = strip_prefixes_toml(pat);
+            assert!(
+                parse_str(&toml_prefix).is_err(),
+                "strip_line_prefixes must reject span-context {pat:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_diagnostic_keywords() {
+        // Classes A, C, ε' on both strip keys. Round-2 BLOCK-2
+        // regression guard at the field level.
+        let bad: Vec<&str> = vec![
+            "error",
+            "warning",
+            "note",
+            "error[",
+            "error: aborting due to",
+            "error[E0277]: trait not implemented for this type",
+        ];
+        for pat in &bad {
+            let toml_strip = strip_lines_toml(pat);
+            assert!(
+                parse_str(&toml_strip).is_err(),
+                "strip_lines must reject diagnostic keyword {pat:?}",
+            );
+            let toml_prefix = strip_prefixes_toml(pat);
+            assert!(
+                parse_str(&toml_prefix).is_err(),
+                "strip_line_prefixes must reject diagnostic keyword {pat:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_diagnostic_body() {
+        // Class δ' on both strip keys.
+        let bad: Vec<&str> = vec![
+            "the trait bound `X: Y` is not satisfied",
+            "cannot find function `foo` in scope",
+            "mismatched types when comparing two structs",
+            "consider importing this trait for the call site",
+        ];
+        for pat in &bad {
+            let toml_strip = strip_lines_toml(pat);
+            assert!(
+                parse_str(&toml_strip).is_err(),
+                "strip_lines must reject diagnostic body {pat:?}",
+            );
+            let toml_prefix = strip_prefixes_toml(pat);
+            assert!(
+                parse_str(&toml_prefix).is_err(),
+                "strip_line_prefixes must reject diagnostic body {pat:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_disguised_diagnostic() {
+        // Class θ' on both strip keys. Defense-in-depth: the string
+        // passes (A) and (B) of the banner predicate, then fails the
+        // disjunction (C.1 anchored prefix; C.2 lowercase first byte).
+        // ALSO fails is_path_like (no separator, no `$X`).
+        let pat = "error: cannot find type `Foo` in scope";
+        let toml_strip = strip_lines_toml(pat);
+        assert!(
+            parse_str(&toml_strip).is_err(),
+            "disguised diagnostic must be rejected by strip_lines (defense-in-depth)",
+        );
+        let toml_prefix = strip_prefixes_toml(pat);
+        assert!(
+            parse_str(&toml_prefix).is_err(),
+            "disguised diagnostic must be rejected by strip_line_prefixes",
+        );
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_short_and_dollar() {
+        // Classes D, E, F, F', F'', G, H on both strip keys. Round-4
+        // FIX_BEFORE_BETA-1 (Class F'); round-5 DOC Finding 3 (Class
+        // F'') field-level regression guards.
+        let bad: Vec<&str> = vec![
+            // D. Length-1 separator.
+            "/",
+            r"\",
+            // E. Length-1 dollar.
+            "$",
+            // F. Bare dollar patterns.
+            "$lowercase",
+            "$1",
+            // F'. Lowercase $ + separator.
+            "$nix/path",
+            "$lowercase/anything",
+            // F''. Placeholder with trailing junk.
+            "$DIR-",
+            "$WORKSPACE,",
+            // G. Empty handled at TOML level — skip.
+            // H. Whitespace-only.
+            " ",
+        ];
+        for pat in &bad {
+            let toml_strip = strip_lines_toml(pat);
+            assert!(
+                parse_str(&toml_strip).is_err(),
+                "strip_lines must reject {pat:?}",
+            );
+            let toml_prefix = strip_prefixes_toml(pat);
+            assert!(
+                parse_str(&toml_prefix).is_err(),
+                "strip_line_prefixes must reject {pat:?}",
+            );
+        }
+    }
+
+    #[test]
+    fn validate_strip_patterns_rejects_newline_bearing() {
+        // Class K on both strip keys.
+        let toml = r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_lines = ["alpha\nbeta"]
+        "#;
+        let err = parse_str(toml).unwrap_err();
+        let msg = unwrap_invalid(err);
+        assert!(
+            msg.contains("newline") || msg.contains("single-line"),
+            "newline in strip_lines must surface as newline error: {msg}",
+        );
+        let toml2 = r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_line_prefixes = ["alpha\nbeta"]
+        "#;
+        let err2 = parse_str(toml2).unwrap_err();
+        let msg2 = unwrap_invalid(err2);
+        assert!(
+            msg2.contains("newline") || msg2.contains("single-line"),
+            "newline in strip_line_prefixes must surface as newline error: {msg2}",
+        );
+    }
+
+    // ---- §7.3.4 Composition + interaction tests ----
+
+    #[test]
+    fn extra_substitutions_collision_with_builtin_placeholder() {
+        // Adopter `{ from = "$DIR", to = "$NOT_DIR" }`. Pins
+        // composition order + non-reservation (OQ-3): built-in `$DIR`
+        // fires first, then the adopter rule rewrites the resulting
+        // `$DIR` literal to `$NOT_DIR`.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "$DIR", to = "$NOT_DIR" },
+            ]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.suites[0].extra_substitutions[0].from, "$DIR");
+        assert_eq!(cfg.suites[0].extra_substitutions[0].to, "$NOT_DIR");
+    }
+
+    #[test]
+    fn extra_substitutions_per_suite_override_interaction() {
+        // Default suite 2 entries, named suite 1 different entry;
+        // fixtures see only the 1 (REPLACE, OQ-1).
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [
+                { from = "/default/a", to = "$WORKSPACE/a" },
+                { from = "/default/b", to = "$WORKSPACE/b" },
+            ]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "named"
+            fixture_dirs = ["tests/lihaaf/named"]
+            extra_substitutions = [
+                { from = "/named/x", to = "$WORKSPACE/x" },
+            ]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.suites[0].extra_substitutions.len(), 2);
+        assert_eq!(cfg.suites[1].extra_substitutions.len(), 1);
+        assert_eq!(cfg.suites[1].extra_substitutions[0].from, "/named/x");
+    }
+
+    #[test]
+    fn strip_patterns_per_suite_override_interaction() {
+        // Per-suite REPLACE for strip keys, with one path-shaped + one
+        // banner-shaped strip per suite.
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            strip_lines = [
+                "/default/path",
+                "error: aborting due to 1 previous error",
+            ]
+
+            [[package.metadata.lihaaf.suite]]
+            name = "named"
+            fixture_dirs = ["tests/lihaaf/named"]
+            strip_lines = [
+                "/named/path",
+            ]
+        "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.suites[0].strip_lines.len(), 2);
+        assert_eq!(cfg.suites[1].strip_lines.len(), 1);
+        assert_eq!(cfg.suites[1].strip_lines[0].as_str(), "/named/path");
+    }
+
+    // ── §FIX-1 Serde Deserialize bypass regression tests ──────────────────
+    //
+    // These tests prove that the serde Deserialize path for Config/Suite/
+    // Substitution/StripPattern routes through the same validation guards
+    // as the TOML parse path. Without the `try_from` attribute, an adopter
+    // could call `serde_json::from_value::<Config>(…)` and obtain a Config
+    // with invalid state (non-path-like `from`, newline in `to`, invalid
+    // strip patterns) without triggering any validation error.
+    //
+    // Codex xhigh final-review FIX_BEFORE_BETA-1 finding (PR #68).
+
+    /// Helper that builds the minimal JSON value for a Config with a single
+    /// default suite carrying `extra_substitutions = [{ from, to }]`.
+    fn serde_json_config_with_sub(from: &str, to: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [{ "from": from, "to": to }],
+                "strip_lines": [],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    /// Helper that builds the minimal JSON value for a Config with
+    /// `strip_lines = [pattern]` in the default suite.
+    fn serde_json_config_with_strip_lines(pattern: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [pattern],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    /// Helper that builds the minimal JSON value for a Config with
+    /// `strip_line_prefixes = [pattern]` in the default suite.
+    fn serde_json_config_with_strip_line_prefixes(pattern: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [],
+                "strip_line_prefixes": [pattern]
+            }]
+        })
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_substitution_from() {
+        // FIX-1 regression guard: serde_json::from_value::<Config> with a
+        // non-path-like `from` must fail.  Before the fix, `Substitution`
+        // derived `Deserialize` directly and bypassed `is_path_like`.
+        let bad_from_values = [
+            "error",
+            "error:",
+            "expected due to this",
+            "  |",
+            "warning: x",
+        ];
+        for bad_from in &bad_from_values {
+            let v = serde_json_config_with_sub(bad_from, "x");
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject from={bad_from:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("not path-like")
+                    || msg.contains("path-shaped")
+                    || msg.contains("is_path_like")
+                    || msg.contains("extra_substitutions"),
+                "error for from={bad_from:?} should mention path validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_substitution_to_newline() {
+        // FIX-1 regression guard: `to` containing a newline must be rejected
+        // via the serde path.
+        let v = serde_json_config_with_sub("/valid/path", "alpha\nbeta");
+        let result = serde_json::from_value::<Config>(v);
+        assert!(
+            result.is_err(),
+            "serde_json::from_value should reject to with newline but succeeded",
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("newline") || msg.contains("single-line"),
+            "error for newline-in-to should mention newline: {msg}",
+        );
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_strip_lines() {
+        // FIX-1 regression guard: strip_lines entry that is neither
+        // path-like nor banner-shaped must be rejected via the serde path.
+        let bad_patterns = ["error", "  |", "expected due to this", "warning: x", "foo"];
+        for bad_pat in &bad_patterns {
+            let v = serde_json_config_with_strip_lines(bad_pat);
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject strip_lines={bad_pat:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path-shaped")
+                    || msg.contains("banner-shaped")
+                    || msg.contains("neither")
+                    || msg.contains("not path-like"),
+                "error for strip_lines={bad_pat:?} should mention validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_rejects_invalid_strip_line_prefixes() {
+        // FIX-1 regression guard: strip_line_prefixes entry that is neither
+        // path-like nor banner-shaped must be rejected via the serde path.
+        let bad_patterns = ["error", "  |", "expected due to this", "mismatched types"];
+        for bad_pat in &bad_patterns {
+            let v = serde_json_config_with_strip_line_prefixes(bad_pat);
+            let result = serde_json::from_value::<Config>(v);
+            assert!(
+                result.is_err(),
+                "serde_json::from_value should reject strip_line_prefixes={bad_pat:?} \
+                 but succeeded",
+            );
+            let msg = result.unwrap_err().to_string();
+            assert!(
+                msg.contains("path-shaped")
+                    || msg.contains("banner-shaped")
+                    || msg.contains("neither")
+                    || msg.contains("not path-like"),
+                "error for strip_line_prefixes={bad_pat:?} should mention validation: {msg}",
+            );
+        }
+    }
+
+    #[test]
+    fn serde_deserialize_accepts_valid_substitution() {
+        // FIX-1 happy path: valid path-shaped `from` and single-line `to`
+        // must deserialize successfully and preserve the values.
+        let v = serde_json_config_with_sub("/path/$DIR", "$RUST/lib");
+        let cfg = serde_json::from_value::<Config>(v).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid substitution but failed: {e}")
+        });
+        assert_eq!(cfg.suites[0].extra_substitutions.len(), 1);
+        assert_eq!(cfg.suites[0].extra_substitutions[0].from, "/path/$DIR");
+        assert_eq!(cfg.suites[0].extra_substitutions[0].to, "$RUST/lib");
+    }
+
+    #[test]
+    fn serde_deserialize_accepts_valid_strip_pattern() {
+        // FIX-1 happy path: path-shaped and banner-shaped strip patterns
+        // must deserialize successfully via the serde path and preserve values.
+        let path_pattern = "/build/sandbox/cc-wrapper";
+        let v = serde_json_config_with_strip_lines(path_pattern);
+        let cfg = serde_json::from_value::<Config>(v).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid strip_lines but failed: {e}")
+        });
+        assert_eq!(cfg.suites[0].strip_lines.len(), 1);
+        assert_eq!(cfg.suites[0].strip_lines[0].as_str(), path_pattern);
+
+        let banner_pattern = "error: aborting due to 1 previous error";
+        let v2 = serde_json_config_with_strip_line_prefixes(banner_pattern);
+        let cfg2 = serde_json::from_value::<Config>(v2).unwrap_or_else(|e| {
+            panic!("serde_json::from_value should accept valid strip_line_prefixes but failed: {e}")
+        });
+        assert_eq!(cfg2.suites[0].strip_line_prefixes.len(), 1);
+        assert_eq!(
+            cfg2.suites[0].strip_line_prefixes[0].as_str(),
+            banner_pattern
+        );
+    }
+
+    /// Helper that builds the minimal JSON value for a Config whose default
+    /// suite has a single `extra_substitutions` entry with only a `from`
+    /// field — `to` is absent — so we can exercise the "to missing" error
+    /// path in `TryFrom<RawSubstitution>`.
+    fn serde_json_config_with_sub_from_only(from: &str) -> serde_json::Value {
+        serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [{ "from": from }],
+                "strip_lines": [],
+                "strip_line_prefixes": []
+            }]
+        })
+    }
+
+    #[test]
+    fn serde_and_toml_paths_agree_on_first_error_for_multiply_invalid() {
+        // Codex round-2 FIX_BEFORE_BETA-1 ordering-parity test.
+        //
+        // Input: from = "error" (not path-like) with `to` absent.  This is
+        // multiply-invalid: the `from` shape is bad AND `to` is missing.
+        // After the fix the TryFrom impl checks presence of both keys before
+        // running shape validation, so both paths report "to is missing" as
+        // the first error rather than one reporting shape and the other
+        // reporting presence.
+
+        // TOML path — via parse_str (finalize_substitutions →
+        // validate_extra_substitutions).
+        let toml_err = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            extra_substitutions = [{ from = "error" }]
+        "#,
+        )
+        .unwrap_err();
+        let toml_msg = unwrap_invalid(toml_err);
+
+        // serde path — via serde_json::from_value::<Config>.
+        let v = serde_json_config_with_sub_from_only("error");
+        let serde_result = serde_json::from_value::<Config>(v);
+        assert!(
+            serde_result.is_err(),
+            "serde_json::from_value should reject missing `to` but succeeded",
+        );
+        let serde_msg = serde_result.unwrap_err().to_string();
+
+        // Both paths must agree that the first-reported failure is the
+        // missing `to` key, not the non-path-like `from`.  The exact
+        // wording differs between paths, so we assert on shared substrings.
+        let to_missing_markers = ["to", "missing"];
+        for marker in &to_missing_markers {
+            assert!(
+                toml_msg.contains(marker),
+                "TOML-path error should reference `{marker}` but got: {toml_msg}",
+            );
+            assert!(
+                serde_msg.contains(marker),
+                "serde-path error should reference `{marker}` but got: {serde_msg}",
+            );
+        }
+        // Neither path should fire the is_path_like guard as the first error.
+        assert!(
+            !toml_msg.contains("not path-like"),
+            "TOML path fired is_path_like before reporting missing `to`: {toml_msg}",
+        );
+        assert!(
+            !serde_msg.contains("not path-like"),
+            "serde path fired is_path_like before reporting missing `to`: {serde_msg}",
+        );
     }
 }

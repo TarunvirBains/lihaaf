@@ -28,6 +28,9 @@ fn ctx_compat() -> NormalizationContext {
         sysroot: PathBuf::from("/sysroot"),
         cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
         compat_short_cargo: true,
+        extra_substitutions: Vec::new(),
+        strip_lines: Vec::new(),
+        strip_line_prefixes: Vec::new(),
     }
 }
 
@@ -39,6 +42,9 @@ fn ctx_non_compat() -> NormalizationContext {
         sysroot: PathBuf::from("/sysroot"),
         cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
         compat_short_cargo: false,
+        extra_substitutions: Vec::new(),
+        strip_lines: Vec::new(),
+        strip_line_prefixes: Vec::new(),
     }
 }
 

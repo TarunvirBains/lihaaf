@@ -806,6 +806,15 @@ mod tests {
         // value for both inputs so the plumbing seam in `session::run`
         // cannot regress silently. A renamed flag, a typo'd `true`/`false`,
         // or an inverted builder argument bites here.
+        //
+        // Issue #45 / v0.1.0-beta.10 note: the three adopter-defined
+        // normalizer override keys (`extra_substitutions`, `strip_lines`,
+        // `strip_line_prefixes`) are intentionally NOT chained here. The
+        // compat driver synthesizes `[package.metadata.lihaaf]` entirely
+        // and does not surface adopter TOML into the inner session, so
+        // there is no Suite-level value to forward. Compat-mode adopter
+        // extras are unsupported in v0.1.0-beta.10 (OQ-4 deferral) —
+        // see docs/spec/lihaaf-v0.1.md §6.6.
         let ctx_compat =
             crate::normalize::NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/r"))
                 .with_compat_short_cargo(true);

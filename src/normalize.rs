@@ -24,7 +24,44 @@
 
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+
+use crate::config::RawSubstitution;
 use crate::util;
+
+/// One adopter-defined `extra_substitutions` entry.
+///
+/// `from` is the literal-substring needle (gated by `is_path_like`
+/// at config-parse time — see [`crate::config`] §3.3); `to` is the
+/// replacement (subject only to the no-newline rule, per Decision #3
+/// / OQ-D — adopters legitimately need `to = ""` (strip-via-
+/// substitute), `to = "$RUST"`, and compound paths). The needle is
+/// matched left-to-right, advancing past each match so already-
+/// rewritten bytes do not re-match (same `replace_advancing` shape as
+/// the built-in path substitutions).
+///
+/// Validation rules are in [`crate::config`]; this struct is the
+/// validated typed shape passed into the normalizer.
+///
+/// # Serde validation
+///
+/// Deserialization routes through [`crate::config::RawSubstitution`]
+/// via `#[serde(try_from = "RawSubstitution")]`. The `TryFrom` impl
+/// (in `crate::config`) enforces the `is_path_like` + no-newline rules
+/// identically to the TOML parse path, so any external format
+/// (JSON, TOML, etc.) that constructs a `Substitution` cannot bypass
+/// validation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "RawSubstitution")]
+pub struct Substitution {
+    /// Literal-substring needle. Allowlist-gated to be path-shaped
+    /// (`is_path_like`) at config-parse time so `from` cannot rewrite
+    /// arbitrary diagnostic text.
+    pub from: String,
+    /// Literal-substring replacement. Subject only to no-newline
+    /// validation; otherwise unconstrained per Decision #3 / OQ-D.
+    pub to: String,
+}
 
 /// Substring prefixes the normalizer rewrites to placeholders.
 #[derive(Debug, Clone)]
@@ -44,6 +81,24 @@ pub struct NormalizationContext {
     /// form. Default `false`; non-compat callers leave it `false` and
     /// observe byte-identical v0.1 output.
     pub compat_short_cargo: bool,
+    /// Adopter-defined `extra_substitutions` (per-suite, REPLACE
+    /// semantics — see `docs/spec/lihaaf-v0.1.md` §3.6). Applied
+    /// left-to-right in declared order, AFTER built-in path
+    /// substitutions and BEFORE TypeId collapse. Empty by default;
+    /// when empty, normalizer output is byte-identical to v0.1.0-beta.9.
+    pub extra_substitutions: Vec<Substitution>,
+    /// Adopter-defined `strip_lines` (per-suite, REPLACE semantics).
+    /// Full-line exact-match drops applied after trim-trailing-whitespace
+    /// and before blank-line collapse. Empty by default. Each entry
+    /// must be `is_path_like` OR `is_banner_shape` per config-parse
+    /// validation — see `docs/spec/lihaaf-v0.1.md` §6.6.
+    pub strip_lines: Vec<String>,
+    /// Adopter-defined `strip_line_prefixes` (per-suite, REPLACE
+    /// semantics). Prefix-match drops applied after trim-trailing-
+    /// whitespace and before blank-line collapse. Empty by default.
+    /// Each entry must be `is_path_like` OR `is_banner_shape` per
+    /// config-parse validation.
+    pub strip_line_prefixes: Vec<String>,
 }
 
 impl NormalizationContext {
@@ -55,6 +110,14 @@ impl NormalizationContext {
     /// builder so the §3.2.2 trybuild short-form rewrite fires for the
     /// inner session; non-compat callers leave it untouched and observe
     /// byte-identical v0.1 output.
+    ///
+    /// The three adopter-defined override fields ([`Self::extra_substitutions`],
+    /// [`Self::strip_lines`], [`Self::strip_line_prefixes`]) default to
+    /// empty `Vec`s. Callers that need to wire per-suite values use the
+    /// dedicated builders ([`Self::with_extra_substitutions`],
+    /// [`Self::with_strip_lines`], [`Self::with_strip_line_prefixes`]).
+    /// When all three are empty (the legacy path), normalizer output is
+    /// byte-identical to v0.1.0-beta.9.
     pub fn new(workspace_root: PathBuf, sysroot: PathBuf) -> Self {
         let cargo_registry = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -65,6 +128,9 @@ impl NormalizationContext {
             sysroot,
             cargo_registry,
             compat_short_cargo: false,
+            extra_substitutions: Vec::new(),
+            strip_lines: Vec::new(),
+            strip_line_prefixes: Vec::new(),
         }
     }
 
@@ -76,6 +142,39 @@ impl NormalizationContext {
     /// default), preserved for symmetry with future overrides.
     pub fn with_compat_short_cargo(mut self, enabled: bool) -> Self {
         self.compat_short_cargo = enabled;
+        self
+    }
+
+    /// Builder-style mutator to set [`Self::extra_substitutions`].
+    ///
+    /// Returns `self` so call sites can chain with other builders. The
+    /// caller is responsible for having run config-parse validation
+    /// (`is_path_like` on each `from`, no newline in `to`) before
+    /// reaching here — the normalizer does not re-validate.
+    pub fn with_extra_substitutions(mut self, subs: Vec<Substitution>) -> Self {
+        self.extra_substitutions = subs;
+        self
+    }
+
+    /// Builder-style mutator to set [`Self::strip_lines`].
+    ///
+    /// Returns `self` so call sites can chain with other builders. The
+    /// caller is responsible for having run config-parse validation
+    /// (`is_path_like || is_banner_shape` on each entry) before
+    /// reaching here.
+    pub fn with_strip_lines(mut self, lines: Vec<String>) -> Self {
+        self.strip_lines = lines;
+        self
+    }
+
+    /// Builder-style mutator to set [`Self::strip_line_prefixes`].
+    ///
+    /// Returns `self` so call sites can chain with other builders. The
+    /// caller is responsible for having run config-parse validation
+    /// (`is_path_like || is_banner_shape` on each entry) before
+    /// reaching here.
+    pub fn with_strip_line_prefixes(mut self, prefixes: Vec<String>) -> Self {
+        self.strip_line_prefixes = prefixes;
         self
     }
 }
@@ -166,16 +265,47 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         {
             s = rewrite_cargo_short(&s, reg);
         }
+        // Step 7: adopter-defined `extra_substitutions` (issue #45 /
+        // beta.10). Applied AFTER built-in path substitutions and
+        // (when compat is on) the short-CARGO post-pass — so adopter
+        // rules can refer to the post-built-in placeholders (e.g.,
+        // `{ from = "$RUST/lib/rust-1.95.0", to = "$RUST" }`) — and
+        // BEFORE TypeId collapse so any introduced `#<digits>`
+        // collapses on the same line (§4). Entries are validated
+        // upstream (`is_path_like` on `from`, no newline in `to`) —
+        // no per-line revalidation. `replace_advancing` matches the
+        // built-in-substitution shape so already-rewritten bytes
+        // don't re-match.
+        for sub in &ctx.extra_substitutions {
+            s = replace_advancing(&s, &sub.from, &sub.to);
+        }
         s = rewrite_type_ids(&s);
         // Trailing whitespace.
         let trimmed = s.trim_end_matches([' ', '\t']);
         intermediate.push(trimmed.to_string());
     }
 
+    // Step 10: adopter-defined line-drop (`strip_lines` /
+    // `strip_line_prefixes`, issue #45 / beta.10). Runs AFTER per-
+    // line trim-trailing-whitespace (so strip patterns match logical
+    // content) and BEFORE blank-line collapse (so a stripped line
+    // participates in the collapse — adjacent blank lines stay
+    // collapsed even when a non-blank line between them gets
+    // dropped). Empty allow-vectors short-circuit each line to a
+    // simple push so the absent-config path remains byte-identical
+    // to beta.9.
+    let mut after_strip: Vec<String> = Vec::with_capacity(intermediate.len());
+    for line in intermediate {
+        if should_strip_line(&line, &ctx.strip_lines, &ctx.strip_line_prefixes) {
+            continue;
+        }
+        after_strip.push(line);
+    }
+
     // Step 3: collapse runs of blank lines to a single blank line.
     let mut out = String::with_capacity(input.len());
     let mut prev_blank = false;
-    for line in intermediate {
+    for line in after_strip {
         let is_blank = line.is_empty();
         if is_blank && prev_blank {
             continue;
@@ -191,6 +321,25 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         out.pop();
     }
     out
+}
+
+/// Test whether `line` matches any adopter-defined drop rule from
+/// `strip_lines` (full-line exact equality) or `strip_line_prefixes`
+/// (prefix match).
+///
+/// Both rule sets are validated upstream at config-parse time
+/// (`is_path_like || is_banner_shape`) — see `crate::config` §3.3.
+/// On the absent-config (empty-vector) path the two `iter().any`
+/// calls collapse to constant `false` so the legacy normalizer
+/// output is byte-identical to v0.1.0-beta.9.
+fn should_strip_line(line: &str, exact: &[String], prefixes: &[String]) -> bool {
+    if exact.iter().any(|e| e == line) {
+        return true;
+    }
+    if prefixes.iter().any(|p| line.starts_with(p.as_str())) {
+        return true;
+    }
+    false
 }
 
 /// Pre-format a path as a string and push it onto the substitution
@@ -474,6 +623,9 @@ mod tests {
             sysroot: PathBuf::from(sysroot),
             cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
             compat_short_cargo: false,
+            extra_substitutions: Vec::new(),
+            strip_lines: Vec::new(),
+            strip_line_prefixes: Vec::new(),
         }
     }
 
@@ -607,8 +759,35 @@ mod tests {
 
     #[test]
     fn determinism_same_inputs_produce_same_bytes() {
-        let input = "  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1\n";
-        let c = ctx("/p", "/r");
+        // Per plan §7.4: this test was extended in #45 / beta.10 with a
+        // non-empty `extra_substitutions` + `strip_lines` +
+        // `strip_line_prefixes` triple that exercises BOTH allowlist
+        // predicates (one path-shaped + one banner-shaped entry in each
+        // strip key). Determinism guarantee covers the full normalizer
+        // surface including adopter-defined override paths, not just the
+        // built-in path-substitution loop.
+        let input = "\
+  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1
+/nix/store/abc123-rust-1.95.0/lib/rustlib/x.rs:1:1
+/build/sandbox/internal/wrappers/cc-wrapper-1.0
+error: aborting due to 1 previous error
+
+For more information about this error, try `rustc --explain E0277`.
+$WORKSPACE/.cargo-cache/dropped
+";
+        let mut c = ctx("/p", "/r");
+        c.extra_substitutions = vec![Substitution {
+            from: "/nix/store/abc123-rust-1.95.0/lib/rustlib".into(),
+            to: "$RUST/lib/rustlib".into(),
+        }];
+        c.strip_lines = vec![
+            "/build/sandbox/internal/wrappers/cc-wrapper-1.0".into(),
+            "error: aborting due to 1 previous error".into(),
+        ];
+        c.strip_line_prefixes = vec![
+            "$WORKSPACE/.cargo-cache/".into(),
+            "For more information about this error".into(),
+        ];
         let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
         let a = normalize(input, &c, &dir);
         let b = normalize(input, &c, &dir);
@@ -778,6 +957,9 @@ error: aborting due to 1 previous error
             sysroot: PathBuf::from(sysroot),
             cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
             compat_short_cargo: true,
+            extra_substitutions: Vec::new(),
+            strip_lines: Vec::new(),
+            strip_line_prefixes: Vec::new(),
         }
     }
 
@@ -787,6 +969,9 @@ error: aborting due to 1 previous error
             sysroot: PathBuf::from(sysroot),
             cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
             compat_short_cargo: false,
+            extra_substitutions: Vec::new(),
+            strip_lines: Vec::new(),
+            strip_line_prefixes: Vec::new(),
         }
     }
 
@@ -837,5 +1022,297 @@ error: aborting due to 1 previous error
             out,
             "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1"
         );
+    }
+
+    // ====================================================================
+    // Issue #45 / v0.1.0-beta.10 — `extra_substitutions` framework
+    //
+    // Per plan §7.1 (`docs/spec/extra-substitutions-plan-2026-05-19.md`).
+    // Tests cover normalizer composition: extras apply AFTER built-ins,
+    // extras apply in declared order, strip drops with both exact and
+    // prefix matchers, strip runs after trim-trailing-whitespace and
+    // before blank-line collapse, no interference with diagnostic text.
+    //
+    // Predicate-level + field-level allowlist tests for the validators
+    // live in `src/config.rs` tests module.
+    // ====================================================================
+
+    /// Build a context with the three #45 override fields populated.
+    /// Uses long, non-colliding workspace/sysroot paths so the
+    /// built-in path-substitution loop doesn't accidentally swallow
+    /// substrings inside test-input literals (`/r` would match
+    /// `/rust-...`, `/p` would match `/path/...`).
+    fn ctx_with_extras(
+        extras: Vec<Substitution>,
+        strip_lines: Vec<String>,
+        strip_line_prefixes: Vec<String>,
+    ) -> NormalizationContext {
+        NormalizationContext {
+            workspace_root: PathBuf::from("/lihaaf_test_ws_root"),
+            sysroot: PathBuf::from("/lihaaf_test_sysroot"),
+            cargo_registry: Some(PathBuf::from("/lihaaf_test_cargo/registry")),
+            compat_short_cargo: false,
+            extra_substitutions: extras,
+            strip_lines,
+            strip_line_prefixes,
+        }
+    }
+
+    /// Test-only constant for tests that use the long-form
+    /// non-colliding fixture dir. The dir is chosen so it doesn't
+    /// substring-overlap with the input lines used in these tests.
+    fn test_fixture_dir() -> PathBuf {
+        PathBuf::from("/lihaaf_test_fixture_dir")
+    }
+
+    #[test]
+    fn extra_substitutions_apply_after_builtins() {
+        // Adopter rule rewrites a NixOS sysroot literal to `$RUST` after
+        // built-in path substitutions have already resolved `/p` →
+        // `$WORKSPACE` etc. The built-in `$RUST` substitution does NOT
+        // fire on the Nix path; the adopter rule has to be what
+        // produces the placeholder.
+        let input = "  ::: /nix/store/abc123-rust-1.95.0/lib/rustlib/std/src/option.rs:1:1\n";
+        let extras = vec![Substitution {
+            from: "/nix/store/abc123-rust-1.95.0/lib/rustlib".into(),
+            to: "$RUST/lib/rustlib".into(),
+        }];
+        let c = ctx_with_extras(extras, vec![], vec![]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "  ::: $RUST/lib/rustlib/std/src/option.rs:1:1");
+    }
+
+    #[test]
+    fn extra_substitutions_apply_in_declared_order() {
+        // Two rules; the first rewrites a literal path to `$RUST/lib/...`,
+        // the second collapses the inner version-stamped sub-tree to
+        // bare `$RUST`. Order matters: applying them out of order would
+        // either fail to match (if rule 2 runs first, the input has no
+        // `$RUST/...` substring to collapse) or land on the wrong target.
+        let input = "  ::: /opt/vendored/rust-1.95.0/lib/rust-1.95.0/std/src/option.rs:1:1\n";
+        let extras = vec![
+            Substitution {
+                from: "/opt/vendored/rust-1.95.0/lib".into(),
+                to: "$RUST/lib".into(),
+            },
+            Substitution {
+                from: "$RUST/lib/rust-1.95.0".into(),
+                to: "$RUST".into(),
+            },
+        ];
+        let c = ctx_with_extras(extras, vec![], vec![]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "  ::: $RUST/std/src/option.rs:1:1");
+    }
+
+    #[test]
+    fn extra_substitutions_empty_default_byte_identical() {
+        // Regression guard for §1.3 default invariant: when the three new
+        // vectors are empty, normalizer output must be byte-identical to
+        // the legacy beta.9 path. A simple round-trip with a path-marker
+        // line covers the most common shape.
+        let input = "  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  --> $DIR/foo.rs:3:1");
+    }
+
+    #[test]
+    fn strip_lines_drops_full_line_match() {
+        let input = "alpha\n/build/sandbox/internal/wrappers/cc-wrapper-1.0\nomega\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec!["/build/sandbox/internal/wrappers/cc-wrapper-1.0".into()],
+            vec![],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "alpha\nomega");
+    }
+
+    #[test]
+    fn strip_lines_drops_banner_line_match() {
+        // Exact-match strip of the rustc `error: aborting due to ...`
+        // summary banner. Adopter opt-in: built-in normalization
+        // preserves this line; strip removes it.
+        let input = "error: bad\nerror: aborting due to 1 previous error\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec!["error: aborting due to 1 previous error".into()],
+            vec![],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "error: bad");
+    }
+
+    #[test]
+    fn strip_lines_no_partial_match() {
+        // `strip_lines` is full-line exact-match only. A line that
+        // contains the strip pattern as a substring must NOT be dropped;
+        // adopters who want partial matches use prefix or substitution.
+        let input = "/build/sandbox/internal/wrappers/cc-wrapper-1.0 plus more\nbeta\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec!["/build/sandbox/internal/wrappers/cc-wrapper-1.0".into()],
+            vec![],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(
+            out,
+            "/build/sandbox/internal/wrappers/cc-wrapper-1.0 plus more\nbeta",
+        );
+    }
+
+    #[test]
+    fn strip_line_prefixes_matches_prefix_only() {
+        // Prefix match drops every line starting with the pattern; lines
+        // that don't start with it survive.
+        let input =
+            "$WORKSPACE/.cargo-cache/aaa-001\n$WORKSPACE/.cargo-cache/bbb-002\nother line\n";
+        let c = ctx_with_extras(vec![], vec![], vec!["$WORKSPACE/.cargo-cache/".into()]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "other line");
+    }
+
+    #[test]
+    fn strip_line_prefixes_drops_explain_footer_family() {
+        // Prefix strip of the rustc explain-footer family across multiple
+        // error codes. A single adopter prefix collapses every variant.
+        let input = "error: bad\n\nFor more information about this error, try `rustc --explain E0277`.\nFor more information about this error, try `rustc --explain E0463`.\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec![],
+            vec!["For more information about this error".into()],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        // Both explain-footer lines drop; blank-line collapse runs after
+        // the drop so the trailing blank between `error: bad` and the
+        // first dropped line collapses with the absence of follow-on
+        // content. Result: just `error: bad`.
+        assert_eq!(out, "error: bad");
+    }
+
+    #[test]
+    fn strip_line_prefixes_drops_macro_origin_trailer_family() {
+        let input = "error: bad\nnote: this error originates from the macro `m` in the crate `c`\nnote: this error originates from the attribute macro `derive_more::Display`\nfinal\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec![],
+            vec!["note: this error originates from ".into()],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "error: bad\nfinal");
+    }
+
+    #[test]
+    fn strip_patterns_apply_after_trim_trailing_whitespace() {
+        // Per plan §4: line-drop runs AFTER per-line trim-trailing-
+        // whitespace. The input line has trailing whitespace; after the
+        // trim, the trimmed body matches the strip rule, so the line
+        // drops. If the trim hadn't run first, the pattern wouldn't match.
+        let input = "alpha\n/build/sandbox/internal/wrappers/cc-wrapper-1.0   \t\nomega\n";
+        let c = ctx_with_extras(
+            vec![],
+            vec!["/build/sandbox/internal/wrappers/cc-wrapper-1.0".into()],
+            vec![],
+        );
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(out, "alpha\nomega");
+    }
+
+    #[test]
+    fn strip_patterns_do_not_affect_diagnostic_text() {
+        // NOTE (NIT-2): normalizer composition test, not user-facing
+        // compat support. The strip vectors here are path-shaped (would
+        // pass `is_path_like` at config-parse time) but happen not to
+        // match any line in the input — so diagnostic text passes
+        // through unchanged. Adopters cannot write diagnostic-text strip
+        // patterns at config-parse time; this test pins composition
+        // behavior at the normalizer layer.
+        let input = "error: unknown on_delete value `bogus`; expected one of: cascade\n";
+        let c = ctx_with_extras(vec![], vec![], vec!["$WORKSPACE/.cargo-cache/".into()]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        assert_eq!(
+            out,
+            "error: unknown on_delete value `bogus`; expected one of: cascade",
+        );
+    }
+
+    #[test]
+    fn extra_substitutions_run_before_type_id_collapse() {
+        // Per plan §4: extras run BEFORE TypeId. An adopter rule that
+        // introduces a `#<digits>` sequence must collapse to `$TYPEID`
+        // on the same line. Without the ordering guarantee, the
+        // introduced sequence would slip past TypeId normalization.
+        //
+        // The rule's `from` is path-shaped to pass the upstream
+        // allowlist; the `to` introduces a path-prefixed `#0` shape.
+        let input = "  ::: /vendored/cache/path:1:1\n";
+        let extras = vec![Substitution {
+            from: "/vendored/cache/path".into(),
+            to: "/x/#0/y".into(),
+        }];
+        let c = ctx_with_extras(extras, vec![], vec![]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        // `#0` collapses to `$TYPEID` because TypeId runs after extras.
+        assert_eq!(out, "  ::: /x/$TYPEID/y:1:1");
+    }
+
+    #[test]
+    fn compose_with_compat_short_cargo() {
+        // NOTE (NIT-2): exercises normalizer-internal composition.
+        // Adopter extras remain unsupported in compat mode per §5 /
+        // §6.6 of the v0.1 spec — but the composition order is pinned
+        // here so if compat-mode adopter extras land in beta.11+, the
+        // ordering is already correct: short-CARGO post-pass runs
+        // first, then adopter extras, then TypeId.
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
+        let extras = vec![Substitution {
+            from: "$CARGO/foo-1.0.0".into(),
+            to: "$CARGO/foo".into(),
+        }];
+        let c = NormalizationContext {
+            workspace_root: PathBuf::from("/lihaaf_test_ws_root"),
+            sysroot: PathBuf::from("/lihaaf_test_sysroot"),
+            cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
+            compat_short_cargo: true,
+            extra_substitutions: extras,
+            strip_lines: vec![],
+            strip_line_prefixes: vec![],
+        };
+        let out = normalize(input, &c, &test_fixture_dir());
+        // Short-CARGO post-pass rewrites the registry path to
+        // `$CARGO/foo-1.0.0/...` first; the adopter rule then collapses
+        // the version-stamped sub-tree to bare `$CARGO/foo/...`.
+        assert_eq!(out, "  --> $CARGO/foo/src/lib.rs:3:1");
+    }
+
+    #[test]
+    fn extra_substitutions_no_newline_in_to_debug_assertion() {
+        // Debug-assertion mirror of the config-parse validation rule.
+        // The `to` field must NOT contain a newline. We can't trip the
+        // validator here (the normalizer doesn't validate), but we CAN
+        // verify the normalizer doesn't blow up when fed a multi-line
+        // `to`: it would produce a malformed snapshot, which is exactly
+        // why the upstream validator rejects it.
+        //
+        // This test simply documents the contract by demonstrating the
+        // outcome of bypassing it: synthesized newline lands in stderr
+        // and disrupts the line model. Adopters cannot reach this
+        // shape via TOML — the validator catches it first.
+        let input = "  ::: /a/b/c:1:1\n";
+        let extras = vec![Substitution {
+            from: "/a/b/c".into(),
+            to: "$WORKSPACE/inserted\nbad".into(),
+        }];
+        let c = ctx_with_extras(extras, vec![], vec![]);
+        let out = normalize(input, &c, &test_fixture_dir());
+        // Normalizer doesn't re-validate; the multi-line `to` lands in
+        // the substituted output. The contract is that callers prevent
+        // this via the config-parse validator; the test pins the
+        // expected (admittedly malformed) outcome so a future tightening
+        // of `replace_advancing` doesn't silently change behavior.
+        assert!(out.contains("$WORKSPACE/inserted"));
+        assert!(out.contains("bad:1:1"));
     }
 }

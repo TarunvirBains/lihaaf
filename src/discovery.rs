@@ -167,6 +167,9 @@ mod tests {
             compile_fail_marker: marker.to_string(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: 1024,
+            extra_substitutions: vec![],
+            strip_lines: vec![],
+            strip_line_prefixes: vec![],
         }
     }
 
