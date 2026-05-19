@@ -836,6 +836,9 @@ mod tests {
             compile_fail_marker: "compile_fail".into(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: per_fixture_mb,
+            extra_substitutions: vec![],
+            strip_lines: vec![],
+            strip_line_prefixes: vec![],
         }
     }
 
