@@ -116,8 +116,8 @@ impl WorkerContext {
     /// are forwarded into `norm_ctx` here via the dedicated builders
     /// so the caller's `NormalizationContext` arrives carrying the
     /// suite's per-suite override values. When the suite has all
-    /// three at default (empty), the builders are no-ops and the
-    /// normalizer output is byte-identical to v0.1.0-beta.9.
+    /// three at default (empty), the builders are no-ops and no
+    /// adopter overrides are applied.
     ///
     /// [`Config`]: crate::config::Config
     #[allow(clippy::too_many_arguments)]
@@ -840,8 +840,7 @@ fn render_json_diagnostics(stderr: &str) -> String {
 /// previous scan found the first `"rendered"` token textually and so
 /// latched onto a `null` from `children[0]` whenever children were
 /// serialized before the parent's own `rendered`, silently dropping
-/// the parent diagnostic. See issue #5 for the bless-snapshot failure
-/// mode this caused.
+/// the parent diagnostic.
 ///
 /// Spec §6.1's no-regex rule is preserved: `serde_json` is not a
 /// regex engine.
@@ -860,9 +859,8 @@ fn extract_rendered(line: &str) -> Option<String> {
     {
         return Some(s.to_owned());
     }
-    // Bare rustc `--error-format=json` form (and the legacy "single
-    // object with `rendered` at the top level" shape that existing
-    // tests cover).
+    // Bare rustc `--error-format=json` form (and the "single object
+    // with `rendered` at the top level" shape that existing tests cover).
     v.get("rendered")
         .and_then(serde_json::Value::as_str)
         .map(str::to_owned)
@@ -914,10 +912,10 @@ enum MonitorKind {
 ///   `Cargo.toml`, resolved in [`crate::session::run`]) is the value
 ///   cargo would set; it is already tracked in `ctx.crate_root`.
 ///
-/// Extracted as a discrete helper so the regression test for issue #14
-/// drives the same code path as production rather than asserting
-/// against a hand-rolled copy — removing or mutating either `cmd.env`
-/// call below trips the unit test.
+/// Extracted as a discrete helper so the regression test drives the
+/// same code path as production rather than asserting against a
+/// hand-rolled copy — removing or mutating either `cmd.env` call
+/// below trips the unit test.
 ///
 /// [`proc_macro_crate::crate_name`]: https://docs.rs/proc-macro-crate/latest/proc_macro_crate/fn.crate_name.html
 fn apply_rustc_env(cmd: &mut Command, ctx: &WorkerContext) {
@@ -939,7 +937,7 @@ fn apply_rustc_env(cmd: &mut Command, ctx: &WorkerContext) {
         cmd.env("LD_LIBRARY_PATH", joined);
     }
 
-    // CARGO_MANIFEST_DIR — see function-level rustdoc. Issue #14.
+    // CARGO_MANIFEST_DIR — see function-level rustdoc.
     cmd.env("CARGO_MANIFEST_DIR", &ctx.crate_root);
 }
 
@@ -1362,13 +1360,13 @@ mod tests {
 
     #[test]
     fn extract_rendered_preserves_parent_when_child_rendered_is_null_bare_rustc() {
-        // Regression test for issue #5. rustc `--error-format=json` emits
-        // one object per diagnostic; `children` (help/note sub-diagnostics
-        // whose own `rendered` is typically `null`) is serialized BEFORE
-        // the parent's `rendered`. A naive "find the first `\"rendered\"`
-        // token" scan latches onto the child's `null` and drops the
-        // entire parent diagnostic. The fix must return the outermost
-        // (parent) `rendered`, not the first one it sees textually.
+        // rustc `--error-format=json` emits one object per diagnostic;
+        // `children` (help/note sub-diagnostics whose own `rendered` is
+        // typically `null`) is serialized BEFORE the parent's `rendered`.
+        // A naive "find the first `\"rendered\"` token" scan latches onto
+        // the child's `null` and drops the entire parent diagnostic. The
+        // fix must return the outermost (parent) `rendered`, not the first
+        // one it sees textually.
         let line = concat!(
             r#"{"$message_type":"diagnostic",""#,
             r#"message":"not all trait items implemented","#,
@@ -1641,10 +1639,7 @@ plain text line
     #[test]
     fn sample_rss_returns_some_for_self() {
         // Every supported platform — Linux, macOS, Windows — must return
-        // Some(kib) for our own PID. Previously this test was Linux-only
-        // (returning None on other platforms tripped the implicit
-        // "harness ceiling check disabled" path); KR-5 / FIX_BEFORE_BETA
-        // Spec C closes the gap.
+        // Some(kib) for our own PID.
         let pid = std::process::id();
         let kib = sample_rss_kib(pid);
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
@@ -1664,8 +1659,6 @@ plain text line
         assert_eq!(sample_rss_kib(u32::MAX), None);
     }
 
-    /// Regression test for issue #14.
-    ///
     /// Per-fixture `rustc` invocations must carry `CARGO_MANIFEST_DIR`
     /// set to the consumer crate root. Any proc macro that calls
     /// `proc_macro_crate::crate_name("foo")` reads this variable at
@@ -1679,8 +1672,7 @@ plain text line
     /// any future regression that drops the `CARGO_MANIFEST_DIR` line
     /// trips here without needing to spawn rustc. The test also
     /// asserts that `LD_LIBRARY_PATH` is still set, guarding the
-    /// pre-existing dylib-loader invariant from accidental removal in
-    /// the same edit.
+    /// dylib-loader invariant from accidental removal in the same edit.
     #[test]
     fn fixture_rustc_cmd_carries_cargo_manifest_dir() {
         let ctx = unit_test_ctx();
@@ -1698,9 +1690,7 @@ plain text line
             .iter()
             .find(|(k, _)| k == "CARGO_MANIFEST_DIR")
             .and_then(|(_, v)| v.as_ref())
-            .expect(
-                "CARGO_MANIFEST_DIR must be set on every per-fixture rustc command (issue #14)",
-            );
+            .expect("CARGO_MANIFEST_DIR must be set on every per-fixture rustc command");
         assert_eq!(
             std::path::Path::new(manifest_dir),
             ctx.crate_root.as_path(),
@@ -1724,12 +1714,11 @@ plain text line
     /// only pins the later-write-wins precedence. Without this guard
     /// a future refactor that conditionally skips the
     /// `cmd.env("CARGO_MANIFEST_DIR", …)` line (e.g. "only set it when
-    /// the parent process hasn't already") could regress issue #14:
-    /// the per-fixture rustc would inherit a `CARGO_MANIFEST_DIR`
-    /// pointing at the lihaaf binary's own crate root, not the
-    /// consumer's, and `proc_macro_crate::crate_name` would resolve
-    /// against the wrong manifest. Added per gpt-5.5 xhigh PR-15
-    /// review §"Open questions/assumptions".
+    /// the parent process hasn't already") would silently break: the
+    /// per-fixture rustc would inherit a `CARGO_MANIFEST_DIR` pointing
+    /// at the lihaaf binary's own crate root, not the consumer's, and
+    /// `proc_macro_crate::crate_name` would resolve against the wrong
+    /// manifest.
     #[test]
     fn apply_rustc_env_overwrites_inherited_cargo_manifest_dir() {
         let ctx = unit_test_ctx();
@@ -1746,7 +1735,7 @@ plain text line
         assert_eq!(
             std::path::Path::new(manifest_dir),
             ctx.crate_root.as_path(),
-            "apply_rustc_env must overwrite a stale CARGO_MANIFEST_DIR with the consumer crate root (issue #14)"
+            "apply_rustc_env must overwrite a stale CARGO_MANIFEST_DIR with the consumer crate root"
         );
     }
 

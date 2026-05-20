@@ -1,5 +1,4 @@
-//! Phase 2 of compat mode (issue #11) — sibling-manifest overlay
-//! determinism integration tests.
+//! Staged overlay determinism integration tests.
 //!
 //! Every test in this file calls into `lihaaf::compat_overlay_*`
 //! re-exports (declared in `src/lib.rs`). The re-exports are
@@ -27,8 +26,8 @@
 //!    representative `Cargo.toml` shapes under
 //!    `tests/compat/overlay_corpus/`, each checked against a
 //!    pre-committed `*.expected.toml`). The ninth fixture
-//!    (`workspace_member_with_package`) was added in issue #53 and
-//!    materializes through the `--package`-resolver shape with a
+//!    (`workspace_member_with_package`) exercises the
+//!    `--package`-resolver shape with a
 //!    populated `WorkspaceMemberContext`.
 //! 6. The §3.2.3 risk section's invariant
 //!    (`patch_tables_preserved_verbatim` — `[patch.crates-io]`
@@ -41,51 +40,50 @@
 //!    `[workspace].default-members`, `[workspace.dependencies.*].path`
 //!    absolutization is covered by the unit-level tests in
 //!    `src/compat/overlay.rs::tests`. At the integration level, the
-//!    workspace-identity fix (issue #36) overrides those values
-//!    unconditionally — see test bullet 9 below.
+//!    workspace-identity rewrite overrides those values unconditionally
+//!    — see test bullet 9 below.
 //! 8. Richer cargo-build regression (`cargo_accepts_rich_overlay_for_dylib_build`)
 //!    exercising path-dep + `[patch.crates-io]` path entry + relative
-//!    `--compat-root` — the production failure shapes from the Round-2 panel.
-//! 9. Workspace-identity fix for issue #36 + R2 inheritance-preservation
-//!    fixup (PR #37 Codex + Gemini BLOCK):
-//!    - `staged_overlay_overrides_upstream_workspace_inheritance`
-//!      pins the R2 selective-rewrite contract: the staged overlay
-//!      strips only `members` / `exclude` / `default-members` from
-//!      `[workspace]` and preserves `dependencies`, `package`,
-//!      `lints`, `metadata`, `resolver`, plus any unknown
-//!      `[workspace.X]`.
-//!    - `staged_overlay_rejects_workspace_member_manifest` pins the
-//!      Option-C decision: `[package].workspace = "<path>"` manifests
-//!      are REJECTED (out-of-scope for v0.1.0-beta.6).
-//!    - `staged_overlay_rejects_implicit_workspace_member_manifest`
-//!      is the R3 extension (PR #37 Codex BLOCK fixup): manifests
-//!      that lack a local `[workspace]` but carry any
-//!      `{ workspace = true }` inheritance reference are ALSO
-//!      rejected — they would otherwise produce a manifest with
-//!      stranded inheritance refs that cargo fails to parse with
-//!      "workspace inheritance was specified but `[workspace.X]`
-//!      was not defined".
-//!    - `staged_overlay_rejects_manifest_with_ancestor_workspace`
-//!      is the R4 extension (PR #37 R3 Codex BLOCK fixup):
-//!      manifests with no local `[workspace]` AND no
-//!      `{ workspace = true }` references are ALSO rejected when
-//!      an ancestor `Cargo.toml` on the filesystem walk-up carries
-//!      `[workspace]` — the ancestor may carry `[patch]` /
-//!      `[replace]` / `[profile]` / `resolver` /
-//!      `[workspace.dependencies]` tables that produce a divergent
-//!      cargo dependency graph between baseline (walks up, sees the
-//!      ancestor) and overlay (terminates the walk-up at the staged
-//!      manifest, skips the ancestor entirely) — and therefore
-//!      false compat verdicts.
-//!    - `staged_overlay_allows_root_with_local_workspace_and_inheritance_refs`
-//!      is the negative-case companion: a workspace ROOT carrying
-//!      both `[workspace]` and `{ workspace = true }` refs MUST
-//!      succeed, since the refs resolve LOCALLY.
-//!    - `cargo_accepts_workspace_style_overlay_for_dylib_build` is
-//!      the cargo-level proof for the membership-stripping case.
-//!    - `cargo_accepts_workspace_inheritance_reference_in_overlay`
-//!      is the cargo-level proof for the R2 inheritance-preservation
-//!      contract (the Codex repro that BLOCKed R1).
+//!    `--compat-root` — the production failure shapes from the compat review.
+//! 9. Workspace identity and inheritance preservation:
+//! - `staged_overlay_overrides_upstream_workspace_inheritance`
+//!   pins the selective rewrite contract: the staged overlay
+//!   strips only `members` / `exclude` / `default-members` from
+//!   `[workspace]` and preserves `dependencies`, `package`,
+//!   `lints`, `metadata`, `resolver`, plus any unknown
+//!   `[workspace.X]`.
+//! - `staged_overlay_rejects_workspace_member_manifest` pins the
+//!   explicit-member decision: `[package].workspace = "<path>"`
+//!   manifests are rejected.
+//! - `staged_overlay_rejects_implicit_workspace_member_manifest`
+//!   is the inheritance-reference rejection extension: manifests
+//!   that lack a local `[workspace]` but carry any
+//!   `{ workspace = true }` inheritance reference are ALSO
+//!   rejected — they would otherwise produce a manifest with
+//!   stranded inheritance refs that cargo fails to parse with
+//!   "workspace inheritance was specified but `[workspace.X]`
+//!   was not defined".
+//! - `staged_overlay_rejects_manifest_with_ancestor_workspace`
+//!   is the ancestor-workspace rejection extension:
+//!   manifests with no local `[workspace]` AND no
+//!   `{ workspace = true }` references are ALSO rejected when
+//!   an ancestor `Cargo.toml` on the filesystem walk-up carries
+//!   `[workspace]` — the ancestor may carry `[patch]` /
+//!   `[replace]` / `[profile]` / `resolver` /
+//!   `[workspace.dependencies]` tables that produce a divergent
+//!   cargo dependency graph between baseline (walks up, sees the
+//!   ancestor) and overlay (terminates the walk-up at the staged
+//!   manifest, skips the ancestor entirely) — and therefore
+//!   false compat verdicts.
+//! - `staged_overlay_allows_root_with_local_workspace_and_inheritance_refs`
+//!   is the negative-case companion: a workspace ROOT carrying
+//!   both `[workspace]` and `{ workspace = true }` refs MUST
+//!   succeed, since the refs resolve LOCALLY.
+//! - `cargo_accepts_workspace_style_overlay_for_dylib_build` is
+//!   the cargo-level proof for the membership-stripping case.
+//! - `cargo_accepts_workspace_inheritance_reference_in_overlay`
+//!   is the cargo-level proof for the selective rewrite inheritance-preservation
+//!   contract for the workspace-inheritance repro.
 //!
 //! ## Why every test is hermetic
 //!
@@ -285,7 +283,7 @@ fn workspace_root_manifest_is_rejected_with_directed_diagnostic() {
     // would fail with an opaque error. Phase 2 overlay rejects this
     // upfront with a directed diagnostic.
     //
-    // Issue #53 augments the diagnostic to recommend `--package
+    // augments the diagnostic to recommend `--package
     // <pkg>` as the actionable workspace-member entry shape, so the
     // assertions below check for the augmented text shape ("workspace
     // member" + "--package").
@@ -308,9 +306,9 @@ members = ["crate-a", "crate-b"]
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
-            // Issue #53 — diagnostic now recommends `--package` so
+            // diagnostic now recommends `--package` so
             // the adopter has an actionable workspace-member entry
-            // shape. The legacy "member crate" wording is replaced
+            // shape. The single-root "member crate" wording is replaced
             // with "workspace member" + "--package".
             assert!(
                 message.contains("--package"),
@@ -332,8 +330,7 @@ fn virtual_workspace_with_inherited_workspace_package_is_rejected() {
     // `package.version.workspace = true`. The manifest itself is STILL a
     // virtual workspace (no top-level `[package]`) — cargo cannot build
     // it as a library, so the overlay must reject it just like the
-    // bare-virtual-workspace case. Regression for round-2 review BLOCK:
-    // earlier logic exempted virtual workspaces that carried
+    // bare-virtual-workspace case. Earlier logic exempted virtual workspaces that carried
     // `[workspace.package]`, treating the inherited-metadata table as if
     // it made the root manifest buildable. It does not.
     let input = r#"[workspace]
@@ -360,7 +357,7 @@ edition = "2021"
                 message.contains("--compat-root"),
                 "diagnostic must point at the flag; got: {message}"
             );
-            // Issue #53 — diagnostic now recommends `--package`
+            // diagnostic now recommends `--package`
             // (see workspace_root_manifest_is_rejected_with_directed_diagnostic
             // above for the rationale).
             assert!(
@@ -460,11 +457,11 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
     // spec §3.2.3. Two lihaaf binaries built against the same `toml`
     // 1.x patch level must produce the byte-identical expected output
     // for every fixture. Divergence on a `toml` patch bump trips this
-    // test in CI; the careful-coder handling the bump regenerates the
+    // test in CI; the person handling the bump regenerates the
     // corpus and re-asserts the `overlay_serializer_drift` envelope
     // contract (Phase 8 surfaces this).
     //
-    // **Path-absolutization caveat.** After the PR #34 redesign, the
+    // **Path-absolutization caveat.** After the staged-overlay redesign, the
     // staged overlay carries absolute paths in its `[lib] path` and
     // path-dep entries (resolved against the upstream crate dir). The
     // corpus expected files hold a `__UPSTREAM_DIR__` placeholder that
@@ -482,7 +479,7 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         "with_patch_section",
         "with_comments",
         "with_replace_section",
-        // Two new fixtures pin the issue #40/#47 Option H self-patch
+        // Two new fixtures pin the self-patch policy Option H self-patch
         // policy emission: Rule 1 INJECT for clean upstreams (the
         // anyhow / thiserror / serde_json shape) and Rule 2 REMAP
         // for upstreams that already carry `[patch.crates-io.<self>]
@@ -491,7 +488,7 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         // distinction is in the INPUT.
         "with_self_patch_injected",
         "with_self_patch_remapped",
-        // Issue #53 — workspace-member entry via `--package`. The
+        // workspace-member entry via `--package`. The
         // fixture exercises the workspace-root carry-down +
         // `apply_workspace_member_inheritance` + Option H Rule 1
         // INJECT on a member-shaped input (`{ workspace = true }`
@@ -510,7 +507,7 @@ fn byte_identical_across_two_lihaaf_binaries_on_corpus() {
         let expected_template = std::fs::read_to_string(&expected_path)
             .unwrap_or_else(|e| panic!("reading corpus expected {expected_path:?}: {e}"));
 
-        // Issue #53 — the workspace-member fixture requires a
+        // the workspace-member fixture requires a
         // synthesized workspace-root context. The `--package`
         // resolver's natural shape is `<ws-root>/Cargo.toml` carrying
         // `[workspace.*]` carry-down tables + `<ws-root>/<member>/Cargo.toml`
@@ -588,18 +585,18 @@ unsafe_code = "forbid"
         assert_eq!(
             actual, expected,
             "corpus `{name}` drifted from expected output.\n\
-             If a `toml` 1.x patch bump produced this drift, regenerate \
-             `tests/compat/overlay_corpus/{name}.expected.toml` and bump \
-             the spec §3.2.3 reference. Otherwise this is a bug in the \
-             overlay serializer.\n\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
+ If a `toml` 1.x patch bump produced this drift, regenerate \
+ `tests/compat/overlay_corpus/{name}.expected.toml` and bump \
+ the spec §3.2.3 reference. Otherwise this is a bug in the \
+ overlay serializer.\n\n--- expected ---\n{expected}\n--- actual ---\n{actual}"
         );
         checked += 1;
     }
     assert_eq!(
         checked, 9,
         "corpus must include all 9 representative fixtures \
-         (6 baseline + 2 issue #40/#47 Option H + 1 issue #53 \
-         workspace-member-with-package)"
+ (6 baseline + 2 self-patch policy Option H + 1 workspace-member support \
+ workspace-member-with-package)"
     );
 }
 
@@ -610,7 +607,7 @@ fn trailing_whitespace_stripped() {
     // crate will silently swallow trailing whitespace on parse, so the
     // test is most useful as a defense-in-depth check on
     // `post_process_output`.
-    let input = "[package]   \nname = \"demo\"  \nversion = \"0.1.0\"\n";
+    let input = "[package] \nname = \"demo\" \nversion = \"0.1.0\"\n";
     let (_tmp, upstream) = write_upstream(input);
     let plan = materialize_overlay(&upstream).expect("overlay must succeed");
     let out = read_overlay(&plan.sibling_manifest);
@@ -641,12 +638,12 @@ fn line_endings_are_lf_on_every_platform() {
 fn patch_tables_preserved_verbatim() {
     // Per spec §3.2.3: `[patch]` `git`/`branch`/`tag`/`rev` fields must
     // pass through verbatim — the overlay must NOT rewrite remote-source
-    // fields.  (The `path` sub-key IS absolutized; see
-    // `absolutizes_patch_path_entries` below.)  We assert two properties:
+    // fields. (The `path` sub-key IS absolutized; see
+    // `absolutizes_patch_path_entries` below.) We assert two properties:
     //
     // 1. The `[patch.crates-io]` git/branch fields reach the output unchanged.
     // 2. The `[patch]` ordering relative to the canonical key sequence is
-    //    honored (`patch` lands after `features` per `canonical_key_order()`).
+    // honored (`patch` lands after `features` per `canonical_key_order()`).
     let input = r#"[package]
 name = "demo"
 version = "0.1.0"
@@ -732,8 +729,8 @@ version = "0.1.0"
     assert_eq!(
         filename, "Cargo.toml",
         "`sibling_manifest` filename must be `Cargo.toml` so cargo accepts \
-         `--manifest-path`; got `{filename}`. Cargo rejects any manifest-path \
-         whose last component is not literally `Cargo.toml`."
+ `--manifest-path`; got `{filename}`. Cargo rejects any manifest-path \
+ whose last component is not literally `Cargo.toml`."
     );
 
     // Belt-and-suspenders: the staged overlay must live under
@@ -743,7 +740,7 @@ version = "0.1.0"
     assert!(
         path_str.contains("lihaaf-overlay"),
         "`sibling_manifest` must be staged under `target/lihaaf-overlay/`; \
-         got `{path_str}`"
+ got `{path_str}`"
     );
 
     // The overlay content must be readable and contain the expected
@@ -758,8 +755,7 @@ version = "0.1.0"
 
 /// **Cargo actually accepts the staged overlay and builds the dylib.**
 ///
-/// This test codifies the manual repro strict-swe Opus ran in the PR #34
-/// adversarial review: build a synthetic single-crate fork with
+/// This test builds a synthetic single-crate fork with
 /// `<upstream>/Cargo.toml` + `<upstream>/src/lib.rs`, materialize the
 /// overlay, then invoke `cargo rustc --manifest-path <staged>
 /// --crate-type=dylib --lib` and assert exit 0. Without the
@@ -781,7 +777,7 @@ version = "0.1.0"
 /// **What this test bites.** Three independent regression vectors:
 ///
 /// 1. A future overlay rewrite that drops the `[lib] path` absolutization
-///    (BLOCKER class 1 from the panel review) — cargo's auto-discovery
+///    for path-dependency back-edges — cargo's auto-discovery
 ///    would search `<staged_manifest_dir>/src/lib.rs` and fail.
 /// 2. A future cargo version that surfaces a hard error for the
 ///    "empty bin/test/example/bench auto-discovery dir" case — the
@@ -799,8 +795,8 @@ fn cargo_accepts_staged_overlay_for_dylib_build() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_staged_overlay_for_dylib_build: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this \
-             automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this \
+ automatically)"
         );
         return;
     }
@@ -844,8 +840,8 @@ edition = "2021"
     // The flags mirror `dylib::build()`'s production invocation (see
     // `src/dylib.rs`):
     //
-    //   cargo rustc -p <crate> --lib --release --crate-type=dylib
-    //          --manifest-path <staged> --target-dir <isolated>
+    // cargo rustc -p <crate> --lib --release --crate-type=dylib
+    // --manifest-path <staged> --target-dir <isolated>
     //
     // We point `--target-dir` at a sibling of the staged overlay so
     // build artifacts don't collide with the staged dir itself.
@@ -871,8 +867,8 @@ edition = "2021"
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the staged overlay; got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -885,7 +881,7 @@ edition = "2021"
 /// This is the unit-style cousin of `cargo_accepts_staged_overlay_for_dylib_build`
 /// — instead of running cargo, it inspects the staged overlay bytes
 /// directly. The unit-style form runs on every CI lane (no env-var
-/// gate) and bites the same BLOCKER class 1 regression: a future
+/// gate) and bites the same back-edge regression: a future
 /// refactor that drops or downgrades the path-absolutization step
 /// would leave `[lib] path` either absent or relative, and cargo would
 /// then fail to find the library.
@@ -926,8 +922,8 @@ edition = "2021"
     assert!(
         content.contains(&format!(r#"path = "{expected_forward}""#)),
         "staged overlay must carry an absolute `[lib] path` pointing at \
-         the upstream `src/lib.rs`; expected substring `path = \"{expected_forward}\"`, \
-         got overlay:\n{content}"
+ the upstream `src/lib.rs`; expected substring `path = \"{expected_forward}\"`, \
+ got overlay:\n{content}"
     );
 
     // Auto-discovery for non-lib targets must be disabled so cargo
@@ -938,8 +934,8 @@ edition = "2021"
         assert!(
             content.contains(&format!("{key} = false")),
             "staged overlay must declare `{key} = false` to disable cargo's \
-             auto-discovery of non-lib targets in the (empty) staged dir; \
-             got overlay:\n{content}"
+ auto-discovery of non-lib targets in the (empty) staged dir; \
+ got overlay:\n{content}"
         );
     }
 }
@@ -1009,17 +1005,17 @@ inner-build = { path = "inner-build" }
     assert!(
         content.contains(&format!(r#"path = "{expected_inner}""#)),
         "staged overlay must absolutize `[dependencies.inner].path`; expected \
-         `path = \"{expected_inner}\"`, got overlay:\n{content}"
+ `path = \"{expected_inner}\"`, got overlay:\n{content}"
     );
     assert!(
         content.contains(&format!(r#"path = "{expected_inner_dev}""#)),
         "staged overlay must absolutize `[dev-dependencies.inner-dev].path`; \
-         expected `path = \"{expected_inner_dev}\"`, got overlay:\n{content}"
+ expected `path = \"{expected_inner_dev}\"`, got overlay:\n{content}"
     );
     assert!(
         content.contains(&format!(r#"path = "{expected_inner_build}""#)),
         "staged overlay must absolutize `[build-dependencies.inner-build].path`; \
-         expected `path = \"{expected_inner_build}\"`, got overlay:\n{content}"
+ expected `path = \"{expected_inner_build}\"`, got overlay:\n{content}"
     );
 
     // Defense-in-depth: no relative `path = "inner..."` survives. A
@@ -1040,12 +1036,12 @@ inner-build = { path = "inner-build" }
 /// **`[patch.<registry>.X].path` entries are absolutized in the staged
 /// overlay.**
 ///
-/// Regression for Round-2 strict-swe Opus BLOCK-1 (cxx pilot): cxx's
+/// Regression for the cxx-style workspace-root shape: cxx's
 /// `Cargo.toml` carries `[patch.crates-io] cxx = { path = "." }` and
-/// `cxx-build = { path = "gen/build" }`.  After staging the overlay two
+/// `cxx-build = { path = "gen/build" }`. After staging the overlay two
 /// dirs deeper, those paths resolved against the staged manifest dir:
 /// `"."` became a self-reference to the staged dir and `"gen/build"`
-/// pointed at a nonexistent subdir.  This test pins the fix — path-form
+/// pointed at a nonexistent subdir. This test pins the fix — path-form
 /// patch entries are absolutized like `[dependencies.X].path`.
 ///
 /// The `git`/`branch` form (`serde = { git = "..." }`) must still pass
@@ -1146,30 +1142,30 @@ serde = { git = "https://example.com/serde", branch = "main" }
 }
 
 /// **Workspace identity in the staged overlay: membership keys stripped,
-/// inheritance tables PRESERVED (issues #36 + PR #37 R2 fixup).**
+/// inheritance tables preserved.**
 ///
 /// History:
-/// - v0.1.0-beta.5 (PR #34): no `[workspace]` override at all → cargo
+/// - (staged-overlay redesign): no `[workspace]` override at all → cargo
 ///   walked UP and attached the overlay to the upstream workspace,
 ///   failing every workspace-style pilot with `package <X> is a member
-///   of the wrong workspace`.
-/// - v0.1.0-beta.6 R1 (PR #37 commit 1f6520b): replaced `[workspace]`
+/// of the wrong workspace`.
+/// - full clobber (commit 1f6520b): replaced `[workspace]`
 ///   with an empty table → fixed the "wrong workspace" error but
-///   stranded `{ workspace = true }` inheritance references (Codex +
-///   Gemini panel BLOCK: "workspace inheritance was specified but
+///   stranded `{ workspace = true }` inheritance references ( +
+///   failure: "workspace inheritance was specified but
 ///   `[workspace.dependencies]` was not defined").
-/// - v0.1.0-beta.6 R2 (this commit): selective rewrite — strip ONLY
+/// - selective rewrite (this commit): selective rewrite — strip ONLY
 ///   the membership keys (`members`, `exclude`, `default-members`)
 ///   from `[workspace]`, preserve every other table.
 ///
-/// This test pins the R2 invariant on a workspace-ROOT upstream
+/// This test pins the selective rewrite invariant on a workspace-ROOT upstream
 /// (`[package]` + `[workspace]` in the same Cargo.toml — the actual
 /// shape of cxx / serde-json / anyhow / thiserror upstreams).
 ///
 /// **Why this replaces the prior `…absolutizes_workspace_key_classes`
 /// test.** That test verified an intermediate behavior: workspace
-/// key-class paths were absolutized and survived. R1 clobbered them.
-/// R2 preserves the inheritance tables (`workspace.dependencies`,
+/// key-class paths were absolutized and survived. full clobber clobbered them.
+/// selective rewrite preserves the inheritance tables (`workspace.dependencies`,
 /// `workspace.package`, `workspace.lints`, `workspace.metadata`,
 /// `workspace.resolver`, plus any unknown `[workspace.X]`) while
 /// stripping only the membership keys. The low-level absolutization
@@ -1177,11 +1173,11 @@ serde = { git = "https://example.com/serde", branch = "main" }
 /// covered by the unit-level tests in
 /// `src/compat/overlay.rs::tests`. The earlier-pass
 /// absolutization of `[workspace.dependencies.X].path` is now
-/// LOAD-BEARING (R2-preserved tables carry it through).
+/// LOAD-BEARING (selective rewrite-preserved tables carry it through).
 ///
 /// **The workspace-MEMBER case (`[package].workspace = "../"`) is
 /// covered by a separate test** —
-/// `staged_overlay_rejects_workspace_member_manifest` — because R2
+/// `staged_overlay_rejects_workspace_member_manifest` — because selective rewrite
 /// rejects that shape rather than overlaying it. See the module-level
 /// "Workspace-inheritance override" section in `src/compat/overlay.rs`
 /// for the full rationale.
@@ -1193,14 +1189,14 @@ fn staged_overlay_overrides_upstream_workspace_inheritance() {
 
     // Upstream manifest is the workspace-ROOT case — `[package]` +
     // `[workspace]` in the SAME file. Carries:
-    //   - `[workspace] members = [...]`           (stripped)
-    //   - `[workspace] exclude = [...]`           (stripped)
-    //   - `[workspace] default-members`           (stripped)
-    //   - `[workspace.dependencies.X].path = "..."` (PRESERVED — R2)
-    //   - `[workspace.package].edition`           (PRESERVED — R2)
-    //   - `[workspace.lints].rust.unsafe_code`    (PRESERVED — R2)
-    //   - `[workspace.metadata].my-tool.key`      (PRESERVED — R2)
-    //   - `[workspace.resolver]`                  (PRESERVED — R2)
+    // - `[workspace] members = [...]` (stripped)
+    // - `[workspace] exclude = [...]` (stripped)
+    // - `[workspace] default-members` (stripped)
+    // - `[workspace.dependencies.X].path = "..."` (PRESERVED — selective rewrite)
+    // - `[workspace.package].edition` (PRESERVED — selective rewrite)
+    // - `[workspace.lints].rust.unsafe_code` (PRESERVED — selective rewrite)
+    // - `[workspace.metadata].my-tool.key` (PRESERVED — selective rewrite)
+    // - `[workspace.resolver]` (PRESERVED — selective rewrite)
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -1245,77 +1241,77 @@ serde = "1"
     let parsed: toml::Value = toml::from_str(&content).expect("overlay must parse as TOML");
 
     // 1. `[workspace]` MUST exist (so cargo treats the overlay as its
-    //    own workspace root; the walk-up terminates here).
+    // own workspace root; the walk-up terminates here).
     let ws = parsed
-        .get("workspace")
-        .and_then(|v| v.as_table())
-        .expect("overlay must declare `[workspace]` (even if only inheritance tables) to be a workspace root");
+ .get("workspace")
+ .and_then(|v| v.as_table())
+ .expect("overlay must declare `[workspace]` (even if only inheritance tables) to be a workspace root");
 
     // 2. Membership keys MUST be stripped. These are the keys that
-    //    caused the v0.1.0-beta.5 "wrong workspace" failure — claiming
-    //    the upstream's path-dep crates as overlay members.
+    // caused the "wrong workspace" failure — claiming
+    // the upstream's path-dep crates as overlay members.
     for stripped_key in ["members", "exclude", "default-members"] {
         assert!(
             !ws.contains_key(stripped_key),
             "overlay's `[workspace].{stripped_key}` MUST be stripped to avoid \
-             cross-workspace membership conflicts; got entries: {:?}",
+ cross-workspace membership conflicts; got entries: {:?}",
             ws.keys().collect::<Vec<_>>()
         );
     }
 
-    // 3. Inheritance tables MUST survive — this is the R2 invariant
-    //    that the R1 attempt got wrong. Each of these tables backs
-    //    a `{ workspace = true }` reference shape in cargo.
+    // 3. Inheritance tables MUST survive — this is the selective rewrite invariant
+    // that the full clobber attempt got wrong. Each of these tables backs
+    // a `{ workspace = true }` reference shape in cargo.
     assert!(
         ws.contains_key("dependencies"),
-        "overlay must preserve `[workspace.dependencies]` (R2 — used by \
-         `{{ workspace = true }}` references in `[dependencies]`); got entries: {:?}",
+        "overlay must preserve `[workspace.dependencies]` (selective rewrite — used by \
+ `{{ workspace = true }}` references in `[dependencies]`); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
     assert!(
         ws.contains_key("package"),
-        "overlay must preserve `[workspace.package]` (R2 — used by \
-         `{{ workspace = true }}` references in `[package]`); got entries: {:?}",
+        "overlay must preserve `[workspace.package]` (selective rewrite — used by \
+ `{{ workspace = true }}` references in `[package]`); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
     assert!(
         ws.contains_key("lints"),
-        "overlay must preserve `[workspace.lints]` (R2 — used by \
-         `{{ workspace = true }}` references in `[lints]`); got entries: {:?}",
+        "overlay must preserve `[workspace.lints]` (selective rewrite — used by \
+ `{{ workspace = true }}` references in `[lints]`); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
     assert!(
         ws.contains_key("metadata"),
-        "overlay must preserve `[workspace.metadata]` (R2 — passes through \
-         tool-owned namespaced metadata); got entries: {:?}",
+        "overlay must preserve `[workspace.metadata]` (selective rewrite — passes through \
+ tool-owned namespaced metadata); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
     assert!(
         ws.contains_key("resolver"),
-        "overlay must preserve `[workspace.resolver]` (R2 — cargo's deps resolver \
-         version); got entries: {:?}",
+        "overlay must preserve `[workspace.resolver]` (selective rewrite — cargo's deps resolver \
+ version); got entries: {:?}",
         ws.keys().collect::<Vec<_>>()
     );
 
-    // 4. R2 fix-specific: `[workspace.dependencies.shared-utils]` must
-    //    SURVIVE (R1 stripped it). The earlier `absolutize_path_bearing_keys`
-    //    pass has rewritten the `path = "utils"` to an absolute path; we
-    //    verify the dep entry is there.
+    // 4. selective rewrite fix-specific: `[workspace.dependencies.shared-utils]` must
+    // SURVIVE (full clobber stripped it). The earlier `absolutize_path_bearing_keys`
+    // pass has rewritten the `path = "utils"` to an absolute path; we
+    // verify the dep entry is there.
     let ws_deps = ws
         .get("dependencies")
         .and_then(|v| v.as_table())
         .expect("`[workspace.dependencies]` must be a table");
     assert!(
         ws_deps.contains_key("shared-utils"),
-        "R2 invariant: `[workspace.dependencies.shared-utils]` MUST survive \
-         (R1 stripped it; this is the regression Codex + Gemini caught); \
-         got workspace.dependencies entries: {:?}",
+        "selective rewrite invariant: `[workspace.dependencies.shared-utils]` MUST survive \
+ (full clobber stripped it; this is the regression tests caught); \
+ got workspace.dependencies entries: {:?}",
         ws_deps.keys().collect::<Vec<_>>()
     );
 
-    // 5. R2 fix-specific: `[workspace.package].edition` must SURVIVE so
-    //    a future `[package] edition.workspace = true` reference would
-    //    resolve correctly.
+    // 5. selective rewrite fix-specific: `[workspace.package].edition` must SURVIVE so
+    // a future `[package] edition.workspace = true` reference would
+    // resolve correctly.
     let ws_pkg = ws
         .get("package")
         .and_then(|v| v.as_table())
@@ -1323,25 +1319,25 @@ serde = "1"
     assert_eq!(
         ws_pkg.get("edition").and_then(|v| v.as_str()),
         Some("2021"),
-        "R2 invariant: `[workspace.package].edition` MUST survive so \
-         `{{ workspace = true }}` in `[package].edition` resolves; got: {:?}",
+        "selective rewrite invariant: `[workspace.package].edition` MUST survive so \
+ `{{ workspace = true }}` in `[package].edition` resolves; got: {:?}",
         ws_pkg
     );
 
-    // 6. R2 fix-specific: `[workspace.lints]` content must SURVIVE.
+    // 6. selective rewrite fix-specific: `[workspace.lints]` content must SURVIVE.
     let ws_lints = ws
         .get("lints")
         .and_then(|v| v.as_table())
         .expect("`[workspace.lints]` must be a table");
     assert!(
         ws_lints.contains_key("rust"),
-        "R2 invariant: `[workspace.lints.rust]` MUST survive so `{{ workspace = true }}` \
-         in `[lints.rust]` resolves; got: {:?}",
+        "selective rewrite invariant: `[workspace.lints.rust]` MUST survive so `{{ workspace = true }}` \
+ in `[lints.rust]` resolves; got: {:?}",
         ws_lints
     );
 
     // 7. The non-workspace part of the overlay (the actual buildable
-    //    crate identity) MUST be preserved.
+    // crate identity) MUST be preserved.
     let pkg_table = parsed
         .get("package")
         .and_then(|v| v.as_table())
@@ -1358,7 +1354,7 @@ serde = "1"
     );
 
     // 8. The regular `[dependencies]` table must also pass through (the
-    //    override only targets `[workspace]`, not deps).
+    // override only targets `[workspace]`, not deps).
     let deps = parsed
         .get("dependencies")
         .and_then(|v| v.as_table())
@@ -1369,14 +1365,14 @@ serde = "1"
     );
 
     // 9. Defense-in-depth on the serialized bytes — neither the
-    //    `members` nor `default-members` keys must survive in any form
-    //    (the absolutization-then-strip path could in principle have a
-    //    leak; this catches it). `exclude` would have been absolutized
-    //    to a path starting with the tempdir prefix; we check the bare
-    //    key, which still appears in the absolutized array form.
+    // `members` nor `default-members` keys must survive in any form
+    // (the absolutization-then-strip path could in principle have a
+    // leak; this catches it). `exclude` would have been absolutized
+    // to a path starting with the tempdir prefix; we check the bare
+    // key, which still appears in the absolutized array form.
     //
-    //    Note: we cannot blindly `!contains("members")` because
-    //    `default-members` would match; we use precise key syntax.
+    // Note: we cannot blindly `!contains("members")` because
+    // `default-members` would match; we use precise key syntax.
     assert!(
         !content.contains("\nmembers ="),
         "[workspace] members must not survive in overlay; got:\n{content}"
@@ -1391,7 +1387,7 @@ serde = "1"
     );
 }
 
-/// **Workspace-MEMBER manifest is REJECTED (PR #37 R2 — Option C).**
+/// **Workspace-MEMBER manifest is REJECTED (selective rewrite — Option C).**
 ///
 /// When the overlay manifest itself declares `[package].workspace =
 /// "<path>"`, it is a member of an ANCESTOR workspace — and the
@@ -1399,10 +1395,10 @@ serde = "1"
 /// `[workspace.dependencies]` / `[workspace.package]` / `[workspace.lints]`
 /// tables live. To overlay this shape and keep inheritance working,
 /// we would need to read the ancestor's `Cargo.toml` and copy those
-/// tables down. That cross-manifest read is out-of-scope for
-/// v0.1.0-beta.6 (the R2 fix).
+/// tables down. That cross-manifest read is out of scope for this
+/// selective rewrite path.
 ///
-/// All four Round-1 pilots (cxx, serde-json, anyhow, thiserror) invoke
+/// All four workspace-root pilots (cxx, serde-json, anyhow, thiserror) invoke
 /// lihaaf from the upstream ROOT (workspace-root shape: `[package]` +
 /// `[workspace]` in the same file). NONE invoke from a workspace-member
 /// sub-crate. So this rejection does not affect any currently-enrolled
@@ -1412,9 +1408,9 @@ serde = "1"
 /// **What this test pins:** when `[package].workspace = "../"` is
 /// present in the upstream manifest, `materialize_overlay` returns an
 /// `Error::Cli` with a directed diagnostic — NOT a silently-stripped
-/// pointer (R1's behavior) or a silently-overlayed manifest.
+/// pointer (full clobber's behavior) or a silently-overlayed manifest.
 ///
-/// **R3 tightening (PR #37, strict-swe Finding 1):** the rejection
+/// **Inheritance-reference rejection tightening:** the rejection
 /// MUST surface as `Error::Cli { clap_exit_code: 2, message }`, not
 /// as a different `Error` variant that happens to have a Debug repr
 /// containing "workspace member". The earlier
@@ -1454,8 +1450,7 @@ serde = "1"
     let result = materialize_overlay(&upstream_manifest);
     let err = result.expect_err(
         "workspace-member manifest (`[package].workspace = \"...\"`) MUST be rejected \
-         under R2 — copying the ancestor's inheritance tables down into the overlay \
-         is out-of-scope for v0.1.0-beta.6",
+ under selective rewrite; copying ancestor inheritance tables into the overlay is out of scope",
     );
 
     match err {
@@ -1486,7 +1481,7 @@ serde = "1"
     }
 }
 
-/// **R3 invariant: IMPLICIT workspace-member case is REJECTED.**
+/// **inheritance-reference rejection invariant: IMPLICIT workspace-member case is REJECTED.**
 ///
 /// In real cargo workspaces, members commonly OMIT
 /// `[package].workspace` from their own manifests. Cargo discovers
@@ -1505,14 +1500,14 @@ serde = "1"
 /// { workspace = true }`), `materialize_overlay` rejects with an
 /// `Error::Cli { clap_exit_code: 2, ... }` whose message names the
 /// implicit-member category, the missing local `[workspace]` table,
-/// and the offending inheritance shape. Without R3 this case
+/// and the offending inheritance shape. Without inheritance-reference rejection this case
 /// produced a manifest with stranded `{ workspace = true }`
 /// references that cargo rejected with the cryptic "workspace
 /// inheritance was specified but `[workspace.X]` was not defined"
 /// parse error — opaque to users.
 ///
 /// This case doesn't currently exercise in production for the four
-/// Round-1 pilots (all are invoked from upstream ROOT per
+/// workspace-root pilots (all are invoked from upstream ROOT per
 /// `compat/templates/pilot-stage2.yml`), but it is required for
 /// completeness — any future user invoking lihaaf from a workspace
 /// sub-crate hits the cryptic cargo error instead of a clean
@@ -1524,12 +1519,12 @@ fn staged_overlay_rejects_implicit_workspace_member_manifest() {
     let upstream_manifest = upstream_dir.join("Cargo.toml");
 
     // Implicit workspace-member shape:
-    //  - `[package]` present (it IS a buildable crate)
-    //  - NO `[package].workspace` line (membership is implicit)
-    //  - NO local `[workspace]` table (the ancestor is the
-    //    workspace root)
-    //  - ONE `{ workspace = true }` inheritance reference — enough
-    //    to trigger the rejection.
+    // - `[package]` present (it IS a buildable crate)
+    // - NO `[package].workspace` line (membership is implicit)
+    // - NO local `[workspace]` table (the ancestor is the
+    // workspace root)
+    // - ONE `{ workspace = true }` inheritance reference — enough
+    // to trigger the rejection.
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -1550,11 +1545,11 @@ foo = { workspace = true }
 
     let result = materialize_overlay(&upstream_manifest);
     let err = result.expect_err(
-        "implicit workspace-member manifest (no local `[workspace]` but `{ workspace = true }` \
-         reference present) MUST be rejected under R3 — injecting `[workspace] = {}` here \
-         would strand the inheritance reference at cargo parse time with `\"workspace \
-         inheritance was specified but [workspace.X] was not defined\"`",
-    );
+ "implicit workspace-member manifest (no local `[workspace]` but `{ workspace = true }` \
+ reference present) MUST be rejected under inheritance-reference rejection — injecting `[workspace] = {}` here \
+ would strand the inheritance reference at cargo parse time with `\"workspace \
+ inheritance was specified but [workspace.X] was not defined\"`",
+ );
 
     match err {
         lihaaf::Error::Cli {
@@ -1588,9 +1583,9 @@ foo = { workspace = true }
     }
 }
 
-/// **R4 invariant: ancestor-workspace implicit-member case is REJECTED.**
+/// **ancestor-workspace rejection invariant: ancestor-workspace implicit-member case is REJECTED.**
 ///
-/// The Codex R3 review (PR #37) surfaced a high-severity correctness
+/// The a compat review () surfaced a high-severity correctness
 /// gap: a manifest can be an IMPLICIT workspace member even without
 /// any `{ workspace = true }` inheritance references. Cargo's
 /// dependency resolution walks up the filesystem from the manifest
@@ -1610,21 +1605,21 @@ foo = { workspace = true }
 /// `[workspace] members = ["<dir>"]` plus `[patch.crates-io]`,
 /// `materialize_overlay` rejects with `Error::Cli { clap_exit_code:
 /// 2, ... }` whose message names the implicit-member-via-ancestor
-/// category AND the ancestor manifest path. Without R4 the overlay
+/// category AND the ancestor manifest path. Without ancestor-workspace rejection the overlay
 /// would silently produce a manifest with a divergent resolved
 /// dependency graph — the worst possible failure mode (no error
 /// surfaced, just a wrong compat verdict).
 ///
 /// This integration test mirrors the unit test
 /// `override_workspace_rejects_manifest_with_ancestor_workspace` at
-/// the full pipeline level, so a regression in the R4 logic is
+/// the full pipeline level, so a regression in the ancestor-workspace rejection logic is
 /// caught at both layers.
 #[test]
 fn staged_overlay_rejects_manifest_with_ancestor_workspace() {
     let tmp = tempfile::tempdir().expect("tempdir for ancestor-workspace rejection test");
 
     // Parent: workspace root with [patch.crates-io]. This mirrors
-    // the Codex repro pattern exactly: an ancestor workspace whose
+    // the workspace-inheritance repro pattern exactly: an ancestor workspace whose
     // [patch] / [replace] / [profile] state would affect baseline
     // cargo's resolution.
     let parent_manifest = tmp.path().join("Cargo.toml");
@@ -1640,7 +1635,7 @@ serde = { path = "../my-serde-fork" }
     .expect("writing parent Cargo.toml");
 
     // Sub-crate: no local [workspace], no inheritance refs. The
-    // implicit-member-via-ancestor shape — R4's exact target.
+    // implicit-member-via-ancestor shape — ancestor-workspace rejection's exact target.
     let sub_dir = tmp.path().join("sub");
     std::fs::create_dir_all(&sub_dir).expect("creating sub/");
     let sub_manifest = sub_dir.join("Cargo.toml");
@@ -1661,12 +1656,12 @@ serde = "1"
 
     let result = materialize_overlay(&sub_manifest);
     let err = result.expect_err(
-        "manifest with ancestor `[workspace]` MUST be rejected under R4 — \
-         injecting `[workspace] = {}` would silently skip the ancestor's \
-         `[patch]` / `[replace]` / `[profile]` state during cargo resolution, \
-         producing a divergent dependency graph between baseline and overlay \
-         and therefore false compat verdicts (the worst failure mode)",
-    );
+ "manifest with ancestor `[workspace]` MUST be rejected under ancestor-workspace rejection — \
+ injecting `[workspace] = {}` would silently skip the ancestor's \
+ `[patch]` / `[replace]` / `[profile]` state during cargo resolution, \
+ producing a divergent dependency graph between baseline and overlay \
+ and therefore false compat verdicts (the worst failure mode)",
+ );
 
     match err {
         lihaaf::Error::Cli {
@@ -1693,7 +1688,7 @@ serde = "1"
                 message.contains(&parent_str),
                 "diagnostic must include the ancestor manifest path `{parent_str}`; got: {message}"
             );
-            // Distinguish from the R3 inheritance-refs rejection:
+            // Distinguish from the inheritance-reference rejection inheritance-refs rejection:
             // this case has no `{ workspace = true }` references, and
             // surfacing that wording would mislead users about which
             // signal triggered the rejection.
@@ -1708,7 +1703,7 @@ serde = "1"
     }
 }
 
-/// **R3 invariant: workspace-root case (local `[workspace]` + own
+/// **inheritance-reference rejection invariant: workspace-root case (local `[workspace]` + own
 /// inheritance refs) is NOT rejected.**
 ///
 /// A manifest with BOTH a local `[workspace]` table AND
@@ -1716,7 +1711,7 @@ serde = "1"
 /// shape: the root crate hosts `[workspace.dependencies]` /
 /// `[workspace.package]` / `[workspace.lints]` and also has its OWN
 /// `[package]` whose inheritance refs resolve against those local
-/// tables. The R3 implicit-member check must NOT fire — the
+/// tables. The inheritance-reference rejection implicit-member check must NOT fire — the
 /// inheritance refs resolve LOCALLY, within the same manifest, which
 /// the overlay preserves verbatim.
 ///
@@ -1755,7 +1750,7 @@ shared = "1.0"
         bytes.contains("workspace = true"),
         "the local-inheritance reference must pass through unchanged; got:\n{bytes}"
     );
-    // The `[workspace.package]` table must survive (preserves R2
+    // The `[workspace.package]` table must survive (preserves selective rewrite
     // inheritance-table contract).
     assert!(
         bytes.contains("[workspace.package]"),
@@ -1766,8 +1761,7 @@ shared = "1.0"
         bytes.contains("[workspace.dependencies]"),
         "the local `[workspace.dependencies]` table must pass through; got:\n{bytes}"
     );
-    // The membership key must be stripped (R2 selective-rewrite
-    // contract).
+    // The membership key must be stripped (selective rewrite contract).
     assert!(
         !bytes.contains("members = ["),
         "the `members` membership key must be stripped; got:\n{bytes}"
@@ -1775,25 +1769,25 @@ shared = "1.0"
 }
 
 /// **Richer cargo-build regression: path-dep + `[patch.crates-io]` path
-/// entry + relative `--compat-root` form.**  (FIX class D)
+/// entry + relative `--compat-root` form.**
 ///
 /// The existing `cargo_accepts_staged_overlay_for_dylib_build` test uses a
-/// minimal crate that would NOT have caught FIX class A (relative
+/// minimal crate that would NOT have caught relative
 /// `--compat-root`) because `tempfile::tempdir()` returns an absolute path,
-/// and would NOT have caught FIX class C (`[patch.crates-io.X].path`) because
+/// and would NOT have caught `[patch.crates-io.X].path` because
 /// it has no `[patch]` block.
 ///
-/// This test exercises the three production failure shapes the Round-2 panel
+/// This test exercises the three production failure shapes the compat review
 /// surfaced:
 ///
 /// 1. A path-dep (`demo-impl = { path = "impl" }`) — catches any regression
 ///    to `[dependencies.X].path` absolutization.
 /// 2. A `[patch.crates-io]` block with `path = "."` (cxx pattern) — catches
-///    FIX class C regressions.
+///    patch-path regressions.
 /// 3. The manifest path is given to `materialize_overlay` as an absolute path
-///    (reflecting what `CompatArgs::from_cli` now guarantees after FIX class A),
+///    (reflecting what `CompatArgs::from_cli` guarantees after absolutization),
 ///    but `upstream_dir` is confirmed absolute before use — this is the
-///    structural guard that FIX class A is exercised via the CLI layer (see
+///    structural guard that CLI-layer absolutization is exercised (see
 ///    `CompatArgs::from_cli` absolutization) and the overlay layer handles only
 ///    the manifest path it is given.
 ///
@@ -1804,14 +1798,14 @@ fn cargo_accepts_rich_overlay_for_dylib_build() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_rich_overlay_for_dylib_build: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
 
     // Build a synthetic fork with:
-    //   - a path-dep pointing at <upstream>/impl/ (mirrors thiserror pattern)
-    //   - a [patch.crates-io] entry with path = "." (mirrors cxx pattern)
+    // - a path-dep pointing at <upstream>/impl/ (mirrors thiserror pattern)
+    // - a [patch.crates-io] entry with path = "." (mirrors cxx pattern)
     //
     // The path-dep crate is a stub with its own Cargo.toml + src/lib.rs.
     // The patch entry references the same crate (self-patch); per Option H
@@ -1820,11 +1814,11 @@ fn cargo_accepts_rich_overlay_for_dylib_build() {
     let tmp = tempfile::tempdir().expect("creating tempdir for rich cargo build test");
     let upstream_dir = tmp.path();
 
-    // Guarantee upstream_dir is absolute — mirrors what FIX class A
+    // Guarantee upstream_dir is absolute — mirrors what `CompatArgs::from_cli`
     // ensures at the CLI layer (CompatArgs::from_cli absolutizes compat_root).
     assert!(
         upstream_dir.is_absolute(),
-        "tempdir must be absolute; FIX class A ensures compat_root is absolute before overlay"
+        "tempdir must be absolute; CompatArgs::from_cli ensures compat_root is absolute before overlay"
     );
 
     let upstream_manifest = upstream_dir.join("Cargo.toml");
@@ -1914,15 +1908,15 @@ rich-demo = { path = "." }
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the rich staged overlay; got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
-/// **Workspace-style cargo-build regression for issue #36.**
+/// **Workspace-style cargo-build regression for workspace-identity case.**
 ///
 /// Constructs a real workspace-style synthetic upstream that mirrors the
 /// thiserror pilot's shape: the root `Cargo.toml` declares BOTH
@@ -1930,7 +1924,7 @@ rich-demo = { path = "." }
 /// `[workspace] members = ["impl"]` (claiming a member sub-crate). The
 /// root package has a path-dep `path = "impl"` pointing at the member.
 ///
-/// This is the exact failure shape v0.1.0-beta.5 produced on cxx +
+/// This is the exact failure shape produced on cxx +
 /// thiserror in the post-publish refresh-pilots run #26000403851:
 /// `package <X>/impl/Cargo.toml is a member of the wrong workspace`.
 /// The workspace-identity fix (`override_workspace_inheritance`) makes
@@ -1955,7 +1949,7 @@ fn cargo_accepts_workspace_style_overlay_for_dylib_build() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_workspace_style_overlay_for_dylib_build: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -1967,16 +1961,16 @@ fn cargo_accepts_workspace_style_overlay_for_dylib_build() {
     assert!(
         upstream_dir.is_absolute(),
         "tempdir must be absolute (CompatArgs::from_cli already guarantees \
-         compat_root is absolute before overlay)"
+ compat_root is absolute before overlay)"
     );
 
     let upstream_manifest = upstream_dir.join("Cargo.toml");
 
     // 1. Member sub-crate at `<upstream>/impl/` (mirrors thiserror's
-    //    `thiserror-impl` and cxx's `cxx-build` arrangement). Both the
-    //    root upstream AND this member have their own `Cargo.toml` and
-    //    `src/lib.rs`. The root upstream's `[workspace] members = ["impl"]`
-    //    claims this member.
+    // `thiserror-impl` and cxx's `cxx-build` arrangement). Both the
+    // root upstream AND this member have their own `Cargo.toml` and
+    // `src/lib.rs`. The root upstream's `[workspace] members = ["impl"]`
+    // claims this member.
     let impl_dir = upstream_dir.join("impl");
     std::fs::create_dir_all(impl_dir.join("src")).expect("creating impl/src/");
     std::fs::write(
@@ -1995,8 +1989,8 @@ edition = "2021"
     .expect("writing impl/src/lib.rs");
 
     // 2. Root upstream manifest: `[package]` (the dylib_crate) +
-    //    `[workspace]` (claiming impl as a member) + path-dep on impl.
-    //    This is the EXACT shape thiserror's `Cargo.toml` has on master.
+    // `[workspace]` (claiming impl as a member) + path-dep on impl.
+    // This is the EXACT shape thiserror's `Cargo.toml` has on master.
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -2040,23 +2034,23 @@ ws-demo-impl = { path = "impl" }
     // defense-in-depth at the cargo-test layer, catching the case where
     // the override stops running but the absolutization still does.)
     //
-    // Under R2 (PR #37 fixup), `[workspace]` may carry inheritance
+    // Under selective rewrite , `[workspace]` may carry inheritance
     // tables (`dependencies`, `package`, `lints`, `metadata`,
     // `resolver`). This test's input has no inheritance tables so
     // the overlay's `[workspace]` will be empty in practice — but the
     // assertion below only checks that `members` is stripped, which
-    // is the load-bearing R2 invariant.
+    // is the load-bearing selective rewrite invariant.
     let content = read_overlay(&plan.sibling_manifest);
     assert!(
         content.contains("[workspace]"),
         "staged overlay must declare `[workspace]` (so cargo treats it as its \
-         own workspace root); got overlay:\n{content}"
+ own workspace root); got overlay:\n{content}"
     );
     assert!(
         !content.contains("\nmembers ="),
         "staged overlay must NOT preserve any form of the upstream's \
-         `[workspace] members` array (the override strips it in both relative \
-         and absolutized form); got overlay:\n{content}"
+ `[workspace] members` array (the override strips it in both relative \
+ and absolutized form); got overlay:\n{content}"
     );
 
     // The acid test: cargo rustc against the staged overlay. Without the
@@ -2081,22 +2075,22 @@ ws-demo-impl = { path = "impl" }
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the workspace-style staged overlay; \
-         got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
     );
 }
 
-/// **R2 regression: `{ workspace = true }` inheritance reference resolves
+/// **selective rewrite regression: `{ workspace = true }` inheritance reference resolves
 /// against the preserved `[workspace.dependencies]` in the staged overlay.**
 ///
-/// This is the exact production failure shape Codex's BLOCK identified
-/// on PR #37 R1 (commit 1f6520b). R1 replaced `[workspace]` with `{}`,
+/// This is the exact production failure shape:
+/// on full clobber (commit 1f6520b). full clobber replaced `[workspace]` with `{}`,
 /// which broke any overlay manifest that used cargo's workspace
-/// inheritance feature. The Codex repro:
+/// inheritance feature. The workspace-inheritance repro:
 ///
 /// ```toml
 /// [package]
@@ -2110,15 +2104,15 @@ ws-demo-impl = { path = "impl" }
 /// ws-demo-impl = { path = "impl" }
 ///
 /// [dependencies]
-/// ws-demo-impl = { workspace = true }   # ← inherits from above
+/// ws-demo-impl = { workspace = true } # ← inherits from above
 /// ```
 ///
-/// Under R1: `[workspace.dependencies]` was clobbered to `{}`, so the
+/// Under full clobber: `[workspace.dependencies]` was clobbered to `{}`, so the
 /// surviving `{ workspace = true }` reference produced cargo's
 /// "workspace inheritance was specified but `[workspace.dependencies]`
 /// was not defined" error.
 ///
-/// Under R2 (this commit): `[workspace.dependencies]` is preserved
+/// Under selective rewrite (this commit): `[workspace.dependencies]` is preserved
 /// (only `members` / `exclude` / `default-members` are stripped), so
 /// the inheritance reference resolves correctly.
 ///
@@ -2126,9 +2120,8 @@ ws-demo-impl = { path = "impl" }
 /// same OOM concern as the other `cargo_accepts_*` tests. CI sets
 /// `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; local runs skip by default.
 ///
-/// **Why this test is load-bearing for the R2 fixup.** Mentally
-/// disabling the R2 selective rewrite (reverting to R1's full clobber)
-/// would cause `[workspace.dependencies]` to be `{}` in the overlay,
+/// **Why this test is load-bearing for the selective rewrite.** Reverting to
+/// a full clobber would cause `[workspace.dependencies]` to be `{}` in the overlay,
 /// and the `{ workspace = true }` reference would fail cargo's parser.
 /// This test catches that regression at the cargo-test layer; the
 /// structural unit test
@@ -2139,7 +2132,7 @@ fn cargo_accepts_workspace_inheritance_reference_in_overlay() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_workspace_inheritance_reference_in_overlay: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -2175,7 +2168,7 @@ edition = "2021"
 
     // Root upstream: workspace ROOT carrying both `[package]` and
     // `[workspace.dependencies]`, plus a `{ workspace = true }`
-    // reference in `[dependencies]`. The Codex repro shape exactly.
+    // reference in `[dependencies]`. The workspace-inheritance repro shape exactly.
     std::fs::write(
         &upstream_manifest,
         r#"[package]
@@ -2205,29 +2198,29 @@ ws-demo-impl = { workspace = true }
 
     // Pre-cargo sanity: parsed overlay must carry
     // `[workspace.dependencies.ws-demo-impl]` (with absolutized path).
-    // This is the R2 invariant the cargo build below tests end-to-end.
+    // This is the selective rewrite invariant the cargo build below tests end-to-end.
     let content = read_overlay(&plan.sibling_manifest);
     let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
     let ws_deps = parsed
-        .get("workspace")
-        .and_then(|v| v.as_table())
-        .and_then(|ws| ws.get("dependencies"))
-        .and_then(|v| v.as_table())
-        .expect(
-            "R2 invariant: `[workspace.dependencies]` MUST survive in the overlay so \
-             `{ workspace = true }` references resolve",
-        );
+ .get("workspace")
+ .and_then(|v| v.as_table())
+ .and_then(|ws| ws.get("dependencies"))
+ .and_then(|v| v.as_table())
+ .expect(
+ "selective rewrite invariant: `[workspace.dependencies]` MUST survive in the overlay so \
+ `{ workspace = true }` references resolve",
+ );
     assert!(
         ws_deps.contains_key("ws-demo-impl"),
-        "[workspace.dependencies.ws-demo-impl] MUST survive (Codex repro shape); \
-         got entries: {:?}",
+        "[workspace.dependencies.ws-demo-impl] MUST survive (workspace-inheritance repro shape); \
+ got entries: {:?}",
         ws_deps.keys().collect::<Vec<_>>()
     );
 
-    // The acid test: cargo rustc against the staged overlay. Under R1
-    // (the BLOCKed attempt), this produces: "workspace inheritance was
+    // The acid test: cargo rustc against the staged overlay. Under full clobber
+    // (with a full clobber), this produces: "workspace inheritance was
     // specified but `[workspace.dependencies]` was not defined". Under
-    // R2 (this commit), it succeeds.
+    // selective rewrite (this commit), it succeeds.
     let target_dir = upstream_dir.join("target").join("lihaaf-build");
     let output = std::process::Command::new("cargo")
         .arg("rustc")
@@ -2246,10 +2239,10 @@ ws-demo-impl = { workspace = true }
 
     assert!(
         output.status.success(),
-        "cargo rustc must accept the workspace-inheritance overlay (Codex repro); \
-         got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+        "cargo rustc must accept the workspace-inheritance overlay (workspace-inheritance repro); \
+ got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -2258,12 +2251,12 @@ ws-demo-impl = { workspace = true }
 
 /// **`[replace]` path entries are absolutized in the overlay.**
 ///
-/// `[replace]` is cargo's older, soft-deprecated replacement form.  Like
+/// `[replace]` is cargo's older, soft-deprecated replacement form. Like
 /// `[patch]`, its relative `path` entries would point into the staged
 /// manifest dir after overlay materialization — the same failure mode
-/// Round-2 FIX class C fixed for `[patch]`. This test pins FIX class IV
-/// (Round-3): a future regression removing `absolutize_replace_paths` would
-/// produce a relative path in the overlay and fail this assertion.
+/// self-patch path rewrite handles for `[patch]`. This test ensures a
+/// future regression removing `absolutize_replace_paths` would produce
+/// a relative path in the overlay and fail this assertion.
 #[test]
 fn replace_paths_are_absolutized() {
     let input = r#"[package]
@@ -2306,7 +2299,7 @@ version = "0.1.0"
 }
 
 // =====================================================================
-// Issue #40 + #47 §5.2 cargo-build-gated integration tests.
+// Self-patch policy §5.2 cargo-build-gated integration tests.
 //
 // These tests prove the Option H 4-rule self-patch policy and the
 // staged-mirror writer at the cargo-build integration layer, end to
@@ -2331,7 +2324,7 @@ version = "0.1.0"
 // and inspects the emitted byte shape, no cargo spawn.
 //
 // Plan reference: `docs/plans/issue-40-47-overlay-vs-registry.md`
-// §5.2 (R4 Option H 4-rule mapping + R5/R6 staged-mirror closure).
+// §5.2 (ancestor-workspace rejection Option H 4-rule mapping + staged-mirror closure/idempotency extension staged-mirror closure).
 // =====================================================================
 
 /// §5.2.5 — Rule 1 INJECT cargo-graph proof (anyhow-shape).
@@ -2364,7 +2357,7 @@ fn cargo_accepts_inject_when_clean_upstream_anyhow_shape() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_inject_when_clean_upstream_anyhow_shape: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -2444,9 +2437,9 @@ path = "src/lib.rs"
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the Rule 1 INJECT overlay; \
-         got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -2476,10 +2469,10 @@ path = "src/lib.rs"
 /// fixture.
 ///
 /// **What this test bites.** Two simultaneous regressions:
-///   - Rule 2 mis-detection (e.g. comparing un-normalized paths) →
-///     Rule 4 REJECT fires by mistake, materialize returns Err.
-///   - Mirror writer fails to populate `<staged>/src/` → build.rs
-///     `read_to_string` fails with `No such file or directory`.
+/// - Rule 2 mis-detection (e.g. comparing un-normalized paths) →
+///   Rule 4 REJECT fires by mistake, materialize returns Err.
+/// - Mirror writer fails to populate `<staged>/src/` → build.rs
+///   `read_to_string` fails with `No such file or directory`.
 ///
 /// Gated behind `LIHAAF_RUN_CARGO_BUILD_TESTS=1`; plan §5.2.6.
 #[test]
@@ -2487,7 +2480,7 @@ fn cargo_accepts_remap_when_upstream_self_patch_cxx_shape() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_remap_when_upstream_self_patch_cxx_shape: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -2503,19 +2496,19 @@ fn cargo_accepts_remap_when_upstream_self_patch_cxx_shape() {
     let upstream_manifest = upstream_dir.join("Cargo.toml");
 
     // Upstream package-root layout faithfully mirrors the cxx upstream
-    // Cargo.toml (github.com/dtolnay/cxx, verified Codex rollout 019e3cc3):
-    //   - root manifest with `[package]` + `links` + `build.rs`
-    //   - `[workspace] members = ["test-suite"]` — workspace declaration ONLY;
-    //     cxx does NOT carry a root `[dependencies]` edge to the member
-    //   - workspace member `test-suite` with `foo = "1.0"` registry dep
-    //   - `[patch.crates-io.foo] = { path = "." }` (the cxx self-patch)
-    //   - build.rs reads `src/cxx_stub.cc` via CARGO_MANIFEST_DIR
-    //   - include/stub.h is referenced via `Path::exists()`
+    // Cargo.toml (github.com/dtolnay/cxx, verified implementation update):
+    // - root manifest with `[package]` + `links` + `build.rs`
+    // - `[workspace] members = ["test-suite"]` — workspace declaration ONLY;
+    // cxx does NOT carry a root `[dependencies]` edge to the member
+    // - workspace member `test-suite` with `foo = "1.0"` registry dep
+    // - `[patch.crates-io.foo] = { path = "." }` (the cxx self-patch)
+    // - build.rs reads `src/cxx_stub.cc` via CARGO_MANIFEST_DIR
+    // - include/stub.h is referenced via `Path::exists()`
     //
     // The absence of `[dependencies] test-suite = { path = "test-suite" }` in
     // the root is load-bearing: adding it creates a `foo → test-suite → foo`
     // active-dep cycle that cargo rejects even when both `foo` references
-    // resolve to the same source-id (Codex diagnosis, rollout 019e3cc3).
+    // resolve to the same source-id (graph diagnosis, rollout 019e3cc3).
     // The real cxx avoids this because it never declares test-suite as a
     // root build dependency.
     //
@@ -2548,15 +2541,15 @@ foo = { path = "." }
     std::fs::write(
         upstream_dir.join("build.rs"),
         r#"fn main() {
-    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
-    let src_path = std::path::Path::new(&manifest_dir).join("src").join("cxx_stub.cc");
-    let _content = std::fs::read_to_string(&src_path)
-        .expect("build.rs: failed to read src/cxx_stub.cc via CARGO_MANIFEST_DIR");
-    let include_path = std::path::Path::new(&manifest_dir).join("include").join("stub.h");
-    assert!(include_path.exists(),
-        "build.rs: include/stub.h not found via CARGO_MANIFEST_DIR: {:?}", include_path);
-    println!("cargo:rerun-if-changed=src/cxx_stub.cc");
-    println!("cargo:rerun-if-changed=include/stub.h");
+ let manifest_dir = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+ let src_path = std::path::Path::new(&manifest_dir).join("src").join("cxx_stub.cc");
+ let _content = std::fs::read_to_string(&src_path)
+ .expect("build.rs: failed to read src/cxx_stub.cc via CARGO_MANIFEST_DIR");
+ let include_path = std::path::Path::new(&manifest_dir).join("include").join("stub.h");
+ assert!(include_path.exists(),
+ "build.rs: include/stub.h not found via CARGO_MANIFEST_DIR: {:?}", include_path);
+ println!("cargo:rerun-if-changed=src/cxx_stub.cc");
+ println!("cargo:rerun-if-changed=include/stub.h");
 }
 "#,
     )
@@ -2603,7 +2596,7 @@ foo = "1.0"
 
     // Pre-cargo sanity: Rule 2 REMAP must have rewritten the patch
     // entry to the staged-overlay-dir (NOT to upstream root, which
-    // would be the BLOCK-1 self-loop bug).
+    // would be the case 1 self-loop bug).
     let content = read_overlay(&plan.sibling_manifest);
     let parsed: toml::Value = toml::from_str(&content).expect("overlay must be valid TOML");
     let remap_path = parsed
@@ -2622,8 +2615,8 @@ foo = "1.0"
     assert_eq!(
         remap_path, staged_overlay_dir_str,
         "Rule 2 REMAP must rewrite [patch.crates-io.foo].path to the \
-         staged-overlay-dir, NOT the upstream root (BLOCK-1 self-loop \
-         avoidance pin); got `{remap_path}`"
+ staged-overlay-dir, NOT the upstream root (case 1 self-loop \
+ avoidance pin); got `{remap_path}`"
     );
 
     // Mirror verification: <staged>/src/cxx_stub.cc and
@@ -2668,10 +2661,10 @@ foo = "1.0"
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the Rule 2 REMAP cxx-shape overlay \
-         (validates BOTH policy correctness + staged-mirror correctness); \
-         got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ (validates BOTH policy correctness + staged-mirror correctness); \
+ got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -2700,7 +2693,7 @@ fn cargo_accepts_continue_absolutize_when_non_root_patch() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_continue_absolutize_when_non_root_patch: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -2783,15 +2776,15 @@ path = "src/lib.rs"
     assert!(
         foo_path.ends_with("/target/lihaaf-overlay"),
         "Rule 2 REMAP: [patch.crates-io.foo].path must target the \
-         staged-overlay-dir; got `{foo_path}`"
+ staged-overlay-dir; got `{foo_path}`"
     );
     assert_eq!(
         foo_helper_path,
         format!("{upstream_dir_str}/helper"),
         "Rule 3 CONTINUE-ABSOLUTIZE: [patch.crates-io.foo-helper].path \
-         must be absolutized to `<upstream>/helper` (unchanged by \
-         apply_self_patch_policy; absolutize_patch_paths handles it); \
-         got `{foo_helper_path}`"
+ must be absolutized to `<upstream>/helper` (unchanged by \
+ apply_self_patch_policy; absolutize_patch_paths handles it); \
+ got `{foo_helper_path}`"
     );
 
     let target_dir = upstream_dir.join("target").join("lihaaf-build");
@@ -2813,9 +2806,9 @@ path = "src/lib.rs"
     assert!(
         output.status.success(),
         "cargo rustc must succeed against the Rule 3 overlay; \
-         got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -2827,8 +2820,8 @@ path = "src/lib.rs"
 /// Negative test: upstream carries a vendored-fork-style self-patch
 /// (`path = "../my-fork"`). The path resolves to a sibling dir, NOT
 /// upstream root → Rule 4 REJECT fires. The materializer returns
-/// `Error::CompatPatchOverrideConflict` referencing the v0.2/v1.1
-/// escape hatch (`--compat-allow-patch-override`).
+/// `Error::CompatPatchOverrideConflict` with a clear unsupported-
+/// combination diagnostic.
 ///
 /// **Plan-mechanics deviation.** Plan §5.2.8 was labelled
 /// "Cargo-build-gated test" in the §5.2 list header, but the test
@@ -2898,25 +2891,24 @@ foo = { path = "../my-fork" }
             assert_eq!(
                 crate_name, "foo",
                 "Rule 4 REJECT must name the self-keyed crate (`foo`); \
-                 got `{crate_name}`"
+ got `{crate_name}`"
             );
             assert!(
-                expected_resolution.contains("compat-allow-patch-override"),
-                "Rule 4 REJECT message must reference the v0.2/v1.1 escape \
-                 hatch (`--compat-allow-patch-override`); got: {expected_resolution}"
+                expected_resolution.contains("not currently supported"),
+                "Rule 4 REJECT message must explain the unsupported patch shape; got: {expected_resolution}"
             );
         }
         other => panic!(
             "Rule 4 must return Error::CompatPatchOverrideConflict at the \
-             integration layer; got {other:?}"
+ integration layer; got {other:?}"
         ),
     }
 }
 
 /// §5.2.9 — SEC-8 Rule 1 INJECT cargo-graph proof: workspace member registry
-/// dep remapped via injected self-patch (R8 rescope).
+/// dep remapped via injected self-patch (self-patch rescope rescope).
 ///
-/// **R8 rescope (Codex rollout 019e3cc3, 2026-05-18):** The prior fixture
+/// **self-patch rescope rescope (implementation update):** The prior fixture
 /// carried `[dependencies] test-suite = { path = "test-suite" }` in the
 /// root, creating a `bar → test-suite → bar` active-dep cycle that cargo
 /// rejects even when both `bar` references resolve to the same source-id.
@@ -2951,7 +2943,7 @@ fn cargo_accepts_workspace_member_registry_dep_via_self_patch() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_accepts_workspace_member_registry_dep_via_self_patch: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -3059,9 +3051,9 @@ bar = "1.0"
     assert!(
         output.status.success(),
         "cargo rustc must accept the workspace-member-registry-dep-via-self-patch \
-         topology (SEC-8 Rule 1 INJECT closure); got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ topology (SEC-8 Rule 1 INJECT closure); got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -3095,7 +3087,7 @@ fn cargo_build_anyhow_shape_probe_file_resolves_via_mirror() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_build_anyhow_shape_probe_file_resolves_via_mirror: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -3127,17 +3119,17 @@ path = "src/lib.rs"
     std::fs::write(
         upstream_dir.join("build.rs"),
         r#"fn main() {
-    let probe = std::path::Path::new("src").join("nightly.rs");
-    if probe.exists() {
-        println!("cargo:rustc-cfg=probe_file_found");
-    } else {
-        println!("cargo:rustc-cfg=probe_file_missing");
-    }
-    // Tell cargo we look at this cfg (suppresses unexpected_cfgs warning
-    // on newer cargos so the test surfaces only the load-bearing failure).
-    println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
-    println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
-    println!("cargo:rerun-if-changed=src/nightly.rs");
+ let probe = std::path::Path::new("src").join("nightly.rs");
+ if probe.exists() {
+ println!("cargo:rustc-cfg=probe_file_found");
+ } else {
+ println!("cargo:rustc-cfg=probe_file_missing");
+ }
+ // Tell cargo we look at this cfg (suppresses unexpected_cfgs warning
+ // on newer cargos so the test surfaces only the load-bearing failure).
+ println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
+ println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
+ println!("cargo:rerun-if-changed=src/nightly.rs");
 }
 "#,
     )
@@ -3197,9 +3189,9 @@ compile_error!("probe_file_missing: staged-mirror did not provide src/nightly.rs
     assert!(
         output.status.success(),
         "cargo build must succeed for the M.5 anyhow-shape probe \
-         (staged-mirror provides src/nightly.rs); got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ (staged-mirror provides src/nightly.rs); got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -3221,7 +3213,7 @@ fn cargo_build_thiserror_shape_probe_file_resolves_via_mirror() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_build_thiserror_shape_probe_file_resolves_via_mirror: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -3253,15 +3245,15 @@ path = "src/lib.rs"
     std::fs::write(
         upstream_dir.join("build.rs"),
         r#"fn main() {
-    let probe = std::path::Path::new("build").join("probe.rs");
-    if probe.exists() {
-        println!("cargo:rustc-cfg=probe_file_found");
-    } else {
-        println!("cargo:rustc-cfg=probe_file_missing");
-    }
-    println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
-    println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
-    println!("cargo:rerun-if-changed=build/probe.rs");
+ let probe = std::path::Path::new("build").join("probe.rs");
+ if probe.exists() {
+ println!("cargo:rustc-cfg=probe_file_found");
+ } else {
+ println!("cargo:rustc-cfg=probe_file_missing");
+ }
+ println!("cargo:rustc-check-cfg=cfg(probe_file_found)");
+ println!("cargo:rustc-check-cfg=cfg(probe_file_missing)");
+ println!("cargo:rerun-if-changed=build/probe.rs");
 }
 "#,
     )
@@ -3297,7 +3289,7 @@ compile_error!("probe_file_missing: staged-mirror did not provide build/probe.rs
     assert!(
         mirrored_probe.exists(),
         "mirror must populate <staged>/build/probe.rs (the M.6 path \
-         form, distinct from the M.5 `src/` form); got missing at {:?}",
+ form, distinct from the M.5 `src/` form); got missing at {:?}",
         mirrored_probe
     );
 
@@ -3314,9 +3306,9 @@ compile_error!("probe_file_missing: staged-mirror did not provide build/probe.rs
     assert!(
         output.status.success(),
         "cargo build must succeed for the M.6 thiserror-shape probe \
-         (staged-mirror provides build/probe.rs); got exit {:?}\n\
-         stdout:\n{}\n\
-         stderr:\n{}",
+ (staged-mirror provides build/probe.rs); got exit {:?}\n\
+ stdout:\n{}\n\
+ stderr:\n{}",
         output.status.code(),
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr),
@@ -3328,10 +3320,10 @@ compile_error!("probe_file_missing: staged-mirror did not provide build/probe.rs
 /// Unit-style integration test (UNGATED) that asserts the
 /// materialized overlay's `[patch.crates-io.<self>].path` value is:
 ///
-///   1. Absolute (starts with `/` on Unix, drive letter prefix on
-///      Windows).
-///   2. Tail-matches `/target/lihaaf-overlay` (the staged-overlay
-///      directory shape).
+/// 1. Absolute (starts with `/` on Unix, drive letter prefix on
+///    Windows).
+/// 2. Tail-matches `/target/lihaaf-overlay` (the staged-overlay
+///    directory shape).
 ///
 /// Applies to BOTH Rule 1 (INJECT) and Rule 2 (REMAP) emission
 /// paths — both rules emit the same absolute byte shape per plan
@@ -3368,13 +3360,13 @@ version = "0.1.0"
     assert!(
         Path::new(rule1_path).is_absolute(),
         "Rule 1 INJECT path MUST be absolute (plan §6.5: avoids cargo's \
-         coincidental anchoring of `.`; future-proofs against \
-         absolutize_patch_paths policy changes); got `{rule1_path}`"
+ coincidental anchoring of `.`; future-proofs against \
+ absolutize_patch_paths policy changes); got `{rule1_path}`"
     );
     assert!(
         rule1_path.ends_with("/target/lihaaf-overlay"),
         "Rule 1 INJECT path MUST tail-match `/target/lihaaf-overlay` \
-         (plan §6.5 emission contract); got `{rule1_path}`"
+ (plan §6.5 emission contract); got `{rule1_path}`"
     );
     drop(tmp1);
 
@@ -3400,12 +3392,12 @@ demo = { path = "." }
     assert!(
         Path::new(rule2_path).is_absolute(),
         "Rule 2 REMAP path MUST be absolute (plan §6.5 emission contract \
-         is unified across Rule 1 / Rule 2); got `{rule2_path}`"
+ is unified across Rule 1 / Rule 2); got `{rule2_path}`"
     );
     assert!(
         rule2_path.ends_with("/target/lihaaf-overlay"),
         "Rule 2 REMAP path MUST tail-match `/target/lihaaf-overlay`; \
-         got `{rule2_path}`"
+ got `{rule2_path}`"
     );
 
     // Cross-rule shape parity pin: Rule 1 and Rule 2 emit the same
@@ -3426,13 +3418,13 @@ demo = { path = "." }
     assert_eq!(
         rule1_tail, rule2_tail,
         "Rule 1 / Rule 2 emission must share the same final component \
-         (unified emission contract); got Rule 1 `{rule1_tail}` vs \
-         Rule 2 `{rule2_tail}`"
+ (unified emission contract); got Rule 1 `{rule1_tail}` vs \
+ Rule 2 `{rule2_tail}`"
     );
     drop(tmp2);
 }
 
-/// **Issue #53 §7.3 integration test: axum-macros workspace-member shape.**
+/// **§7.3 integration test: axum-macros workspace-member shape.**
 ///
 /// Synthesizes a workspace that mirrors `tokio-rs/axum`'s shape (virtual
 /// workspace with `members = ["pkg-a", "pkg-*"]`, `[workspace.package]
@@ -3471,7 +3463,7 @@ fn cargo_lihaaf_resolves_axum_macros_shape_workspace_member() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_lihaaf_resolves_axum_macros_shape_workspace_member: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -3635,10 +3627,10 @@ serde = { workspace = true }
     drop(tmp);
 }
 
-/// **Issue #53 BLOCK-1 §7.3 extension: dot-prefix + exclude integration test.**
+/// **case 1 §7.3 extension: dot-prefix + exclude integration test.**
 ///
 /// Variant of `cargo_lihaaf_resolves_axum_macros_shape_workspace_member` that
-/// exercises the BLOCK-1 path-normalization contract end-to-end:
+/// exercises the case 1 path-normalization contract end-to-end:
 ///
 /// - `members = ["./pkg-a", "./pkg-*"]` (dot-prefixed literal + glob),
 /// - `exclude = ["pkg-a"]` (bare exclude, no dot prefix),
@@ -3660,7 +3652,7 @@ fn cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude() {
     if std::env::var_os("LIHAAF_RUN_CARGO_BUILD_TESTS").is_none() {
         eprintln!(
             "skipping cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude: \
-             set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
+ set LIHAAF_RUN_CARGO_BUILD_TESTS=1 to opt in (CI does this automatically)"
         );
         return;
     }
@@ -3669,7 +3661,7 @@ fn cargo_lihaaf_resolves_axum_macros_shape_with_dot_prefix_and_exclude() {
     let ws_root = tmp.path();
     let ws_root_manifest = ws_root.join("Cargo.toml");
 
-    // Members carry dot-prefix; exclude is bare. Without BLOCK-1
+    // Members carry dot-prefix; exclude is bare. Without case 1
     // normalization the `pkg-a` exclude would not subtract the
     // `./pkg-a` member, breaking the resolver's intent.
     let ws_root_toml = r#"[workspace]
@@ -3716,7 +3708,7 @@ path = "src/lib.rs"
     .expect("write pkg-macros Cargo.toml");
     std::fs::write(
         pkg_macros_dir.join("src").join("lib.rs"),
-        "// minimal proc-macro lib stub for BLOCK-1 integration test\n",
+        "// minimal proc-macro lib stub for case 1 integration test\n",
     )
     .expect("write pkg-macros src/lib.rs");
 
@@ -3726,7 +3718,7 @@ path = "src/lib.rs"
     assert!(
         pkg_a_result.is_err(),
         "`./pkg-a` member must be subtracted by `pkg-a` exclude; \
-         resolving `pkg-a` must error (BLOCK-1: lexical normalization)"
+ resolving `pkg-a` must error (case 1: lexical normalization)"
     );
 
     let (member_manifest, ws_root_value) =

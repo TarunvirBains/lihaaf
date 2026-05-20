@@ -33,9 +33,9 @@ use crate::util;
 ///
 /// `from` is the literal-substring needle (gated by `is_path_like`
 /// at config-parse time — see [`crate::config`] §3.3); `to` is the
-/// replacement (subject only to the no-newline rule, per Decision #3
-/// / OQ-D — adopters legitimately need `to = ""` (strip-via-
-/// substitute), `to = "$RUST"`, and compound paths). The needle is
+/// replacement (subject only to the no-newline rule — adopters
+/// legitimately need `to = ""` (strip-via-substitute), `to = "$RUST"`,
+/// and compound paths). The needle is
 /// matched left-to-right, advancing past each match so already-
 /// rewritten bytes do not re-match (same `replace_advancing` shape as
 /// the built-in path substitutions).
@@ -59,16 +59,20 @@ pub struct Substitution {
     /// arbitrary diagnostic text.
     pub from: String,
     /// Literal-substring replacement. Subject only to no-newline
-    /// validation; otherwise unconstrained per Decision #3 / OQ-D.
+    /// validation; otherwise unconstrained (empty string strips the
+    /// match; arbitrary path-shaped replacement is accepted).
     pub to: String,
 }
 
 /// Substring prefixes the normalizer rewrites to placeholders.
 #[derive(Debug, Clone)]
 pub struct NormalizationContext {
-    /// Workspace root (the `package.metadata.lihaaf` host crate's
-    /// parent). Path prefixes equal to this are rewritten to
-    /// `$WORKSPACE`.
+    /// Workspace root placeholder source. Suites without
+    /// `build_targets` pass the `package.metadata.lihaaf` host crate's
+    /// parent to preserve the existing byte shape; staged
+    /// `build_targets` suites pass the nearest ancestor Cargo workspace
+    /// root so sibling-member diagnostics normalize portably. Path
+    /// prefixes equal to this are rewritten to `$WORKSPACE`.
     pub workspace_root: PathBuf,
     /// rustc sysroot (from `rustc --print sysroot`). Rewritten to
     /// `$RUST`.
@@ -85,7 +89,7 @@ pub struct NormalizationContext {
     /// semantics — see `docs/spec/lihaaf-v0.1.md` §3.6). Applied
     /// left-to-right in declared order, AFTER built-in path
     /// substitutions and BEFORE TypeId collapse. Empty by default;
-    /// when empty, normalizer output is byte-identical to v0.1.0-beta.9.
+    /// when empty, no adopter substitutions are applied.
     pub extra_substitutions: Vec<Substitution>,
     /// Adopter-defined `strip_lines` (per-suite, REPLACE semantics).
     /// Full-line exact-match drops applied after trim-trailing-whitespace
@@ -116,8 +120,8 @@ impl NormalizationContext {
     /// empty `Vec`s. Callers that need to wire per-suite values use the
     /// dedicated builders ([`Self::with_extra_substitutions`],
     /// [`Self::with_strip_lines`], [`Self::with_strip_line_prefixes`]).
-    /// When all three are empty (the legacy path), normalizer output is
-    /// byte-identical to v0.1.0-beta.9.
+    /// When all three are empty, normalizer output matches a run with no
+    /// adopter overrides.
     pub fn new(workspace_root: PathBuf, sysroot: PathBuf) -> Self {
         let cargo_registry = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -220,12 +224,9 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     let unified_le = unify_line_endings(input);
 
     // Step 2: per-line path substitution + TypeId + trailing space.
-    // Per the policy (and the Cluster 10.3 fix from the Codex
-    // Spark xhigh review), rustc's summary lines (`error: aborting due
-    // to N previous error[s]`, `For more information about this error,
-    // try \`rustc --explain ...\``) are NOT dropped — they pass through
-    // alongside every other diagnostic line and are subject only to the
-    // normalization categories the policy enumerates.
+    // rustc summary and explain-pointer lines are preserved; they pass
+    // through like other diagnostic text unless one of the explicit
+    // normalization categories applies.
     let mut intermediate: Vec<String> = Vec::with_capacity(unified_le.lines().count() + 1);
     for line in unified_le.lines() {
         let mut s = line.to_string();
@@ -255,27 +256,22 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         // Compat-mode post-pass (§3.2.2): rewrite
         // `<cargo_registry>/src/<host>-<16hex>/` to `$CARGO/` so the
         // output matches trybuild's short form
-        // `$CARGO/<crate>-<ver>/<rest>`. Runs AFTER the literal $DIR /
+        // `$CARGO/<crate>-<ver>/<rest>`. Runs after literal $DIR /
         // $WORKSPACE / $RUST substitutions so the longest-prefix-wins
-        // invariant on those three placeholders is intact, and only
-        // when the compat flag is set with a known registry root —
-        // non-compat callers see byte-identical v0.1 output.
+        // invariant on those three placeholders is intact. Non-compat
+        // callers do not take this branch.
         if ctx.compat_short_cargo
             && let Some(reg) = &ctx.cargo_registry
         {
             s = rewrite_cargo_short(&s, reg);
         }
-        // Step 7: adopter-defined `extra_substitutions` (issue #45 /
-        // beta.10). Applied AFTER built-in path substitutions and
-        // (when compat is on) the short-CARGO post-pass — so adopter
-        // rules can refer to the post-built-in placeholders (e.g.,
-        // `{ from = "$RUST/lib/rust-1.95.0", to = "$RUST" }`) — and
-        // BEFORE TypeId collapse so any introduced `#<digits>`
-        // collapses on the same line (§4). Entries are validated
-        // upstream (`is_path_like` on `from`, no newline in `to`) —
-        // no per-line revalidation. `replace_advancing` matches the
-        // built-in-substitution shape so already-rewritten bytes
-        // don't re-match.
+        // Step 7: adopter-defined `extra_substitutions`. Applied after
+        // built-in path substitutions and the optional short-CARGO
+        // post-pass, so adopter rules can match post-built-in
+        // placeholders (for example, `$RUST/lib/rust-1.95.0`). Applied
+        // before TypeId collapse so any introduced `#<digits>` collapses
+        // on the same line. Entries are validated upstream, so no
+        // per-line revalidation is needed.
         for sub in &ctx.extra_substitutions {
             s = replace_advancing(&s, &sub.from, &sub.to);
         }
@@ -286,14 +282,10 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     }
 
     // Step 10: adopter-defined line-drop (`strip_lines` /
-    // `strip_line_prefixes`, issue #45 / beta.10). Runs AFTER per-
-    // line trim-trailing-whitespace (so strip patterns match logical
-    // content) and BEFORE blank-line collapse (so a stripped line
-    // participates in the collapse — adjacent blank lines stay
-    // collapsed even when a non-blank line between them gets
-    // dropped). Empty allow-vectors short-circuit each line to a
-    // simple push so the absent-config path remains byte-identical
-    // to beta.9.
+    // `strip_line_prefixes`). Runs after per-line trailing whitespace
+    // trim and before blank-line collapse, so patterns match logical
+    // content and removed lines still participate in the collapse.
+    // Empty rule vectors leave the output unchanged.
     let mut after_strip: Vec<String> = Vec::with_capacity(intermediate.len());
     for line in intermediate {
         if should_strip_line(&line, &ctx.strip_lines, &ctx.strip_line_prefixes) {
@@ -329,9 +321,8 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
 ///
 /// Both rule sets are validated upstream at config-parse time
 /// (`is_path_like || is_banner_shape`) — see `crate::config` §3.3.
-/// On the absent-config (empty-vector) path the two `iter().any`
-/// calls collapse to constant `false` so the legacy normalizer
-/// output is byte-identical to v0.1.0-beta.9.
+/// With empty rule vectors, both `iter().any` calls collapse to
+/// constant `false` and normalizer output is unchanged.
 fn should_strip_line(line: &str, exact: &[String], prefixes: &[String]) -> bool {
     if exact.iter().any(|e| e == line) {
         return true;
@@ -720,11 +711,8 @@ mod tests {
 
     #[test]
     fn preserves_rustc_aborting_summary() {
-        // This summary line is not in the rewrite category list and is not
-        // in the explicit-preserve list either, but preservation stays the
-        // default ("Diagnostic text …").
-        // preserved byte-for-byte"). Earlier drafts dropped this line;
-        // Cluster 10.3 of the Codex Spark xhigh review reverted that.
+        // Summary lines are ordinary diagnostic text unless an explicit
+        // normalization rule matches them.
         assert_normalizes(
             "error: bad\nerror: aborting due to 1 previous error\n",
             "error: bad\nerror: aborting due to 1 previous error",
@@ -749,8 +737,7 @@ mod tests {
 
     #[test]
     fn preserves_rustc_explain_pointer() {
-        // The explain pointer is preserved byte-for-byte. Earlier drafts
-        // dropped it; Codex Spark review reverted that.
+        // The explain pointer is preserved byte-for-byte.
         assert_normalizes(
             "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.\n",
             "error: bad\n\nFor more information about this error, try `rustc --explain E0463`.",
@@ -759,13 +746,9 @@ mod tests {
 
     #[test]
     fn determinism_same_inputs_produce_same_bytes() {
-        // Per plan §7.4: this test was extended in #45 / beta.10 with a
-        // non-empty `extra_substitutions` + `strip_lines` +
-        // `strip_line_prefixes` triple that exercises BOTH allowlist
-        // predicates (one path-shaped + one banner-shaped entry in each
-        // strip key). Determinism guarantee covers the full normalizer
-        // surface including adopter-defined override paths, not just the
-        // built-in path-substitution loop.
+        // Determinism covers the full normalizer surface, including
+        // adopter substitutions and strip rules. This uses both allowed
+        // strip predicate families: path-shaped and banner-shaped.
         let input = "\
   --> /p/tests/lihaaf/compile_fail/foo.rs:3:1
 /nix/store/abc123-rust-1.95.0/lib/rustlib/x.rs:1:1
@@ -1025,9 +1008,8 @@ error: aborting due to 1 previous error
     }
 
     // ====================================================================
-    // Issue #45 / v0.1.0-beta.10 — `extra_substitutions` framework
+    // Extra substitution and strip-rule coverage.
     //
-    // Per plan §7.1 (`docs/spec/extra-substitutions-plan-2026-05-19.md`).
     // Tests cover normalizer composition: extras apply AFTER built-ins,
     // extras apply in declared order, strip drops with both exact and
     // prefix matchers, strip runs after trim-trailing-whitespace and
@@ -1107,10 +1089,8 @@ error: aborting due to 1 previous error
 
     #[test]
     fn extra_substitutions_empty_default_byte_identical() {
-        // Regression guard for §1.3 default invariant: when the three new
-        // vectors are empty, normalizer output must be byte-identical to
-        // the legacy beta.9 path. A simple round-trip with a path-marker
-        // line covers the most common shape.
+        // When adopter normalization vectors are empty, output must match
+        // the built-in normalizer path exactly.
         let input = "  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1\n";
         let c = ctx("/p", "/r");
         let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
@@ -1260,12 +1240,12 @@ error: aborting due to 1 previous error
 
     #[test]
     fn compose_with_compat_short_cargo() {
-        // NOTE (NIT-2): exercises normalizer-internal composition.
-        // Adopter extras remain unsupported in compat mode per §5 /
-        // §6.6 of the v0.1 spec — but the composition order is pinned
-        // here so if compat-mode adopter extras land in beta.11+, the
-        // ordering is already correct: short-CARGO post-pass runs
-        // first, then adopter extras, then TypeId.
+        // Exercises normalizer-internal composition. Adopter extras remain
+        // unsupported in compat mode per §5 / §6.6 of the v0.1 spec —
+        // but the composition order is pinned here so the ordering is
+        // already correct if compat-mode adopter extras are ever added:
+        // short-CARGO post-pass runs first, then adopter extras, then
+        // TypeId.
         let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
         let extras = vec![Substitution {
             from: "$CARGO/foo-1.0.0".into(),

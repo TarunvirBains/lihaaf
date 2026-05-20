@@ -179,8 +179,8 @@ pub struct Cli {
     pub(crate) inner_compat_normalize: bool,
 }
 
-/// Reject empty `--package` values at parse time (issue #53 — see
-/// plan §6.16). clap's default `Option<String>` value parser accepts
+/// Reject empty `--package` values at parse time. clap's default
+/// `Option<String>` value parser accepts
 /// empty strings; we tighten to "non-empty required" so the bad
 /// invocation fails immediately with a clap error rather than reaching
 /// the resolver and surfacing as a no-match diagnostic that doesn't
@@ -319,9 +319,8 @@ impl Cli {
             if self.compat_report.is_none() {
                 return Err(missing_required_compat_flag("--compat-report"));
             }
-            // Issue #53 — `--package` and `--compat-manifest` are
-            // mutually exclusive (see plan §3.3 Rule B). The two flags
-            // address opposite ends of the same problem space:
+            // `--package` and `--compat-manifest` are mutually exclusive.
+            // The two flags address opposite ends of the same problem space:
             // `--compat-manifest` supplies an explicit manifest path
             // directly to compat mode, bypassing the workspace-member
             // resolver; `--package` invokes the resolver to find the
@@ -355,9 +354,9 @@ impl Cli {
             if self.compat_manifest.is_some() {
                 return Err(non_compat_mode_error("--compat-manifest"));
             }
-            // Issue #53 — `--package` outside compat mode is a mode error.
-            // Surface via the existing `non_compat_mode_error` helper so the
-            // diagnostic shape matches the rest of the matrix.
+            // `--package` outside compat mode is a mode error. Surface via
+            // the existing `non_compat_mode_error` helper so the diagnostic
+            // shape matches the rest of the matrix.
             if self.compat_package.is_some() {
                 return Err(non_compat_mode_error("--package"));
             }
@@ -505,7 +504,7 @@ mod tests {
         assert!(parse_from(argv).is_err());
     }
 
-    /// **Issue #53 — short `-p` form parses into `compat_package`.**
+    /// Short `-p` form parses into `compat_package`.
     ///
     /// The clap-derive `short = 'p'` attribute makes the CLI accept the
     /// short form. This test pins that the parsed `Cli` carries the
@@ -526,7 +525,7 @@ mod tests {
         assert_eq!(c.compat_package.as_deref(), Some("axum-macros"));
     }
 
-    /// **Issue #53 — long `--package` form parses into `compat_package`.**
+    /// Long `--package` form parses into `compat_package`.
     /// Mirror of `cli_parses_short_p_flag` for the long form.
     #[test]
     fn cli_parses_long_package_flag() {
@@ -542,7 +541,7 @@ mod tests {
         assert_eq!(c.compat_package.as_deref(), Some("axum-macros"));
     }
 
-    /// **Issue #53 — `--package ""` is rejected at parse time.**
+    /// `--package ""` is rejected at parse time.
     ///
     /// The `parse_compat_package` value parser tightens clap's default
     /// `Option<String>` parser (which would accept the empty string) so
@@ -575,7 +574,7 @@ mod tests {
         }
     }
 
-    /// **Issue #53 — `--package` outside compat mode is a mode error.**
+    /// `--package` outside compat mode is a mode error.
     ///
     /// Symmetric with the rest of the compat-mode matrix; the
     /// `validate_mode_consistency` validator owns the rejection per the
@@ -600,10 +599,10 @@ mod tests {
         }
     }
 
-    /// **Issue #53 — `--package` and `--compat-manifest` are mutually
-    /// exclusive.** Combining them is incoherent (the two flags address
-    /// opposite ends of the manifest-resolution problem); the validator
-    /// surfaces a directed diagnostic naming both flags.
+    /// `--package` and `--compat-manifest` are mutually exclusive.
+    /// Combining them is incoherent (the two flags address opposite ends
+    /// of the manifest-resolution problem); the validator surfaces a
+    /// directed diagnostic naming both flags.
     #[test]
     fn cli_rejects_package_with_compat_manifest() {
         let argv: Vec<String> = [

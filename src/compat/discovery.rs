@@ -325,15 +325,14 @@ pub fn discover(crate_root: &Path, custom_macros: &[String]) -> Result<Discovery
             }
         };
 
-        // Round-6 fix (Gemini BLOCK-B File): a file-level inner cfg
-        // attribute (`#![cfg(unix)]` at the top of the file) gates the
-        // ENTIRE file's contents — every item, every test, every
-        // module. `syn::parse_file` parses inner attributes into
-        // `File.attrs` (via `Attribute::parse_inner`), so the same
-        // `find_cfg_attribute` helper applies. Without this check the
-        // visitor would descend through the file as if it were
-        // compiled on every platform, surfacing phantom fixtures on
-        // the disabled cfg arm.
+        // A file-level inner cfg attribute (`#![cfg(unix)]` at the top
+        // of the file) gates the ENTIRE file's contents — every item,
+        // every test, every module. `syn::parse_file` parses inner
+        // attributes into `File.attrs` (via `Attribute::parse_inner`),
+        // so the same `find_cfg_attribute` helper applies. Without
+        // this check the visitor would descend through the file as if
+        // it were compiled on every platform, surfacing phantom
+        // fixtures on the disabled cfg arm.
         //
         // Emission shape: one `discovery_unrecognized` entry at line 1
         // (inner-attr `#![...]` spans typically start at the file's
@@ -765,15 +764,15 @@ impl<'a> DiscoveryVisitor<'a> {
 
 impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        // Round-5 BLOCK fix: `#[cfg(...)]`-gated functions cannot be
-        // evaluated at AST time — the cfg's truth value depends on the
-        // adopter's `--features` selection at `cargo build`. A function
-        // with ANY `#[cfg]` / `#[cfg_attr]` attribute is therefore
-        // recorded as `discovery_unrecognized` and its body is NOT
-        // descended into. Under-discovery (with operator visibility)
-        // is the safe failure mode: a feature-disabled trybuild call
-        // would otherwise produce a phantom fixture in the discovery
-        // output that the dispatch run could never match.
+        // `#[cfg(...)]`-gated functions cannot be evaluated at AST
+        // time — the cfg's truth value depends on the adopter's
+        // `--features` selection at `cargo build`. A function with ANY
+        // `#[cfg]` / `#[cfg_attr]` attribute is therefore recorded as
+        // `discovery_unrecognized` and its body is NOT descended into.
+        // Under-discovery (with operator visibility) is the safe
+        // failure mode: a feature-disabled trybuild call would
+        // otherwise produce a phantom fixture in the discovery output
+        // that the dispatch run could never match.
         if let Some(cfg_attr) = find_cfg_attribute(&node.attrs) {
             let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
                 "cfg_attr"
@@ -802,18 +801,17 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // per-function bindings so cross-function leakage is
         // impossible.
         //
-        // Round-6 BLOCK fix (Gemini): `use` declarations inside a
-        // function body are LOCAL to that function in Rust — they do
-        // NOT leak to sibling functions in the same file. The visitor
-        // must therefore save and RESTORE `imported_testcases` and
-        // `aliased_testcases` after the body walk. Unlike `visit_item_mod`
-        // (which clears the sets on entry so the inner module starts
-        // from an empty file-scope set), functions INHERIT the enclosing
-        // file's imports — a file-level `use trybuild::TestCases;` IS
-        // visible inside every function in that file. The fix is
-        // therefore "snapshot before, restore after": any body-local
-        // `use` additions are observed during the walk but rolled back
-        // on exit so they cannot leak to siblings.
+        // `use` declarations inside a function body are LOCAL to that
+        // function in Rust — they do NOT leak to sibling functions in
+        // the same file. The visitor must therefore save and RESTORE
+        // `imported_testcases` and `aliased_testcases` after the body
+        // walk. Unlike `visit_item_mod` (which clears the sets on entry
+        // so the inner module starts from an empty file-scope set),
+        // functions INHERIT the enclosing file's imports — a file-level
+        // `use trybuild::TestCases;` IS visible inside every function
+        // in that file. Any body-local `use` additions are observed
+        // during the walk but rolled back on exit so they cannot leak
+        // to siblings.
         //
         // Implementation: snapshot via `.clone()` (the sets are
         // typically empty or small — a handful of imports per file),
@@ -896,8 +894,7 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        // Round-5 BLOCK fix (mirrored from `visit_item_fn`): a
-        // `#[cfg(...)]`-gated impl method cannot be evaluated at AST
+        // A `#[cfg(...)]`-gated impl method cannot be evaluated at AST
         // time. Surface as `discovery_unrecognized` and skip the body.
         if let Some(cfg_attr) = find_cfg_attribute(&node.attrs) {
             let attr_kind = if cfg_attr.meta.path().is_ident("cfg_attr") {
@@ -929,12 +926,12 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
         // impl methods is exceedingly rare but supported uniformly
         // (the same `is_test_attribute` filter applies).
         //
-        // Round-6 BLOCK fix (Gemini, mirrored from `visit_item_fn`):
-        // also snapshot/restore `imported_testcases` and `aliased_testcases`
-        // because `use` declarations inside an impl method body are
-        // local to that method in Rust. Use `.clone()` (snapshot) rather
-        // than `mem::take` so the method INHERITS file-scope imports
-        // during the walk but body-local additions roll back on exit.
+        // Also snapshot/restore `imported_testcases` and
+        // `aliased_testcases` because `use` declarations inside an impl
+        // method body are local to that method in Rust. Use `.clone()`
+        // (snapshot) rather than `mem::take` so the method INHERITS
+        // file-scope imports during the walk but body-local additions
+        // roll back on exit.
         let saved_enclosing = self.enclosing_test_fn.take();
         let saved_bindings = std::mem::take(&mut self.local_bindings);
         let saved_aliased_bindings = std::mem::take(&mut self.aliased_bindings);
@@ -954,16 +951,16 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        // Round-6 BLOCK fix: `#[cfg(...)]` / `#[cfg_attr(...)]` on the
-        // module itself gates the ENTIRE inline body — every `use`,
-        // every `#[test] fn`, every nested module. Without resolving
-        // the cfg (which depends on `--features` at `cargo build` time)
-        // we cannot descend safely: a `#[cfg(unix)] mod tests { ... }`
-        // on Windows must NOT contribute fixtures, and vice-versa.
+        // `#[cfg(...)]` / `#[cfg_attr(...)]` on the module itself gates
+        // the ENTIRE inline body — every `use`, every `#[test] fn`,
+        // every nested module. Without resolving the cfg (which depends
+        // on `--features` at `cargo build` time) we cannot descend
+        // safely: a `#[cfg(unix)] mod tests { ... }` on Windows must
+        // NOT contribute fixtures, and vice-versa.
         //
-        // Mirror the `visit_item_fn` / `visit_impl_item_fn` round-5
-        // pattern: emit one `discovery_unrecognized` entry naming the
-        // module, then skip the walk (do NOT descend into `node.content`).
+        // Mirror the `visit_item_fn` / `visit_impl_item_fn` pattern:
+        // emit one `discovery_unrecognized` entry naming the module,
+        // then skip the walk (do NOT descend into `node.content`).
         // Under-discovery with operator visibility is the safe failure
         // mode — descending silently would produce a phantom fixture
         // whenever the cfg is disabled at adopter build time.
@@ -987,11 +984,10 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
             return;
         }
 
-        // Round-5 BLOCK fix: `imported_testcases` and `aliased_testcases`
-        // are FILE-scope sets — populated by `visit_item_use` from
-        // `use` statements at file top-level. But inline modules
-        // (`mod a { ... }`) can ALSO carry `use` statements; those uses
-        // must NOT leak into:
+        // `imported_testcases` and `aliased_testcases` are FILE-scope
+        // sets populated by `visit_item_use` from `use` statements at
+        // file top-level. But inline modules (`mod a { ... }`) can ALSO
+        // carry `use` statements; those uses must NOT leak into:
         //   - the enclosing file's scope (siblings of `mod a` should
         //     not see `mod a`'s imports), or
         //   - sibling modules (`mod b { ... }` after `mod a { ... }`).
@@ -1054,15 +1050,15 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
-        // Round-6 fix (Gemini BLOCK-B extension): a `#[cfg(...)]`-gated
-        // type alias is NOT materially present when the cfg is disabled
-        // at adopter build time. Surfacing `discovery_unrecognized` for
-        // an item that does not exist in the compiled crate is
-        // noise — the operator cannot act on it. Skip processing
-        // entirely; downstream `<alias>::new()` calls inside the same
-        // (gated) context will also be silently dropped by the visitor's
-        // unknown-shape policy, and a non-gated call to a gated alias
-        // would have failed to compile in the first place.
+        // A `#[cfg(...)]`-gated type alias is NOT materially present
+        // when the cfg is disabled at adopter build time. Surfacing
+        // `discovery_unrecognized` for an item that does not exist in
+        // the compiled crate is noise — the operator cannot act on it.
+        // Skip processing entirely; downstream `<alias>::new()` calls
+        // inside the same (gated) context will also be silently dropped
+        // by the visitor's unknown-shape policy, and a non-gated call
+        // to a gated alias would have failed to compile in the first
+        // place.
         if find_cfg_attribute(&node.attrs).is_some() {
             return;
         }
@@ -1105,14 +1101,13 @@ impl<'ast, 'a> Visit<'ast> for DiscoveryVisitor<'a> {
     }
 
     fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
-        // Round-6 fix (Gemini BLOCK-B extension): a `#[cfg(...)]`-gated
-        // `use` declaration is NOT in scope at adopter build time when
-        // the cfg is disabled. Adding the local name to
-        // `imported_testcases` / `aliased_testcases` would cause a
-        // downstream `TestCases::new()` call (gated under the SAME cfg
-        // and disabled together — or gated under a DIFFERENT cfg and
-        // potentially enabled in the wrong half) to be incorrectly
-        // recognized or incorrectly flagged.
+        // A `#[cfg(...)]`-gated `use` declaration is NOT in scope at
+        // adopter build time when the cfg is disabled. Adding the local
+        // name to `imported_testcases` / `aliased_testcases` would
+        // cause a downstream `TestCases::new()` call (gated under the
+        // SAME cfg and disabled together — or gated under a DIFFERENT
+        // cfg and potentially enabled in the wrong half) to be
+        // incorrectly recognized or incorrectly flagged.
         //
         // The conservative choice: skip processing the `use` entirely.
         // If the call is gated under the same cfg, it shares the use's
@@ -1164,11 +1159,11 @@ impl<'a> DiscoveryVisitor<'a> {
     /// constructor-suffix idiom) AND `<aliased>()` (the
     /// no-`::new` form a registered alias would also accept via
     /// [`Self::is_testcases_constructor_path`]'s `alias_segs` arm).
-    /// Round-5 BLOCK fix: previously only the two-segment `::new` form
-    /// was matched here, so `use trybuild::TestCases as Foo; Foo()`
-    /// silently dropped instead of emitting `discovery_unrecognized`
-    /// at the terminal call site. The registered-alias matcher already
-    /// recognized both shapes; mirroring that parity here keeps the
+    /// The unregistered-alias diagnostic recognizes both constructor
+    /// shapes so `use trybuild::TestCases as Foo; Foo()` emits
+    /// `discovery_unrecognized` at the terminal call site instead of
+    /// silently dropping. The registered-alias matcher already
+    /// recognizes both shapes; mirroring that parity here keeps the
     /// unregistered-alias diagnostic surface aligned.
     fn is_aliased_testcases_constructor(&self, expr: &syn::Expr) -> bool {
         let syn::Expr::Path(p) = expr else {

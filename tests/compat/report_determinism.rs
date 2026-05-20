@@ -1,13 +1,11 @@
-//! Phase 8 of compat mode (§3.3 of `docs/compatibility-plan.md`) —
-//! deterministic JSON envelope writer integration tests.
+//! Deterministic JSON envelope writer integration tests for compat mode.
 //!
 //! Every test in this file reaches the envelope writer through the
 //! `#[doc(hidden)]` re-exports declared in `src/lib.rs`
 //! (`lihaaf::CompatEnvelope`, `lihaaf::compat_write_envelope`, etc.).
 //! The re-exports exist exclusively for this test crate (and for the
-//! `cargo-lihaaf` binary, once Phase 9 wires the writer into
-//! `compat::run`). The v0.1 supported entry to compat mode is `cargo
-//! lihaaf --compat`, not the Rust API.
+//! `cargo-lihaaf` binary). The v0.1 supported entry to compat mode is
+//! `cargo lihaaf --compat`, not the Rust API.
 //!
 //! ## The contract under test
 //!
@@ -360,8 +358,8 @@ fn excluded_fixtures_sorted_by_fixture() {
 
 /// Test 6 — `generated_paths` sorted by `path` ASCII byte order.
 ///
-/// The three paths below mirror the actual production output of a
-/// compat run after the PR #34 redesign: a staged overlay under
+/// The three paths below mirror the output of a compat run: a staged
+/// overlay under
 /// `target/lihaaf-overlay/`, a converted-fixtures tree under
 /// `target/lihaaf-compat-converted/`, and a snapshot file under
 /// `tests/snapshots/`. The sort honors strict lexicographic byte
@@ -728,10 +726,10 @@ fn generated_path_from_cleanup_round_trip() {
 /// `/home/runner/work/lihaaf/lihaaf/./Cargo.lihaaf.toml` from the cargo
 /// invocation embedded in `DylibBuildFailed::Display`.
 ///
-/// This test is the regression gate for FIX class V. It would FAIL
-/// without the `normalize_error_detail_paths` call in `compat::run`
-/// (or, equivalently, without calling `normalize_error_detail_paths`
-/// before `write_envelope` here in the test).
+/// This test would fail without the `normalize_error_detail_paths` call
+/// in `compat::run` (or, equivalently, without calling
+/// `normalize_error_detail_paths` before `write_envelope` here in the
+/// test).
 ///
 /// Verification that the test actually bites: remove the
 /// `normalize_error_detail_paths` call below and confirm the
@@ -815,7 +813,7 @@ fn error_detail_paths_cross_root_byte_determinism() {
     // one for a local developer machine. Same relative layout, different
     // absolute prefix.
     let abs_root_a = PathBuf::from("/home/runner/work/my-crate/my-crate");
-    let abs_root_b = PathBuf::from("/home/tarunvir/projects/my-crate");
+    let abs_root_b = PathBuf::from("/workspace/local/my-crate");
 
     let make_detail = |root: &str| {
         format!(
@@ -880,7 +878,7 @@ fn error_detail_paths_cross_root_byte_determinism() {
         "runner-A root must not appear in serialized envelope; got:\n{text_a}"
     );
     assert!(
-        !text_b.contains("/home/tarunvir/projects/my-crate"),
+        !text_b.contains("/workspace/local/my-crate"),
         "runner-B root must not appear in serialized envelope; got:\n{text_b}"
     );
 }

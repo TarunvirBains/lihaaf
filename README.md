@@ -79,6 +79,9 @@ dylib_crate = "consumer"
 extern_crates = ["consumer", "consumer-macros"]
 features = ["testing"]
 dev_deps = ["serde", "serde_json"]
+# Optional. Use when fixtures import crates from `dev_deps` directly and
+# those crates must be built before the per-fixture rustc loop.
+build_targets = ["tests"]
 edition = "2021"
 # Suppress rustc lints on each per-fixture invocation (forwarded as `-A <lint>`).
 # Common entries under v0.1: unused_imports and dead_code, which fire under
@@ -164,12 +167,22 @@ incremental caches isolated. `cargo lihaaf` (no `--suite`) runs every
 defined suite in declared order; `cargo lihaaf --suite spatial`
 restricts to the named subset.
 
+`build_targets = ["tests"]` is the opt-in path for fixtures that import
+crates listed in `dev_deps` directly. For that suite, lihaaf synthesizes
+a temporary isolated suite workspace: the staged dylib package points at
+the real source with an absolute `[lib].path` and emits both `rlib` and
+`dylib`, while a synthetic collector package depends on the explicit
+`dev_deps`. This is one Cargo resolver graph per suite. Suites that omit
+`build_targets` keep the default dylib-only build path.
+
 Constraints (validated at config parse time):
 - Suite names must be `[A-Za-z0-9_-]` and not equal to `default`.
 - `fixture_dirs` must be disjoint across suites (no shared snapshot files).
 - `dylib_crate` is not per-suite — one consumer crate per session.
 - `features` does not inherit (a named suite that omits `features`
   gets `[]`, not the default suite's features).
+- `build_targets` does not inherit. A named suite that omits it gets
+  `[]`, even if the default suite opts into `["tests"]`.
 - Other keys (`extern_crates`, `dev_deps`, `edition`,
   `compile_fail_marker`, `fixture_timeout_secs`,
   `per_fixture_memory_mb`, `allow_lints`) inherit from the top-level
@@ -218,11 +231,11 @@ felt easiest to keep stable and debuggable in day-to-day use:
 - **Cargo invocation for the dylib build**:
   `cargo rustc -p <crate> --lib --release --crate-type=dylib
   --message-format=json-render-diagnostics --target-dir=<lihaaf-build>`
-  with `RUSTFLAGS="-C prefer-dynamic"`. Validated end-to-end by the
-  inventory-on-dylib spike (verdict `GO_NATIVE`). A dedicated target dir
-  (`target/lihaaf-build/`) avoids thrashing the normal
-  `cargo build` cache, since `RUSTFLAGS` is part of cargo's
-  fingerprint.
+  with `RUSTFLAGS="-C prefer-dynamic"` when `build_targets` is omitted.
+  With `build_targets = ["tests"]`, lihaaf instead runs `cargo build`
+  against the staged suite workspace described above, still using a
+  dedicated suite target dir. The default path remains byte-stable for
+  adopters that do not opt in.
 
 - **File copy primitive**: `std::fs::copy`. It's plain and predictable:
   POSIX semantics on Linux/macOS, `CopyFileW` on Windows. Reflink is

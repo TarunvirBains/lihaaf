@@ -1,4 +1,4 @@
-//! Phase 2 of compat mode (issue #11) — staged overlay manifest generator.
+//! Staged overlay manifest generator for compat mode.
 //!
 //! Reads the upstream `Cargo.toml`, canonicalizes `[lib] crate-type` so the
 //! lihaaf stage-3 dylib build can succeed without mutating the upstream
@@ -19,8 +19,7 @@
 //! Per `docs/compatibility-plan.md` §3.2.3, the overlay is:
 //!
 //! 1. Re-serialized through the existing `toml = "1"` dependency. No
-//!    second TOML crate is introduced (the v0.1 surface forbids
-//!    `toml_edit` — that's a v0.2 conversation).
+//!    second TOML crate is introduced.
 //! 2. Written with table keys in cargo's canonical order: `package`,
 //!    `lib`, `bin`, `dependencies`, `dev-dependencies`,
 //!    `build-dependencies`, `features`, `workspace`, then alphabetical
@@ -43,14 +42,14 @@
 //! `[lib] crate-type` is the only field the overlay modifies. The
 //! semantics:
 //!
-//! | Input                                       | Output                                       |
+//! | Input | Output |
 //! |---------------------------------------------|----------------------------------------------|
-//! | absent                                      | `["dylib", "rlib"]`                          |
-//! | `["rlib"]`                                  | `["dylib", "rlib"]`                          |
-//! | `["dylib"]`                                 | `["dylib", "rlib"]` (rlib appended)          |
-//! | `["dylib", "rlib"]`                         | unchanged                                    |
-//! | `["cdylib"]`                                | `["dylib", "rlib", "cdylib"]`                |
-//! | `["rlib", "staticlib"]`                     | `["dylib", "rlib", "staticlib"]`             |
+//! | absent | `["dylib", "rlib"]` |
+//! | `["rlib"]` | `["dylib", "rlib"]` |
+//! | `["dylib"]` | `["dylib", "rlib"]` (rlib appended) |
+//! | `["dylib", "rlib"]` | unchanged |
+//! | `["cdylib"]` | `["dylib", "rlib", "cdylib"]` |
+//! | `["rlib", "staticlib"]` | `["dylib", "rlib", "staticlib"]` |
 //!
 //! `rlib` is retained on every output shape so the non-lihaaf
 //! `cargo test` baseline (§3.4) keeps working. Other entries
@@ -60,7 +59,7 @@
 //! ## What the overlay does and does NOT touch in `[patch]`
 //!
 //! - `[patch.<registry>.X]` `git`, `branch`, `tag`, `rev` keys — these
-//!   identify a remote source and must pass through verbatim.  The spec
+//!   identify a remote source and must pass through verbatim. The spec
 //!   (§3.2.3 risks section) is explicit that `[patch]` cannot add crate-type
 //!   and the overlay code must not rewrite those fields.
 //! - The `path` sub-key inside a `[patch.<registry>.X]` entry IS rewritten
@@ -80,11 +79,9 @@
 //! `workspace.package`, `workspace.lints`, `workspace.metadata`,
 //! `workspace.resolver`, plus any future `[workspace.*]` cargo adds)
 //! and strip only the MEMBERSHIP keys (`members`, `exclude`,
-//! `default-members`). This is the workspace-identity fix for the
-//! v0.1.0-beta.5 regression on workspace-style pilots (see issue #36)
-//! combined with the R2 follow-up that preserves inheritance for
-//! manifests that use `{ workspace = true }` references (issue #38 /
-//! PR #37 Codex + Gemini panel BLOCK).
+//! `default-members`). This gives the overlay its own cargo workspace
+//! identity while preserving inheritance tables for manifests that use
+//! `{ workspace = true }` references.
 //!
 //! **Why a `[workspace]` table at all (cargo walk-up).** Cargo
 //! determines a manifest's workspace root by walking UP the filesystem
@@ -112,9 +109,9 @@
 //! `[workspace.dependencies]` / `[workspace.package]` / `[workspace.lints]`
 //! tables, any surviving `{ workspace = true }` reference in the
 //! overlay manifest fails cargo's parser with `"workspace inheritance
-//! was specified but [workspace.<X>] was not defined"`. R1
-//! (v0.1.0-beta.6 attempt 1) clobbered these unconditionally and broke
-//! every pilot fork that uses inheritance; R2 preserves them.
+//! was specified but [workspace.<X>] was not defined"`. The overlay
+//! must therefore preserve inheritance tables while dropping only
+//! membership keys.
 //!
 //! **Why ONLY the membership keys are stripped.** If the overlay
 //! claimed the upstream's `members = [...]` (even absolutized to abs
@@ -126,9 +123,9 @@
 //!
 //! **Why unknown `[workspace.X]` tables pass through.** If cargo adds
 //! a new `[workspace.<future>]` table in a later release, a hardcoded
-//! preserve-list would silently drop it. The R2 implementation
-//! preserves anything that is NOT one of the three membership keys, so
-//! the overlay stays forward-compatible with future cargo additions.
+//! preserve-list would silently drop it. The implementation preserves
+//! anything that is NOT one of the three membership keys, so the
+//! overlay stays forward-compatible with future cargo additions.
 //!
 //! **Five branches of the override decision tree.** The
 //! [`override_workspace_inheritance`] function classifies the upstream
@@ -138,43 +135,37 @@
 //!    REJECTED with a directed diagnostic. The ancestor pointer
 //!    declares the manifest as a member of an ancestor workspace; the
 //!    overlay cannot self-declare as a workspace root and a member
-//!    simultaneously. R1 silently stripped the pointer, which strands
-//!    every surviving `{ workspace = true }` reference (the actual
-//!    inheritance tables live in the ancestor). Copying the
-//!    ancestor's tables down is out-of-scope for v0.1.0-beta.6 — see
-//!    "Workspace-member cases are out-of-scope" in the function-level
-//!    docs.
+//!    simultaneously. Silently stripping the pointer would strand every
+//!    surviving `{ workspace = true }` reference because the actual
+//!    inheritance tables live in the ancestor. Without an explicit
+//!    workspace-member entry context, copying the ancestor's tables down
+//!    is out of scope.
 //!
 //! 2. **Implicit workspace member via ancestor `Cargo.toml`**
 //!    (no `[package].workspace`, no local `[workspace]`, AND any
 //!    ancestor `Cargo.toml` on the filesystem walk-up carries
 //!    `[workspace]`): REJECTED with a directed diagnostic naming the
-//!    offending ancestor manifest path. This catches the case Codex
-//!    flagged in PR #37 R3 review: an ancestor workspace carrying
+//!    offending ancestor manifest path. An ancestor workspace carrying
 //!    `[patch.<registry>]` / `[replace]` / `[profile]` / `resolver` /
 //!    `[workspace.dependencies]` would change cargo's baseline
-//!    resolution but the lihaaf overlay (which terminates cargo's
-//!    walk-up at the staged manifest) would resolve against the
-//!    REGISTRY versions of those deps — producing a divergent baseline
-//!    vs. overlay graph and false compat verdicts. The R4 rejection
-//!    runs even when the manifest has NO `{ workspace = true }`
-//!    inheritance references; the ancestor-state divergence applies
-//!    regardless of inheritance usage.
+//!    resolution, but the lihaaf overlay (which terminates cargo's
+//!    walk-up at the staged manifest) would skip that state and produce
+//!    a divergent baseline vs. overlay graph. The rejection runs even
+//!    when the manifest has NO `{ workspace = true }` inheritance
+//!    references; ancestor-state divergence applies regardless of
+//!    inheritance usage.
 //!
 //! 3. **Implicit workspace member via inheritance refs only**
 //!    (no `[package].workspace`, no local `[workspace]`, no ancestor
 //!    workspace detected, BUT one or more `{ workspace = true }`
 //!    inheritance references present in `[package]` / `[dependencies]`
 //!    / `[dev-dependencies]` / `[build-dependencies]` /
-//!    `[target.<cfg>.<deps>]` / `[lints]`): REJECTED. R3 (PR #37
-//!    R3) added this branch — the only way a manifest can carry
-//!    `{ workspace = true }` references is if its workspace root
-//!    lives elsewhere (either an ancestor we DIDN'T detect because
-//!    it has no `Cargo.toml`, or a path-via-non-filesystem-walk that
-//!    cargo somehow resolves). Without rejection the overlay would
-//!    strand these refs at cargo parse time with the cryptic
-//!    "workspace inheritance was specified but `[workspace.X]` was
-//!    not defined" error.
+//!    `[target.<cfg>.<deps>]` / `[lints]`): REJECTED. A manifest can
+//!    carry `{ workspace = true }` references only if its workspace
+//!    root lives elsewhere. Without rejection the overlay would strand
+//!    these refs at cargo parse time with the cryptic "workspace
+//!    inheritance was specified but `[workspace.X]` was not defined"
+//!    error.
 //!
 //! 4. **Workspace-root** (local `[workspace]` table present): the
 //!    overlay CLONES the upstream's `[workspace]` table and strips
@@ -183,10 +174,9 @@
 //!    (`workspace.dependencies`, `workspace.package`, `workspace.lints`,
 //!    `workspace.metadata`, `workspace.resolver`, plus any unknown
 //!    `[workspace.X]` cargo may add in future releases) is preserved
-//!    verbatim. This is the case the four Round-1 pilots (cxx,
-//!    serde-json, anyhow, thiserror) all hit: each invokes lihaaf
-//!    from the upstream ROOT, which carries both `[package]` and
-//!    `[workspace]`.
+//!    verbatim. This is the common workspace-root shape: the adopter
+//!    invokes lihaaf from the upstream ROOT, which carries both
+//!    `[package]` and `[workspace]`.
 //!
 //! 5. **Standalone single-crate** (no local `[workspace]`, no
 //!    inheritance refs, no ancestor workspace): the overlay INJECTS
@@ -195,7 +185,7 @@
 //!    `Cargo.toml` is a single-crate manifest with no workspace
 //!    relationships.
 //!
-//! **R4 ancestor-walk: how it works.** When a manifest has no local
+//! **Ancestor-walk: how it works.** When a manifest has no local
 //! `[workspace]` and no `[package].workspace`, the override walks UP
 //! the filesystem from the manifest's parent directory, checking each
 //! ancestor directory for a `Cargo.toml`. If any ancestor `Cargo.toml`
@@ -222,18 +212,14 @@
 //! correct conservative behavior; a finer-grained check would require
 //! reasoning about cargo's full resolution algorithm against the
 //! ancestor's specific configuration, which is far more complex than
-//! the value it adds for v0.1.0-beta.6.
+//! the value it adds here.
 //!
-//! All four Round-1 pilots (cxx, serde-json, anyhow, thiserror) invoke
-//! lihaaf from the upstream ROOT, which carries `[package]` +
-//! `[workspace]` (case 4, workspace-root) — NOT from a sub-crate — so
-//! none of cases 1, 2, or 3 affects any currently-enrolled pilot. The
-//! ancestor-walk rejection is defense-in-depth for any future user
-//! invoking lihaaf from a workspace-member sub-crate or a crate inside
-//! a parent workspace tree: they get a clean diagnostic instead of a
-//! cryptic cargo parse error OR a silent false compat verdict.
+//! The ancestor-walk rejection is defense-in-depth for users invoking
+//! lihaaf from a workspace-member sub-crate or a crate inside a parent
+//! workspace tree: they get a clean diagnostic instead of a cryptic
+//! cargo parse error OR a silent false compat verdict.
 //!
-//! **Workspace-member entry via `--package` (issue #53).** When the
+//! **Workspace-member entry via `--package`.** When the
 //! adopter supplies `--package <pkg>` and `--compat-root` is a virtual
 //! workspace root (per the v0.1.0 scope; see compat plan §3.2.3), the
 //! resolver ([`resolve_workspace_member_manifest`]) maps `<pkg>` to
@@ -258,17 +244,16 @@
 //! The carry-down ensures the overlay's dependency graph CONVERGES
 //! with baseline cargo's: cargo applies the workspace root's
 //! `[workspace.*]` and `[patch]` tables when building any member, and
-//! the overlay now does the same. v0.1.0 scope is virtual workspaces
-//! only (workspace root declares `[workspace]` without `[package]`);
-//! the package+workspace shape is deferred to v0.2 / v1.0.
+//! the overlay now does the same. The supported workspace-member entry
+//! shape is a virtual workspace root (workspace root declares
+//! `[workspace]` without `[package]`).
 
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 use crate::util;
 
-/// Dual-root vocabulary for compat-mode invocations (issue #53 — see
-/// plan §3.1.bis).
+/// Dual-root vocabulary for compat-mode invocations.
 ///
 /// When the adopter invokes compat mode with `-p <package>` /
 /// `--package <package>`, the consumer roles previously occupied by the
@@ -282,7 +267,7 @@ use crate::util;
 ///
 /// The struct is the resolver's structured output. Every downstream
 /// consumer (per §3.1.bis routing table) reads the explicit role
-/// instead of the legacy `compat_root` / `upstream_manifest`. The
+/// instead of a single `compat_root` / `upstream_manifest`. The
 /// `workspace_member_context` field carries the parsed workspace-root
 /// TOML value (consumed by [`apply_workspace_member_inheritance`] for
 /// the §5.3 carry-down) and the workspace-root manifest path (consumed
@@ -294,8 +279,8 @@ use crate::util;
 /// - `workspace_root == member_root`
 /// - `workspace_root_manifest == member_manifest`
 ///
-/// This is the v0.1-pre-#53 single-root collapse case (single-crate
-/// repos, single-crate roots, `--compat-manifest` overrides).
+/// This is the single-root collapse case (single-crate repos,
+/// single-crate roots, `--compat-manifest` overrides).
 #[derive(Debug, Clone)]
 pub(crate) struct DualRoot {
     /// Workspace-root directory. The dir passed via `--compat-root`. For
@@ -331,7 +316,7 @@ pub(crate) struct DualRoot {
     pub(crate) workspace_member_context: Option<WorkspaceMemberContext>,
 }
 
-/// Carry-down context for the workspace-member entry shape (issue #53 —
+/// Carry-down context for the workspace-member entry shape (workspace-member support —
 /// see plan §5.4). When the materializer is invoked with a populated
 /// `WorkspaceMemberContext`, it (a) skips the implicit-ancestor REJECT
 /// branches of the workspace-inheritance override and (b) carries the
@@ -436,10 +421,9 @@ pub struct SyntheticMetadata {
     pub fixture_dirs: Vec<String>,
     /// `allow_lints` — rustc lints forwarded as `-A <lint>` on every
     /// per-fixture invocation. Defaults to `["unexpected_cfgs"]` in
-    /// compat mode as **forward-only insurance**. Today, with rustc
-    /// 1.95 not passing `--check-cfg` automatically and lihaaf not
-    /// setting it (verified `src/worker.rs:916-919, 929-972`), this
-    /// default is a no-op — the `unexpected_cfgs` lint is
+    /// compat mode as **forward-only insurance**. Today, without
+    /// `--check-cfg` being active, this default is a no-op — the
+    /// `unexpected_cfgs` lint is
     /// `--check-cfg`-gated and does not fire. Once `--check-cfg` is
     /// active in rustc (either by default or by lihaaf passing it
     /// explicitly in a future release), compat pilots would otherwise
@@ -450,8 +434,8 @@ pub struct SyntheticMetadata {
     ///
     /// This default does NOT address the v0.1-active default-on lints
     /// (`unused_imports`, `dead_code`, etc.) that fire under bare
-    /// rustc today. Round-2 compat pilots that hit those add the
-    /// relevant entries to their own fork's
+    /// rustc today. Adopters that hit those add the relevant entries
+    /// to their own fork's
     /// `[package.metadata.lihaaf].allow_lints` via the v0.1 TOML path.
     ///
     /// To override (e.g. add more lints, or empty for diagnostic
@@ -546,7 +530,7 @@ pub fn materialize_overlay_with_metadata(
 }
 
 /// Variant of `materialize_overlay_with_metadata` that ALSO accepts
-/// an optional [`WorkspaceMemberContext`] (issue #53). Used by the
+/// an optional [`WorkspaceMemberContext`] . Used by the
 /// byte-determinism corpus test for the `workspace_member_with_package`
 /// fixture, which exercises the carry-down without injecting synthetic
 /// metadata (the corpus expected files are pre-committed and would
@@ -577,7 +561,7 @@ pub fn materialize_overlay_with_metadata_and_workspace_member_context(
 /// malformed manifests (where the caller decides on a fallback). The
 /// builder may return `None` to skip metadata injection entirely.
 ///
-/// `workspace_member_ctx` (issue #53) — when `Some`, the materializer:
+/// `workspace_member_ctx` — when `Some`, the materializer:
 ///
 /// 1. Suppresses Branches 2 + 3 of [`override_workspace_inheritance`]
 ///    (the implicit-ancestor + inheritance-ref REJECTs — the adopter
@@ -652,7 +636,7 @@ where
     // `[package]` nor `[workspace]`) stays tolerant — that may be a
     // test fixture or a partial manifest the operator is constructing.
     //
-    // Issue #53 — the workspace-member entry shape (axum-macros) is now
+    // the workspace-member entry shape (axum-macros) is now
     // supported via `--package <pkg>`. When the adopter passes
     // `--package`, the resolver finds the member manifest and we don't
     // reach this branch (the materializer is invoked with the member's
@@ -665,8 +649,8 @@ where
             clap_exit_code: 2,
             message: format!(
                 "error: `--compat-root` `{}` is a workspace root (declares `[workspace]` \
-                 without `[package]`); pass `--package <pkg>` to target a specific workspace \
-                 member, or set `--compat-root` to a single-crate Cargo.toml.",
+ without `[package]`); pass `--package <pkg>` to target a specific workspace \
+ member, or set `--compat-root` to a single-crate Cargo.toml.",
                 upstream_manifest_path.display()
             ),
         });
@@ -722,24 +706,23 @@ where
         absolutize_path_bearing_keys(top, &upstream_dir, upstream_manifest_path)?;
 
         // Option H intent-aware self-patch policy for
-        // `[patch.crates-io.<upstream-package-name>]` (issues #40 + #47).
+        // `[patch.crates-io.<upstream-package-name>]` (self-patch policy).
         //
         // - cxx (#47) fails with `package cxx links to the native library
-        //   cxxbridge1, but it conflicts with a previous package which
-        //   links to cxxbridge1 as well` because cxx-test-suite declares
-        //   `cxx = "1.0"` from crates.io while the overlay declares
-        //   `[package] name = "cxx"` from `target/lihaaf-overlay/`: two
-        //   distinct source-ids for the same `links` claim.
+        // cxxbridge1, but it conflicts with a previous package which
+        // links to cxxbridge1 as well` because cxx-test-suite declares
+        // `cxx = "1.0"` from crates.io while the overlay declares
+        // `[package] name = "cxx"` from `target/lihaaf-overlay/`: two
+        // distinct source-ids for the same `links` claim.
         // - serde_json (#40) fails with `specification serde_json is
-        //   ambiguous` for the same root cause without the `links`
-        //   collision detail.
+        // ambiguous` for the same root cause without the `links`
+        // collision detail.
         //
-        // Rule 1 INJECT (clean upstream — anyhow / thiserror / serde_json
-        // / clean Round-2 candidates) emits a `{ path =
-        // "<staged-overlay-dir>" }` entry pointing at the overlay's own
-        // package; cargo collapses both registry-name references to the
-        // staged-overlay path-source-id and the conflict / ambiguity is
-        // gone.
+        // Rule 1 INJECT (clean upstream) emits a
+        // `{ path = "<staged-overlay-dir>" }` entry pointing at the
+        // overlay's own package; cargo collapses both registry-name
+        // references to the staged-overlay path-source-id and the
+        // conflict / ambiguity is gone.
         //
         // Rule 2 REMAP (cxx upstream's `[patch.crates-io.cxx] = { path =
         // "." }`) replaces the upstream's self-patch entry with the same
@@ -751,11 +734,9 @@ where
         // already absolutized them against `upstream_dir`.
         //
         // Rule 4 REJECT (vendored fork / git source / non-root path)
-        // surfaces `Error::CompatPatchOverrideConflict`; the
-        // `--compat-allow-patch-override` escape hatch is deferred to
-        // v0.2 / v1.1.
+        // surfaces `Error::CompatPatchOverrideConflict`.
         //
-        // Issue #53 — apply workspace-member inheritance carry-down
+        // Apply workspace-member inheritance carry-down
         // BEFORE `apply_self_patch_policy`. The carry-down (a) rejects
         // all member-local `[patch.<registry>]` tables per §5.3.bis
         // Step 2 and (b) copies the workspace root's `[workspace.*]`,
@@ -770,7 +751,7 @@ where
         }
 
         // Targets the STAGED OVERLAY DIR (not the upstream dir) to
-        // avoid the R1 self-loop bug: pointing the patch at the upstream
+        // avoid the full clobber self-loop bug: pointing the patch at the upstream
         // dir IS the source-id cargo already aliases to crates.io. See
         // `apply_self_patch_policy` rustdoc and §2.1 / §2.6 of the
         // implementation plan for the cargo-anchoring reasoning. When
@@ -805,7 +786,7 @@ where
         // `members` / `exclude` / `default-members` is harmlessly discarded.
         //
         // REJECTS workspace-member cases EXCEPT when
-        // `workspace_member_ctx` is `Some` (issue #53). When `Some`,
+        // `workspace_member_ctx` is `Some` . When `Some`,
         // Branches 2 + 3 are SUPPRESSED (the adopter named the member
         // explicitly via `--package`; the carry-down has populated the
         // workspace tables); Branch 1 (explicit `[package].workspace =
@@ -846,20 +827,20 @@ where
         util::write_file_atomic(&sibling_path, &serialized)?;
     }
 
-    // Staged package-root mirror (issues #40 + #47, §4.5). After the
+    // Staged package-root mirror (self-patch policy, §4.5). After the
     // overlay manifest is written, populate the staged-overlay dir with
     // a structural mirror of the upstream package root so build scripts
     // can read package-root files via `CARGO_MANIFEST_DIR` / cwd:
     //
     // - cxx `build.rs:143-148` reads `src/cxx.cc` via
-    //   `manifest_dir.join(...)` (hard error without the mirror).
+    // `manifest_dir.join(...)` (hard error without the mirror).
     // - cxx `build.rs:154-159` references `include/cxx.h`.
     // - anyhow `build.rs:255-257,323-367` probes
-    //   `Path::new("src").join("nightly.rs")` from cwd (silent-false
-    //   without the mirror — wrong cfg flags).
+    // `Path::new("src").join("nightly.rs")` from cwd (silent-false
+    // without the mirror — wrong cfg flags).
     // - thiserror `build.rs:261-263,328-371` probes
-    //   `Path::new("build").join("probe.rs")` from cwd (same silent-
-    //   false hazard).
+    // `Path::new("build").join("probe.rs")` from cwd (same silent-
+    // false hazard).
     //
     // Exclusions: `target/` (disposable), `.git/` (must-be-absent),
     // `Cargo.toml` (overlay-generated, post-condition assertion),
@@ -896,8 +877,8 @@ fn read_upstream_crate_name(value: &toml::Value) -> Option<String> {
 ///
 /// Keeping this list as a single source of truth makes the
 /// selective-rewrite intent explicit: an addition to this list strips
-/// more, a removal preserves more. The R1 implementation effectively
-/// listed every workspace key (full clobber); the R2 implementation
+/// more, a removal preserves more. The A full clobber would effectively
+/// listed every workspace key (full clobber); the the selective rewrite
 /// lists only the three keys that actually cause the "wrong workspace"
 /// error.
 const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-members"];
@@ -909,10 +890,10 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// **What this does (in order — five mutually-exclusive branches):**
 ///
 /// 1. **Explicit member.** If the upstream has `[package].workspace =
-///    "<ancestor>"`, REJECT with a directed diagnostic. The overlay
+/// "<ancestor>"`, REJECT with a directed diagnostic. The overlay
 ///    cannot self-declare as a workspace root and an explicit member
 ///    of another workspace simultaneously.
-/// 2. **Implicit member via ancestor workspace (R4).** If the
+/// 2. **Implicit member via ancestor workspace (ancestor-workspace rejection).** If the
 ///    upstream has NO local `[workspace]` and an ancestor `Cargo.toml`
 ///    on the filesystem walk-up carries `[workspace]`, REJECT with a
 ///    directed diagnostic naming the offending ancestor manifest path.
@@ -923,7 +904,7 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 ///    skips the ancestor entirely, producing a divergent dependency
 ///    graph and false compat verdicts. See module-level docs for the
 ///    "conservative reject any ancestor workspace" rationale.
-/// 3. **Implicit member via inheritance refs only (R3).** If the
+/// 3. **Implicit member via inheritance refs only (inheritance-reference rejection).** If the
 ///    upstream has NO local `[workspace]`, NO ancestor workspace
 ///    detected on the walk-up, BUT any `{ workspace = true }`
 ///    inheritance reference is present, REJECT with a directed
@@ -948,22 +929,22 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// the upstream `Cargo.toml` first, which declares `[workspace]`. The
 /// overlay's package isn't in the upstream's `members`, so cargo errors
 /// with `package <X>/Cargo.toml is a member of the wrong workspace`.
-/// See issue #36 for the v0.1.0-beta.5 GitHub Actions run that surfaced
+/// See workspace-identity case for the GitHub Actions run that surfaced
 /// this on every workspace-style pilot.
 ///
-/// **Why we don't simply clobber (the R1 failure mode).** Cargo's
+/// **Why we don't simply clobber (the full clobber failure mode).** Cargo's
 /// workspace-inheritance feature lets a manifest write
 /// `[dependencies] foo = { workspace = true }` and inherit the actual
 /// dep spec from `[workspace.dependencies.foo]`. The same pattern
 /// applies to `[package].version.workspace = true` (from
 /// `[workspace.package]`), `[lints].rust.workspace = true` (from
 /// `[workspace.lints]`), and all dep tables (`dev-dependencies`,
-/// `build-dependencies`, `target.<cfg>.dependencies`). R1 replaced
+/// `build-dependencies`, `target.<cfg>.dependencies`). full clobber replaced
 /// `[workspace]` with an empty table — which is correct for the
 /// `members` problem but wrong because surviving `{ workspace = true }`
 /// references in `[dependencies]` / `[package]` / `[lints]` then fail
 /// cargo's parser with "workspace inheritance was specified but
-/// `[workspace.<X>]` was not defined". This R2 implementation
+/// `[workspace.<X>]` was not defined". This the selective rewrite
 /// preserves the inheritance tables.
 ///
 /// **Workspace-member cases are out of scope (explicit AND implicit).**
@@ -977,13 +958,13 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// `[workspace.lints]` tables live in the ancestor — to preserve the
 /// inheritance references we would need to read that ancestor and
 /// copy the tables down into the overlay. That cross-manifest read is
-/// out-of-scope for v0.1.0-beta.6; we reject all three cases with
-/// directed diagnostics instead. None of the four Round-1 pilots
+/// out of scope; we reject all three cases with
+/// directed diagnostics instead. None of the four workspace-root pilots
 /// (cxx, serde-json, anyhow, thiserror) invokes lihaaf from a
 /// workspace member — they all invoke from upstream ROOT (which
 /// carries both `[package]` and `[workspace]`, the workspace-root
 /// case) — so none of the rejections affect any currently-enrolled
-/// pilot. The R3 + R4 rejections are defense-in-depth for any future
+/// pilot. The inheritance-reference and ancestor-workspace rejections are defense-in-depth for any future
 /// invocation from a workspace sub-crate. The follow-up to enable
 /// workspace-member overlays (copying ancestor inheritance tables
 /// down) will land separately.
@@ -991,7 +972,7 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 /// **Why this runs LAST.** The earlier `absolutize_path_bearing_keys`
 /// pass has already rewritten `[workspace.dependencies.X].path`,
 /// `[workspace.package]` fields (if any path-bearing), and the
-/// membership arrays. Since R2 preserves the inheritance tables, the
+/// membership arrays. Since selective rewrite preserves the inheritance tables, the
 /// earlier absolutization is now LOAD-BEARING — the preserved
 /// `[workspace.dependencies.X].path` is consumed by cargo to resolve
 /// `{ workspace = true }` references from `[dependencies]`. The
@@ -1000,7 +981,7 @@ const WORKSPACE_MEMBERSHIP_KEYS: &[&str] = &["members", "exclude", "default-memb
 ///
 /// Idempotent: a second call on already-overridden output is a no-op
 /// (the membership keys are already absent and `[package].workspace`
-/// is absent). The R4 ancestor walk re-reads the filesystem on each
+/// is absent). The ancestor walk re-reads the filesystem on each
 /// call but never mutates it; the walk's result is the same on a
 /// second invocation.
 ///
@@ -1019,19 +1000,18 @@ fn override_workspace_inheritance(
     workspace_member_ctx: Option<&WorkspaceMemberContext>,
 ) -> Result<(), Error> {
     // 1. Reject the EXPLICIT workspace-member case. A package
-    //    declaring itself as a member of an ancestor workspace
-    //    (`[package].workspace = "<path>"`) cannot simultaneously be
-    //    declared as a workspace root — and copying the ancestor's
-    //    inheritance tables into the overlay is out-of-scope for
-    //    v0.1.0-beta.6 (see function-level docs above for the full
-    //    rationale).
+    // declaring itself as a member of an ancestor workspace
+    // (`[package].workspace = "<path>"`) cannot simultaneously be
+    // declared as a workspace root — and copying the ancestor's
+    // inheritance tables into the overlay is out of scope for this
+    // path (see function-level docs above for the rationale).
     //
-    //    Issue #53: Branch 1 STILL fires even when
-    //    `workspace_member_ctx.is_some()`. An explicit
-    //    `[package].workspace = "<path>"` is incompatible with the
-    //    resolver-determined workspace — the adopter named the member
-    //    via `--package`, but the member itself declares an explicit
-    //    membership pointer elsewhere. Surface the conflict.
+    // Branch 1 STILL fires even when
+    // `workspace_member_ctx.is_some()`. An explicit
+    // `[package].workspace = "<path>"` is incompatible with the
+    // resolver-determined workspace — the adopter named the member
+    // via `--package`, but the member itself declares an explicit
+    // membership pointer elsewhere. Surface the conflict.
     if let Some(toml::Value::Table(pkg)) = top.get("package")
         && pkg.contains_key("workspace")
     {
@@ -1039,16 +1019,16 @@ fn override_workspace_inheritance(
             clap_exit_code: 2,
             message: format!(
                 "error: `--compat-root` `{}` is a workspace member: \
-                 `[package].workspace = \"...\"` declares membership in \
-                 an ancestor workspace, which compat mode cannot reach. \
-                 Compat mode currently supports only single-crate \
-                 manifests and workspace-root manifests (where \
-                 `[workspace]` lives in the same Cargo.toml). \
-                 Pass the workspace-ROOT Cargo.toml as `--compat-root` \
-                 instead; it will still resolve `{{ workspace = true }}` \
-                 references in its own manifest because \
-                 `[workspace.dependencies]` / `[workspace.package]` / \
-                 `[workspace.lints]` are preserved in the staged overlay.",
+ `[package].workspace = \"...\"` declares membership in \
+ an ancestor workspace, which compat mode cannot reach. \
+ Compat mode currently supports only single-crate \
+ manifests and workspace-root manifests (where \
+ `[workspace]` lives in the same Cargo.toml). \
+ Pass the workspace-ROOT Cargo.toml as `--compat-root` \
+ instead; it will still resolve `{{ workspace = true }}` \
+ references in its own manifest because \
+ `[workspace.dependencies]` / `[workspace.package]` / \
+ `[workspace.lints]` are preserved in the staged overlay.",
                 upstream_manifest_path.display()
             ),
         });
@@ -1057,19 +1037,18 @@ fn override_workspace_inheritance(
     let has_local_workspace = top.get("workspace").is_some_and(|v| v.is_table());
 
     // 2. Reject the IMPLICIT workspace-member case via ancestor
-    //    `Cargo.toml` walk-up (R4 — Codex BLOCK fixup in PR #37 R3
-    //    review). If the manifest has no local `[workspace]` table
-    //    AND any ancestor `Cargo.toml` on the filesystem walk-up
-    //    carries `[workspace]`, REJECT.
+    // `Cargo.toml` walk-up. If the manifest has no local `[workspace]` table
+    // AND any ancestor `Cargo.toml` on the filesystem walk-up
+    // carries `[workspace]`, REJECT.
     //
-    //    Issue #53 — when `workspace_member_ctx.is_some()`, this
-    //    Branch is SUPPRESSED. The adopter named the member
-    //    explicitly via `--package <pkg>`; `apply_workspace_member_inheritance`
-    //    has already carried the ancestor workspace's tables down
-    //    into the overlay (so the "divergent dependency graph"
-    //    hypothesis is closed). The augmented diagnostic when ctx
-    //    IS None and the implicit case fires now suggests
-    //    `--package` so the adopter gets an actionable fix.
+    // when `workspace_member_ctx.is_some()`, this
+    // Branch is SUPPRESSED. The adopter named the member
+    // explicitly via `--package <pkg>`; `apply_workspace_member_inheritance`
+    // has already carried the ancestor workspace's tables down
+    // into the overlay (so the "divergent dependency graph"
+    // hypothesis is closed). The augmented diagnostic when ctx
+    // IS None and the implicit case fires now suggests
+    // `--package` so the adopter gets an actionable fix.
     if workspace_member_ctx.is_none()
         && !has_local_workspace
         && let Some(ancestor_manifest) = detect_implicit_ancestor_workspace(upstream_manifest_path)?
@@ -1078,22 +1057,22 @@ fn override_workspace_inheritance(
             clap_exit_code: 2,
             message: format!(
                 "error: `--compat-root` `{}` is an implicit workspace member: \
-                 it has no local `[workspace]` table but an ancestor manifest \
-                 at `{}` carries `[workspace]`. Pass the workspace ROOT \
-                 (`{}` or its containing directory) as `--compat-root` AND \
-                 target this specific member with `--package <pkg-name>`, \
-                 where `<pkg-name>` is the value of the member's \
-                 `[package].name`. Cargo's baseline build walks up the \
-                 filesystem and would apply the ancestor's `[patch]` / \
-                 `[replace]` / `[profile]` / `resolver` / \
-                 `[workspace.dependencies]` tables during dependency \
-                 resolution; without `--package`, the lihaaf overlay \
-                 terminates cargo's walk-up at the staged manifest and \
-                 produces a divergent dependency graph between baseline \
-                 and overlay — and therefore false compat verdicts. \
-                 `--package` enables compat mode to carry the workspace \
-                 root's tables down into the staged overlay so the \
-                 dependency graphs converge.",
+ it has no local `[workspace]` table but an ancestor manifest \
+ at `{}` carries `[workspace]`. Pass the workspace ROOT \
+ (`{}` or its containing directory) as `--compat-root` AND \
+ target this specific member with `--package <pkg-name>`, \
+ where `<pkg-name>` is the value of the member's \
+ `[package].name`. Cargo's baseline build walks up the \
+ filesystem and would apply the ancestor's `[patch]` / \
+ `[replace]` / `[profile]` / `resolver` / \
+ `[workspace.dependencies]` tables during dependency \
+ resolution; without `--package`, the lihaaf overlay \
+ terminates cargo's walk-up at the staged manifest and \
+ produces a divergent dependency graph between baseline \
+ and overlay — and therefore false compat verdicts. \
+ `--package` enables compat mode to carry the workspace \
+ root's tables down into the staged overlay so the \
+ dependency graphs converge.",
                 upstream_manifest_path.display(),
                 ancestor_manifest.display(),
                 ancestor_manifest.display(),
@@ -1102,18 +1081,18 @@ fn override_workspace_inheritance(
     }
 
     // 3. Reject the IMPLICIT workspace-member case via inheritance
-    //    references only (R3 fixup). If the manifest has no local
-    //    `[workspace]` table but contains any `{ workspace = true }`
-    //    inheritance reference, it is a workspace member whose
-    //    membership is declared in an ancestor `Cargo.toml`'s
-    //    `members = [...]` array. The R4 ancestor-walk above
-    //    catches the common case where the ancestor exists as a
-    //    parseable `Cargo.toml`; this branch catches the residual
-    //    case where the ancestor is unreachable on the walk-up.
+    // references only. If the manifest has no local `[workspace]`
+    // table but contains any `{ workspace = true }`
+    // inheritance reference, it is a workspace member whose
+    // membership is declared in an ancestor `Cargo.toml`'s
+    // `members = [...]` array. The ancestor-walk above
+    // catches the common case where the ancestor exists as a
+    // parseable `Cargo.toml`; this branch catches the residual
+    // case where the ancestor is unreachable on the walk-up.
     //
-    //    Issue #53 — when `workspace_member_ctx.is_some()`, this
-    //    Branch is SUPPRESSED. The carry-down has populated the
-    //    workspace tables; inheritance references resolve cleanly.
+    // when `workspace_member_ctx.is_some()`, this
+    // Branch is SUPPRESSED. The carry-down has populated the
+    // workspace tables; inheritance references resolve cleanly.
     if workspace_member_ctx.is_none()
         && !has_local_workspace
         && manifest_has_inheritance_reference(top, upstream_manifest_path)?
@@ -1122,28 +1101,28 @@ fn override_workspace_inheritance(
             clap_exit_code: 2,
             message: format!(
                 "error: `--compat-root` `{}` is an implicit workspace member: \
-                 it has no local `[workspace]` table but uses workspace \
-                 inheritance (one or more `{{ workspace = true }}` \
-                 references in `[package]` / `[dependencies]` / \
-                 `[dev-dependencies]` / `[build-dependencies]` / \
-                 `[target.<cfg>.<deps>]` / `[lints]`). Cargo discovers \
-                 the ancestor workspace by walking up the filesystem, \
-                 but compat mode cannot reach into that ancestor to \
-                 copy down the `[workspace.dependencies]` / \
-                 `[workspace.package]` / `[workspace.lints]` tables \
-                 the inheritance references resolve against. \
-                 Pass the workspace-ROOT Cargo.toml as `--compat-root` \
-                 AND target this member with `--package <pkg-name>`; \
-                 the carry-down then populates the workspace tables.",
+ it has no local `[workspace]` table but uses workspace \
+ inheritance (one or more `{{ workspace = true }}` \
+ references in `[package]` / `[dependencies]` / \
+ `[dev-dependencies]` / `[build-dependencies]` / \
+ `[target.<cfg>.<deps>]` / `[lints]`). Cargo discovers \
+ the ancestor workspace by walking up the filesystem, \
+ but compat mode cannot reach into that ancestor to \
+ copy down the `[workspace.dependencies]` / \
+ `[workspace.package]` / `[workspace.lints]` tables \
+ the inheritance references resolve against. \
+ Pass the workspace-ROOT Cargo.toml as `--compat-root` \
+ AND target this member with `--package <pkg-name>`; \
+ the carry-down then populates the workspace tables.",
                 upstream_manifest_path.display()
             ),
         });
     }
 
     // 4. Build the overlay's `[workspace]` table. If the upstream
-    //    had one, clone it and strip ONLY the membership keys.
-    //    Otherwise inject an empty table so cargo treats the overlay
-    //    as its own workspace root (terminating the walk-up).
+    // had one, clone it and strip ONLY the membership keys.
+    // Otherwise inject an empty table so cargo treats the overlay
+    // as its own workspace root (terminating the walk-up).
     let mut new_workspace = if let Some(toml::Value::Table(existing)) = top.get("workspace") {
         let mut cloned = existing.clone();
         for key in WORKSPACE_MEMBERSHIP_KEYS {
@@ -1155,8 +1134,8 @@ fn override_workspace_inheritance(
     };
 
     // 5. Idempotency / belt-and-braces: if a future pass re-introduces
-    //    one of the membership keys, this re-strips. Cheap; preserves
-    //    the documented idempotency contract.
+    // one of the membership keys, this re-strips. Cheap; preserves
+    // the documented idempotency contract.
     for key in WORKSPACE_MEMBERSHIP_KEYS {
         new_workspace.remove(*key);
     }
@@ -1234,7 +1213,7 @@ fn detect_implicit_ancestor_workspace(
                         // the user did not author.
                         eprintln!(
                             "lihaaf: warning: skipping ancestor Cargo.toml `{}` during \
-                             workspace detection: TOML parse error: {}",
+ workspace detection: TOML parse error: {}",
                             candidate.display(),
                             e
                         );
@@ -1296,7 +1275,7 @@ fn detect_implicit_ancestor_workspace(
 /// entry is the boolean `true`. We only need to check for that
 /// shape; the parser handles both surface syntaxes uniformly.
 ///
-/// # Errors (issue #53 FOLLOWUP-A)
+/// # Errors (workspace-member support non-table rejection)
 ///
 /// Returns `Err(Error::TomlParse)` when a dep-style key
 /// (`dependencies`, `dev-dependencies`, `build-dependencies`,
@@ -1320,7 +1299,7 @@ fn manifest_has_inheritance_reference(
     // Helper: scan every entry of a dep-style table (the value at
     // each key is a per-dep table) for an inheritance reference.
     //
-    // **Non-table rejection (issue #53 FOLLOWUP-A).** A
+    // **Non-table rejection (workspace-member support non-table rejection).** A
     // present-but-non-table dep section (`dependencies = "oops"`) is
     // malformed cargo grammar. Previously this returned `false`
     // (silent absence); now it returns a `TomlParse` error naming
@@ -1342,15 +1321,15 @@ fn manifest_has_inheritance_reference(
     };
 
     // 1. `[package].<key>` — every sub-key of `[package]`. We scan
-    //    all sub-keys (not just the cargo-documented inheritable
-    //    fields) so a future cargo addition does not silently bypass
-    //    the rejection.
+    // all sub-keys (not just the cargo-documented inheritable
+    // fields) so a future cargo addition does not silently bypass
+    // the rejection.
     //
-    //    Skip the `workspace` sub-key itself: `[package].workspace`
-    //    is the EXPLICIT workspace-member pointer, not an inheritance
-    //    reference. (It is a String pointing at the ancestor dir,
-    //    not a Table containing `workspace = true`.) The explicit
-    //    case is handled upstream of this helper.
+    // Skip the `workspace` sub-key itself: `[package].workspace`
+    // is the EXPLICIT workspace-member pointer, not an inheritance
+    // reference. (It is a String pointing at the ancestor dir,
+    // not a Table containing `workspace = true`.) The explicit
+    // case is handled upstream of this helper.
     if let Some(toml::Value::Table(pkg)) = top.get("package") {
         for (k, v) in pkg.iter() {
             if k == "workspace" {
@@ -1370,10 +1349,10 @@ fn manifest_has_inheritance_reference(
     }
 
     // 3. Platform-conditional `[target.<cfg>.<deps>]`. The shape is
-    //    a table-of-tables: each cfg key maps to a table that may
-    //    contain `dependencies` / `dev-dependencies` /
-    //    `build-dependencies` sub-tables. A cfg-value that is not a
-    //    table is malformed and reported via the helper.
+    // a table-of-tables: each cfg key maps to a table that may
+    // contain `dependencies` / `dev-dependencies` /
+    // `build-dependencies` sub-tables. A cfg-value that is not a
+    // table is malformed and reported via the helper.
     if let Some(toml::Value::Table(targets)) = top.get("target") {
         for (cfg_name, cfg_value) in targets.iter() {
             let Some(cfg_table) = cfg_value.as_table() else {
@@ -1394,14 +1373,14 @@ fn manifest_has_inheritance_reference(
     }
 
     // 4. `[lints]`. The cargo-recognized form is `[lints]
-    //    workspace = true` (top-level `workspace` key). We also
-    //    defensively scan one level deeper (`[lints.rust].workspace`,
-    //    `[lints.clippy].workspace`, etc.) for forward-compat: if
-    //    cargo adds per-namespace inheritance, the existing form will
-    //    keep being detected here.
+    // workspace = true` (top-level `workspace` key). We also
+    // defensively scan one level deeper (`[lints.rust].workspace`,
+    // `[lints.clippy].workspace`, etc.) for forward-compat: if
+    // cargo adds per-namespace inheritance, the existing form will
+    // keep being detected here.
     //
-    //    **Non-table rejection (issue #53 FOLLOWUP-A).** `[lints]`
-    //    present-but-not-table → error.
+    // **Non-table rejection (workspace-member support non-table rejection).** `[lints]`
+    // present-but-not-table → error.
     if let Some(lints_value) = top.get("lints") {
         let toml::Value::Table(lints) = lints_value else {
             return Err(Error::TomlParse {
@@ -1427,7 +1406,7 @@ fn manifest_has_inheritance_reference(
 }
 
 /// Resolve `<workspace_root>/Cargo.toml` + `<package_name>` to the
-/// member's manifest path (issue #53 — see plan §4).
+/// member's manifest path (see plan §4).
 ///
 /// Reads the workspace root's `[workspace.members]` array, expands
 /// globs against the workspace-root directory, subtracts
@@ -1452,14 +1431,14 @@ fn manifest_has_inheritance_reference(
 ///    the same string-or-glob rules as step 5 and subtracted from the
 ///    effective member set before scanning.
 /// 5. Iterate `members` (after exclude subtraction). For each entry:
-///    - Classify as literal, single-segment glob, single-segment-with-
-///      slash glob (`crates/*`), or explicit nested literal
-///      (`crates/foo`).
-///    - REJECT `**` deep globs, glob-in-non-final-segment, absolute
-///      paths, parent traversal (`..`).
-///    - Trailing-slash normalization (`axum-macros/` ≡ `axum-macros`).
-///    - For a glob entry, enumerate the parent directory and match
-///      the LAST segment against the pattern.
+/// - Classify as literal, single-segment glob, single-segment-with-
+///   slash glob (`crates/*`), or explicit nested literal
+///   (`crates/foo`).
+/// - REJECT `**` deep globs, glob-in-non-final-segment, absolute
+///   paths, parent traversal (`..`).
+/// - Trailing-slash normalization (`axum-macros/` ≡ `axum-macros`).
+/// - For a glob entry, enumerate the parent directory and match
+///   the LAST segment against the pattern.
 /// 6. Read each candidate's `Cargo.toml`, find `[package].name`.
 ///    Workspace-inheritance note: `[package].name` is NOT inheritable
 ///    in cargo, so the literal field value is trusted (no recursion
@@ -1534,10 +1513,10 @@ pub fn resolve_workspace_member_manifest(
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` requires `--compat-root` to point at a \
-                 workspace root (a `Cargo.toml` declaring `[workspace]` without `[package]`); \
-                 `{}` does not match this shape. Either drop `--package` and point `--compat-root` \
-                 directly at the member's `Cargo.toml`, or fix `--compat-root` to the \
-                 workspace-root directory.",
+ workspace root (a `Cargo.toml` declaring `[workspace]` without `[package]`); \
+ `{}` does not match this shape. Either drop `--package` and point `--compat-root` \
+ directly at the member's `Cargo.toml`, or fix `--compat-root` to the \
+ workspace-root directory.",
                 workspace_root_manifest.display()
             ),
         });
@@ -1558,9 +1537,9 @@ pub fn resolve_workspace_member_manifest(
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: `{}` has `[workspace]` but no \
-                 `[workspace.members]` array; cannot resolve `{package_name}`. Add the package \
-                 to `[workspace.members]` or pass the member's manifest path directly via \
-                 `--compat-manifest`.",
+ `[workspace.members]` array; cannot resolve `{package_name}`. Add the package \
+ to `[workspace.members]` or pass the member's manifest path directly via \
+ `--compat-manifest`.",
                 workspace_root_manifest.display()
             ),
         });
@@ -1577,7 +1556,7 @@ pub fn resolve_workspace_member_manifest(
     // same rules as step 5. Path normalization (trailing slash,
     // forward-slash form) matches the candidate paths.
     //
-    // **Path-key normalization (issue #53 BLOCK-1).** Every PathBuf
+    // **Path-key normalization (workspace-member support case 1).** Every PathBuf
     // inserted into `exclude_dirs` is lexically normalized via
     // [`lexical_normalize_pathbuf`] so that `./pkg-a`, `pkg-a/`,
     // `pkg-a/.`, and `pkg-a` all key the same set entry. The match
@@ -1616,7 +1595,7 @@ pub fn resolve_workspace_member_manifest(
     // Step 5 + 8 — iterate members, expand, deduplicate by
     // canonicalized directory path.
     //
-    // **Path-key normalization (issue #53 BLOCK-1).** Every candidate
+    // **Path-key normalization (workspace-member support case 1).** Every candidate
     // PathBuf is lexically normalized via [`lexical_normalize_pathbuf`]
     // before insertion / exclude lookup, so that overlapping shapes
     // (`pkg-a`, `./pkg-a`, `pkg-a/`, `pkg-a/.`) all collapse to ONE
@@ -1630,7 +1609,7 @@ pub fn resolve_workspace_member_manifest(
                 path: workspace_root_manifest.to_path_buf(),
                 message: format!(
                     "`[workspace.members]` element is not a string; `--package <{package_name}>` \
-                     resolver requires every member entry to be a path or glob string"
+ resolver requires every member entry to be a path or glob string"
                 ),
             });
         };
@@ -1717,10 +1696,10 @@ pub fn resolve_workspace_member_manifest(
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: no member of workspace `{}` has \
-                 `[package].name = \"{package_name}\"`. Members scanned: [{}]. Confirm \
-                 `{package_name}` exists in `[workspace.members]` and its `Cargo.toml` declares \
-                 the expected package name (if `{package_name}` is also in `[workspace.exclude]`, \
-                 it was subtracted before scanning).",
+ `[package].name = \"{package_name}\"`. Members scanned: [{}]. Confirm \
+ `{package_name}` exists in `[workspace.members]` and its `Cargo.toml` declares \
+ the expected package name (if `{package_name}` is also in `[workspace.exclude]`, \
+ it was subtracted before scanning).",
                 workspace_root_manifest.display(),
                 scanned_member_names.join(", "),
             ),
@@ -1730,8 +1709,8 @@ pub fn resolve_workspace_member_manifest(
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: multiple workspace members claim \
-                 `[package].name = \"{package_name}\"`: [{}]. Workspace package names must be \
-                 unique. Inspect each manifest and resolve the duplicate.",
+ `[package].name = \"{package_name}\"`: [{}]. Workspace package names must be \
+ unique. Inspect each manifest and resolve the duplicate.",
                 matches
                     .iter()
                     .map(|p| p.display().to_string())
@@ -1743,7 +1722,7 @@ pub fn resolve_workspace_member_manifest(
 }
 
 /// Validate a single `[workspace.members]` / `[workspace.exclude]`
-/// entry shape (issue #53 — see plan §4.3 step 5). REJECT shapes:
+/// entry shape (see plan §4.3 step 5). REJECT shapes:
 ///
 /// - Deep glob `**` (any segment containing `**`). Cargo does not
 ///   support `**` in workspace-members.
@@ -1765,8 +1744,8 @@ fn validate_workspace_member_entry(entry: &str, package_name: &str) -> Result<()
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
-                 is absolute; `[workspace.members]` entries are workspace-relative paths only. \
-                 Use a relative path."
+ is absolute; `[workspace.members]` entries are workspace-relative paths only. \
+ Use a relative path."
             ),
         });
     }
@@ -1777,8 +1756,8 @@ fn validate_workspace_member_entry(entry: &str, package_name: &str) -> Result<()
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
-                 uses `**` (deep glob); cargo does not support `**` in `[workspace.members]`. \
-                 Use `*` (single-segment glob) or an explicit literal path instead."
+ uses `**` (deep glob); cargo does not support `**` in `[workspace.members]`. \
+ Use `*` (single-segment glob) or an explicit literal path instead."
             ),
         });
     }
@@ -1789,8 +1768,8 @@ fn validate_workspace_member_entry(entry: &str, package_name: &str) -> Result<()
             clap_exit_code: 2,
             message: format!(
                 "error: `--package <{package_name}>` resolver: workspace member entry `{entry}` \
-                 uses `..` (parent traversal); members must be descendants of the workspace root. \
-                 Use a relative path within the workspace."
+ uses `..` (parent traversal); members must be descendants of the workspace root. \
+ Use a relative path within the workspace."
             ),
         });
     }
@@ -1806,9 +1785,9 @@ fn validate_workspace_member_entry(entry: &str, package_name: &str) -> Result<()
                     clap_exit_code: 2,
                     message: format!(
                         "error: `--package <{package_name}>` resolver: workspace member entry \
-                         `{entry}` uses a glob in a non-final path segment; only the LAST segment \
-                         may contain glob metachars (`*`, `?`, `[...]`). Use a literal parent \
-                         path or split into multiple entries."
+ `{entry}` uses a glob in a non-final path segment; only the LAST segment \
+ may contain glob metachars (`*`, `?`, `[...]`). Use a literal parent \
+ path or split into multiple entries."
                     ),
                 });
             }
@@ -1843,7 +1822,7 @@ fn expand_workspace_member_entry(
     workspace_root_dir: &Path,
     package_name: &str,
 ) -> Result<Vec<PathBuf>, Error> {
-    // **Segment filter (issue #53 BLOCK-1).** Strip both empty segments
+    // **Segment filter (workspace-member support case 1).** Strip both empty segments
     // (`"a//b"`) AND `Component::CurDir` segments (`"./a"`, `"a/./b"`)
     // at the SOURCE — the segment vector then carries only meaningful
     // path components. This is symmetric with [`lexical_normalize_pathbuf`]'s
@@ -1939,7 +1918,7 @@ fn expand_workspace_member_entry(
 /// `[workspace.package]`, `[workspace.lints]`, `[workspace.metadata]`,
 /// `[workspace.resolver]`, `[replace]`, and `[profile.*]` tables down
 /// into the staged overlay's matching top-level / `[workspace.*]`
-/// tables (issue #53 — see plan §5.3 / §5.3.bis).
+/// tables (see plan §5.3 / §5.3.bis).
 ///
 /// `[patch.<registry>]` carry-down is NOT handled by this function —
 /// it is the concern of the Option H 4-rule policy implemented in
@@ -1988,7 +1967,7 @@ fn apply_workspace_member_inheritance(
     // have failed cargo's own baseline load anyway; we surface the
     // directed diagnostic eagerly.
     //
-    // **Non-table rejection (issue #53 FOLLOWUP-B).** The previous
+    // **Non-table rejection (workspace-member support member-local patch rejection).** The previous
     // chain `top.get("patch").and_then(|p| p.get("crates-io")).and_then(|c| c.as_table())`
     // silently skipped when `[patch]` or `[patch.crates-io]` were
     // present-but-not-table, BYPASSING the intended member-local
@@ -1998,7 +1977,7 @@ fn apply_workspace_member_inheritance(
     // 2802 / 2814) so member-local non-table maps to the same hard-
     // reject as workspace-root non-table.
     //
-    // **Multi-registry rejection (issue #53 BLOCK-3).** The previous
+    // **Multi-registry rejection (workspace-member support case 3).** The previous
     // check only inspected `[patch.crates-io]`; a member-local
     // `[patch.my-vendor]` (or any other registry key) slipped through
     // silently and would have been incorporated by the workspace-root
@@ -2027,9 +2006,9 @@ fn apply_workspace_member_inheritance(
                     clap_exit_code: 2,
                     message: format!(
                         "error: `--package` resolver: workspace member `{}` declares \
-                         `[patch.{registry}]`; cargo does not permit `[patch]` in workspace \
-                         members (only the workspace root). Move the patch entries to the \
-                         workspace root's `[patch.{registry}]` or remove them.",
+ `[patch.{registry}]`; cargo does not permit `[patch]` in workspace \
+ members (only the workspace root). Move the patch entries to the \
+ workspace root's `[patch.{registry}]` or remove them.",
                         member_manifest.display()
                     ),
                 });
@@ -2096,7 +2075,7 @@ fn apply_workspace_member_inheritance(
             // `[workspace.dependencies]` — absolutize `.path` keys
             // against `workspace_root_dir`.
             //
-            // **Non-table rejection (issue #53 BLOCK-2).** When the
+            // **Non-table rejection (workspace-member support case 2).** When the
             // key is PRESENT but the value is NOT a table, that is a
             // malformed cargo workspace root (cargo itself would
             // reject it). Surfacing as a `TomlParse` error is correct;
@@ -2132,7 +2111,7 @@ fn apply_workspace_member_inheritance(
             // `[workspace.package]` — absolutize `readme` and
             // `license-file` path keys; carry the rest verbatim.
             //
-            // **Non-table rejection (issue #53 BLOCK-2).** Same
+            // **Non-table rejection (workspace-member support case 2).** Same
             // pattern as `[workspace.dependencies]`: present-but-not-
             // a-table is a malformed workspace root and must be
             // rejected, not silently skipped.
@@ -2181,7 +2160,7 @@ fn apply_workspace_member_inheritance(
         return Err(Error::TomlParse {
             path: member_manifest.to_path_buf(),
             message: "member manifest's `[workspace]` is not a table; cannot carry down \
-                      workspace-root inheritance"
+ workspace-root inheritance"
                 .to_string(),
         });
     }
@@ -2189,7 +2168,7 @@ fn apply_workspace_member_inheritance(
     // Carry `[replace]` from the workspace root (absolutize `.path`
     // keys against workspace_root_dir).
     //
-    // **Non-table rejection (issue #53 BLOCK-2).** When `[replace]`
+    // **Non-table rejection (workspace-member support case 2).** When `[replace]`
     // is PRESENT but not a table, that is malformed cargo grammar.
     // Surface as `TomlParse`; silently skipping would discard a real
     // `[replace]` table the operator intended to carry.
@@ -2223,7 +2202,7 @@ fn apply_workspace_member_inheritance(
     // Carry `[profile.*]` from the workspace root — profile keys have
     // no path values, so verbatim copy is correct.
     //
-    // **Non-table rejection (issue #53 BLOCK-2).** Same pattern:
+    // **Non-table rejection (workspace-member support case 2).** Same pattern:
     // `[profile]` present but non-table is malformed and must error.
     if let Some(profile_value) = ws_root_top.get("profile") {
         let toml::Value::Table(ws_profile) = profile_value else {
@@ -2256,7 +2235,7 @@ fn apply_workspace_member_inheritance(
 /// `extern_crates` is an array of strings, `fixture_dirs` is an array of
 /// strings. These match the v0.1 [`crate::config::RawMetadata`] schema.
 ///
-/// # Errors (issue #53 FOLLOWUP-A)
+/// # Errors (workspace-member support non-table rejection)
 ///
 /// Returns `Err(Error::TomlParse)` when `[package]` or
 /// `[package.metadata]` is PRESENT in `top` but NOT a table.
@@ -2417,7 +2396,7 @@ fn absolutize_path_bearing_keys(
     // any `path = "..."` sub-key of an inline-table or explicit-table
     // dependency.
     //
-    // **Non-table rejection (issue #53 FOLLOWUP-A).** A
+    // **Non-table rejection (workspace-member support non-table rejection).** A
     // present-but-non-table dep section (`dependencies = "oops"`) is
     // malformed cargo grammar; previously the closure silently
     // skipped, masking user error. Surface as `TomlParse` naming the
@@ -2448,11 +2427,11 @@ fn absolutize_path_bearing_keys(
     };
 
     // 1. `[lib] path`. The `[lib]` table is guaranteed to exist by the
-    //    caller (`canonicalize_crate_type` ran before us and inserted
-    //    the table if absent), so this is an unconditional rewrite.
-    //    If `path` is unset, inject the conventional
-    //    `<upstream>/src/lib.rs` so cargo doesn't auto-discover against
-    //    the empty staged dir.
+    // caller (`canonicalize_crate_type` ran before us and inserted
+    // the table if absent), so this is an unconditional rewrite.
+    // If `path` is unset, inject the conventional
+    // `<upstream>/src/lib.rs` so cargo doesn't auto-discover against
+    // the empty staged dir.
     if let Some(toml::Value::Table(lib)) = top.get_mut("lib") {
         let needs_inject = !lib.contains_key("path");
         if needs_inject {
@@ -2470,11 +2449,11 @@ fn absolutize_path_bearing_keys(
     }
 
     // 2. `[package] build`. Cargo auto-discovers
-    //    `<manifest_dir>/build.rs` when this key is unset — which would
-    //    miss the upstream build script. We inject only when
-    //    `<upstream>/build.rs` exists, so this is a no-op on most
-    //    pilots (none of cxx / serde-json / anyhow / thiserror carry a
-    //    build script for the macro crate itself).
+    // `<manifest_dir>/build.rs` when this key is unset — which would
+    // miss the upstream build script. We inject only when
+    // `<upstream>/build.rs` exists, so this is a no-op on most
+    // pilots (none of cxx / serde-json / anyhow / thiserror carry a
+    // build script for the macro crate itself).
     let upstream_build_rs = upstream_dir.join("build.rs");
     if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
         if pkg.contains_key("build") {
@@ -2488,25 +2467,25 @@ fn absolutize_path_bearing_keys(
     }
 
     // 3. Explicit `path = "..."` on every `[[bin]]` / `[[example]]` /
-    //    `[[test]]` / `[[bench]]` entry. Auto-discovery is disabled
-    //    below, but explicit entries still need their paths fixed up.
+    // `[[test]]` / `[[bench]]` entry. Auto-discovery is disabled
+    // below, but explicit entries still need their paths fixed up.
     absolutize_array_table_paths(top, "bin", upstream_dir);
     absolutize_array_table_paths(top, "example", upstream_dir);
     absolutize_array_table_paths(top, "test", upstream_dir);
     absolutize_array_table_paths(top, "bench", upstream_dir);
 
     // 4. Disable auto-discovery for non-lib targets. The staged overlay's
-    //    parent dir now contains symlinks to upstream top-level entries
-    //    (§4.5 staged-mirror), so auto-discovery would surface upstream
-    //    targets and produce spurious build artifacts. Making the overlay's
-    //    "lib-only" intent explicit also guards against future cargo
-    //    versions that might change auto-discovery semantics.
+    // parent dir now contains symlinks to upstream top-level entries
+    // (§4.5 staged-mirror), so auto-discovery would surface upstream
+    // targets and produce spurious build artifacts. Making the overlay's
+    // "lib-only" intent explicit also guards against future cargo
+    // versions that might change auto-discovery semantics.
     //
-    //    We unconditionally write `false` regardless of any pre-existing
-    //    value — the overlay's target surface is the lib only, by
-    //    construction. The autolib flag is intentionally NOT set because
-    //    we explicitly set `[lib] path`, which already overrides auto-
-    //    discovery for the lib target.
+    // We unconditionally write `false` regardless of any pre-existing
+    // value — the overlay's target surface is the lib only, by
+    // construction. The autolib flag is intentionally NOT set because
+    // we explicitly set `[lib] path`, which already overrides auto-
+    // discovery for the lib target.
     if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
         pkg.insert("autobins".to_string(), toml::Value::Boolean(false));
         pkg.insert("autoexamples".to_string(), toml::Value::Boolean(false));
@@ -2515,20 +2494,20 @@ fn absolutize_path_bearing_keys(
     }
 
     // 5. `path = "..."` inside `[dependencies]`, `[dev-dependencies]`,
-    //    `[build-dependencies]`. Path-deps are how workspace-style
-    //    pilots (cxx's `cxx-build`/`cxx-gen`/etc, thiserror's
-    //    `thiserror-impl = { path = "impl" }`) reference sibling
-    //    crates; without absolutization the overlay would point cargo
-    //    at non-existent dirs under `target/lihaaf-overlay/`.
+    // `[build-dependencies]`. Path-deps are how workspace-style
+    // pilots (cxx's `cxx-build`/`cxx-gen`/etc, thiserror's
+    // `thiserror-impl = { path = "impl" }`) reference sibling
+    // crates; without absolutization the overlay would point cargo
+    // at non-existent dirs under `target/lihaaf-overlay/`.
     absolutize_deps_paths(top, "dependencies", "[", upstream_dir, manifest_path)?;
     absolutize_deps_paths(top, "dev-dependencies", "[", upstream_dir, manifest_path)?;
     absolutize_deps_paths(top, "build-dependencies", "[", upstream_dir, manifest_path)?;
 
     // 6. Same for the platform-conditional `[target.<cfg>.dependencies]`
-    //    family. `target` is a table-of-tables; each inner table has
-    //    its own `dependencies` / `dev-dependencies` / `build-dependencies`
-    //    sub-tables. A cfg-value that is not a table is malformed and
-    //    rejected (FOLLOWUP-A).
+    // family. `target` is a table-of-tables; each inner table has
+    // its own `dependencies` / `dev-dependencies` / `build-dependencies`
+    // sub-tables. A cfg-value that is not a table is malformed and
+    // rejected (non-table rejection).
     if let Some(toml::Value::Table(targets)) = top.get_mut("target") {
         for (cfg_name, cfg_value) in targets.iter_mut() {
             let toml::Value::Table(cfg_table) = cfg_value else {
@@ -2565,16 +2544,16 @@ fn absolutize_path_bearing_keys(
     }
 
     // 7. `[workspace] members` / `[workspace] exclude`. These are
-    //    string arrays; each entry is a glob or a sub-directory name
-    //    relative to the manifest dir. Absolutize each so cargo can
-    //    locate workspace members from the staged manifest.
+    // string arrays; each entry is a glob or a sub-directory name
+    // relative to the manifest dir. Absolutize each so cargo can
+    // locate workspace members from the staged manifest.
     //
-    //    **Lexical normalization (issue #53 BLOCK-1).** Each joined
-    //    absolutized path is lexically normalized via
-    //    [`lexical_normalize_pathbuf`] so `./pkg-a`, `pkg-a/.`, and
-    //    trailing-slash forms emit a CANONICAL absolute path string in
-    //    the overlay. This keeps overlay byte-shape deterministic
-    //    across equivalent input forms.
+    // **Lexical normalization (workspace-member support case 1).** Each joined
+    // absolutized path is lexically normalized via
+    // [`lexical_normalize_pathbuf`] so `./pkg-a`, `pkg-a/.`, and
+    // trailing-slash forms emit a CANONICAL absolute path string in
+    // the overlay. This keeps overlay byte-shape deterministic
+    // across equivalent input forms.
     if let Some(toml::Value::Table(ws)) = top.get_mut("workspace") {
         for key in ["members", "exclude"] {
             if let Some(toml::Value::Array(arr)) = ws.get_mut(key) {
@@ -2593,7 +2572,7 @@ fn absolutize_path_bearing_keys(
         }
 
         // 7b. `[workspace].default-members` — another string array, same
-        //     absolutization + lexical-normalize semantics as `members`.
+        // absolutization + lexical-normalize semantics as `members`.
         if let Some(toml::Value::Array(arr)) = ws.get_mut("default-members") {
             for entry in arr.iter_mut() {
                 if let toml::Value::String(s) = entry {
@@ -2609,9 +2588,9 @@ fn absolutize_path_bearing_keys(
         }
 
         // 7c. `[workspace.dependencies.<name>].path` — workspace-inherited
-        //     dependency paths.  These have the same shape as the top-level
-        //     `[dependencies.X] path` entries handled by `absolutize_deps_paths`,
-        //     but live one table level deeper inside `[workspace]`.
+        // dependency paths. These have the same shape as the top-level
+        // `[dependencies.X] path` entries handled by `absolutize_deps_paths`,
+        // but live one table level deeper inside `[workspace]`.
         absolutize_deps_paths(
             ws,
             "dependencies",
@@ -2621,33 +2600,33 @@ fn absolutize_path_bearing_keys(
         )?;
     }
 
-    // 8. `[package].workspace` — explicit workspace root pointer.  A single
-    //    path string; the member crate declares `[package] workspace = "../"` to
-    //    point at its containing workspace.  Absolutize so cargo can resolve the
-    //    workspace root from the staged manifest dir.
+    // 8. `[package].workspace` — explicit workspace root pointer. A single
+    // path string; the member crate declares `[package] workspace = "../"` to
+    // point at its containing workspace. Absolutize so cargo can resolve the
+    // workspace root from the staged manifest dir.
     if let Some(toml::Value::Table(pkg)) = top.get_mut("package") {
         absolutize_string_at(pkg, "workspace", upstream_dir);
     }
 
-    // 9. `[patch.<registry>.X].path` — path-form patch overrides.  For
-    //    example, cxx carries `cxx = { path = "." }` and
-    //    `cxx-build = { path = "gen/build" }` in `[patch.crates-io]`.
-    //    After staging the overlay two dirs deeper, those relative paths
-    //    would resolve against the staged manifest dir and either form a
-    //    self-reference (`path = "."`) or point at a nonexistent dir.
-    //    Only the `path` sub-key is rewritten; `git`, `branch`, `tag`, and
-    //    `rev` pass through verbatim per spec §3.2.3.
+    // 9. `[patch.<registry>.X].path` — path-form patch overrides. For
+    // example, cxx carries `cxx = { path = "." }` and
+    // `cxx-build = { path = "gen/build" }` in `[patch.crates-io]`.
+    // After staging the overlay two dirs deeper, those relative paths
+    // would resolve against the staged manifest dir and either form a
+    // self-reference (`path = "."`) or point at a nonexistent dir.
+    // Only the `path` sub-key is rewritten; `git`, `branch`, `tag`, and
+    // `rev` pass through verbatim per spec §3.2.3.
     absolutize_patch_paths(top, upstream_dir, manifest_path)?;
 
     // 10. `[replace."<source-id>"].path` — the older replacement form
-    //     (`[patch]` superseded it but `[replace]` is still valid cargo
-    //     grammar).  The structure is a flat table where each key is a
-    //     source-id string (`"<package_name>:<version>"`) and the value is
-    //     a table possibly containing a `path` sub-key.  Without
-    //     absolutization, a relative `path = "vendor/cxx"` entry would
-    //     resolve against the staged manifest dir — the same failure mode
-    //     `[patch]` had (Round-2 FIX class C). Only `path` is rewritten;
-    //     `git`, `branch`, `tag`, and `rev` pass through verbatim.
+    // (`[patch]` superseded it but `[replace]` is still valid cargo
+    // grammar). The structure is a flat table where each key is a
+    // source-id string (`"<package_name>:<version>"`) and the value is
+    // a table possibly containing a `path` sub-key. Without
+    // absolutization, a relative `path = "vendor/cxx"` entry would
+    // resolve against the staged manifest dir — the same failure mode
+    // `[patch]` had (self-patch path rewrite). Only `path` is rewritten;
+    // `git`, `branch`, `tag`, and `rev` pass through verbatim.
     absolutize_replace_paths(top, upstream_dir, manifest_path)?;
 
     Ok(())
@@ -2658,15 +2637,15 @@ fn absolutize_path_bearing_keys(
 ///
 /// `[patch]` is a table-of-registries: each registry key (e.g. `crates-io`)
 /// maps to a table of crate overrides, and each override may carry a `path`
-/// sub-key.  This function walks all registries and all overrides, absolutizing
-/// only the `path` key.  All other sub-keys (`git`, `branch`, `tag`, `rev`, …)
+/// sub-key. This function walks all registries and all overrides, absolutizing
+/// only the `path` key. All other sub-keys (`git`, `branch`, `tag`, `rev`, …)
 /// are passed through verbatim — this is intentional and matches the spec
 /// §3.2.3 promise that `[patch]` remote-source fields are never rewritten.
 ///
 /// Registry-agnostic: the same walk covers `[patch.crates-io]`,
 /// `[patch.https://my-registry.example.com/]`, or any other registry key.
 ///
-/// # Errors (issue #53 FOLLOWUP-A)
+/// # Errors (workspace-member support non-table rejection)
 ///
 /// Returns `Err(Error::TomlParse)` when `[patch]` is PRESENT in `top`
 /// but NOT a table. Previously the function silently returned,
@@ -2723,14 +2702,14 @@ fn absolutize_patch_paths(
 ///
 /// Structure: `[replace]` is a flat table where each key is a source-id
 /// string (`"<package_name>:<version>"`, e.g. `"cxx:0.3.0"`) and the value
-/// is a table possibly containing a `path` sub-key.  Only `path` is
+/// is a table possibly containing a `path` sub-key. Only `path` is
 /// rewritten; `git`, `branch`, `tag`, and `rev` pass through verbatim (same
 /// policy as `[patch]`).
 ///
 /// This is intentionally a mirror of [`absolutize_patch_paths`] for the
 /// simpler (one-level-deep) `[replace]` structure.
 ///
-/// # Errors (issue #53 FOLLOWUP-A)
+/// # Errors (workspace-member support non-table rejection)
 ///
 /// Returns `Err(Error::TomlParse)` when `[replace]` is PRESENT in
 /// `top` but NOT a table. Previously the function silently returned,
@@ -2785,7 +2764,7 @@ fn absolutize_replace_paths(
 /// not collapsed — collapsing `..` would change semantics on a
 /// filesystem with symlinks, and lihaaf is explicit about NOT calling
 /// `canonicalize()` here (see [`crate::compat::overlay`] module docs
-/// and issue #40/#47 plan §6.11). Symlinked-equivalent paths compare
+/// and self-patch policy plan §6.11). Symlinked-equivalent paths compare
 /// lexically unequal.
 ///
 /// Tests in this module pin the supported equivalences:
@@ -2804,7 +2783,7 @@ fn lexical_path_normalize_path(p: &Path) -> Vec<std::path::Component<'_>> {
 /// `PathBuf` from the filtered component vector, suitable for use as a
 /// `BTreeMap` / `BTreeSet` key or for `PathBuf == PathBuf` comparison.
 ///
-/// **Why this exists (issue #53 post-review BLOCK-1).** The `--package`
+/// **Why this exists (workspace-member support post-review case 1).** The `--package`
 /// resolver and overlay path absolutization compare and deduplicate
 /// `[workspace.members]` / `[workspace.exclude]` / `[workspace.default-members]`
 /// path strings by raw `PathBuf` form. Without lexical normalization,
@@ -2843,7 +2822,7 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 /// `self` is the upstream's `[package].name`, captured by
 /// [`read_upstream_crate_name`] before this function runs.
 ///
-/// **Why this exists (issue #40 / #47).** The staged overlay manifest
+/// **Why this exists (self-patch policy).** The staged overlay manifest
 /// at `<upstream>/target/lihaaf-overlay/Cargo.toml` declares
 /// `[package].name = "<self>"` with the upstream's version. From
 /// cargo's POV the staged-overlay package lives at a path-source-id
@@ -2852,8 +2831,8 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 /// same crate-name+version pair and fails with either:
 ///
 /// - `package <X> links to the native library <L>, but it conflicts
-///   with a previous package which links to <L> as well` (cxx-shape,
-///   issue #47; fires when any path-dep / workspace member references
+/// with a previous package which links to <L> as well` (cxx-shape,
+///   self-patch policy; fires when any path-dep / workspace member references
 ///   `<self>` by registry-name AND `<self>` declares `links = "<L>"`),
 ///   OR
 /// - `error: specification <X> is ambiguous` (serde-json-shape, issue
@@ -2874,7 +2853,7 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 ///
 /// **Rule 1 (INJECT)** — `[patch.crates-io.<self>]` is absent. Insert
 /// `{ path = "<absolutized staged-overlay-dir>" }`. Pilots:
-/// anyhow / thiserror / serde-json / clean Round-2 candidates.
+/// anyhow / thiserror / serde-json / clean workspace-root candidates.
 ///
 /// **Rule 2 (REMAP)** — `[patch.crates-io.<self>]` is present with a
 /// `.path` key and NO `git`/`branch`/`tag`/`rev`, AND the resolved
@@ -2898,9 +2877,7 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 /// (vendored fork), (b) `git`/`branch`/`tag`/`rev` keys present
 /// (registry-name aliased to git source), or (c) both `.path` and
 /// `git`/etc. Return [`Error::CompatPatchOverrideConflict`]; the
-/// overlay materialization fails fast. The
-/// `--compat-allow-patch-override` escape hatch is deferred to v0.2 /
-/// v1.1.
+/// overlay materialization fails fast.
 ///
 /// # Why REMAP over PRESERVE-AS-IS
 ///
@@ -2930,7 +2907,7 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 /// `/abs/path` on Unix (the prefix wins) so the join is correct
 /// regardless of whether the value is pre-absolutized.
 ///
-/// # Workspace-member case (issue #53)
+/// # Workspace-member case
 ///
 /// When `workspace_member_ctx` is `Some`, ALL `[patch.<registry>]` subtables
 /// come from the WORKSPACE ROOT (per §5.3.bis composition order: root-first,
@@ -2945,18 +2922,18 @@ fn lexical_normalize_pathbuf(p: &Path) -> PathBuf {
 ///    table here would already have errored).
 /// 3. Runs the simplified workspace-member dispatch on the merged
 ///    table:
-///    - Self-entry absent → Rule 1 INJECT (synthetic self-patch).
-///    - Self-entry with `.path` (no git keys) → Rule 2 REMAP
-///      unconditionally (the workspace-root declared a self-patch
-///      intent; we honor by re-anchoring to overlay-root form
-///      regardless of whether the original path resolves to upstream
-///      root).
-///    - Self-entry with git/branch/tag/rev keys → Rule 4 REJECT
-///      (vendored fork / git source; deferred to v0.2 / v1.1).
+/// - Self-entry absent → Rule 1 INJECT (synthetic self-patch).
+/// - Self-entry with `.path` (no git keys) → Rule 2 REMAP
+///   unconditionally (the workspace-root declared a self-patch
+///   intent; we honor by re-anchoring to overlay-root form
+///   regardless of whether the original path resolves to upstream
+///   root).
+/// - Self-entry with git/branch/tag/rev keys → Rule 4 REJECT
+///   (vendored fork / git source).
 ///
 /// When `workspace_member_ctx` is `None`, the function behaves
-/// exactly as on pre-#53 main (the single-root case): Rule 2 fires
-/// only when the path resolves lexically to `upstream_dir`.
+/// exactly as in the single-root case: Rule 2 fires only when the path
+/// resolves lexically to `upstream_dir`.
 ///
 /// # Errors
 ///
@@ -3004,7 +2981,7 @@ fn apply_self_patch_policy(
         });
     };
 
-    // Step 4.5 — Issue #53 workspace-member case: merge the
+    // Step 4.5 — workspace-member case: merge the
     // workspace-root's `[patch]` registries into the overlay's table
     // BEFORE the 4-rule dispatch (per §5.3.bis Step 1 composition
     // order). This runs FIRST so the `crates_io` long-lived borrow
@@ -3017,7 +2994,7 @@ fn apply_self_patch_policy(
     // workspace-root table are absolutized against `workspace_root_dir`
     // (NOT against `upstream_dir`/`member_root`).
     //
-    // **Non-table rejection (issue #53 BLOCK-2).** Each layer of the
+    // **Non-table rejection (workspace-member support case 2).** Each layer of the
     // workspace-root patch table (`[patch]` and each
     // `[patch.<registry>]`) is validated to be a TABLE when present.
     // Silently skipping the carry-down on a non-table value would
@@ -3025,7 +3002,7 @@ fn apply_self_patch_policy(
     // Errors carry the workspace-root manifest path so the operator
     // can locate the file.
     //
-    // **Multi-registry carry-down (issue #53 COUNTER_SIGNAL).** ALL
+    // **Multi-registry carry-down (workspace-member support multi-registry carry-down).** ALL
     // `[patch.<registry>]` subtables are carried down, not just
     // `[patch.crates-io]`. Adopters using a vendored registry alias
     // (e.g. `[patch.my-vendor]`) get the same carry-down semantics as
@@ -3073,7 +3050,7 @@ fn apply_self_patch_policy(
                         path: ctx.workspace_root_manifest.clone(),
                         message: format!(
                             "workspace-root `[patch.{registry}]` must be a table; found a \
-                             non-table value"
+ non-table value"
                         ),
                     });
                 };
@@ -3119,7 +3096,7 @@ fn apply_self_patch_policy(
                         // overlay-side registry value. Replace with
                         // an empty table to honor the carry-down
                         // intent (member-local non-table is already
-                        // rejected by FOLLOWUP-B).
+                        // rejected by member-local patch rejection).
                         *other = toml::Value::Table(toml::map::Map::new());
                         match other {
                             toml::Value::Table(t) => t,
@@ -3172,20 +3149,20 @@ fn apply_self_patch_policy(
             // between the single-root and workspace-member cases:
             //
             // - Single-root (workspace_member_ctx is None): the
-            //   joined-and-lexical-normalized path MUST equal the
-            //   upstream manifest dir (the pre-#53 condition). This
-            //   keeps the rule narrow for the standalone case where
-            //   the upstream's intent is unambiguously "patch myself
-            //   to my own root".
+            // joined-and-lexical-normalized path MUST equal the
+            // upstream manifest dir (the pre-#53 condition). This
+            // keeps the rule narrow for the standalone case where
+            // the upstream's intent is unambiguously "patch myself
+            // to my own root".
             //
             // - Workspace-member (workspace_member_ctx is Some): Rule
-            //   2 fires unconditionally on any `.path` entry. Per
-            //   §5.3.bis Step 3, the workspace-root's intent to self-
-            //   patch the member is honored by re-anchoring to the
-            //   overlay-root form regardless of where the original
-            //   path pointed. The workspace-root's self-patch was
-            //   declared with the member's overlay-target intent;
-            //   #53 honors it.
+            // 2 fires unconditionally on any `.path` entry. Per
+            // §5.3.bis Step 3, the workspace-root's intent to self-
+            // patch the member is honored by re-anchoring to the
+            // overlay-root form regardless of where the original
+            // path pointed. The workspace-root's self-patch was
+            // declared with the member's overlay-target intent;
+            // #53 honors it.
             if let Some(path_raw) = path_raw
                 && !any_git_keys
             {
@@ -3222,13 +3199,12 @@ fn apply_self_patch_policy(
                 upstream_entry: format!("{:?}", toml::Value::Table(existing_entry)),
                 expected_resolution: format!(
                     "lihaaf would inject [patch.crates-io.{self_name}] = \
-                     {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT) \
-                     or remap an upstream self-patch to that path (Rule 2 \
-                     REMAP), but the upstream's existing entry declares an \
-                     external target (vendored fork, git source, or non-root \
-                     path). To opt into overwriting, use \
-                     --compat-allow-patch-override (deferred to v0.2 / v1.1; \
-                     see issues #40 + #47 for tracking)."
+ {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT) \
+ or remap an upstream self-patch to that path (Rule 2 \
+ REMAP), but the upstream's existing entry declares an \
+ external target (vendored fork, git source, or non-root \
+ path). This combination is not currently supported; \
+ open an issue with the manifest shape if you need it."
                 ),
             })
         }
@@ -3240,9 +3216,9 @@ fn apply_self_patch_policy(
             upstream_entry: format!("{other:?}"),
             expected_resolution: format!(
                 "lihaaf would inject [patch.crates-io.{self_name}] = \
-                 {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT), \
-                 but the upstream's existing entry is not a table — cargo \
-                 requires `[patch.crates-io.<X>] = {{ ... }}`."
+ {{ path = \"{staged_overlay_abs}\" }} (Rule 1 INJECT), \
+ but the upstream's existing entry is not a table — cargo \
+ requires `[patch.crates-io.<X>] = {{ ... }}`."
             ),
         }),
     }
@@ -3288,7 +3264,7 @@ const MIRROR_MUST_REMOVE_IF_PRESENT: &[&str] = &[".git", "Cargo.lock"];
 /// `<upstream>/`, create a symlink (or copy under fallback) at the
 /// matching path under `<staged-overlay>/`.
 ///
-/// # Why this exists (issue #40 / #47, §4.5)
+/// # Why this exists (self-patch policy, §4.5)
 ///
 /// When cargo builds the overlay package via `cargo rustc
 /// --manifest-path <staged-overlay>/Cargo.toml`, it sets
@@ -3298,7 +3274,7 @@ const MIRROR_MUST_REMOVE_IF_PRESENT: &[&str] = &[".git", "Cargo.lock"];
 ///
 /// - `cxx build.rs`: reads `src/cxx.cc` via `manifest_dir.join(...)`
 ///   and references `include/cxx.h` — hard error (`No such file or
-///   directory`) if the staged dir is empty.
+/// directory`) if the staged dir is empty.
 /// - `anyhow build.rs`: probes `Path::new("src").join("nightly.rs")`
 ///   from cwd — silent-false (returns `false` and disables nightly
 ///   cfg) if missing.
@@ -3335,8 +3311,8 @@ const MIRROR_MUST_REMOVE_IF_PRESENT: &[&str] = &[".git", "Cargo.lock"];
 /// - CASE 5: real file in staged vs file in upstream → remove + create
 ///   canonical symlink (symlink mode) or byte-check (copy mode).
 /// - CASE 6: real directory in staged vs dir in upstream → remove tree
-///   + create canonical symlink (symlink mode) or exact-sync copy
-///     (copy mode — MUST remove destination-only files).
+/// + create canonical symlink (symlink mode) or exact-sync copy
+///   (copy mode — MUST remove destination-only files).
 /// - CASE 7: type mismatch (file ↔ dir) → remove + create canonical
 ///   with current type.
 /// - CASE 8: manual placement at a mirror-eligible path → replace
@@ -3795,7 +3771,7 @@ pub(crate) fn canonicalize_crate_type(
                             path: PathBuf::from("<overlay>"),
                             message: format!(
                                 "`[lib] crate-type` element at index {idx} is not a string; \
-                                 the overlay accepts only string crate-type entries"
+ the overlay accepts only string crate-type entries"
                             ),
                         });
                     }
@@ -4314,7 +4290,7 @@ mod tests {
 
     #[test]
     fn post_process_strips_trailing_whitespace() {
-        let raw = "foo = 1  \nbar = 2\t\n";
+        let raw = "foo = 1 \nbar = 2\t\n";
         let out = post_process_output(raw);
         assert!(out.lines().all(|l| !l.ends_with(' ') && !l.ends_with('\t')));
     }
@@ -4602,7 +4578,7 @@ version = "0.1.0"
         assert!(
             !pkg.contains_key("build"),
             "build key must not be injected when no upstream build.rs exists; \
-             got pkg keys {:?}",
+ got pkg keys {:?}",
             pkg.keys().collect::<Vec<_>>()
         );
     }
@@ -4639,7 +4615,7 @@ version = "0.1.0"
                 val,
                 Some(false),
                 "[package] {key} must be `false` to disable cargo auto-discovery; \
-                 got {val:?}",
+ got {val:?}",
             );
         }
     }
@@ -4698,12 +4674,12 @@ version = "0.1.0"
         }
     }
 
-    // ── FIX class B unit tests ──────────────────────────────────────────────
+    // ── package workspace path unit tests ──────────────────────────────────
 
     /// **`[package].workspace` explicit pointer is absolutized.**
     ///
     /// A member crate may declare `[package] workspace = "../"` to name its
-    /// containing workspace root explicitly.  Without absolutization the
+    /// containing workspace root explicitly. Without absolutization the
     /// staged overlay would carry a relative pointer that cargo resolves
     /// against the staged manifest dir — two dirs deeper than the crate root.
     #[test]
@@ -4740,7 +4716,7 @@ version = "0.1.0"
     /// **`[workspace].default-members` array entries are absolutized.**
     ///
     /// `default-members` is an array of paths (strings), parallel to
-    /// `members` and `exclude`.  The existing `members`/`exclude` rewrite
+    /// `members` and `exclude`. The existing `members`/`exclude` rewrite
     /// was already tested; this test pins the extension to `default-members`.
     #[test]
     fn absolutizes_workspace_default_members() {
@@ -4841,14 +4817,14 @@ version = "0.1.0"
         );
     }
 
-    // ── FIX class C unit tests ──────────────────────────────────────────────
+    // ── patch path unit tests ───────────────────────────────────────────────
 
     /// **`[patch.<registry>.X].path` entries are absolutized.**
     ///
     /// Mirrors the cxx pilot shape: `[patch.crates-io] cxx = { path = "." }`
-    /// and `cxx-build = { path = "gen/build" }`.  After staging the overlay
+    /// and `cxx-build = { path = "gen/build" }`. After staging the overlay
     /// two dirs deeper, those relative paths would resolve against the staged
-    /// manifest dir and fail.  The absolutizer must rewrite `path` but leave
+    /// manifest dir and fail. The absolutizer must rewrite `path` but leave
     /// `git`, `branch`, `tag`, and `rev` untouched.
     #[test]
     fn absolutizes_patch_registry_path() {
@@ -4903,7 +4879,7 @@ version = "0.1.0"
         assert_eq!(
             cxx_path, "/work/cxx/.",
             "[patch.crates-io.cxx].path absolutized via Path::join preserves the `.`; \
-             cargo treats `/work/cxx/.` as equivalent to `/work/cxx`; got `{cxx_path}`"
+ cargo treats `/work/cxx/.` as equivalent to `/work/cxx`; got `{cxx_path}`"
         );
 
         // cxx-build path = "gen/build" → "/work/cxx/gen/build"
@@ -4981,7 +4957,7 @@ version = "0.1.0"
         );
     }
 
-    // ── FIX class IV unit tests ─────────────────────────────────────────────
+    // ── replace path unit tests ─────────────────────────────────────────────
 
     /// **`[replace."<source-id>"].path` entries are absolutized.**
     ///
@@ -4990,7 +4966,7 @@ version = "0.1.0"
     /// (`"<name>:<version>"`) rather than crate names under a registry table.
     /// Without absolutization, a `path = "vendor/cxx"` entry would resolve
     /// against the staged manifest dir after overlay materialization — the
-    /// same failure mode `[patch]` had before Round-2 FIX class C.
+    /// same failure mode `[patch]` had before self-patch path rewrite.
     ///
     /// This test would fail if `absolutize_replace_paths` were removed from
     /// `absolutize_path_bearing_keys`.
@@ -5078,7 +5054,7 @@ version = "0.1.0"
         );
     }
 
-    // ── R2 (PR #37 fixup) unit tests for `override_workspace_inheritance` ────
+    // ── selective rewrite  unit tests for `override_workspace_inheritance` ────
 
     /// Test helper: a non-existent upstream path used only to populate
     /// the error-diagnostic string. The override function never reads
@@ -5088,9 +5064,9 @@ version = "0.1.0"
         std::path::PathBuf::from("/tmp/lihaaf-test-upstream/Cargo.toml")
     }
 
-    /// **R2 invariant: only membership keys are stripped from `[workspace]`.**
+    /// **selective rewrite invariant: only membership keys are stripped from `[workspace]`.**
     ///
-    /// R1 replaced the entire `[workspace]` table with `{}`. R2
+    /// full clobber replaced the entire `[workspace]` table with `{}`. selective rewrite
     /// preserves every key EXCEPT `members`, `exclude`,
     /// `default-members`. This test exercises the full preserve-list:
     /// `dependencies`, `package`, `lints`, `metadata`, `resolver`.
@@ -5113,7 +5089,7 @@ version = "0.1.0"
         );
         ws.insert("resolver".to_string(), toml::Value::String("2".into()));
 
-        // `[workspace.dependencies]` — the key R1 stranded for
+        // `[workspace.dependencies]` — the key full clobber stranded for
         // `{ workspace = true }` references.
         let mut ws_deps = toml::map::Map::new();
         let mut shared = toml::map::Map::new();
@@ -5223,7 +5199,7 @@ version = "0.1.0"
         );
     }
 
-    /// **R2 invariant: missing `[workspace]` injects an empty one.**
+    /// **selective rewrite invariant: missing `[workspace]` injects an empty one.**
     ///
     /// For single-crate forks the upstream `Cargo.toml` may have no
     /// `[workspace]` declaration of its own. The overlay still needs
@@ -5249,17 +5225,17 @@ version = "0.1.0"
         );
     }
 
-    /// **R2 invariant: EXPLICIT workspace-member case is REJECTED.**
+    /// **selective rewrite invariant: EXPLICIT workspace-member case is REJECTED.**
     ///
     /// `[package].workspace = "<path>"` declares the manifest as a
     /// member of an ANCESTOR workspace. Copying the ancestor's
-    /// inheritance tables into the overlay is out-of-scope for
-    /// v0.1.0-beta.6, so the manifest is rejected with a directed
+    /// inheritance tables into the overlay is out of scope for this
+    /// path, so the manifest is rejected with a directed
     /// diagnostic instead of being silently overlayed (with stripped
-    /// inheritance) or silently emptied (R1's behavior, which stranded
+    /// inheritance) or silently emptied (full clobber's behavior, which stranded
     /// `{ workspace = true }` references).
     ///
-    /// **R3 tightening (PR #37, strict-swe Finding 1):** the
+    /// **Inheritance-reference rejection tightening:** the
     /// rejection MUST surface as `Error::Cli { clap_exit_code: 2,
     /// message }`, not as a different `Error` variant that happens
     /// to have a Debug repr containing "workspace member". A loose
@@ -5310,7 +5286,7 @@ version = "0.1.0"
         }
     }
 
-    /// **R3 invariant: IMPLICIT workspace-member case is REJECTED.**
+    /// **inheritance-reference rejection invariant: IMPLICIT workspace-member case is REJECTED.**
     ///
     /// When the upstream manifest has NO local `[workspace]` table
     /// but DOES carry any `{ workspace = true }` inheritance
@@ -5321,7 +5297,7 @@ version = "0.1.0"
     /// this rejection, the overlay would inject `[workspace] = {}`
     /// and strand the inheritance reference at cargo parse time
     /// ("workspace inheritance was specified but `[workspace.X]` was
-    /// not defined"). R3 (PR #37 Codex + Gemini BLOCK fixup) extends
+    /// not defined"). inheritance-reference rejection  extends
     /// the rejection to this case so the user gets a clean directed
     /// diagnostic instead of a cryptic cargo error.
     ///
@@ -5332,12 +5308,12 @@ version = "0.1.0"
     /// families) is exercised by
     /// `manifest_has_inheritance_reference_*` below.
     ///
-    /// **Test environment caveat**: like the R4 standalone-allows
+    /// **Test environment caveat**: like the ancestor-workspace rejection standalone-allows
     /// test, this assertion depends on no `Cargo.toml` existing
     /// along the filesystem walk-up from
     /// `/tmp/lihaaf-test-upstream/Cargo.toml` (i.e., no
     /// `/tmp/Cargo.toml` or `/Cargo.toml` declaring `[workspace]`
-    /// on the runner). If such a file exists, R4's ancestor-walk
+    /// on the runner). If such a file exists, ancestor-workspace rejection's ancestor-walk
     /// branch (`detect_implicit_ancestor_workspace`) fires before
     /// this rejection branch and produces a diagnostic naming the
     /// ancestor path instead of the "implicit workspace member"
@@ -5402,10 +5378,10 @@ version = "0.1.0"
         }
     }
 
-    /// **R4 invariant: IMPLICIT workspace-member case via ancestor
+    /// **ancestor-workspace rejection invariant: IMPLICIT workspace-member case via ancestor
     /// `Cargo.toml` is REJECTED.**
     ///
-    /// The Codex R3 review flagged a correctness gap: a manifest with
+    /// The a compat review flagged a correctness gap: a manifest with
     /// NO local `[workspace]` AND NO `{ workspace = true }`
     /// inheritance references could still be contained within an
     /// ancestor workspace that carries `[patch.crates-io]`,
@@ -5415,7 +5391,7 @@ version = "0.1.0"
     /// the lihaaf overlay declares its own `[workspace]` and
     /// terminates the walk-up at the staged manifest, skipping the
     /// ancestor state entirely. Result: divergent dependency graphs
-    /// and false compat verdicts. R4 (PR #37 R3 BLOCK fixup) walks
+    /// and false compat verdicts. ancestor-workspace rejection  walks
     /// up the filesystem from the manifest's parent and rejects on
     /// any ancestor `Cargo.toml` carrying `[workspace]`.
     ///
@@ -5427,10 +5403,10 @@ version = "0.1.0"
     /// clap_exit_code: 2, ... }` whose message names the implicit-
     /// member category AND the ancestor manifest path.
     ///
-    /// **Defense-in-depth:** this is the case the R3 implicit-
+    /// **Defense-in-depth:** this is the case the inheritance-reference rejection implicit-
     /// inheritance-refs rejection does NOT catch (no `{ workspace =
     /// true }` is required to trigger the failure mode), so without
-    /// R4 the overlay silently produced a manifest with a divergent
+    /// ancestor-workspace rejection the overlay silently produced a manifest with a divergent
     /// resolved graph relative to baseline — the worst failure mode
     /// (false compat verdict, no error surfaced).
     #[test]
@@ -5438,7 +5414,7 @@ version = "0.1.0"
         let tmp = tempfile::tempdir().expect("tempdir for ancestor-workspace rejection test");
 
         // Parent dir: workspace ROOT carrying `[workspace]` +
-        // `[patch.crates-io]`. The Codex repro shape exactly.
+        // `[patch.crates-io]`. The workspace-inheritance repro shape exactly.
         let parent_manifest = tmp.path().join("Cargo.toml");
         std::fs::write(
             &parent_manifest,
@@ -5520,10 +5496,10 @@ version = "0.1.0"
         }
     }
 
-    /// **R4 invariant: STANDALONE single-crate manifest (no ancestor
+    /// **ancestor-workspace rejection invariant: STANDALONE single-crate manifest (no ancestor
     /// workspace) is ALLOWED — branch 5 still works.**
     ///
-    /// The R4 ancestor-walk must NOT produce false-positive rejections
+    /// The ancestor-walk must NOT produce false-positive rejections
     /// for the standard standalone single-crate case: a fork whose
     /// `Cargo.toml` has no local `[workspace]`, no inheritance refs,
     /// AND lives in a directory tree whose ancestors have no
@@ -5539,8 +5515,8 @@ version = "0.1.0"
     /// successful `override_workspace_inheritance` call with an
     /// injected empty `[workspace]`.
     ///
-    /// **Defense-in-depth:** without R4 this test would still pass
-    /// (the standalone case has always worked); with R4 it confirms
+    /// **Defense-in-depth:** without ancestor-workspace rejection this test would still pass
+    /// (the standalone case has always worked); with ancestor-workspace rejection it confirms
     /// that the ancestor-walk does not regress the standalone case.
     /// The test asserts the SPECIFIC absence of the ancestor-walk
     /// rejection AND the presence of the injected empty `[workspace]`
@@ -5587,9 +5563,9 @@ version = "0.1.0"
         override_workspace_inheritance(&mut top, &manifest, None).unwrap_or_else(|err| {
             panic!(
                 "standalone manifest with no ancestor workspace must NOT be rejected; \
-                 got: {err:?} (this would indicate an R4 regression — the ancestor walk \
-                 spuriously detected a workspace where there is none, OR the test \
-                 environment has an unexpected `Cargo.toml` somewhere above the temp dir)"
+ got: {err:?} (this would indicate an ancestor-workspace rejection regression — the ancestor walk \
+ spuriously detected a workspace where there is none, OR the test \
+ environment has an unexpected `Cargo.toml` somewhere above the temp dir)"
             )
         });
 
@@ -5602,7 +5578,7 @@ version = "0.1.0"
         );
     }
 
-    /// **R4 helper: `detect_implicit_ancestor_workspace` returns
+    /// **ancestor-workspace rejection helper: `detect_implicit_ancestor_workspace` returns
     /// `None` when no ancestor Cargo.toml exists on the walk-up.**
     ///
     /// Direct unit test on the helper function — the negative case
@@ -5626,7 +5602,7 @@ version = "0.1.0"
         );
     }
 
-    /// **R4 helper: `detect_implicit_ancestor_workspace` returns
+    /// **ancestor-workspace rejection helper: `detect_implicit_ancestor_workspace` returns
     /// `Some(path)` when an ancestor Cargo.toml carries
     /// `[workspace]`.**
     ///
@@ -5819,7 +5795,7 @@ version = "0.1.0"
         );
 
         // 8. `[lints] workspace = true` (top-level form, the only
-        //    form cargo currently supports for lints inheritance).
+        // form cargo currently supports for lints inheritance).
         let mut top = toml::map::Map::new();
         let mut lints = toml::map::Map::new();
         lints.insert("workspace".to_string(), toml::Value::Boolean(true));
@@ -5830,9 +5806,9 @@ version = "0.1.0"
         );
 
         // 9. `[lints.rust] workspace = true` — forward-compat
-        //    nested form. Cargo doesn't currently support this, but
-        //    the detector flags it defensively to stay
-        //    forward-compatible.
+        // nested form. Cargo doesn't currently support this, but
+        // the detector flags it defensively to stay
+        // forward-compatible.
         let mut top = toml::map::Map::new();
         let mut lints = toml::map::Map::new();
         let mut rust = toml::map::Map::new();
@@ -5845,10 +5821,10 @@ version = "0.1.0"
         );
 
         // 10. Unknown future `[package].<future-key> = { workspace
-        //     = true }`. Forward-compat: the detector scans all
-        //     `[package]` sub-keys, not just the cargo-documented
-        //     inheritable ones, so a future cargo addition gets the
-        //     correct rejection on day one.
+        // = true }`. Forward-compat: the detector scans all
+        // `[package]` sub-keys, not just the cargo-documented
+        // inheritable ones, so a future cargo addition gets the
+        // correct rejection on day one.
         let mut top = toml::map::Map::new();
         let mut pkg = toml::map::Map::new();
         let mut future = toml::map::Map::new();
@@ -5864,14 +5840,14 @@ version = "0.1.0"
         );
     }
 
-    /// **R3 invariant: implicit-member detection coexists with the
+    /// **inheritance-reference rejection invariant: implicit-member detection coexists with the
     /// workspace-root case.**
     ///
     /// A manifest with BOTH a local `[workspace]` table AND
     /// `{ workspace = true }` references is the standard
     /// workspace-root shape (root cargo manifest that hosts both
     /// `[workspace.dependencies]` and its OWN `[package]` with
-    /// inheritance refs back to itself). The R3 implicit-member
+    /// inheritance refs back to itself). The inheritance-reference rejection implicit-member
     /// check must NOT fire here — the inheritance references resolve
     /// against the LOCAL `[workspace.*]` tables, which the overlay
     /// preserves.
@@ -5916,11 +5892,11 @@ version = "0.1.0"
         );
     }
 
-    /// **R2 invariant: idempotent on already-overridden output.**
+    /// **selective rewrite invariant: idempotent on already-overridden output.**
     ///
     /// Running the override twice must produce the same result as
-    /// running it once. R1's full-clobber was trivially idempotent;
-    /// R2's selective rewrite requires verification because the
+    /// running it once. full clobber's full-clobber was trivially idempotent;
+    /// selective rewrite's selective rewrite requires verification because the
     /// preserved tables flow through unmodified on the second call.
     #[test]
     fn override_workspace_is_idempotent() {
@@ -6003,7 +5979,7 @@ version = "0.1.0"
             meta.allow_lints,
             vec!["unexpected_cfgs".to_string()],
             "compat-driver default allow_lints must be [\"unexpected_cfgs\"]; \
-             changes also require spec §3.2/C.4 + CHANGELOG updates",
+ changes also require spec §3.2/C.4 + CHANGELOG updates",
         );
     }
 
@@ -6055,7 +6031,7 @@ version = "0.1.0"
 
     // ───────────────────────────────────────────────────────────────
     // §5.1 Option H self-patch policy + staged-mirror tests
-    // (issues #40 + #47).
+    // (self-patch policy).
     // ───────────────────────────────────────────────────────────────
 
     /// Helper: drop an input manifest in a tempdir, run the
@@ -6145,11 +6121,11 @@ version = "0.1.0"
         drop(tmp);
     }
 
-    /// §5.1.3: Rule 1 + BLOCK-1 self-loop avoidance pin. The emitted
+    /// §5.1.3: Rule 1 + case 1 self-loop avoidance pin. The emitted
     /// `path` must be the absolutized staged-overlay-dir (ends with
     /// `/target/lihaaf-overlay`), NOT the upstream dir. A regression
     /// pointing at the upstream dir would reintroduce the self-loop
-    /// bug R1 carried.
+    /// bug full clobber carried.
     #[test]
     fn apply_self_patch_path_form_is_staged_overlay_dir_not_upstream_rule1() {
         let input = r#"[package]
@@ -6168,9 +6144,9 @@ version = "0.1.0"
         assert!(
             path.ends_with("/target/lihaaf-overlay"),
             "Rule 1 emission must target the STAGED-OVERLAY-DIR \
-             (`<upstream>/target/lihaaf-overlay`), NOT the upstream dir. \
-             Got `{path}`. A regression to the upstream-dir target would \
-             reintroduce the R1 self-loop bug (issue #40 plan §2.1)."
+ (`<upstream>/target/lihaaf-overlay`), NOT the upstream dir. \
+ Got `{path}`. A regression to the upstream-dir target would \
+ reintroduce the full clobber self-loop bug (self-patch policy §2.1)."
         );
 
         // Double-pin: the staged manifest's parent dir is exactly the
@@ -6187,7 +6163,7 @@ version = "0.1.0"
         drop(tmp);
     }
 
-    /// §5.1.4 (R6 extended): Option B idempotency contract — second
+    /// §5.1.4 (idempotency extension extended): Option B idempotency contract — second
     /// `materialize_overlay` call returns Ok, the staged state is
     /// byte-identical, and the canonical mirror symlinks preserve
     /// their inodes (CASE 2 idempotent skip — no re-creation).
@@ -6316,7 +6292,7 @@ demo = { path = "." }
         assert_eq!(
             path, staged_parent,
             "Rule 2 REMAP must REWRITE the upstream's `path = \".\"` to point at \
-             the absolutized staged-overlay-dir; got `{path}` vs expected `{staged_parent}`"
+ the absolutized staged-overlay-dir; got `{path}` vs expected `{staged_parent}`"
         );
         // The REMAP must not leave any git/branch/tag/rev fields
         // behind — Rule 2 fires only when those are absent in the
@@ -6365,7 +6341,7 @@ demo = { path = "./" }
     /// §5.1.7: Rule 4 (REJECT) — vendored fork (`path = "../forked"`)
     /// resolves to a sibling dir, NOT upstream root. The
     /// materializer must return `Error::CompatPatchOverrideConflict`
-    /// referencing the v0.2/v1.1 escape hatch.
+    /// with a clear unsupported-combination diagnostic.
     #[test]
     fn apply_self_patch_rejects_when_upstream_path_targets_external_source_rule4_path() {
         let input = r#"[package]
@@ -6396,8 +6372,8 @@ demo = { path = "../forked-demo" }
             } => {
                 assert_eq!(crate_name, "demo");
                 assert!(
-                    expected_resolution.contains("compat-allow-patch-override"),
-                    "Rule 4 error must reference the v0.2/v1.1 escape hatch flag; got: {expected_resolution}"
+                    expected_resolution.contains("not currently supported"),
+                    "Rule 4 error must explain the unsupported patch shape; got: {expected_resolution}"
                 );
             }
             other => panic!("Rule 4 must return CompatPatchOverrideConflict; got {other:?}"),
@@ -6543,7 +6519,7 @@ demo = { path = "." }
         );
     }
 
-    /// §5.1.12: lexical normalizer — repeated separators (R3 BLOCK-2
+    /// §5.1.12: lexical normalizer — repeated separators (inheritance-reference rejection case 2
     /// finish). `Path::components()` collapses `//` and `///` on
     /// Unix; the normalizer naturally handles this case.
     #[cfg(unix)]
@@ -6560,7 +6536,7 @@ demo = { path = "." }
     }
 
     /// §5.1.13: lexical normalizer — does NOT resolve symlinks
-    /// (R3 BLOCK-2 finish; known limitation documented in
+    /// (inheritance-reference rejection case 2 finish; known limitation documented in
     /// `apply_self_patch_policy` rustdoc and plan §6.11). Two paths
     /// that point to the same canonical filesystem location via
     /// symlinks compare UNEQUAL at the lexical layer.
@@ -6587,8 +6563,8 @@ demo = { path = "." }
         assert_ne!(
             real_norm, alias_norm,
             "lexical normalize must NOT resolve symlinks; \
-             this is a documented known limitation (plan §6.11): \
-             symlinked-equivalent paths fall to Rule 4 REJECT"
+ this is a documented known limitation (plan §6.11): \
+ symlinked-equivalent paths fall to Rule 4 REJECT"
         );
     }
 
@@ -6797,8 +6773,8 @@ demo = { path = "." }
     }
 
     // ────────────────────────────────────────────────────────────────────
-    // Issue #53 — workspace-member entry via `--package` (tests T-1
-    // through T-17 + R2 NEW tests T-24 through T-41 per plan §7.2).
+    // workspace-member entry via `--package` (tests T-1
+    // through T-17 + selective rewrite NEW tests T-24 through T-41 per plan §7.2).
     //
     // Each test exercises one acceptance contract from the plan; group
     // boundaries mirror the §7.2 sub-sections.
@@ -7033,7 +7009,7 @@ demo = { path = "." }
     #[test]
     fn resolve_workspace_member_manifest_workspace_inheritance_captured() {
         let extra = "[workspace.package]\nedition = \"2021\"\n\
-                     [workspace.dependencies]\nserde = \"1.0\"\n";
+ [workspace.dependencies]\nserde = \"1.0\"\n";
         let (tmp, ws_manifest) = synthesize_workspace_root(r#"["pkg-a"]"#, None, extra);
         write_member_manifest(tmp.path(), "pkg-a", "pkg-a", "");
         let (_manifest, ws_value) = resolve_workspace_member_manifest(&ws_manifest, "pkg-a")
@@ -7181,7 +7157,7 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [workspace.dependencies]\nserde = \"1.0\"\n",
+ [workspace.dependencies]\nserde = \"1.0\"\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7208,9 +7184,9 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [workspace.package]\nedition = \"2021\"\n\
-             [workspace.lints.rust]\nunsafe_code = \"forbid\"\n\
-             [workspace.metadata.docs]\ncustom = \"value\"\n",
+ [workspace.package]\nedition = \"2021\"\n\
+ [workspace.lints.rust]\nunsafe_code = \"forbid\"\n\
+ [workspace.metadata.docs]\ncustom = \"value\"\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7282,7 +7258,7 @@ demo = { path = "." }
         top.insert("package".to_string(), toml::Value::Table(pkg));
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"pkg-macros\"]\n\
-             [patch.crates-io.other-dep]\npath = \"vendored/other-dep\"\n",
+ [patch.crates-io.other-dep]\npath = \"vendored/other-dep\"\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7389,9 +7365,9 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [workspace.dependencies]\n\
-             foo = { path = \"crates/foo\" }\n\
-             bar = { git = \"https://example.com/bar.git\" }\n",
+ [workspace.dependencies]\n\
+ foo = { path = \"crates/foo\" }\n\
+ bar = { git = \"https://example.com/bar.git\" }\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7436,9 +7412,9 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [workspace.package]\n\
-             readme = \"../../README.md\"\n\
-             license-file = \"LICENSE-MIT\"\n",
+ [workspace.package]\n\
+ readme = \"../../README.md\"\n\
+ license-file = \"LICENSE-MIT\"\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7476,9 +7452,9 @@ demo = { path = "." }
 
     /// Workspace root declares `[patch.crates-io.pkg-name].path = "../local-fork"`
     /// (a self-patch on the member-under-test). The pipeline:
-    ///  - Step 1: absolutize against workspace_root → `<ws>/../local-fork`.
-    ///  - Step 2: member-local `[patch]` is empty → no REJECT.
-    ///  - Step 3: Rule 2 REMAPs the self entry to the overlay-root form.
+    /// - Step 1: absolutize against workspace_root → `<ws>/../local-fork`.
+    /// - Step 2: member-local `[patch]` is empty → no REJECT.
+    /// - Step 3: Rule 2 REMAPs the self entry to the overlay-root form.
     #[test]
     fn option_h_root_first_member_second_with_workspace_root_self_patch_entry() {
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
@@ -7487,7 +7463,7 @@ demo = { path = "." }
         top.insert("package".to_string(), toml::Value::Table(pkg));
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"pkg-name\"]\n\
-             [patch.crates-io.pkg-name]\npath = \"../local-fork\"\n",
+ [patch.crates-io.pkg-name]\npath = \"../local-fork\"\n",
         )
         .unwrap();
         let ctx = WorkspaceMemberContext {
@@ -7823,7 +7799,7 @@ demo = { path = "." }
         std::fs::write(
             &manifest,
             "[package]\nname = \"the-root-pkg\"\nversion = \"0.1.0\"\n\
-             [workspace]\nmembers = [\"the-member\"]\n",
+ [workspace]\nmembers = [\"the-member\"]\n",
         )
         .expect("write package+workspace manifest");
         let err = resolve_workspace_member_manifest(&manifest, "the-member")
@@ -7838,8 +7814,8 @@ demo = { path = "." }
         drop(tmp);
     }
 
-    // ── §7.2 BLOCK-1 (issue #53 post-review): resolver path
-    //    normalization ───────────────────────────────────────────────
+    // ── §7.2 case 1 : resolver path
+    // normalization ───────────────────────────────────────────────
     //
     // The `--package` resolver compares `[workspace.members]` /
     // `[workspace.exclude]` path strings by PathBuf form. Without
@@ -7854,7 +7830,7 @@ demo = { path = "." }
 
     /// [`lexical_normalize_pathbuf`] equivalences: `./pkg-a` ≡ `pkg-a`,
     /// `pkg-a/.` ≡ `pkg-a`, `pkg-a/` ≡ `pkg-a` (the four shapes named
-    /// in the BLOCK-1 enumeration), under joining with a workspace-root
+    /// in the case 1 enumeration), under joining with a workspace-root
     /// dir. `..` is preserved (lexical-only, no symlink resolution).
     #[test]
     fn lexical_normalize_pathbuf_collapses_dot_and_trailing_slash_forms() {
@@ -7872,7 +7848,7 @@ demo = { path = "." }
                 p,
                 &first,
                 "shape {} (`{}`) must lexically-normalize to the same PathBuf as `pkg-a`; \
-                 got `{}`",
+ got `{}`",
                 idx,
                 raw[idx],
                 p.display()
@@ -8012,8 +7988,8 @@ demo = { path = "." }
         drop(tmp);
     }
 
-    // ── §7.2 BLOCK-2 (issue #53 post-review): workspace-root non-table
-    //    silent-absence → hard rejection ─────────────────────────────
+    // ── §7.2 case 2 : workspace-root non-table
+    // silent-absence → hard rejection ─────────────────────────────
     //
     // Workspace-root keys that MUST be tables (`[workspace.dependencies]`,
     // `[workspace.package]`, `[replace]`, `[profile]`, `[patch]`,
@@ -8172,10 +8148,10 @@ demo = { path = "." }
         }
     }
 
-    // ── §7.2 FOLLOWUP-A (issue #53 post-review): broader non-table
-    //    tolerance → hard rejection ─────────────────────────────────
+    // ── §7.2 non-table rejection : broader non-table
+    // tolerance → hard rejection ─────────────────────────────────
     //
-    // Same silent-absence pattern as BLOCK-2, but in sites that
+    // Same silent-absence pattern as case 2, but in sites that
     // affect error surfacing rather than silent policy misapplication.
     // Each previously "silently skip on non-table"; now each rejects
     // with a `TomlParse` error.
@@ -8374,8 +8350,8 @@ demo = { path = "." }
         }
     }
 
-    // ── §7.2 FOLLOWUP-B (issue #53 post-review): member-local patch
-    //    bypass ─────────────────────────────────────────────────────
+    // ── §7.2 member-local patch rejection : member-local patch
+    // bypass ─────────────────────────────────────────────────────
     //
     // The member-local `[patch.crates-io]` rejection at
     // `apply_workspace_member_inheritance` Step 2 previously walked
@@ -8442,10 +8418,10 @@ demo = { path = "." }
         }
     }
 
-    // ── §7.2 BLOCK-3 (issue #53 post-review): member-local non-crates-io
-    //    `[patch.<registry>]` rejection ─────────────────────────────────
+    // ── §7.2 case 3 : member-local non-crates-io
+    // `[patch.<registry>]` rejection ─────────────────────────────────
     //
-    // BLOCK-3 extends the member-local patch rejection to ALL registries.
+    // case 3 extends the member-local patch rejection to ALL registries.
     // Prior to this fix, only `[patch.crates-io]` was checked; a member
     // declaring `[patch.my-vendor]` (or any other registry) would slip
     // through and be silently incorporated by `apply_self_patch_policy`'s
@@ -8578,14 +8554,14 @@ demo = { path = "." }
         }
     }
 
-    // ── §7.2 COUNTER_SIGNAL (issue #53 post-review): multi-registry
-    //    `[patch]` carry-down ────────────────────────────────────────
+    // ── §7.2 multi-registry carry-down : multi-registry
+    // `[patch]` carry-down ────────────────────────────────────────
     //
     // The workspace-member `[patch]` carry-down (introduced in PR
     // #61) previously walked `[patch.crates-io]` only — adopters
     // using a vendored registry alias (e.g. `[patch.my-vendor]`)
     // had their non-crates-io patch entries silently dropped during
-    // Option H self-patch carry-down. The COUNTER_SIGNAL extension
+    // Option H self-patch carry-down. The multi-registry carry-down extension
     // walks ALL `[patch.<registry>]` subtables, preserving each one
     // verbatim (path-absolutized) into `top["patch"][<registry>]`.
     //
@@ -8603,8 +8579,8 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [patch.my-vendor]\n\
-             my-dep = { path = \"vendored/my-dep\" }\n",
+ [patch.my-vendor]\n\
+ my-dep = { path = \"vendored/my-dep\" }\n",
         )
         .expect("ws-root parses");
         let ctx = WorkspaceMemberContext {
@@ -8669,10 +8645,10 @@ demo = { path = "." }
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();
         let ws_value: toml::Value = toml::from_str(
             "[workspace]\nmembers = [\"m\"]\n\
-             [patch.crates-io]\n\
-             other-crate = { path = \"vendored/other\" }\n\
-             [patch.my-vendor]\n\
-             my-dep = { path = \"vendored/my-dep\" }\n",
+ [patch.crates-io]\n\
+ other-crate = { path = \"vendored/other\" }\n\
+ [patch.my-vendor]\n\
+ my-dep = { path = \"vendored/my-dep\" }\n",
         )
         .expect("ws-root parses");
         let ctx = WorkspaceMemberContext {
@@ -8718,7 +8694,7 @@ demo = { path = "." }
     /// Workspace-root `[patch.my-vendor] = "oops"` (non-table
     /// registry value) is rejected with a `TomlParse` error naming
     /// the offending registry — the multi-registry walk applies
-    /// BLOCK-2 hard-rejection to every registry, not just crates-io.
+    /// case 2 hard-rejection to every registry, not just crates-io.
     #[test]
     fn apply_self_patch_policy_rejects_non_table_non_crates_io_registry() {
         let mut top: toml::map::Map<String, toml::Value> = toml::map::Map::new();

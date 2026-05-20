@@ -50,7 +50,7 @@
 // stderr-capture test for this diagnostic (spec §5, fallback
 // paragraph) — wiring an in-process stderr-capture seam costs more
 // than it saves at this scope; the manual procedure above remains
-// the regression guard for v0.1.0-beta.1.
+// the regression guard for the session-lock implementation.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -411,14 +411,13 @@ mod tests {
     }
 
     // Spec §5 test 4 ("acquire_emits_waiting_diagnostic_on_contention")
-    // is intentionally NOT implemented as a unit test for v0.1.0-beta.1.
+    // is intentionally NOT implemented as a unit test.
     //
-    // The spec authorizes deferral (§5 fallback paragraph): capturing
-    // stderr from a specific thread inside a Rust unit test requires
-    // either the `gag` crate or fd-redirection trickery, both of which
-    // add complexity that outweighs the unit-test value at this scope.
-    // The MANUAL_VERIFY comment at the top of this file documents the
-    // hand-test procedure for the two-terminal contention case.
+    // Capturing stderr from a specific thread inside a Rust unit test
+    // requires either the `gag` crate or fd-redirection trickery, both
+    // of which add complexity that outweighs the unit-test value at this
+    // scope. The MANUAL_VERIFY comment at the top of this file documents
+    // the hand-test procedure for the two-terminal contention case.
     //
     // The bite for the underlying behavior is preserved:
     // - The "waiting" diagnostic path is exercised by the

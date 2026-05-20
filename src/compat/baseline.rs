@@ -133,9 +133,8 @@ use crate::util;
 #[allow(dead_code)]
 pub struct BaselineResult {
     /// Number of fixtures libtest reported as passing. Populated only
-    /// when fixture-level baseline is RECOGNIZED per §1 — Phase 4
-    /// (issue #9) wires the conservative parser. The Phase 3 entry
-    /// point [`run_baseline`] always returns `None`; Phase 4's
+    /// when fixture-level baseline output is recognized. The basic
+    /// [`run_baseline`] entry point always returns `None`;
     /// [`run_baseline_with_recognized_fixtures`] returns `Some(n)` only
     /// when at least one recognized fixture correlated to a libtest
     /// verdict.
@@ -144,12 +143,12 @@ pub struct BaselineResult {
     /// rule as [`Self::pass`].
     pub fail: Option<u32>,
     /// Number of fixtures whose libtest output didn't match a
-    /// recognized trybuild invocation. Always populated. The Phase 3
-    /// entry point [`run_baseline`] always returns `0`. Phase 4's
+    /// recognized trybuild invocation. Always populated. The basic
+    /// [`run_baseline`] entry point always returns `0`.
     /// [`run_baseline_with_recognized_fixtures`] increments this for
-    /// every unrecognized libtest line, every recognized fixture
-    /// absent from libtest output, and every garbled verdict line —
-    /// see [`parse_libtest_output`] for the full classification rule.
+    /// every unrecognized libtest line, every recognized fixture absent
+    /// from libtest output, and every garbled verdict line — see
+    /// [`parse_libtest_output`] for the full classification rule.
     pub unknown_count: u32,
     /// Exit code from the child process. On a signal-terminated child
     /// (no real exit code; `ExitStatus::code()` returns [`None`]) this
@@ -735,8 +734,7 @@ pub fn run_baseline(
 }
 
 /// Run the baseline `cargo test` invocation with conservative
-/// fixture-level libtest parsing layered on top (Phase 4 of compat
-/// mode, issue #9).
+/// fixture-level libtest parsing layered on top.
 ///
 /// Same argv-only / no-shell guarantees as [`run_baseline`]. After
 /// the capture completes, [`parse_libtest_output`] is called against

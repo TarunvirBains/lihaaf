@@ -178,11 +178,13 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
 }
 
 /// One `compiler-artifact` JSON message line. Cargo emits one per
-/// crate it built; the target is the one whose `target.name` matches the
-/// dylib_crate AND whose `target.kind` includes `"dylib"`.
+/// crate it built; the target is the one whose package identity matches
+/// the dylib_crate AND whose target crate-types include `"dylib"`.
 #[derive(Debug, Deserialize)]
 struct CompilerArtifact {
     reason: String,
+    #[serde(default)]
+    package_id: Option<String>,
     target: ArtifactTarget,
     filenames: Vec<PathBuf>,
 }
@@ -190,7 +192,10 @@ struct CompilerArtifact {
 #[derive(Debug, Deserialize)]
 struct ArtifactTarget {
     name: String,
+    #[serde(default)]
     kind: Vec<String>,
+    #[serde(default)]
+    crate_types: Vec<String>,
 }
 
 /// Parse the `--message-format=json-render-diagnostics` stdout stream
@@ -198,10 +203,12 @@ struct ArtifactTarget {
 /// `crate_name`.
 ///
 /// the policy: "lihaaf finds the `compiler-artifact` message whose
-/// `target.name` equals `dylib_crate` and whose `target.kind` includes
-/// `"dylib"`, reads the `filenames` array, and selects the first entry
-/// matching the platform's dynamic-library extension. If multiple
-/// `compiler-artifact` messages match, the last one wins."
+/// package identity equals `dylib_crate` and whose `target.crate_types`
+/// includes `"dylib"`, reads the `filenames` array, and selects the first
+/// entry matching the platform's dynamic-library extension. Cargo streams
+/// from older or synthetic callers may omit `package_id`; when absent,
+/// `target.name` is used as the package identity substitute.
+/// If multiple `compiler-artifact` messages match, the last one wins.
 pub fn parse_dylib_path(stdout: &str, crate_name: &str) -> Option<PathBuf> {
     let extensions = dylib_extensions();
     let mut last_match: Option<PathBuf> = None;
@@ -216,10 +223,10 @@ pub fn parse_dylib_path(stdout: &str, crate_name: &str) -> Option<PathBuf> {
         if artifact.reason != "compiler-artifact" {
             continue;
         }
-        if artifact.target.name != crate_name {
+        if !artifact_matches_crate(&artifact, crate_name) {
             continue;
         }
-        if !artifact.target.kind.iter().any(|k| k == "dylib") {
+        if !artifact_is_dylib(&artifact.target) {
             continue;
         }
         // Walk filenames; the first whose extension matches wins for
@@ -234,6 +241,46 @@ pub fn parse_dylib_path(stdout: &str, crate_name: &str) -> Option<PathBuf> {
         }
     }
     last_match
+}
+
+fn artifact_matches_crate(artifact: &CompilerArtifact, crate_name: &str) -> bool {
+    if let Some(package_id) = artifact.package_id.as_deref() {
+        return package_id_matches_crate(package_id, crate_name);
+    }
+
+    artifact.target.name == crate_name
+}
+
+fn artifact_is_dylib(target: &ArtifactTarget) -> bool {
+    if !target.crate_types.is_empty() {
+        return target.crate_types.iter().any(|k| k == "dylib");
+    }
+
+    target.kind.iter().any(|k| k == "dylib")
+}
+
+fn package_id_matches_crate(package_id: &str, crate_name: &str) -> bool {
+    let Some((source, suffix)) = package_id.rsplit_once('#') else {
+        return false;
+    };
+    if package_fragment_matches_crate(suffix, crate_name) {
+        return true;
+    }
+
+    let source_tail = source
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    package_fragment_matches_crate(source_tail, crate_name)
+}
+
+fn package_fragment_matches_crate(fragment: &str, crate_name: &str) -> bool {
+    fragment == crate_name
+        || fragment.replace('-', "_") == crate_name
+        || fragment
+            .strip_prefix(crate_name)
+            .is_some_and(|rest| rest.starts_with('@'))
 }
 
 /// Per-platform dynamic library extensions (no leading dot).
@@ -376,9 +423,9 @@ pub fn workspace_target_dir(manifest_path: &Path) -> PathBuf {
 
 /// Per-suite cargo target directory under `<workspace_target>/`.
 ///
-/// The default suite uses `<workspace_target>/lihaaf-build` (the legacy
-/// path, kept stable so adopters who never add a named suite see no
-/// cache-key change across the suite-introducing release). Named suites
+/// The default suite uses `<workspace_target>/lihaaf-build` (kept stable
+/// so adopters who never add a named suite see no cache-key change).
+/// Named suites
 /// use `<workspace_target>/lihaaf-build-<suite>` so each suite's
 /// `--features` set lives in its own cargo cache and never thrashes a
 /// sibling suite's build artifacts. Suite names are validated by
@@ -407,17 +454,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parse_dylib_path_picks_dylib_kind_and_extension() {
+    fn parse_dylib_path_picks_dylib_crate_type_and_extension() {
         // Linux: `.so`. The test bakes an artifact line; the parser must pick
         // the first `.so` listed in `filenames`.
         #[cfg(target_os = "linux")]
-        let line = r#"{"reason":"compiler-artifact","target":{"name":"consumer","kind":["dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.so"]}"#;
+        let line = r#"{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{"name":"consumer","kind":["lib"],"crate_types":["rlib","dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.so"]}"#;
         #[cfg(target_os = "macos")]
-        let line = r#"{"reason":"compiler-artifact","target":{"name":"consumer","kind":["dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.dylib"]}"#;
+        let line = r#"{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{"name":"consumer","kind":["lib"],"crate_types":["rlib","dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.dylib"]}"#;
         #[cfg(target_os = "windows")]
-        let line = r#"{"reason":"compiler-artifact","target":{"name":"consumer","kind":["dylib"]},"filenames":["C:/p/target/release/deps/consumer-abc.dll"]}"#;
+        let line = r#"{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{"name":"consumer","kind":["lib"],"crate_types":["rlib","dylib"]},"filenames":["C:/p/target/release/deps/consumer-abc.dll"]}"#;
         #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
-        let line = r#"{"reason":"compiler-artifact","target":{"name":"consumer","kind":["dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.so"]}"#;
+        let line = r#"{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{"name":"consumer","kind":["lib"],"crate_types":["rlib","dylib"]},"filenames":["/p/target/release/deps/libconsumer-abc.so"]}"#;
 
         let path = parse_dylib_path(line, "consumer").unwrap();
         assert!(path.to_string_lossy().contains("consumer-abc"));
@@ -444,6 +491,53 @@ mod tests {
     }
 
     #[test]
+    fn parse_dylib_path_can_match_package_id_when_lib_target_name_differs() {
+        let stream = r#"{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{"name":"consumer_lib","kind":["lib"],"crate_types":["rlib","dylib"]},"filenames":["/p/libconsumer_lib-abc.so"]}"#;
+        #[cfg(target_os = "windows")]
+        let _ = stream;
+        #[cfg(not(target_os = "windows"))]
+        {
+            let p = parse_dylib_path(stream, "consumer").unwrap();
+            assert!(p.to_string_lossy().ends_with(".so"));
+        }
+    }
+
+    #[test]
+    fn parse_dylib_path_prefers_package_id_over_target_name_collision() {
+        let ext = dylib_extensions()[0];
+        let stream = format!(
+            "\
+{{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file:///p#consumer@0.1.0\",\"target\":{{\"name\":\"consumer_lib\",\"kind\":[\"lib\"],\"crate_types\":[\"rlib\",\"dylib\"]}},\"filenames\":[\"/p/libconsumer_lib-right.{ext}\"]}}
+{{\"reason\":\"compiler-artifact\",\"package_id\":\"path+file:///p#other@0.1.0\",\"target\":{{\"name\":\"consumer\",\"kind\":[\"lib\"],\"crate_types\":[\"rlib\",\"dylib\"]}},\"filenames\":[\"/p/libconsumer-wrong.{ext}\"]}}
+"
+        );
+
+        let p = parse_dylib_path(&stream, "consumer").unwrap();
+        assert!(p.to_string_lossy().contains("right"));
+    }
+
+    #[test]
+    fn parse_dylib_path_uses_crate_types_when_cargo_provides_them() {
+        let ext = dylib_extensions()[0];
+        let stream = format!(
+            r#"{{"reason":"compiler-artifact","package_id":"path+file:///p#consumer@0.1.0","target":{{"name":"consumer","kind":["dylib"],"crate_types":["rlib"]}},"filenames":["/p/libconsumer-not-dylib.{ext}"]}}"#
+        );
+
+        assert!(parse_dylib_path(&stream, "consumer").is_none());
+    }
+
+    #[test]
+    fn parse_dylib_path_matches_path_package_id_source_tail() {
+        let ext = dylib_extensions()[0];
+        let stream = format!(
+            r#"{{"reason":"compiler-artifact","package_id":"path+file:///workspace/consumer#0.1.0","target":{{"name":"consumer","kind":["dylib"],"crate_types":["dylib"]}},"filenames":["/p/libconsumer.{ext}"]}}"#
+        );
+
+        let p = parse_dylib_path(&stream, "consumer").unwrap();
+        assert!(p.to_string_lossy().contains("libconsumer"));
+    }
+
+    #[test]
     fn managed_dylib_path_preserves_hash() {
         let p = managed_dylib_path(
             Path::new("/p/target"),
@@ -463,11 +557,10 @@ mod tests {
     }
 
     #[test]
-    fn build_dir_for_default_suite_uses_legacy_name() {
+    fn build_dir_for_default_suite_uses_default_name() {
         let p = build_dir_for_suite(Path::new("/p/target"), crate::config::DEFAULT_SUITE_NAME);
-        // Backward compat: an adopter who never adds a named suite
-        // hashes against the same cargo target dir as before the suite
-        // concept existed.
+        // Single-suite adopters hash against the unsuffixed cargo target
+        // dir for cache-key stability.
         assert_eq!(p, PathBuf::from("/p/target/lihaaf-build"));
     }
 

@@ -1,10 +1,8 @@
-//! Phase 5 of compat mode (issue #10) — dirty-worktree-safe generated
-//! output policy.
+//! Dirty-worktree-safe generated output policy for compat mode.
 //!
 //! The compat driver materializes a small set of artifacts inside the
 //! adopter's target-crate checkout: the staged overlay
-//! (`target/lihaaf-overlay/Cargo.toml`, Phase 2), the §3.3 envelope
-//! (Phase 8), and — once Phase 6 fixture-conversion lands — a
+//! (`target/lihaaf-overlay/Cargo.toml`), the §3.3 envelope, and a
 //! transient directory of converted fixtures under
 //! `target/lihaaf-compat-converted/`. Per
 //! `docs/compatibility-plan.md` §3.2.3:
@@ -15,7 +13,7 @@
 //! > run must not leave ambiguous untracked files in the fork.
 //!
 //! This module owns the lifecycle of those generated paths: every
-//! phase that produces an artifact calls [`CleanupGuard::track`] before
+//! component that produces an artifact calls [`CleanupGuard::track`] before
 //! returning the path to the caller, and the driver consumes the guard
 //! at the end of [`crate::compat::run`] via [`CleanupGuard::finalize`].
 //! Drop is the safety-net for panic / early-return paths.
@@ -64,12 +62,11 @@
 //! 4. **`--keep-output` overrides `Cleaned`, never `Ignored` /
 //!    `Committed`.** A flag designed for local debugging does not
 //!    override the user's explicit `.gitignore` or `git add` choice.
-//! 5. **SIGINT / SIGTERM are out of scope for Phase 5.** Installing a
+//! 5. **SIGINT / SIGTERM are out of scope.** Installing a
 //!    signal handler would either pull in a new crate (`ctrlc` /
 //!    `signal-hook`) or hand-roll cross-platform FFI; both expand the
 //!    dependency surface for marginal gain. Drop covers the panic /
-//!    early-return cases; `SIGKILL` and `SIGTERM` remain unrecoverable
-//!    by design (documented gap, revisit in Phase 6+).
+//!    early-return cases; `SIGKILL` and `SIGTERM` remain unrecoverable.
 //! 6. **Panic hook is diagnostic, not cleanup.** Drop runs during stack
 //!    unwinding on panic, so the cleanup itself is guaranteed by the
 //!    Drop impl alone. The optional [`install_panic_hook`] adds a
@@ -133,7 +130,7 @@ pub struct GeneratedPath {
 /// [`GeneratedPath`] list the envelope writer consumes.
 ///
 /// `target_root` is recorded per-entry rather than once per guard
-/// because Phase 8+ may add multi-root scenarios (e.g. an overlay
+/// because future multi-root scenarios may add multiple roots (e.g. an overlay
 /// generated under one crate and a sidecar generated under another).
 /// In v0.1 every entry shares the same root, but the per-entry shape
 /// keeps the structure additive.
@@ -181,8 +178,8 @@ struct CleanupTracker {
 /// ## Thread safety
 ///
 /// The interior `Mutex<CleanupTracker>` makes the guard `Sync` so it
-/// can be referenced from `&self` methods on multiple threads (Phase
-/// 6+ fixture-conversion may parallelize). The `try_lock` path in
+/// can be referenced from `&self` methods on multiple threads if
+/// fixture conversion is parallelized. The `try_lock` path in
 /// Drop avoids a secondary panic if another thread is still inside
 /// `track` when an unwinding panic begins on this thread; the
 /// original panic is more informative than a "poisoned mutex"
@@ -193,8 +190,8 @@ struct CleanupTracker {
 #[derive(Debug)]
 pub struct CleanupGuard {
     /// Tracker state. Behind a `Mutex` so `track` can be called from
-    /// `&self` (Phase 2 overlay generation is single-threaded today,
-    /// but Phase 6 fixture conversion is the natural place to
+    /// `&self` (overlay generation is single-threaded today,
+    /// but fixture conversion is the natural place to
     /// parallelize and the guard surface should not need to change).
     inner: Mutex<CleanupTracker>,
     /// Mirrors `CompatArgs::inner_cli.keep_output`. When `true`, every
@@ -210,8 +207,8 @@ pub struct CleanupGuard {
 impl CleanupGuard {
     /// Construct a fresh guard. `keep_output` is typically
     /// [`crate::cli::Cli::keep_output`] — pass it through from the
-    /// driver so a single source of truth governs both Phase 5 cleanup
-    /// and Phase 9 inner-session output-retention.
+    /// driver so a single source of truth governs cleanup and
+    /// inner-session output-retention.
     ///
     /// `pub` to allow the test crate's `#[doc(hidden)]` re-export to
     /// reach this constructor. Adopters must drive compat mode through
@@ -539,9 +536,9 @@ fn git_quiet_status(target_root: &Path, args: &[&str], path: &Path) -> bool {
 ///
 /// Thin wrapper that delegates to [`crate::util::remove_path_race_free`]
 /// with the `"compat-generated"` context prefix. The race-free cascade
-/// itself lives in `util` (Round-4) because the same TOCTOU shape
-/// existed at `src/dylib.rs`'s managed-dylib swap; sharing the
-/// cascade keeps both call sites in sync. The full cascade design,
+/// itself lives in `util` because the same TOCTOU shape exists at
+/// `src/dylib.rs`'s managed-dylib swap; sharing the cascade keeps both
+/// call sites in sync. The full cascade design,
 /// platform-specific cfg arms, and "why not pre-stat" rationale are
 /// documented on [`crate::util::remove_path_race_free`].
 fn remove_path_best_effort(path: &Path) -> Result<(), Error> {
@@ -709,13 +706,10 @@ mod tests {
 
     /// **Unix `PermissionDenied` on step 1 surfaces with the file-stage
     /// context.** A regular file whose parent denies write permission
-    /// returns `EACCES` from `unlink(2)`. Before commit `<this round-4
-    /// commit>`, the cascade's `matches!(.., IsADirectory |
-    /// PermissionDenied)` arm conflated the Windows directory signal
-    /// with this Unix EACCES — the file fell through to step 2 (rmdir)
-    /// which surfaced an empty-dir context, then step 3 (remove_dir_all)
-    /// which surfaced the recursive-removal context. Either of those is
-    /// misleading: the failure has nothing to do with directories.
+    /// returns `EACCES` from `unlink(2)`. The cascade must not conflate
+    /// this with the Windows directory signal: the file must not fall
+    /// through to the empty-dir or recursive-removal contexts because
+    /// the failure has nothing to do with directories.
     ///
     /// Pin: the file-stage context (`"removing compat-generated
     /// file/symlink"`) is what an operator sees, so they can map the

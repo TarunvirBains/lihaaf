@@ -1,5 +1,4 @@
-//! Phase 4 of compat mode (issue #9) — conservative trybuild baseline
-//! extraction integration tests.
+//! Conservative trybuild baseline extraction integration tests.
 //!
 //! The single load-bearing invariant under test is the §1 conservatism
 //! rule:
@@ -189,10 +188,9 @@ fn recognized_fixture_prefix_does_not_match_longer_libtest_name() {
 /// - `tests/ui/foo.rs` — extension preserved
 /// - `tests::ui::foo` — `::` module-path separator
 ///
-/// Regression for round-2 review BLOCK: earlier code stripped `.rs`
-/// only from the recognized side and only forward-slashed the libtest
-/// side, so the `.rs`-preserved and `::`-separator shapes failed to
-/// correlate and silently became `unknown_count`.
+/// The parser must strip `.rs` and normalize separators consistently
+/// on both sides; otherwise `.rs`-preserved and `::`-separator shapes
+/// fail to correlate and silently become `unknown_count`.
 #[test]
 fn libtest_name_with_rs_extension_correlates() {
     let recognized = vec![fid("tests/ui/foo.rs")];
@@ -339,8 +337,9 @@ fn mismatch_entries_sorted_for_determinism() {
     assert_eq!(result.mismatch_entries[2].fixture, "tests/zzz_last.rs");
 }
 
-/// **Round-3 BLOCK regression.** The `mismatch_entries[*].fixture`
-/// field must be byte-equal to the original `repo_relative_path`
+/// **Mismatch fixtures preserve the original path.** The
+/// `mismatch_entries[*].fixture` field must be byte-equal to the
+/// original `repo_relative_path`
 /// (forward-slash projected), NOT to a `canonical_test_name + ".rs"`
 /// reconstruction. The earlier code reconstructed via
 /// `normalized[idx].0.clone() + ".rs"`, which:
@@ -353,8 +352,8 @@ fn mismatch_entries_sorted_for_determinism() {
 /// canonical stem is `tests/ui/foo` (same as a more conventional
 /// `tests/ui/foo.rs`) but whose original `repo_relative_path` uses
 /// the `::` module-path-style separator. Old code emitted
-/// `tests/ui/foo.rs` (the canonical-form reconstruction); the fix
-/// emits the original `tests::ui::foo.rs` byte-for-byte.
+/// `tests/ui/foo.rs` (the canonical-form reconstruction); the expected
+/// output is the original `tests::ui::foo.rs` byte-for-byte.
 #[test]
 fn mismatch_fixture_preserves_original_repo_relative_path() {
     // Two fixtures whose canonical forms collide on `tests/ui/foo`

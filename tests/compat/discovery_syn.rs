@@ -177,7 +177,7 @@ fn pattern_3_test_wrapped_let_binding() {
     );
 }
 
-/// **Round-3 BLOCK regression: `#[std::test]` attribute recognized.**
+/// **`#[std::test]` attribute recognized.**
 /// `is_test_attribute` must accept `std::test` / `::std::test` in
 /// addition to the bare `test`, `core::test`, and `::core::test`
 /// variants — a `#[std::test]` function body must have
@@ -281,10 +281,10 @@ fn empty_tests_directory_yields_empty_output() {
 /// **`use trybuild::TestCases as Foo;` without `--compat-trybuild-macro`
 /// emits `discovery_unrecognized`.** `Foo::new().compile_fail(...)`
 /// must produce no fixtures and exactly one `discovery_unrecognized`
-/// entry naming the file/line — the round-3 fix added `visit_item_use`
-/// detection so the visitor records the rename and flags the terminal
-/// call on the aliased receiver. Adopters silence the warning by
-/// registering the local name via `--compat-trybuild-macro Foo` (see
+/// entry naming the file/line. The visitor records the rename and
+/// flags the terminal call on the aliased receiver. Adopters silence
+/// the warning by registering the local name via
+/// `--compat-trybuild-macro Foo` (see
 /// `use_alias_registered_via_flag_does_not_emit_unrecognized`).
 #[test]
 fn use_alias_not_recognized_without_flag() {
@@ -299,13 +299,13 @@ fn use_alias_not_recognized_without_flag() {
             .collect::<Vec<_>>()
     );
     // The `Foo::new(); t.compile_fail(...)` chain emits exactly one
-    // unrecognized entry — the round-3 `visit_item_use` walker
-    // populates `aliased_testcases` from `use trybuild::TestCases as
-    // Foo;`, and the terminal-call dispatcher (`try_record_terminal_call`)
+    // unrecognized entry. The `visit_item_use` walker populates
+    // `aliased_testcases` from `use trybuild::TestCases as Foo;`, and
+    // the terminal-call dispatcher (`try_record_terminal_call`)
     // surfaces the misconfigured alias on the `t.compile_fail(...)`
-    // line. The entry must point at the `tests/trybuild.rs` corpus
-    // file and the detail must mention the alias scenario so the
-    // operator can map back to a `--compat-trybuild-macro` flag.
+    // line. The entry must point at the `tests/trybuild.rs` corpus file
+    // and the detail must mention the alias scenario so the operator
+    // can map back to a `--compat-trybuild-macro` flag.
     assert_eq!(
         out.unrecognized.len(),
         1,
@@ -325,19 +325,20 @@ fn use_alias_not_recognized_without_flag() {
     );
 }
 
-/// **Round-3 BLOCK regression: `use trybuild::TestCases as Foo;` must
-/// emit `discovery_unrecognized`.** Earlier the visitor silently
-/// dropped the `Foo::new(); t.compile_fail(...)` call chain because
+/// **`use trybuild::TestCases as Foo;` must emit
+/// `discovery_unrecognized`.** The visitor must not silently drop the
+/// `Foo::new(); t.compile_fail(...)` call chain when
 /// `Foo` didn't match the canonical `trybuild::TestCases` path and
 /// didn't match any registered `--compat-trybuild-macro` alias.
 /// Adopters then lost visibility into the misconfigured-alias case.
 ///
-/// The fix walks `ItemUse` trees to populate a per-file
+/// The visitor walks `ItemUse` trees to populate a per-file
 /// `aliased_testcases` set whenever the rename source is `TestCases`.
 /// A subsequent `Foo::new()` (and any `let t = Foo::new(); t.<...>`)
 /// terminal call surfaces as exactly one `discovery_unrecognized`
-/// entry pointing at the `compile_fail` line, naming the alias issue
-/// in `detail`. Zero fixtures because the call was never resolvable.
+/// entry pointing at the `compile_fail` line and naming the alias issue
+/// in `detail`. Zero fixtures are emitted because the call was never
+/// resolvable.
 #[test]
 fn use_alias_emits_discovery_unrecognized_for_terminal_call() {
     let crate_root = corpus("use_alias_unrecognized");
@@ -379,15 +380,15 @@ fn use_alias_emits_discovery_unrecognized_for_terminal_call() {
     );
 }
 
-/// **Round-5 BLOCK regression: an unregistered `use trybuild::TestCases
+/// **An unregistered `use trybuild::TestCases
 /// as Foo;` called as `Foo()` (NO `::new`) also surfaces as
-/// `discovery_unrecognized`.** The previous `is_aliased_testcases_constructor`
-/// only matched the two-segment `Foo::new` shape, so `Foo()` paired
-/// with `Foo().compile_fail(...)` (or via a `let t = Foo();` binding)
-/// silently dropped instead of emitting an entry. The registered-alias
-/// matcher already accepts both `<alias>::new` AND `<alias>` forms;
-/// the unregistered-alias diagnostic surface should mirror it so
-/// adopters using either constructor idiom see the same warning.
+/// `discovery_unrecognized`.** The diagnostic must cover both the
+/// two-segment `Foo::new` shape and the `Foo()` constructor shape.
+/// Otherwise `Foo().compile_fail(...)` (or a `let t = Foo();` binding)
+/// would silently drop instead of emitting an entry. The registered-
+/// alias matcher already accepts both `<alias>::new` AND `<alias>`
+/// forms; the unregistered-alias diagnostic surface should mirror it
+/// so adopters using either constructor idiom see the same warning.
 ///
 /// Two sub-shapes: the direct chain (`Foo().compile_fail(...)`) and
 /// the bound chain (`let t = Foo(); t.compile_fail(...)`). Each must
@@ -482,10 +483,9 @@ fn ui() {\n\
 /// adopter has registered the originating path, the `use` rename
 /// silently re-exports a recognized name; we must not double-emit.
 ///
-/// This test pairs with the BLOCK regression above to lock the
-/// "register to silence the warning" workflow: the unrecognized
-/// emission is gated on the alias NOT being registered, not on the
-/// `use` rename's presence.
+/// This test locks the "register to silence the warning" workflow: the
+/// unrecognized emission is gated on the alias NOT being registered,
+/// not on the `use` rename's presence.
 #[test]
 fn use_alias_registered_via_flag_does_not_emit_unrecognized() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -621,9 +621,9 @@ fn macro_wrapper_invocation_not_recognized() {
 /// not unrecognized trybuild shapes — and the expression-position
 /// invocation `helper_macro!()` inside a `#[test]` body never reaches
 /// `visit_item_macro` because it is an `ExprMacro`, not an
-/// `ItemMacro`. Regression for round-2 review FIX_BEFORE_BETA: the
-/// earlier code flagged every `ItemMacro` indiscriminately, including
-/// `macro_rules!` definitions.
+/// `ItemMacro`. The visitor must not flag every `ItemMacro`
+/// indiscriminately, because `macro_rules!` definitions are normal
+/// local helpers.
 #[test]
 fn macro_rules_definition_not_flagged_as_unrecognized() {
     let crate_root = corpus("macro_rules_definition");
@@ -1153,13 +1153,11 @@ fn second() {\n\
     );
 }
 
-/// **Round-4 FIX regression: `use trybuild::TestCases;` (no rename)
+/// **`use trybuild::TestCases;` (no rename)
 /// IS recognized at the call site.** The most common trybuild import
 /// idiom — a plain `use trybuild::TestCases;` followed by
-/// `TestCases::new()` — was previously silently dropped because the
-/// `ItemUse` walker only handled `UseTree::Rename` (the `use X as Y`
-/// case). The fix extends the walker to also handle `UseTree::Name`
-/// when the prefix is exactly `["trybuild"]`; the local name (always
+/// `TestCases::new()` — must be recognized. The walker handles
+/// `UseTree::Name` when the prefix is exactly `["trybuild"]`; the local name (always
 /// `TestCases` in the canonical form) is then recorded into a per-file
 /// `imported_testcases` set and `is_testcases_constructor_path`
 /// accepts the 2-segment `TestCases::new` form.
@@ -1244,7 +1242,7 @@ fn ui() {\n\
     );
 }
 
-/// **Round-4 FIX regression: a `let` shadow of a trybuild binding
+/// **A `let` shadow of a trybuild binding
 /// invalidates the binding.** Inside one `#[test]` body, an early
 /// `let t = TestCases::new();` records `t` as a trybuild receiver; a
 /// subsequent `let t = some_other_function();` REBINDS `t` to a
@@ -1252,13 +1250,11 @@ fn ui() {\n\
 /// treated as a trybuild call — the binding tracker must remove the
 /// stale entry on every non-TestCases `let` against the same ident.
 ///
-/// Before the fix the visitor only INSERTED into `local_bindings`,
-/// never REMOVED. The shadow above would leave the original `t` entry
-/// in place; `t.compile_fail("path")` after the shadow would be
-/// silently surfaced as a fixture even though it points at a
-/// different runtime value. False positives like this survive every
-/// snapshot check until a human notices the discovered fixture has
-/// no business being there.
+/// If the visitor only inserts into `local_bindings` and never removes
+/// stale entries, the shadow above leaves the original `t` entry in
+/// place. `t.compile_fail("path")` after the shadow would be silently
+/// surfaced as a fixture even though it points at a different runtime
+/// value.
 #[test]
 fn let_shadow_invalidates_trybuild_binding() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1298,16 +1294,14 @@ fn ui() {\n\
     );
 }
 
-/// **Round-4 FIX regression: `type Foo = trybuild::TestCases;` emits
+/// **`type Foo = trybuild::TestCases;` emits
 /// `discovery_unrecognized`.** Type aliases of `trybuild::TestCases`
-/// previously went silent — no `visit_item_type` override existed —
-/// so an adopter writing the alias plus `Foo::new()` would see zero
-/// fixtures from their tests with no diagnostic. The fix adds a
-/// `visit_item_type` override that flags any `type <ident> = <Path>;`
-/// where the trailing path segment is `TestCases`. The visitor does
-/// NOT auto-recognize the alias (the spec scope is conservative); the
-/// emission directs the operator at `--compat-trybuild-macro` or the
-/// canonical-form rewrite.
+/// must not go silent: an adopter writing the alias plus `Foo::new()`
+/// should get a diagnostic instead of zero fixtures with no context.
+/// The visitor flags any `type <ident> = <Path>;` where the trailing
+/// path segment is `TestCases`. The visitor does NOT auto-recognize
+/// the alias (the spec scope is conservative); the emission directs the
+/// operator at `--compat-trybuild-macro` or the canonical-form rewrite.
 #[test]
 fn type_alias_of_testcases_emits_discovery_unrecognized() {
     let crate_root = corpus("type_alias_unrecognized");
@@ -1344,23 +1338,21 @@ fn type_alias_of_testcases_emits_discovery_unrecognized() {
     );
 }
 
-/// **Round-5 BLOCK regression: `use trybuild::TestCases;` inside an
+/// **`use trybuild::TestCases;` inside an
 /// inline `mod a { ... }` does NOT leak into sibling `mod b { ... }`.**
-/// `imported_testcases` and `aliased_testcases` were previously
-/// file-scope BTreeSets — a `use trybuild::TestCases;` inside one
-/// module would silently populate the set for the rest of the file,
-/// causing a `TestCases::new()` inside a sibling module to be treated
-/// as recognized even though `TestCases` is not in scope there. This
-/// false positive would surface a phantom fixture from the sibling
-/// module's call.
+/// `imported_testcases` and `aliased_testcases` must be scoped around
+/// inline modules. A `use trybuild::TestCases;` inside one module must
+/// not populate the set for the rest of the file, because a
+/// `TestCases::new()` inside a sibling module is not in scope there.
+/// Leaking it would surface a phantom fixture from the sibling module's
+/// call.
 ///
-/// The fix adds a `visit_item_mod` override that mirrors the
-/// save/restore pattern used by `visit_item_fn` for `local_bindings`:
-/// `imported_testcases` and `aliased_testcases` are taken into local
-/// variables on entry, the inline module is walked with the cleared
-/// (empty) sets, and the saved sets are restored on exit. File-level
-/// `use` statements (those outside any `mod` block) continue to work
-/// because they execute on the file's outer scope before any
+/// The visitor mirrors the save/restore pattern used by `visit_item_fn`
+/// for `local_bindings`: `imported_testcases` and `aliased_testcases`
+/// are taken into local variables on entry, the inline module is walked
+/// with cleared sets, and the saved sets are restored on exit. File-
+/// level `use` statements (those outside any `mod` block) continue to
+/// work because they execute on the file's outer scope before any
 /// `visit_item_mod` runs.
 #[test]
 fn imported_testcases_does_not_leak_across_modules() {
@@ -1422,10 +1414,10 @@ mod b {\n\
 /// **`use trybuild::TestCases as Foo;` inside a `mod a` does NOT leak
 /// the alias into `mod b`.** The companion to
 /// `imported_testcases_does_not_leak_across_modules` — `aliased_testcases`
-/// is also a per-file set that the round-5 fix scopes to the inline
-/// module. Before the fix, a `use trybuild::TestCases as Foo;` in `mod a`
-/// would populate the file-scope `aliased_testcases`, causing a
-/// `Foo::new(); t.compile_fail(...)` chain in `mod b` to emit a
+/// is also scoped to the inline module. A
+/// `use trybuild::TestCases as Foo;` in `mod a` must not populate the
+/// file-scope `aliased_testcases`, because a
+/// `Foo::new(); t.compile_fail(...)` chain in `mod b` would emit a
 /// spurious `discovery_unrecognized` entry (since `Foo` is not actually
 /// in scope in `mod b`).
 ///
@@ -1465,10 +1457,10 @@ mod b {\n\
 
     let out = discover(&crate_root, &[]).expect("discover succeeds");
 
-    // `mod a` produces exactly one unrecognized entry (alias not
-    // registered via flag — the round-3 behavior). `mod b`'s sibling
-    // call must NOT add a second one — if the alias set leaked, the
-    // sibling would also emit `unrecognized`.
+    // `mod a` produces exactly one unrecognized entry because the alias
+    // is not registered via flag. `mod b`'s sibling call must NOT add a
+    // second one — if the alias set leaked, the sibling would also emit
+    // `unrecognized`.
     assert!(
         out.fixtures.is_empty(),
         "no aliases are registered; expected zero fixtures. got {:?}",
@@ -1495,7 +1487,7 @@ mod b {\n\
     );
 }
 
-/// **Round-5 BLOCK regression: `#[cfg(...)]`-gated `#[test]` functions
+/// **`#[cfg(...)]`-gated `#[test]` functions
 /// emit `discovery_unrecognized` and do NOT contribute fixtures.** A
 /// `#[cfg(feature = "foo")] #[test] fn ui() { ... trybuild call ... }`
 /// is unevaluable at AST time — the cfg's truth value depends on
@@ -1503,8 +1495,8 @@ mod b {\n\
 /// into the body and surfaced the trybuild call as an active fixture,
 /// producing a phantom entry whenever the feature was disabled.
 ///
-/// The fix: any function carrying `#[cfg]` or `#[cfg_attr]` is recorded
-/// as `discovery_unrecognized` (detail names the function and mentions
+/// Any function carrying `#[cfg]` or `#[cfg_attr]` is recorded as
+/// `discovery_unrecognized` (detail names the function and mentions
 /// `cfg`) and its body is NOT descended. Adjacent un-gated functions
 /// remain unaffected — the corpus fixture below has both
 /// `#[cfg(feature = "foo")] fn ui` (gated) and `#[test] fn ui_always`
@@ -1619,16 +1611,16 @@ fn ui() {\n\
     );
 }
 
-/// **Round-6 BLOCK regression: file-level `#![cfg(...)]` inner
+/// **File-level `#![cfg(...)]` inner
 /// attribute gates the entire file.** A `tests/trybuild.rs` whose
 /// first non-comment line is `#![cfg(unix)]` is excluded from the build
 /// on non-Unix platforms — every item inside is invisible to the
 /// compiler. The visitor must NOT descend into a file gated this way;
 /// doing so would surface phantom fixtures on the disabled cfg arm.
 ///
-/// The fix: in `discover()`, after parsing the `syn::File`, check
-/// `ast.attrs` for `#[cfg]` / `#[cfg_attr]` (inner attributes parse
-/// into `File.attrs` via `Attribute::parse_inner`). If gated, emit one
+/// In `discover()`, after parsing the `syn::File`, check `ast.attrs`
+/// for `#[cfg]` / `#[cfg_attr]` (inner attributes parse into
+/// `File.attrs` via `Attribute::parse_inner`). If gated, emit one
 /// `discovery_unrecognized` entry for the file and skip the visitor
 /// walk entirely.
 ///
@@ -1696,18 +1688,18 @@ fn ui() {\n\
     );
 }
 
-/// **Round-6 regression: `#[cfg(...)]`-gated `use` declarations are
+/// **`#[cfg(...)]`-gated `use` declarations are
 /// skipped.** A `#[cfg(feature = "x")] use trybuild::TestCases;` is
 /// NOT in scope at adopter build time when the feature is disabled.
 /// Populating `imported_testcases` from a cfg-gated use would falsely
 /// recognize a downstream `TestCases::new()` call as a fixture even
 /// when the corresponding `use` is gated out.
 ///
-/// The fix: skip processing cfg-gated `use` items entirely. The
-/// downstream `TestCases::new()` call, lacking the no-cfg path entry,
-/// matches no known shape (not in `imported_testcases`, not canonical
-/// 3-segment, not in `aliased_testcases`) and is silently dropped —
-/// the safe under-discovery outcome.
+/// Skip processing cfg-gated `use` items entirely. The downstream
+/// `TestCases::new()` call, lacking the no-cfg path entry, matches no
+/// known shape (not in `imported_testcases`, not canonical 3-segment,
+/// not in `aliased_testcases`) and is silently dropped — the safe
+/// under-discovery outcome.
 ///
 /// The test exercises exactly that shape: a cfg-gated
 /// `use trybuild::TestCases;` followed by a `#[test]` function that
@@ -1753,16 +1745,15 @@ fn ui() {\n\
     );
 }
 
-/// **Round-6 regression: `#[cfg(...)]`-gated `type Foo = TestCases;`
+/// **`#[cfg(...)]`-gated `type Foo = TestCases;`
 /// aliases are skipped.** A cfg-gated type alias is NOT materially
 /// present when the cfg is disabled at adopter build time. Emitting
 /// `discovery_unrecognized` for an item that does not exist in the
 /// compiled crate is noise — the operator cannot act on it.
 ///
-/// The fix: skip processing cfg-gated `type` items entirely. The
-/// existing un-gated `type Foo = TestCases;` warning continues to fire
-/// as round-3 specified — the fix is the cfg-conditional skip, not a
-/// behavior change for un-gated aliases.
+/// Skip processing cfg-gated `type` items entirely. The existing
+/// un-gated `type Foo = TestCases;` warning continues to fire; this is
+/// a cfg-conditional skip, not a behavior change for un-gated aliases.
 #[test]
 fn cfg_gated_type_alias_is_skipped() {
     let tmp = tempfile::tempdir().expect("tempdir");
@@ -1794,19 +1785,19 @@ type Foo = trybuild::TestCases;\n";
     );
 }
 
-/// **Round-6 BLOCK regression: `use trybuild::TestCases;` inside a
+/// **`use trybuild::TestCases;` inside a
 /// function body does NOT leak to sibling functions.** In Rust, `use`
 /// declarations inside a function body are LOCAL to that function — they
 /// do NOT leak to sibling functions. The visitor must therefore scope
 /// `imported_testcases` per-function, mirroring what `visit_item_mod`
 /// already does for inline modules.
 ///
-/// Before the fix, `visit_item_fn` saved/restored `local_bindings` and
-/// `aliased_bindings` but NOT `imported_testcases` / `aliased_testcases`.
-/// A `fn a() { use trybuild::TestCases; ... }` would populate the
-/// file-scope set, and a sibling `fn b() { let t = TestCases::new(); ... }`
-/// (where `TestCases` is NOT actually in scope) would silently surface
-/// as a phantom fixture.
+/// `visit_item_fn` must save/restore `imported_testcases` and
+/// `aliased_testcases` as well as local receiver bindings. Otherwise
+/// `fn a() { use trybuild::TestCases; ... }` would populate the
+/// file-scope set, and a sibling
+/// `fn b() { let t = TestCases::new(); ... }` (where `TestCases` is
+/// NOT actually in scope) would silently surface as a phantom fixture.
 ///
 /// The test exercises exactly that shape: `fn a` imports `TestCases`
 /// inside its body; `fn b` (the `#[test]` function) constructs a
@@ -1844,8 +1835,8 @@ fn b() {\n\
 
     let out = discover(&crate_root, &[]).expect("discover succeeds");
 
-    // The leak fix demands that `fn b`'s `TestCases::new()` chain is
-    // NOT recognized — `TestCases` is not imported at the file level
+    // `fn b`'s `TestCases::new()` chain must NOT be recognized —
+    // `TestCases` is not imported at the file level
     // and `fn a`'s body-scoped `use` must not leak. The chain is a
     // 2-segment local-name path that is not in `imported_testcases`,
     // not in `aliased_testcases`, and not the canonical 3-segment
@@ -1871,7 +1862,7 @@ fn b() {\n\
     );
 }
 
-/// **Round-6 BLOCK regression: `#[cfg(...)]`-gated inline modules emit
+/// **`#[cfg(...)]`-gated inline modules emit
 /// `discovery_unrecognized` and do NOT contribute fixtures.** A
 /// `#[cfg(feature = "x")] mod gated { ... trybuild call ... }` is
 /// unevaluable at AST time — the cfg's truth value depends on
@@ -1879,10 +1870,10 @@ fn b() {\n\
 /// into the body and surfaced the trybuild call as an active fixture,
 /// producing a phantom entry whenever the feature was disabled.
 ///
-/// The fix: any inline module carrying `#[cfg]` or `#[cfg_attr]` is
-/// recorded as `discovery_unrecognized` (detail names the module and
-/// mentions `cfg`) and its body is NOT descended — mirroring the round-5
-/// `visit_item_fn` / `visit_impl_item_fn` fix.
+/// Any inline module carrying `#[cfg]` or `#[cfg_attr]` is recorded as
+/// `discovery_unrecognized` (detail names the module and mentions
+/// `cfg`) and its body is NOT descended, mirroring the function and
+/// impl-method handling.
 ///
 /// The test pairs a `#[cfg(feature = "x")] mod gated { ... }` with a
 /// sibling un-gated module so the assertion validates both halves of

@@ -99,9 +99,9 @@ pub struct CompatArgs {
     /// `None`, the compat driver derives the path from `--compat-root`
     /// (the upstream manifest sits at `<compat_root>/Cargo.toml`).
     pub(crate) compat_manifest: Option<PathBuf>,
-    /// Workspace-member package selector forwarded from `--package`
-    /// (issue #53). Resolved to a member-manifest path inside the
-    /// compat driver via [`crate::compat::overlay::resolve_workspace_member_manifest`].
+    /// Workspace-member package selector forwarded from `--package`.
+    /// Resolved to a member-manifest path inside the compat driver via
+    /// [`crate::compat::overlay::resolve_workspace_member_manifest`].
     /// Mutually exclusive with `compat_manifest` (enforced at validator
     /// time — see `crate::cli::Cli::validate_mode_consistency`).
     pub(crate) compat_package: Option<String>,
@@ -149,8 +149,8 @@ impl CompatArgs {
         // joins produce relative paths like `./target/lihaaf-compat-converted/`
         // that cargo resolves against the staged manifest dir
         // (`<upstream>/target/lihaaf-overlay/`) — not the crate root — causing
-        // the double-`target/` nonexistent-path failure first caught in the
-        // Round-2 panel. Fix once here so all consumers see an absolute path.
+        // the double-`target/` nonexistent-path failure. Fix once here
+        // so all consumers see an absolute path.
         let compat_root = absolutize_required_path(
             cli.compat_root
                 .clone()
@@ -420,7 +420,7 @@ mod tests {
         }
     }
 
-    /// **Issue #53 — `CompatArgs::from_cli` carries `compat_package`.**
+    /// **`CompatArgs::from_cli` carries `compat_package`.**
     ///
     /// The projection plumbing is a single-line clone. This test pins
     /// the contract so a future refactor that drops the carry trips

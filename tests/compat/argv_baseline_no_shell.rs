@@ -1,4 +1,4 @@
-//! Phase 3 of compat mode (issue #8) — argv-only baseline integration tests.
+//! Argv-only baseline integration tests for compat mode.
 //!
 //! The acid test is **"no shell, ever":** shell metacharacters in argv
 //! entries are passed verbatim to the spawned process, never expanded

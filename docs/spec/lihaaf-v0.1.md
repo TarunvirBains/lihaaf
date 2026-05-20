@@ -4,8 +4,9 @@
 > parallel, non-flaky compile-fail and compile-pass testing of proc-macros
 > and macro-emitted code. Named after Ismat Chughtai's 1942 short story.
 
-Status: design spec. No code yet. Target: a single-binary `cargo lihaaf`
-subcommand publishable to crates.io from v0.1.
+Status: v0.1.0 implementation and release-gate spec. Target: a
+single-binary `cargo lihaaf` subcommand publishable to crates.io from
+v0.1.
 
 This document stands alone. It does not require any prior conversation or
 internal note to be understood, and it is the authoritative design source
@@ -86,12 +87,11 @@ Where this happens the spec calls it out.
 Lihaaf assumes that concurrent cargo activity in the same `target/`
 directory is the **default operating environment**, not an edge case.
 
-Agentic-development workflows — multiple Claude/Codex/AI agents working
-in worktrees, IDE `cargo check` loops running in the background, manual
-`cargo build` in a second terminal, parallel CI jobs sharing a warm
-`target/` cache — make multi-writer `target/` directories the norm.
-Tools that live in `target/` and assume single-writer semantics are
-broken in this era.
+Parallel cargo activity is common: worktree builds, IDE `cargo check`
+loops, manual `cargo build` in a second terminal, and CI jobs sharing a
+warm `target/` cache can all write under the same target tree. Tools
+that live in `target/` and assume single-writer semantics are broken in
+this environment.
 
 Worktrees mitigate the problem (each worktree gets its own `target/`),
 but not all setups use them, and even within a single worktree an IDE
@@ -161,7 +161,7 @@ user → cargo lihaaf
    │ Session startup                                      │
    │  1. Read [package.metadata.lihaaf]                   │
    │  2. Capture rustc --version, sysroot, host triple    │
-   │  3. cargo rustc consumer as dylib                    │
+   │  3. Build suite dylib (and collector if opted in)    │
    │     Parse --message-format=json → dylib path         │
    │  4. Copy dylib → target/lihaaf/lib<crate>-current-*  │
    │     (--use-symlink: symlink instead; see §4.3)       │
@@ -225,13 +225,9 @@ mechanisms (`inventory::submit!` and similar `dlopen`-friendly patterns)
 must propagate items registered inside the dylib to consumers that link
 the dylib.
 
-A research spike validated this property end-to-end on 2026-05-10 and
-returned the `GO_NATIVE` outcome: `cargo rustc --crate-type=dylib`
-override works AND inventory propagates natively across the dylib
-boundary, with no consumer-side `Cargo.toml` change required.
-
-The spike's research note is at
-`docs/research/2026-05-10-inventory-on-dylib-spike.md`.
+`cargo rustc --crate-type=dylib` validates the native path:
+registration propagates across the dylib boundary with no consumer-side
+`Cargo.toml` change required.
 
 Section 13 retains the full contingency catalog for revalidation
 cadence and for adopters whose consumer crates differ from the
@@ -327,9 +323,15 @@ features = ["testing"]
 edition = "2021"
 
 # DEFAULT: []. Extra crates beyond extern_crates that fixtures import
-# directly (e.g., serde, serde_json). Resolved via cargo metadata and
-# forwarded as `--extern` flags.
+# directly (e.g., serde, serde_json). Resolved from the suite build's
+# deps dir and forwarded as `--extern` flags.
 dev_deps = ["serde", "serde_json"]
+
+# DEFAULT: []. v0.1.0 accepts only ["tests"]. Opts the suite into a
+# staged suite workspace that prebuilds explicit dev_deps in the same
+# Cargo resolver graph as the dylib package. Named suites that omit
+# this key get [], even if the default suite opts in.
+build_targets = ["tests"]
 
 # DEFAULT: "compile_fail". A fixture is compile_fail if its enclosing
 # directory name (relative to crate root) contains this string;
@@ -430,6 +432,10 @@ doing any work. Any of these conditions hard-error with a non-zero exit:
 - `edition` not in the allowed set.
 - `fixture_timeout_secs` not a positive integer.
 - `per_fixture_memory_mb` (if set) not a positive integer.
+- `build_targets` contains anything other than `"tests"`, or repeats a
+  target name.
+- A suite's final `build_targets` is non-empty but its final
+  `dev_deps` is empty.
 - An entry in `allow_lints` is an empty string.
 - An entry in `allow_lints` starts with `-` (caller must not supply the
   `-A` prefix; lihaaf supplies it).
@@ -498,9 +504,10 @@ fixture_dirs = ["tests/lihaaf/compile_pass_spatial"]
 # extern_crates, dev_deps, edition, compile_fail_marker,
 # fixture_timeout_secs, per_fixture_memory_mb, allow_lints all
 # inherit from the top-level table when omitted on a named suite.
+# build_targets does NOT inherit; omitted named suites get [].
 ```
 
-**Per-suite resources.** The default suite uses the legacy paths
+**Per-suite resources.** The default suite uses the default paths
 `target/lihaaf/manifest.json` and `target/lihaaf-build/`; named suites
 get suite-namespaced paths `target/lihaaf/manifest-<name>.json` and
 `target/lihaaf-build-<name>/`. Different feature sets therefore have
@@ -525,6 +532,10 @@ at session startup with the list of valid names.
   gets `[]`, not the default suite's features. The explicit-replacement
   rule keeps a "spatial only" suite from accidentally pulling in a
   sibling `testing` feature.
+- `build_targets` does NOT inherit. A named suite that omits
+  `build_targets` gets `[]`, even when the default suite opts into
+  `["tests"]`. This keeps a suite that only changes fixture layout from
+  accidentally changing its Cargo graph.
 - `extra_substitutions`, `strip_lines`, and `strip_line_prefixes` DO
   NOT inherit. Per-suite REPLACE semantics match the `features`
   precedent: a named suite that omits these keys gets `[]`, not the
@@ -558,7 +569,7 @@ the same fixture under two different feature sets must use two
 distinct directories.
 
 **Reporter shape.** Single-suite runs (adopters who never declare a
-`[[suite]]` entry) keep their legacy output byte-identical: no header,
+`[[suite]]` entry) keep their default-suite output byte-identical: no header,
 no per-suite line, just the existing `lihaaf: <n> ok, <n> failed, <n>
 timeout, <n> memory_exhausted` final aggregate. Multi-suite runs add a
 `lihaaf: === suite "<name>" ===` header before each suite's verdict
@@ -589,14 +600,17 @@ failure is terminal — lihaaf does not skip ahead.
 2. **Toolchain capture** — capture `rustc --version --verbose`:
    release string, host triple, sysroot path, commit hash. Persist
    for cross-stage equality checks.
-3. **Dylib build** — build the consumer crate as a release-mode Rust
-   dynamic library, using whichever cargo subcommand the implementer
-   determines is most reliable, in a way that emits cargo's JSON
-   message stream so that `compiler-artifact` messages can be parsed
-   to recover the artifact path. See Section 4.2 for behavioral
-   requirements; Section 13 records the spike-validated invocation.
-4. **Dylib copy** — copy the cargo-emitted dylib from
-   `target/<triple>/<profile>/deps/lib<crate>-<hash>.so` to a
+3. **Suite Cargo build** — build the consumer crate as a release-mode
+   Rust dynamic library. Suites with empty `build_targets` use the
+   default dylib-only Cargo path. Suites with
+   `build_targets = ["tests"]` synthesize an isolated suite workspace
+   and build the staged dylib package plus the synthetic dev-deps
+   collector in one Cargo resolver graph. Both paths emit cargo's JSON
+   message stream so `compiler-artifact` messages can be parsed to
+   recover the dylib path. See Section 4.2 for behavioral requirements;
+   Section 13 records the spike-validated default invocation.
+4. **Dylib copy** — copy the cargo-emitted dylib from the suite target
+   dir's `release/deps/lib<crate>-<hash>.*` artifact to a
    lihaaf-managed stable path `target/lihaaf/lib<crate>-current-<hash>.so`.
    See Section 4.3 for the full rationale and behavioral requirements.
    All subsequent fixture workers reference the COPY, never the
@@ -613,9 +627,9 @@ failure is terminal — lihaaf does not skip ahead.
 8. **Result aggregation** — collect verdicts, render the report.
 9. **Exit** — Section 10 dictates the code.
 
-### 4.2 Cargo invocation for the dylib
+### 4.2 Cargo invocation for the suite build
 
-The dylib build must satisfy these behavioral requirements:
+The suite build must satisfy these behavioral requirements:
 
 - The consumer crate is built in release profile as a Rust dynamic
   library (`.so` on Linux, `.dylib` on macOS, `.dll` on Windows),
@@ -623,20 +637,46 @@ The dylib build must satisfy these behavioral requirements:
 - Cargo's JSON message stream (`--message-format=json` or equivalent)
   is captured so that `compiler-artifact` messages are available for
   artifact-path recovery.
-- lihaaf finds the `compiler-artifact` message whose `target.name`
-  equals `dylib_crate` and whose `target.kind` includes `"dylib"`,
-  reads the `filenames` array, and selects the first entry matching
-  the platform's dynamic-library extension.
+- lihaaf finds the `compiler-artifact` message whose Cargo
+  `package_id` matches `dylib_crate`, whose `target.crate_types`
+  includes `"dylib"`, and whose `filenames` entry has the platform's
+  dynamic-library extension. If Cargo omits `package_id`, lihaaf falls
+  back to `target.name` for default/synthetic message streams only.
 
 If multiple `compiler-artifact` messages match, the last one wins
 (cargo's normal "newest artifact" rule). If none match, lihaaf
 hard-errors, printing both the cargo invocation used and the JSON
 output verbatim so the adopter can reproduce the failure.
 
-The implementer chooses the specific cargo subcommand (`cargo rustc`,
-`cargo build`, or another) that most reliably satisfies the above
-requirements. Section 13 records the spike-validated invocation as a
-recommended starting point.
+When `suite.build_targets` is empty, lihaaf uses the default
+`cargo rustc -p <dylib_crate> --lib --release --crate-type=dylib`
+shape with the suite's feature set and `RUSTFLAGS="-C prefer-dynamic"`.
+This path remains byte-stable for adopters that omit `build_targets`.
+
+When `suite.build_targets == ["tests"]`, lihaaf synthesizes a temporary
+suite workspace under the suite target dir:
+
+- the staged dylib package has the same package name as `dylib_crate`,
+  points `[lib].path` at the real source with an absolute path, emits
+  both `rlib` and `dylib`, and does not receive promoted `dev_deps`;
+- a synthetic collector package depends on the explicit metadata-side
+  `dev_deps`, so their rlibs are present for per-fixture `--extern`
+  resolution;
+- path dependencies and selected `{ workspace = true }` dependencies
+  that target the dylib crate are rewritten to the staged dylib member,
+  preserving one `dylib_crate` identity in the graph;
+- the build is one Cargo resolver graph per suite, never per fixture.
+
+The staged workspace copies the ancestor `Cargo.lock` into the temp
+workspace when one exists, but does not force `--offline`, `--frozen`,
+or `--locked`; ambient Cargo configuration remains the source of truth.
+Member-local `[patch.*]` and `[replace]` tables are rejected. Workspace
+root inheritance carries down `[workspace.dependencies]`,
+`[workspace.package]`, `[workspace.lints]`, `[workspace.metadata]`,
+`[workspace.resolver]`, `[replace]`, `[profile.*]`, and root
+`[patch.*]` tables with path fields absolutized. A root patch whose key
+or package names `dylib_crate` is rejected for v0.1.0 rather than
+rewritten through compat-mode self-patch policy.
 
 Release profile is non-negotiable for v0.1. Debug-mode dylibs are
 faster on first build but slower on every steady-state run because of
@@ -653,13 +693,12 @@ lihaaf copies it to a lihaaf-managed path before any fixture dispatches.
 A developer's IDE runs `cargo check` in a loop; a second terminal runs
 `cargo build`; a parallel CI job shares the target directory. Any of
 these can replace, delete, or partially overwrite the cargo-managed
-dylib at `target/release/deps/lib<crate>-<hash>.so` between the moment
-lihaaf builds it and the moment a fixture worker links it. A symlink
-exposes every fixture in the session to this race — a fixture mid-link
-when cargo replaces the original gets a torn read or a load-time error.
-A copy isolates the session completely: lihaaf's fixture workers all
-reference the same stable bytes regardless of what cargo does to its
-own artifacts.
+dylib in the suite target dir between the moment lihaaf builds it and
+the moment a fixture worker links it. A symlink exposes every fixture in
+the session to this race — a fixture mid-link when cargo replaces the
+original gets a torn read or a load-time error. A copy isolates the
+session completely: lihaaf's fixture workers all reference the same
+stable bytes regardless of what cargo does to its own artifacts.
 
 **Copy mechanics.** The copy destination is
 `target/lihaaf/lib<crate>-current-<hash>.so` where `<hash>` is the
@@ -673,11 +712,11 @@ chooses the file-copy primitive.
 of a few hundred milliseconds on a laptop with a warm page cache, and
 disk usage roughly doubles the single-dylib footprint (cargo-managed
 copy plus lihaaf-managed copy). These are characteristic calibration
-anchors for reviewers, not behavioral commitments; actual numbers
-depend on the platform, filesystem, and dylib size. The safety win
-is accepted as worth this cost; the disk math comparison in Section
-2.5 shows why absolute disk usage remains well below the trybuild
-baseline regardless.
+anchors, not behavioral commitments; actual numbers depend on the
+platform, filesystem, and dylib size. The safety win is accepted as
+worth this cost; the disk math comparison in Section 2.5 shows why
+absolute disk usage remains well below the trybuild baseline
+regardless.
 
 **`--use-symlink` opt-in.** When the caller can assert that no
 concurrent cargo activity will modify `target/` during the session
@@ -778,17 +817,14 @@ path mid-session — significant new state machine in
 operator who hits drift re-runs the session and gets a clean rebuild
 through the normal stage 3 path.
 
-**Post-v0.1.0-beta.1 deferred: in-session rebuild.** A future revision
-(target: v0.1.0-beta.2 or v0.1.0 stable; design TBD) will reclaim
+**Future: in-session rebuild.** A future revision will reclaim
 partial-session progress on benign drift (e.g., an editor saved the
 consumer crate mid-session and cargo replaced the dylib) by rebuilding
 from stage 3 in-place, re-validating the four invariants, and
-resuming dispatch with the new manifest. The rebuild path requires
-worker coordination work that is out of the v0.1.0-beta.1 budget. The
-exit code will remain 67 — adopters' CI scripts that key on
-`TOOLCHAIN_DRIFT` to "blow the cache and re-run" continue to behave
-correctly under both v0.1.0-beta.1's hard-fail and the eventual
-in-session rebuild. Tracked as issue #7.
+resuming dispatch with the new manifest. The exit code will remain 67 —
+adopters' CI scripts that key on `TOOLCHAIN_DRIFT` to "blow the cache
+and re-run" will continue to behave correctly under both the current
+hard-fail and the eventual in-session rebuild.
 
 ### 4.6 Hard-fail on rustc drift
 
@@ -888,12 +924,16 @@ Where:
   affecting any in-progress fixture.
 - `<per_fixture_workdir>` is a per-fixture subdirectory under a
   per-session temporary directory, created before the rustc spawn.
-- `<deps_dir>` is `target/release/deps` (cargo populates this during
-  the dylib build).
-- Each `--extern` after the first resolves through `cargo metadata`
-  output captured during stage 3 — for each crate name in
-  `extern_crates ++ dev_deps`, find the matching `Resolve` node, read
-  its compiled artifact path (`.rlib` or `.so`).
+- `<deps_dir>` is the suite build output's `release/deps` directory.
+  On the default path this is the dylib build's deps dir. On
+  `build_targets = ["tests"]`, the staged suite workspace build also
+  compiles the collector package there, so explicit `dev_deps` have
+  rlibs available before fixture dispatch.
+- Each `--extern` after the first resolves by scanning `<deps_dir>` for
+  the matching compiled artifact name for each crate in
+  `extern_crates[1..] ++ dev_deps`. The dylib crate itself always uses
+  `<managed_dylib_path>` so fixture workers never link the cargo-managed
+  original.
 - `-A <lint>`: one flag pair per entry in the suite's `allow_lints`;
   omitted when the list is empty; forwarded verbatim to rustc with no
   shell expansion (lihaaf uses `Command::arg`, not a shell string).
@@ -1141,7 +1181,7 @@ files (`.stderr.linux`, `.stderr.macos`, `.stderr.windows`) if
 adopters need true cross-OS portability for fixtures that lean on
 paths inside strings.
 
-### 6.6 Adopter-extensible normalization (issue #45 / v0.1.0-beta.10)
+### 6.6 Adopter-extensible normalization
 
 The §6.2 categories cover environment-independent substring rewriting
 that lihaaf can derive from session-startup state (workspace root,
@@ -1182,8 +1222,8 @@ wants (no merge). The default-on-omit rule keeps "feature-isolated"
 suites from accidentally pulling in unrelated overrides.
 
 **Default invariant.** An adopter who does not set any of the three
-keys observes byte-identical output vs v0.1.0-beta.9. The feature is
-additive and opt-in.
+keys observes byte-identical output to a run with no adopter overrides.
+The feature is additive and opt-in.
 
 **`extra_substitutions` validation — `is_path_like` predicate.**
 Each entry's `from` field must satisfy `is_path_like`:
@@ -1292,8 +1332,7 @@ rustc's lowercase-first-byte convention (`error`, `warning`, `note`,
 `help`) — that boundary, not "produced by a CI runner," is what
 makes (C.2) safe to add to the strip allowlist. The enumerated
 banner-prefix list (the rustc trailers + `info:` + `linker version:`
-above) is closed for v0.1.0-beta.10; a future lihaaf release may
-extend it.
+above) is closed; a future lihaaf release may extend it.
 
 **Path-bearing diagnostic stripping caveat.** Strip patterns are
 validated for SHAPE (path-shaped or banner-shaped), not for whether
@@ -1320,16 +1359,12 @@ intermediate output and can rewrite it further (e.g.,
 `{ from = "$RUST/lib/rust-1.95.0", to = "$RUST" }` collapses an
 inner version-stamped sub-tree to bare `$RUST`).
 
-**Compat-mode deferral (OQ-4).** The three keys are *unsupported in
-compat mode* for v0.1.0-beta.10. The compat driver
-(`cargo lihaaf --compat`) synthesizes `[package.metadata.lihaaf]`
-entirely and does not surface adopter TOML into the inner session,
-so the three keys carry no value through compat-mode runs. This is
-not a future-extension placeholder; it is a deliberate scope
-boundary for the beta.10 release. Adopters who need
-extra-substitution / strip behavior must run in v0.1 stable mode
-(without `--compat`). Compat-mode adopter extras may land in
-beta.11+.
+**Compat-mode boundary.** The three keys are unsupported in compat mode.
+The compat driver (`cargo lihaaf --compat`) synthesizes
+`[package.metadata.lihaaf]` and does not carry adopter TOML into the
+inner session, so the keys have no effect there. Adopters who need
+extra-substitution or strip behavior must run the direct lihaaf path
+without `--compat`.
 
 ---
 
@@ -1426,8 +1461,7 @@ CI-side scripts that prefer injecting env to rewriting invocations.
 
 `--bless` is destructive — it overwrites checked-in `.stderr` files
 without confirmation. The harness assumes adopters have version
-control and review diffs before committing. There is no "bless into a
-sidecar for review" mode in v0.1; straightforward to add later.
+control and review diffs before committing.
 
 ### 7.4 Snapshot byte-determinism
 
@@ -2336,9 +2370,8 @@ orchestrator gets if neither (a) nor (b) survives investigation.
 
 ## Known risks
 
-A handful of design choices in this spec carry residual risk that
-no amount of self-review can eliminate. They are documented here so
-the implementation team and reviewers can engage with them directly.
+A handful of design choices in this spec carry residual risk. They are
+documented here for implementation and QA follow-up.
 
 ### KR-1 — RSS sampling resolution on Linux
 

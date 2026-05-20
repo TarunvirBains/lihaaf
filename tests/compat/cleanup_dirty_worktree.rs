@@ -1,12 +1,10 @@
-//! Phase 5 of compat mode (issue #10) — dirty-worktree-safe generated
-//! output policy integration tests.
+//! Dirty-worktree-safe generated output policy integration tests.
 //!
 //! Every test in this file reaches `lihaaf::CompatCleanupGuard` and
 //! friends through the `#[doc(hidden)]` re-exports declared in
 //! `src/lib.rs`. The re-exports exist exclusively for this test crate
-//! (and for the `cargo-lihaaf` binary, once Phase 9 wires the guard
-//! into `compat::run`). The supported entry to compat mode is `cargo
-//! lihaaf --compat`, not the Rust API.
+//! (and for the `cargo-lihaaf` binary). The supported entry to compat
+//! mode is `cargo lihaaf --compat`, not the Rust API.
 //!
 //! ## The contract under test
 //!
@@ -19,14 +17,14 @@
 //! > The report must list every generated path and classify it as
 //! > `committed`, `ignored`, or `cleaned`.
 //!
-//! And the "Cleanup" subsection (reconciled in round 5):
+//! And the "Cleanup" subsection:
 //!
 //! > Cleanup runs on the in-process exit paths the driver controls —
 //! > the hard-fail exit-67 case in §3.4 (freshness drift), the
 //! > `discovery_unrecognized` error path in §3.2.1, and the panic /
 //! > Drop unwind path the guard owns. The single exception is
 //! > `--keep-output`, which preserves all generated paths for local
-//! > debugging. SIGINT/SIGTERM cleanup is OUT OF SCOPE for v0.1 —
+//! > debugging. SIGINT/SIGTERM cleanup is OUT OF SCOPE —
 //! > installing a signal handler would either pull in a new crate
 //! > (`ctrlc` / `signal-hook`) or hand-roll cross-platform FFI; both
 //! > expand the dependency surface for marginal gain. See
@@ -38,7 +36,7 @@
 //! tests that exercise the `Committed` / `Ignored` classifications
 //! `git init` inside the tempdir; the tests that exercise the fallback
 //! to `Cleaned` deliberately skip git initialization to verify locked
-//! decision §5.3 (git absence → `Cleaned`).
+//! decision that git absence falls back to `Cleaned`.
 //!
 //! ## Why these tests bite
 //!
@@ -209,8 +207,8 @@ fn target_directory_path_classified_as_ignored() {
     assert_eq!(class_of(&results, &path), GeneratedPathClass::Ignored);
 }
 
-/// **Round-3 BLOCK regression: relative paths resolve against
-/// `target_root` at `track` time.** The `CleanupGuard::track` API
+/// **Relative paths resolve against `target_root` at `track` time.**
+/// The `CleanupGuard::track` API
 /// accepts relative-to-`target_root` paths for caller convenience,
 /// but the classifier's `is_under_cargo_target` compares against
 /// the joined `<target_root>/target` prefix via `starts_with`. A
@@ -219,9 +217,8 @@ fn target_directory_path_classified_as_ignored() {
 /// default — at which point the file would be REMOVED even though
 /// it lives under cargo's owned `target/` directory.
 ///
-/// The fix resolves relative paths against `target_root` eagerly
-/// in `track`, storing the absolute form internally. After the
-/// fix:
+/// `track` resolves relative paths against `target_root` eagerly,
+/// storing the absolute form internally:
 ///
 /// 1. The result `GeneratedPath.path` is `target_root.join(...)` —
 ///    the absolute form, byte-equal to what a directly-absolute
@@ -601,8 +598,8 @@ fn finalize_consumes_guard_drop_is_noop() {
     );
 }
 
-/// **Round-4 FIX regression: a removal failure on one path does not
-/// leak the remaining pending paths.**
+/// **A removal failure on one path does not leak the remaining pending
+/// paths.**
 ///
 /// Three tracked paths, where the middle one's removal fails (parent
 /// directory has write permission stripped on Unix). Before the fix,
@@ -666,9 +663,7 @@ fn cleanup_continues_after_individual_path_failure() {
     match err {
         lihaaf::Error::Io { context, .. } => {
             // The diagnostic must name the failed removal context. The
-            // race-free cleanup cascade (round-3, commit `57a0e33`)
-            // replaced the single `"removing compat-generated path"`
-            // context with three step-specific contexts:
+            // race-free cleanup cascade uses three step-specific contexts:
             //   - step 1 (file/symlink unlink): "removing compat-generated file/symlink"
             //   - step 2 (empty dir / dir-symlink): "removing compat-generated empty dir / dir-symlink"
             //   - step 3 (recursive walk): "recursively removing compat-generated directory"

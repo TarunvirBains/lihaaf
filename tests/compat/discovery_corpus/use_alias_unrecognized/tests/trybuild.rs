@@ -1,4 +1,4 @@
-// Phase 6 (§3.2.1) discovery-corpus fixture for round-3 review fix:
+// Discovery-corpus fixture for unregistered trybuild aliases:
 // `use trybuild::TestCases as Foo;` aliases must surface as
 // `discovery_unrecognized` when `Foo` is not registered via
 // `--compat-trybuild-macro`. The previous visitor silently dropped the
