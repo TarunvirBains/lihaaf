@@ -134,16 +134,26 @@ dev_deps      = ["serde", "axum-extra"]  # existing — explicit allow-list
 directed diagnostic ("`build_targets[i] = \"<X>\"` is not a recognized
 value; v0.1.0 supports only `\"tests\"`. Future releases may add
 `\"examples\"` and `\"benches\"`.").
-**Inheritance on named suites:** `build_targets` **DOES** inherit from
-the default suite when omitted — same precedent as `dev_deps`
-(`src/config.rs:772-774`). Rationale: the typical adopter shape sets
-both fields once at the top level; suite-level overrides should
-inherit unless explicitly replaced. This matches the existing
-default-suite inheritance for the closely-paired `dev_deps`. The
-adopter who wants suite-local opt-out can write `build_targets = []`
-explicitly. (See §11 OQ-1 for the inheritance-precedent discussion;
-the recommendation is to mirror `dev_deps` exactly so the two paired
-fields behave identically.)
+**Inheritance on named suites:** `build_targets` **DOES NOT** inherit
+from the default suite. A named suite that omits `build_targets` gets
+`[]` (no overlay), matching the REPLACE semantics already established
+for `features` (spec §3.6) and `extra_substitutions`. Rationale:
+lihaaf's explicit-config-first ethos ([[lihaaf-dev-deps-explicit-keep]])
+rejects implicit-by-default inheritance for fields that govern dylib
+build shape. Each named suite compiles its own dylib with its own
+feature set (per §3.6); the overlay-synthesis decision is part of the
+same per-suite build shape and follows the same REPLACE precedent.
+Adopter pilots have already shown that the paired `dev_deps`
+inheritance is fragile in practice — e.g.
+`/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml:108-132`
+restates `dev_deps` per-suite redundantly because round-5 hit
+inheritance breakage. Mirroring REPLACE for `build_targets` makes the
+two paired fields behave consistently with the per-suite build model
+rather than adding another fragile inheritance path. The adopter who
+wants overlay synthesis across all suites declares
+`build_targets = ["tests"]` per suite — same shape as the existing
+per-suite `features = ["macros"]` pattern. (See §11 OQ-1 for the
+locked decision.)
 
 ### §1.2 Truth table — `(build_targets, dev_deps)` combinations
 
@@ -177,16 +187,16 @@ in §5.1 holds.
 ### §1.4 Suite-level interaction
 
 Each suite resolves its `build_targets` value independently per §1.1's
-inheritance rule. Overlay synthesis happens per suite, gated on the
-**resolved** `build_targets`. The per-suite cargo target dir
-(`src/dylib.rs:388-393`) already isolates suite caches; the per-suite
-overlay dir extends that isolation:
+REPLACE rule (no inheritance). Overlay synthesis happens per suite,
+gated on the **resolved** `build_targets`. The per-suite cargo target
+dir (`src/dylib.rs:388-393`) already isolates suite caches; the
+per-suite overlay dir extends that isolation:
 
 | Suite type             | Resolved `build_targets`        | Overlay dir                                              |
 |------------------------|---------------------------------|----------------------------------------------------------|
 | Default, omitted       | `[]` (omitted default)          | none                                                     |
 | Default, opt-in        | `["tests"]`                     | `<target_dir>/lihaaf-build/lihaaf-overlay-default/`      |
-| Named, omitted         | inherited from default          | matches default's choice; if synthesized, named-suite dir|
+| Named, omitted         | `[]` (REPLACE; no inheritance)  | none                                                     |
 | Named "spatial", opt-in| `["tests"]`                     | `<target_dir>/lihaaf-build-spatial/lihaaf-overlay-spatial/`|
 
 The overlay dir sits **inside** the per-suite target dir (not as a
@@ -205,11 +215,12 @@ collision).
 
 ```rust
 /// Build targets to compile beyond `--lib` for the dylib build, gating
-/// the dev-deps overlay-promotion synthesis. Default `[]`. Inherits
-/// from the default suite when omitted on a named suite (same precedent
-/// as `dev_deps`). Validated values: currently only "tests" is
-/// accepted. v0.1.0 design surface; "examples" and "benches" may be
-/// added in v0.2+.
+/// the dev-deps overlay-promotion synthesis. Default `[]`. Does NOT
+/// inherit from the default suite (REPLACE semantics, same as
+/// `features` and `extra_substitutions`). A named suite that omits
+/// this field gets `[]` (no overlay). Validated values: currently only
+/// "tests" is accepted. v0.1.0 design surface; "examples" and "benches"
+/// may be added in v0.2+.
 pub build_targets: Vec<String>,
 ```
 
@@ -252,22 +263,24 @@ The `Suite` constructor at line 630-647 grows a `build_targets`
 field assignment alongside `dev_deps: raw.dev_deps.clone().unwrap_or_default()`.
 
 **Site 5: `fn finalize_named_suite` (line 650).** Same shape as Site 4
-but with inheritance:
+but using REPLACE (no inheritance from default suite — per §11.1
+locked decision):
 
 ```rust
-let build_targets = raw
-    .build_targets
-    .unwrap_or_else(|| default_suite.build_targets.clone());
+let build_targets = raw.build_targets.clone().unwrap_or_default();
 validate_build_targets(&name, &build_targets, &raw.dev_deps)?;
 ```
 
-Inserted near line 772 (the `dev_deps` finalization), and the `Suite`
+Inserted near line 772 (the `dev_deps` finalization, which still
+inherits — see [[lihaaf-dev-deps-explicit-keep]]), and the `Suite`
 constructor at line 766-784 grows the new field assignment.
 
 **Critical:** the validation must run **after** `dev_deps` is resolved
 (default-or-inherited), because §1.2 row 3 checks both fields together.
-For named suites, the resolved `dev_deps` is `raw.dev_deps.unwrap_or_else(|| default_suite.dev_deps.clone())`. The validator
-takes both resolved values.
+For named suites, the resolved `dev_deps` is `raw.dev_deps.unwrap_or_else(|| default_suite.dev_deps.clone())`. Note `build_targets`
+uses REPLACE while `dev_deps` uses INHERIT — this asymmetry is the
+§11.1 locked decision; do not "fix" it by giving `build_targets`
+inheritance.
 
 ### §2.1.bis New helper: `fn validate_build_targets`
 
@@ -1079,23 +1092,22 @@ build_targets = ["tests"]
 
 ### §6.2 Amendment to §3.6 Suite inheritance (lines 517-538)
 
-**Amendment to the inheritance bullet list at lines 532-534:**
+**Amendment to the REPLACE bullet list (the "does NOT inherit" half):**
 
-Current text:
+Current REPLACE list includes `features` and `extra_substitutions`.
 
-> `extern_crates`, `dev_deps`, `edition`, `compile_fail_marker`,
-> `fixture_timeout_secs`, `per_fixture_memory_mb`, and `allow_lints`
-> DO inherit from the default suite when omitted.
+Updated REPLACE list adds `build_targets` to that group per §11.1
+locked decision:
 
-Updated text:
+> `features`, `extra_substitutions`, and `build_targets` do NOT
+> inherit from the default suite. A named suite that omits any of
+> these gets `[]`.
 
-> `extern_crates`, `dev_deps`, `build_targets`, `edition`,
-> `compile_fail_marker`, `fixture_timeout_secs`,
-> `per_fixture_memory_mb`, and `allow_lints` DO inherit from the
-> default suite when omitted.
-
-`build_targets` is inserted between `dev_deps` and `edition` to
-co-locate the paired fields per §1.1.
+The INHERIT list (`extern_crates`, `dev_deps`, `edition`,
+`compile_fail_marker`, `fixture_timeout_secs`,
+`per_fixture_memory_mb`, `allow_lints`) is unchanged. `build_targets`
+joins `features` / `extra_substitutions` because all three govern
+per-suite dylib build shape (§11.1 rationale).
 
 ### §6.2.bis New §4.2.bis subsection — overlay-promotion mechanics
 
@@ -1139,9 +1151,11 @@ The overlay is content-deterministic: same inputs → same overlay
 bytes → same cargo fingerprint → cache hits across reruns. The overlay
 write is idempotent (mtime preserved on byte-identical rerun).
 
-`build_targets` is a per-suite key with default-suite inheritance.
-Setting `build_targets = []` (or omitting) restores the byte-identical
-legacy path (no overlay synthesized; no overlay directory created).
+`build_targets` is a per-suite key with REPLACE semantics (no
+inheritance from the default suite). A named suite that omits
+`build_targets` gets `[]` (no overlay). Setting `build_targets = []`
+explicitly (or omitting) restores the byte-identical legacy path (no
+overlay synthesized; no overlay directory created).
 
 For the worked example, see `docs/user-guide.md` §"Overlay promotion
 for dev-deps fixtures."
@@ -1221,9 +1235,12 @@ build_targets  = ["tests"]
   `dev_deps` entries from `[dev-dependencies]` into `[dependencies]`
   for the single `cargo rustc` invocation that builds the dylib.
 
-The opt-in is per-suite. A multi-suite adopter sets it once at the
-top level; named suites inherit. To opt-out a specific named suite
-(rare), set `build_targets = []` explicitly on that suite.
+The opt-in is per-suite. `build_targets` does NOT inherit from the
+default suite — adopters who want overlay promotion across all suites
+must declare `build_targets = ["tests"]` per suite (same shape as
+`features`). This is intentional: each suite compiles its own dylib
+with its own build shape (see [[lihaaf-dev-deps-explicit-keep]] for
+the explicit-config-first rationale).
 
 ### Cost
 
@@ -1259,12 +1276,18 @@ compile_fail_marker  = "fail"
 fixture_dirs = ["tests/debug_handler/fail", "tests/debug_handler/pass"]
 
 [[package.metadata.lihaaf.suite]]
-name         = "from_request"
-features     = ["macros"]
-dev_deps     = ["axum-extra", "serde"]
-# build_targets inherited from default → ["tests"]
-fixture_dirs = ["tests/from_request/fail", "tests/from_request/pass"]
+name          = "from_request"
+features      = ["macros"]
+dev_deps      = ["axum-extra", "serde"]
+build_targets = ["tests"]    # ← REPLACE semantics; restate per suite
+fixture_dirs  = ["tests/from_request/fail", "tests/from_request/pass"]
 ```
+
+Note `build_targets` is restated on each named suite. Per §11.1 it
+uses REPLACE semantics (same as `features`); omitting it on a named
+suite means that suite gets `[]` (no overlay). Each named suite that
+needs overlay promotion must declare `build_targets = ["tests"]`
+explicitly.
 
 `cargo lihaaf` then:
 
@@ -1325,8 +1348,8 @@ Located in `src/config.rs::tests` module.
 | `build_targets_rejects_invalid_value` | `build_targets = ["examples"]` | Parse error mentioning "examples is not a recognized value" |
 | `build_targets_rejects_duplicate_entry` | `build_targets = ["tests", "tests"]` | Parse error mentioning duplicate |
 | `build_targets_requires_non_empty_dev_deps` | `build_targets = ["tests"]` + `dev_deps = []` | Parse error per §1.2 row 3 |
-| `build_targets_inherits_on_named_suite` | Top-level `build_targets = ["tests"]`, named suite omits | Named suite resolved to `["tests"]` |
-| `build_targets_named_suite_can_override` | Top-level `["tests"]`, named suite `[]` | Named suite resolved to `[]` |
+| `build_targets_does_not_inherit_on_named_suite` | Top-level `build_targets = ["tests"]`, named suite omits | Named suite resolved to `[]` (REPLACE semantics; no inheritance) |
+| `build_targets_named_suite_can_override` | Top-level `["tests"]`, named suite `["tests"]` declared independently | Named suite resolved to `["tests"]` (each suite declares own) |
 | `build_targets_named_suite_can_set_independently` | Top-level omitted (`[]`), named suite `["tests"]` | Default `[]`, named `["tests"]` |
 
 ### §8.2 Unit: overlay synthesis (`src/dev_deps_overlay.rs::tests`)
@@ -1540,41 +1563,49 @@ legacy path.
 
 ## §11 Open questions
 
-Codex round-1 will critique these. The user-locked decisions in the
-dispatch (CLI-only, dylib-only, explicit > implicit, etc.) are NOT
-OQs; the four below are real design choices the planner couldn't
-resolve unilaterally.
+Pre-Codex user decisions (locked 2026-05-19 before dispatch):
 
-### §11.1 OQ-1 — inheritance for `build_targets`
+- **OQ-1** (`build_targets` inheritance) → **LOCKED REPLACE** (§11.1)
+- **OQ-2** (`optional = true` dev-dep policy) → **OPEN for Codex** (§11.2)
+- **OQ-3** (orthogonality) → **LOCKED orthogonal** (§11.3)
+- **OQ-4** (`[patch]` interaction) → **CODEX DECIDES; user-preferred path DEFERRED to v1.0.0** (§11.4, GH-tracked per §12.8)
 
-The recommendation in §1.1 is to mirror `dev_deps` exactly:
-`build_targets` inherits from the default suite when omitted on a
-named suite.
+Codex round-1 will critique all four. The locked decisions are
+user-authorized design choices; if Codex pushes back on a locked
+decision, the planner / orchestrator escalates to the user before
+revising. The OPEN OQ-2 is genuinely open and Codex's preferred
+shape should be adopted (subject to user veto). OQ-4 is also Codex-
+adjudicated: user prefers v0.1.0 ships with warning + GH-tracked
+v1.0.0 follow-up (see §12.8), but Codex may BLOCK the deferral and
+demand inline resolution. Either Codex outcome on OQ-4 is acceptable
+to the user.
 
-**Alternative considered:** mirror `features` and `extra_substitutions`
-instead — REPLACE semantics, where a named suite that omits
-`build_targets` gets `[]`, not the default suite's value.
+### §11.1 OQ-1 — inheritance for `build_targets` — **LOCKED: REPLACE**
 
-**Argument for REPLACE (currently rejected, but Codex may surface):**
-the suite system is built around "each suite is self-contained";
-inheriting a "synthesize overlay" decision feels like the kind of
-implicit-by-default the locked constraints reject.
+**Status:** Locked by user on 2026-05-19 before Codex adversarial
+review. REPLACE semantics chosen; INHERIT explicitly rejected.
 
-**Argument for INHERIT (recommended):** the paired `dev_deps` already
-inherits. Adopters declaring `dev_deps` at the top level expect
-`build_targets` to follow the same precedent. The explicit-opt-out
-shape (`build_targets = []` on a suite that doesn't need overlay) is
-available.
+**Decision:** Named suites that omit `build_targets` get `[]` (no
+overlay). Same REPLACE precedent as `features` (spec §3.6) and
+`extra_substitutions`. Adopter must declare `build_targets = ["tests"]`
+per suite that needs overlay synthesis.
 
-**Decision lens:** if Codex pushes for REPLACE, the implementer
-should run the axum-macros pilot through both shapes and pick the
-one with fewer per-suite-key redundancies. The current axum-macros
-shape (`/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/
-Cargo.toml:108-132`) declares `dev_deps` redundantly per suite (the
-comment at line 100-105 explains why — `dev_deps` inheritance was
-broken in beta.5 round-5); the INHERIT shape proposed here would let
-the adopter declare `build_targets` once and have it cover all
-suites.
+**Rationale (user 2026-05-19):** "redundantly per suite seems fine to
+me since we use that to compile a union? let's not rework lihaaf's
+explicit first behaviour." lihaaf is built around per-suite explicit
+declaration of build shape (`features`, `dev_deps`, `extra_substitutions`);
+each suite compiles its own dylib with its own feature set, and the
+overlay-synthesis decision is part of that build shape. Adding a
+second INHERIT field for paired-with-`dev_deps` would just add another
+fragile inheritance — exactly the kind already observed in pilots
+(see `/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml:108-132`
+restating `dev_deps` per-suite after beta.5 round-5 inheritance
+breakage).
+
+**Codex note:** if Codex pushes for INHERIT during adversarial review,
+the rationale to defend REPLACE is the explicit-config-first ethos
+([[lihaaf-dev-deps-explicit-keep]]) — not a craft question, a
+user-locked architectural decision.
 
 ### §11.2 OQ-2 — `optional = true` dev-dep policy
 
@@ -1605,50 +1636,60 @@ v0.2 may add a REJECT path if a pilot surfaces breakage.
 "flip only if no `dep:<name>` feature reference exists in
 `[features]`"?
 
-### §11.3 OQ-3 — should `build_targets` also auto-add to `extern_crates`?
+### §11.3 OQ-3 — `build_targets` ↔ `extern_crates` orthogonality — **LOCKED: orthogonal**
 
-The current design keeps the three lihaaf metadata fields
-orthogonal:
+**Status:** Locked by user on 2026-05-19 before Codex adversarial
+review. The three fields stay orthogonal; auto-inference rejected.
+
+**Decision:** The three lihaaf metadata fields remain semantically
+distinct:
 
 - `extern_crates` — fixtures' `use <name>` imports (always
   forwarded).
 - `dev_deps` — additional `--extern` forwardings (always
   forwarded).
 - `build_targets` — gates the overlay synthesis (controls dylib
-  build, not per-fixture forwarding).
+  build shape, not per-fixture forwarding).
 
-This is intentionally redundant: an adopter setting
-`build_targets = ["tests"]` and `dev_deps = ["serde"]` writes both,
-even though semantically the dev-deps named for promotion are
-**always** also forwarded as `--extern` (otherwise why promote?).
+Adopter setting `build_targets = ["tests"]` and `dev_deps = ["serde"]`
+writes both. The redundancy is honest separation: one field per
+concept.
 
-**Alternative:** infer that `dev_deps` promoted via `build_targets`
-is also auto-forwarded — adopter sets `build_targets` + a new
-`promote_dev_deps = ["serde"]` field, and lihaaf auto-derives both
-the synthesis-input and the `--extern` forwarding from a single
-list.
+**Rationale (user 2026-05-19):** "agreed on orthogonal." Consistent
+with the explicit-config-first ethos that informs OQ-1's REPLACE
+decision. Inferring "if it's in dev_deps AND build_targets is set,
+also auto-forward" is exactly the magic-by-default pattern lihaaf
+rejects.
 
-**Argument against:** introduces a second field, splits the "names
-of dev-deps to forward to fixtures" surface across two
-implementation-detail-driven concepts. Worse adopter ergonomics.
+**Codex note:** if Codex pushes for inference / single-field
+consolidation during adversarial review, the rationale to defend
+orthogonality is the same as OQ-1 — explicit-config-first is a
+user-locked architectural decision.
 
-**Recommendation:** keep them orthogonal in v0.1.0. The redundancy
-is explicit and easy to document; the conceptual model "what
-crates do fixtures need" is one field (`dev_deps`), "what dylib
-build shape" is another (`build_targets`).
+### §11.4 OQ-4 — `[patch]` table interaction with promotion — **CODEX DECIDES; user-preferred path DEFERRED to v1.0.0**
 
-**For Codex:** is the redundancy actually a problem, or is it the
-honest separation it claims to be?
+**Status:** User on 2026-05-19 prefers deferral to v1.0.0 roadmap but
+delegates final adjudication to Codex adversarial review. Per
+[[no-unilateral-deferral]] this is an explicit user-authorized
+deferral path, not a unilateral shelve.
 
-### §11.4 OQ-4 — `[patch]` table interaction with promotion
+**Two outcomes possible from Codex review:**
 
-§3.3.4 says: don't touch `[patch]`; let cargo's walk-up resolve it.
+1. **Codex ALLOWs the deferral** → plan ships as written with §12.8
+   creating the GH issue + §7 user-guide warning. v0.1.0 cannot ship
+   without §12.8's GH issue filed.
+2. **Codex BLOCKs the deferral** (i.e. demands "carry verbatim"
+   proven or REJECT-path added pre-v0.1.0) → planner re-dispatch to
+   close OQ-4 in this plan body; §12.8 may collapse into the relevant
+   implementation step.
 
-This works for the **common** case (adopter doesn't patch the
-promoted dev-deps). But consider:
+**The deferred risk:** `[patch]` table on adopter's `Cargo.toml`
+interacting with overlay promotion. §3.3.4 ships "carry verbatim"
+policy — don't touch `[patch]`, let cargo's walk-up resolve it. This
+works for the common case (adopter doesn't patch promoted dev-deps).
 
 ```toml
-# adopter's Cargo.toml
+# adopter's Cargo.toml (the deferred-risk shape)
 [dependencies]
 foo = "1.0"
 
@@ -1662,31 +1703,34 @@ serde = { path = "./forks/serde" }
 Pre-promotion: cargo's resolver applies the patch to `serde`
 references in `[dev-dependencies]`. The patch fires.
 
-Post-promotion (overlay): same patch fires for `serde` references
-in `[dependencies]`. The patch fires.
+Post-promotion (overlay): same patch fires for `serde` references in
+`[dependencies]`. The patch SHOULD fire identically.
 
-**Both work — but is the patch correctness invariant proven?** The
-risk: a `[patch]` section on the adopter's manifest is somewhat
-unusual (cargo accepts it but emits a warning). Most patches live
-on the workspace root. The interaction between the overlay's
-`[dependencies]` and the workspace root's `[patch.crates-io]`
-should be identical to the interaction between the workspace
-root's `[patch]` and the **adopter's `[dev-dependencies]`** — but
-cargo's resolver may have subtle path-vs-name resolution edge
-cases when the same `crates-io.X` source-id appears in two
-distinct dep-table classes on the **same** package over the
-overlay-vs-baseline diff.
+**Both should work — but the patch correctness invariant is not
+proven** for the case where the same crates-io.X source-id appears
+across `[dependencies]` (overlay) AND `[dev-dependencies]` (baseline)
+of the same package with a `[patch.crates-io]` redirect.
 
-**Recommendation:** ship the proposed policy. Trip an adversarial
-pilot with `[patch]` interaction (`derive_more` if it has patches;
-otherwise a synthetic test) BEFORE promoting to a guaranteed-safe
-transformation.
+**v0.1.0 mitigation:** the user guide (§7) MUST document that adopters
+with `[patch.crates-io]` patches on their adopter manifest targeting
+crates listed in `dev_deps` should validate the patch fires correctly
+against their dylib build before relying on `build_targets = ["tests"]`.
 
-**For Codex:** does cargo document any "patch source-id" rule that
-this design might violate? The `compat/overlay.rs:725-787`
-`apply_self_patch_policy` 4-rule dispatch is for a different
-problem (self-aliasing of the package being overlaid); does any of
-that thinking apply here?
+**v1.0.0 work tracked in GH issue (per §12.8):**
+
+- Reproduce the deferred-risk shape with a synthetic pilot or
+  `derive_more` if applicable.
+- Cite cargo's documented source-id resolution rules.
+- Either (a) prove the "carry verbatim" policy correct, or (b) add a
+  REJECT path at synthesis for adopter-local `[patch]` sections
+  targeting promoted dev-deps.
+
+**Rationale (user 2026-05-19):** "sure codex decides. I am comfortable
+deferring to post v0.1.0 as our v1.0.0 roadmap can capture it." Cargo
+resolver behavior here is unproven; user-preferred path is v0.1.0
+ships with documented user-guide warning + GH-tracked v1.0.0 follow-up.
+If Codex ALLOWs that shape, deferral stands; if Codex BLOCKs, planner
+closes OQ-4 inline.
 
 ---
 
@@ -1814,6 +1858,33 @@ of this dispatch; the pilot fork is a separate repository.
 3. Measure the cold-cache wall-clock for the §10 estimate.
 4. If measurement diverges materially from §10 estimate, update
    §10.
+
+### §12.8 Step 8 — file v1.0.0 GH issue for OQ-4 `[patch]` deferral
+
+**MANDATORY: v0.1.0 cannot ship without this issue filed.** Per
+[[no-unilateral-deferral]] this is the GH-tracked record of the
+user-authorized §11.4 deferral.
+
+1. Open a GH issue on `lihaaf-rs/lihaaf` titled exactly:
+   `v1.0.0: prove or reject [patch.crates-io] interaction with overlay-promoted dev_deps`
+2. Issue body MUST include:
+   - Link to `docs/spec/dev-deps-overlay-promotion-plan-2026-05-19.md#114-oq-4--patch-table-interaction-with-promotion--deferred-to-v100`
+   - The deferred-risk shape from §11.4 (verbatim toml example).
+   - The three sub-tasks from §11.4: (a) reproduce risk shape with
+     synthetic pilot or `derive_more`, (b) cite cargo's documented
+     source-id resolution rules, (c) either prove "carry verbatim"
+     correct OR add a REJECT path at synthesis.
+   - Label: `v1.0.0`, `deferred-from-v0.1.0`, `overlay-promotion`.
+3. Reference the issue number back into §11.4 as a final paragraph:
+   "Tracked in GH issue #<N>."
+4. Commit the §11.4 backlink update as a follow-up commit on the
+   same plan branch.
+
+**Verification (§9):** the GH issue exists and is reachable; the
+plan doc has been updated with the issue number.
+
+**Adversarial-review trip-wire:** if v0.1.0 ships without this GH
+issue filed → BLOCK at release-gate.
 
 ---
 
