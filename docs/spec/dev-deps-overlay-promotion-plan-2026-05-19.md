@@ -1,30 +1,42 @@
-# Plan: synthetic same-crate overlay promoting selected `dev_deps` to regular `[dependencies]`
+# Plan: Shape δ — dev-deps overlay-promotion via dylib-manifest grafting
 
-**Date:** 2026-05-19
+**Date:** 2026-05-19 (R2 — Shape δ + 6-BLOCK closure)
 **Target milestone:** v0.1.0
 **Working branch:** `plan/dev-deps-overlay-promotion`
 **Author:** strict-swe (planner mode)
-**Status:** draft — pending Codex 5.5 xhigh adversarial review
+**Status:** R2 — closes 6 BLOCKs + OQ-4 from Codex xhigh round-1 review on commit `6d5b7fa`
 
-This plan implements Codex's Candidate E (overlay-promotion shape; user
-approved 2026-05-19 with "perfect"). The shape replaces the rejected
-auto-discovery design ([[plan/dev-deps-auto-discovery]] — `docs/spec/
-dev-deps-auto-default-plan-2026-05-19.md`, on the sibling branch, BLOCKed
-by Codex on source-citation errors and rejected same day by the user)
-with an **opt-in**, **explicit** mechanism: a new `build_targets` field
-that, when non-empty, tells lihaaf to synthesize an overlay manifest in
-which the named `dev_deps` are moved from `[dev-dependencies]` into
-`[dependencies]`. lihaaf then runs its existing release-mode dylib build
-against the overlay rather than against the adopter's `Cargo.toml`
-directly. This makes the named dev-deps part of the regular dependency
-graph for the single `cargo rustc -p X --lib --release --crate-type=dylib`
-invocation, so the dev-dep rlibs land in `deps_dir` and per-fixture rustc
-can resolve them via the existing `--extern` shape.
+This plan implements **Shape δ — Dylib Overlay With Metadata-Sourced Graft**.
+Codex's round-1 adversarial review on R1 (commit `6d5b7fa`) returned
+`VERDICT: BLOCK` with 6 BLOCKs. R1's central design error was
+synthesizing an overlay of the **metadata crate's** manifest
+(`axum-macros/Cargo.toml`) and assuming the workspace walk-up alone
+would handle inheritance. Both assumptions are wrong:
+
+1. **dylib_crate ≠ metadata package.** Cargo invokes `cargo rustc -p
+   <dylib_crate>` (`src/dylib.rs:93-104`). An overlay of `axum-macros/
+   Cargo.toml` with promoted dev-deps in its `[dependencies]` never
+   reaches the build graph of `axum` (the actual dylib_crate). The same
+   shape applies to sassi-macros (dylib_crate = sassi), djogi-macros
+   (dylib_crate = djogi).
+2. **Workspace walk-up is unsound** in the staged-overlay-under-target
+   shape. `src/compat/overlay.rs:580-587, 89-101, 944-950` established
+   the precedent: a staged manifest inside `<adopter>/target/` causes
+   cargo's walk-up to identify the workspace as one where the overlay
+   is not a member — `package <X>/Cargo.toml is a member of the wrong
+   workspace`. R1 ignored this; #36 fixed it for compat-mode by
+   creating an **isolated overlay workspace** (overlay's own
+   `[workspace]` block) plus root-section **carry-down**
+   (`[workspace.dependencies]`, `[patch]`, `[replace]`, `[profile]`).
+
+Shape δ adopts both fixes from compat-mode precedent and synthesizes
+the overlay of the **dylib_crate's** manifest with **specs grafted
+from the metadata crate's `[dev-dependencies]`**.
 
 The design preserves every locked invariant: CLI-only, dylib-only,
 explicit-config, single cargo invocation, no two-phase fingerprint
-split, no auto-discovery, no fork pollution, byte-identical backwards
-compat for every existing adopter.
+split, no auto-discovery, no fork pollution, backwards-compat
+byte-identical for every existing adopter who omits `build_targets`.
 
 ---
 
@@ -60,60 +72,96 @@ because the dylib build skipped it. Fixtures fail with rustc's
 `unresolved import` error class (`use serde::Deserialize;` → E0432).
 
 This is the bug surfaced by the **axum-macros pilot**
-(`/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml:81,
-124, 131`), which configures `dev_deps = ["axum-extra", "serde"]` on
-the default + `from_request` + `typed_path` suites. The fork's
+(`/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml:34-40,
+81, 124, 131`), which configures `dev_deps = ["axum-extra", "serde"]`
+on the default + `from_request` + `typed_path` suites. The fork's
 pilot-CI shows 24 of 93 fixtures fail with `error[E0432]: unresolved
-import` against `serde::Deserialize` and `axum_extra::*`. The same
-class of failure will hit every future adopter whose fixtures `use`
-crates that aren't transitively reachable through the dylib_crate's
-**regular** `[dependencies]` tree.
-
-The four Round-1 + two Round-2 pilots that work today
-(anyhow, thiserror, cxx, serde_json, djogi, sassi, derive_more) work
-**only because** every fixture in their corpora `use`s crates already
-present in the consumer crate's regular `[dependencies]` tree. Once
-an adopter writes a fixture that imports a crate from
-`[dev-dependencies]` only, lihaaf is broken for that crate.
+import` against `serde::Deserialize` and `axum_extra::*`.
 
 This is a v0.1.0 ship-blocker: lihaaf's stated v0.1.0 coverage matrix
 ([[lihaaf-pilot-coverage-gap]]) requires axum-macros, which requires
 this fix.
 
-### §0.2 Why this change is in scope for v0.1.0
+### §0.2 The Shape δ direction (Codex round-1 recommendation)
+
+R1 of this plan assumed lihaaf could synthesize an overlay of the
+**metadata crate's** manifest (the one carrying
+`[package.metadata.lihaaf]`) and move dev-deps within it. Codex
+BLOCK-2 demonstrated this is fatal for the split-crate shape — the
+overlay's `[package].name` and the cargo `-p <dylib_crate>` selector
+diverge. axum-macros' metadata names `dylib_crate = "axum"`; an
+overlay of `axum-macros/Cargo.toml` with grafted dev-deps lives in
+`axum-macros`'s build graph, not `axum`'s.
+
+**Shape δ corrects this** by separating two crates' roles in the
+synthesis:
+
+- **The metadata crate** (`<X>/Cargo.toml` carrying
+  `[package.metadata.lihaaf]`) is the source of truth for **dev-dep
+  specs**. lihaaf reads `[dev-dependencies]` of the metadata crate,
+  pulls out the entries named by `dev_deps`, and uses them as graft
+  inputs.
+
+- **The dylib_crate** (named by `dylib_crate = "<Y>"` in the metadata)
+  is the synthesis target. lihaaf resolves `<Y>/Cargo.toml` via
+  workspace-member resolution, synthesizes an overlay of it, and
+  injects the grafted dev-dep entries into the overlay's
+  `[dependencies]`.
+
+For axum-macros:
+- Metadata crate: `axum-macros/Cargo.toml`. Carries
+  `[package.metadata.lihaaf].dev_deps = ["axum-extra", "serde"]` and
+  has `serde = "1.0", axum-extra = { path = "../axum-extra", ... }`
+  in `[dev-dependencies]` (lines 34-40).
+- dylib_crate: `axum`. Its manifest lives at
+  `/home/tarunvir/projects/axum-lihaaf-pilot/axum/Cargo.toml`.
+- Overlay target: `axum/Cargo.toml` with `serde` + `axum-extra` specs
+  grafted in from `axum-macros`'s `[dev-dependencies]`. Cargo's
+  `-p axum --manifest-path <overlay>` then resolves the grafted entries
+  as part of `axum`'s build graph.
+
+For single-crate adopters (anyhow, serde-json), the metadata crate IS
+the dylib_crate. Shape δ degenerates to same-manifest promotion —
+identical operationally to R1's same-crate model, with the grafting
+step being a no-op rename.
+
+### §0.3 Why this change is in scope for v0.1.0
 
 The fix is surgical:
 
 - One new opt-in field (`build_targets`).
 - One conditional code path in `src/dylib.rs::build` that constructs
   an overlay manifest before invoking `cargo rustc`.
-- Overlay synthesis reuses precedent from `src/compat/overlay.rs`
-  (specifically: TOML round-trip, path absolutization, workspace
-  membership handling).
+- Overlay synthesis is a separate module (`src/dev_deps_overlay/`) that
+  composes `compat/overlay.rs`'s precedent for isolated overlay
+  workspaces + path absolutization + workspace-member resolution.
 - No changes to per-fixture rustc (`src/worker.rs:960-1007`).
 - No new public API.
 - Backwards-compatible: adopters who omit `build_targets` see no
   behavior change — the byte-identical legacy path runs.
 
-### §0.3 The decision (locked, from Codex Candidate E)
+### §0.4 BLOCKs closed from Codex round-1 review
 
-Add an explicit opt-in `build_targets` field to both the top-level
-`[package.metadata.lihaaf]` and each `[[package.metadata.lihaaf.suite]]`
-entry. Default is omitted / `[]` → existing behavior unchanged. The only
-permitted value in v0.1.0 is `"tests"`. When `build_targets = ["tests"]`,
-lihaaf synthesizes an overlay manifest at
-`<target_dir>/lihaaf-overlay-<suite>/Cargo.toml` that is a verbatim copy
-of the dylib_crate's `Cargo.toml` with the entries named in `dev_deps`
-**moved** from `[dev-dependencies]` into `[dependencies]`. The existing
-`cargo rustc` invocation then runs against the overlay's manifest path.
+Codex 5.5 xhigh review on commit `6d5b7fa` returned `VERDICT: BLOCK`
+with 6 BLOCKs + the OQ-4 deferral BLOCK. Each is closed in this R2:
 
-`dev_deps` semantics remain unchanged: the field is still the explicit
-allow-list of `--extern` forwardings to per-fixture rustc. The new
-field is **orthogonal**: it controls overlay-promotion, not extern
-forwarding. They are intentionally coupled in adopter UX (typically
-both are set together) but decoupled in the code path so the lihaaf
-self-test (`Cargo.toml:210-219`, no `dev_deps`, no `build_targets`)
-keeps its zero-overhead model.
+| Codex BLOCK | Closure section | Closure mechanism |
+|-------------|-----------------|-------------------|
+| BLOCK-1: Workspace inheritance breakage on overlay-under-`<adopter>/target/` | §3.4, §3.5 | Use compat-style ISOLATED overlay workspace (overlay declares its own `[workspace]`); CARRY DOWN `[workspace.*]`, `[patch.*]`, `[replace]`, `[profile.*]` from the ancestor workspace root via `compat/overlay.rs:1977+` precedent (`apply_workspace_member_inheritance`) |
+| BLOCK-2: `dylib_crate != package.name` (FATAL) — overlay of metadata crate never enters dylib build graph | §3.1, §3.2, §3.3 | **Shape δ.** Resolve the dylib_crate's manifest first; synthesize the overlay AGAINST IT; graft dev-dep entries from the metadata crate's `[dev-dependencies]` into the overlay's `[dependencies]`. Cargo's `-p <dylib_crate>` selector now resolves to the overlay's package |
+| BLOCK-3: No `[lib]` injection for adopters relying on auto-discovered `src/lib.rs` | §3.6 | Inject `[lib] path = <absolute>` against the dylib_crate's source dir when the overlay sits outside the package root. Mirrors `compat/overlay.rs:2456-2470`. |
+| BLOCK-4: §5 adopter inventory incomplete (`verify` TODOs, missing crates, wrong file:line) | §5.2 | Inventory rewritten with file:line citations for every named adopter; missing crates explicitly surfaced as `NOT LOCALLY PRESENT — verify in CI`. No TODO markers remain. |
+| BLOCK-5 (OQ-2): `optional = true` flip mutates resolver graph | §3.7.5, §11.2 | LOCKED **REJECT** — promoted optional dev-deps are rejected at parse with a directed diagnostic. Unit test added in §8.2. |
+| BLOCK-6: Test coverage gaps; tests passed with axum-macros broken | §8.4 (new) | Add cargo-build-gated split-workspace integration test mirroring the axum-macros shape (dylib_crate != metadata package), a workspace-inheritance test, a root-[patch] carry-down test, and a no-explicit-`[lib]` injection test. |
+| OQ-4: `[patch]` deferral to v1.0.0 | §11.4 | LOCKED **inline closure**. `[patch.<registry>]` and `[replace]` from the ancestor workspace root are carried down with absolutized paths; member-local override tables are REJECTED (mirroring `compat/overlay.rs:2009-2038`). Cargo-build-gated test added in §8.4. The §12.8 GH-issue deferral step is REMOVED. |
+
+The architectural shift between R1 and R2: R1 was "synthesize an
+overlay of the metadata crate's manifest"; R2 is "resolve the
+dylib_crate's manifest, synthesize an overlay of it, graft specs from
+the metadata crate's dev-dependencies." Codex's Shape δ is the
+mechanism that makes the split-crate adopters (axum-macros, djogi-macros,
+sassi-macros) work; the same code path handles single-crate adopters
+as a degenerate case.
 
 ---
 
@@ -149,10 +197,7 @@ inheritance is fragile in practice — e.g.
 restates `dev_deps` per-suite redundantly because round-5 hit
 inheritance breakage. Mirroring REPLACE for `build_targets` makes the
 two paired fields behave consistently with the per-suite build model
-rather than adding another fragile inheritance path. The adopter who
-wants overlay synthesis across all suites declares
-`build_targets = ["tests"]` per suite — same shape as the existing
-per-suite `features = ["macros"]` pattern. (See §11 OQ-1 for the
+rather than adding another fragile inheritance path. (See §11.1 OQ-1
 locked decision.)
 
 ### §1.2 Truth table — `(build_targets, dev_deps)` combinations
@@ -161,17 +206,18 @@ The two fields interact along two axes: whether the overlay manifest
 is synthesized at all (`build_targets`), and which crates are
 `--extern`-forwarded to per-fixture rustc (`dev_deps`).
 
-| `build_targets` | `dev_deps`          | Overlay synthesized? | dylib build manifest                   | `--extern` forwarding                |
-|-----------------|---------------------|----------------------|----------------------------------------|--------------------------------------|
-| omitted / `[]`  | omitted / `[]`      | No                   | adopter's Cargo.toml verbatim          | none beyond `extern_crates`          |
-| omitted / `[]`  | `["a", "b"]`        | No                   | adopter's Cargo.toml verbatim          | `--extern a`, `--extern b`           |
-| `["tests"]`     | omitted / `[]`      | **REJECT** (§1.4)    | n/a                                    | n/a                                  |
-| `["tests"]`     | `["a", "b"]`        | Yes                  | overlay (a, b moved to `[dependencies]`)| `--extern a`, `--extern b`           |
-| `["invalid"]`   | anything            | **REJECT** (parse)   | n/a                                    | n/a                                  |
-| any value       | `["a"]`, `a` not in adopter's `[dev-dependencies]` | **REJECT** at synthesis (§3.2)| n/a | n/a |
+| `build_targets` | `dev_deps`          | Overlay synthesized? | dylib build manifest                         | `--extern` forwarding                |
+|-----------------|---------------------|----------------------|----------------------------------------------|--------------------------------------|
+| omitted / `[]`  | omitted / `[]`      | No                   | adopter's Cargo.toml verbatim                | none beyond `extern_crates`          |
+| omitted / `[]`  | `["a", "b"]`        | No                   | adopter's Cargo.toml verbatim                | `--extern a`, `--extern b`           |
+| `["tests"]`     | omitted / `[]`      | **REJECT** (§1.4)    | n/a                                          | n/a                                  |
+| `["tests"]`     | `["a", "b"]`        | Yes                  | dylib_crate's overlay with a, b grafted in   | `--extern a`, `--extern b`           |
+| `["invalid"]`   | anything            | **REJECT** (parse)   | n/a                                          | n/a                                  |
+| any value       | `["a"]`, `a` not in metadata crate's `[dev-dependencies]` | **REJECT** at synthesis (§3.2) | n/a | n/a |
+| any value       | `["a"]`, `a` has `optional = true` in dev-deps | **REJECT** at synthesis (§3.7.5) | n/a | n/a |
 
 Row 3 (build_targets but no dev_deps) is rejected because the overlay
-would be byte-identical to the adopter's Cargo.toml — paying the
+would be byte-identical to the dylib_crate's Cargo.toml — paying the
 overhead of overlay synthesis + a fresh cargo fingerprint with zero
 behavior change. The directed diagnostic points the adopter at either
 removing `build_targets` or listing the dev-deps they need.
@@ -195,15 +241,15 @@ per-suite overlay dir extends that isolation:
 | Suite type             | Resolved `build_targets`        | Overlay dir                                              |
 |------------------------|---------------------------------|----------------------------------------------------------|
 | Default, omitted       | `[]` (omitted default)          | none                                                     |
-| Default, opt-in        | `["tests"]`                     | `<target_dir>/lihaaf-build/lihaaf-overlay-default/`      |
+| Default, opt-in        | `["tests"]`                     | `<workspace_target>/lihaaf-build/lihaaf-dev-deps-overlay/`|
 | Named, omitted         | `[]` (REPLACE; no inheritance)  | none                                                     |
-| Named "spatial", opt-in| `["tests"]`                     | `<target_dir>/lihaaf-build-spatial/lihaaf-overlay-spatial/`|
+| Named "spatial", opt-in| `["tests"]`                     | `<workspace_target>/lihaaf-build-spatial/lihaaf-dev-deps-overlay/`|
 
-The overlay dir sits **inside** the per-suite target dir (not as a
-sibling), so cargo's fingerprint already isolates it from sibling
-suites. The naming `lihaaf-overlay-<suite>` is for human readability
-in `target/` listings (multiple suites' overlays coexist without
-collision).
+The overlay dir sits **inside** the per-suite target dir, so cargo's
+fingerprint already isolates it from sibling suites. The naming
+`lihaaf-dev-deps-overlay` is distinct from `lihaaf-overlay` (the
+compat-mode overlay) so multiple overlays coexist in the same
+`target/` listing without collision.
 
 ---
 
@@ -277,10 +323,11 @@ constructor at line 766-784 grows the new field assignment.
 
 **Critical:** the validation must run **after** `dev_deps` is resolved
 (default-or-inherited), because §1.2 row 3 checks both fields together.
-For named suites, the resolved `dev_deps` is `raw.dev_deps.unwrap_or_else(|| default_suite.dev_deps.clone())`. Note `build_targets`
-uses REPLACE while `dev_deps` uses INHERIT — this asymmetry is the
-§11.1 locked decision; do not "fix" it by giving `build_targets`
-inheritance.
+For named suites, the resolved `dev_deps` is
+`raw.dev_deps.unwrap_or_else(|| default_suite.dev_deps.clone())`. Note
+`build_targets` uses REPLACE while `dev_deps` uses INHERIT — this
+asymmetry is the §11.1 locked decision; do not "fix" it by giving
+`build_targets` inheritance.
 
 ### §2.1.bis New helper: `fn validate_build_targets`
 
@@ -306,15 +353,24 @@ Body (sketch):
 
 ### §2.2 `src/dylib.rs` — gate overlay synthesis
 
-**Site 1: `pub struct BuildParams<'_>` (line 60).** Add `build_targets`
-and `dev_deps` borrow slices alongside the existing `features`:
+**Site 1: `pub struct BuildParams<'_>` (line 60).** Add the borrow
+slices needed for Shape δ. Note that R2 carries more fields than R1
+because the synthesis needs the metadata crate's manifest (for the
+dev-dep graft inputs) AND the dylib_crate's name (so the synthesis can
+resolve the dylib crate's manifest via workspace-member resolution).
+The dylib_crate name is already in `BuildParams.crate_name` (line 62);
+the metadata-manifest path is `BuildParams.manifest_path` (line 66) —
+both are present, no new fields needed beyond `build_targets` /
+`dev_deps`.
 
 ```rust
 /// Build targets to compile beyond `--lib`, gating the overlay
 /// promotion. Empty slice → no overlay; non-empty → §3 synthesis.
 pub build_targets: &'a [String],
-/// Dev-deps subset to promote into the overlay's `[dependencies]`.
-/// Caller passes the resolved (validated) `dev_deps` slice.
+/// Dev-deps subset to graft into the dylib_crate's overlay
+/// `[dependencies]`. Caller passes the resolved (validated) `dev_deps`
+/// slice. Each entry is a TOML key resolved against the metadata
+/// crate's `[dev-dependencies]` table.
 pub dev_deps: &'a [String],
 ```
 
@@ -326,13 +382,20 @@ BEFORE the cargo command is assembled (line 93). Sketch:
 
 ```rust
 let effective_manifest_path: PathBuf = if !params.build_targets.is_empty() {
-    let overlay_dir = params.target_dir.join("lihaaf-overlay");
-    let overlay_manifest = synthesize_overlay_manifest(
+    let overlay_dir = params.target_dir.join("lihaaf-dev-deps-overlay");
+    crate::dev_deps_overlay::synthesize_overlay(
+        // The crate name `-p` will select. Shape δ: this is the
+        // dylib_crate's name, which already matches params.crate_name.
+        params.crate_name,
+        // The METADATA crate's manifest — the one carrying
+        // [package.metadata.lihaaf]. The graft pulls dev-dep entries
+        // from this manifest's [dev-dependencies] table.
         params.manifest_path,
+        // The dev-dep TOML keys to graft.
         params.dev_deps,
+        // Where to stage the synthesized overlay.
         &overlay_dir,
-    )?;
-    overlay_manifest
+    )?
 } else {
     params.manifest_path.to_path_buf()
 };
@@ -341,13 +404,6 @@ let effective_manifest_path: PathBuf = if !params.build_targets.is_empty() {
 Then `cmd.arg("--manifest-path").arg(&effective_manifest_path)`
 replaces the existing line 101-102. The rest of `build` (RUSTFLAGS,
 features pass-through, output parsing) is unchanged.
-
-The choice to put the overlay dir at `<target_dir>/lihaaf-overlay`
-(not `<target_dir>/lihaaf-overlay-<suite>`) is deliberate: the suite
-namespacing is **already** baked into `target_dir` itself
-(`build_dir_for_suite`, line 388-393). The default suite's overlay
-lives at `<workspace>/target/lihaaf-build/lihaaf-overlay/Cargo.toml`,
-the "spatial" suite's at `<workspace>/target/lihaaf-build-spatial/lihaaf-overlay/Cargo.toml`. No cross-suite collision.
 
 **Site 3: invocation-string rendering (line 125-137).** The diagnostic
 invocation string must reflect the **effective** manifest path so the
@@ -360,117 +416,128 @@ overlay manifest's `target/` is still `<target_dir>` (cargo joins
 artifacts into the same `deps_dir`. Per §4 idempotency, this is the
 load-bearing claim.
 
-### §2.3 New module `src/dev_deps_overlay.rs`
+### §2.3 New module `src/dev_deps_overlay/mod.rs`
 
-Create a sibling-to-`dylib.rs` module:
+Create a new module sibling to `compat/`:
 
 ```text
 src/
-  dev_deps_overlay.rs   (new)
+  dev_deps_overlay/
+    mod.rs          (new — Shape δ orchestrator)
   dylib.rs
   compat/
-    overlay.rs           (existing — compat-mode driver overlay)
+    overlay.rs       (existing — compat-mode driver overlay)
 ```
 
 **Why a new module, not a refactor of `compat/overlay.rs`?**
-The compat-mode overlay (`compat/overlay.rs`, 8751 lines, public entry
-`materialize_overlay` at line 515) is built for a very different
-problem:
 
-- Compat-mode overlay **inserts a `[lib] crate-type = ["dylib"]`** to
-  rewrite a non-dylib upstream into a dylib-buildable shape
-  (`compat/overlay.rs:697-710`).
-- Compat-mode handles workspace-root-vs-workspace-member resolution
-  via `--package` (`compat/overlay.rs:1505+` — `resolve_workspace_member_manifest`).
-- Compat-mode injects synthetic `[package.metadata.lihaaf]` for the
-  inner session driver (`compat/overlay.rs:790`).
-- Compat-mode populates a structural mirror of the upstream package
-  root for build scripts (`compat/overlay.rs:849-869`).
-- Compat-mode applies the 4-rule self-patch policy for path-conflict
-  handling (`compat/overlay.rs:725-787, 2966+ — apply_self_patch_policy`).
+The compat-mode overlay (`compat/overlay.rs`, ~8800 lines, public
+entry `materialize_overlay` at line 515) handles a different problem
+shape — it rewrites a non-dylib upstream into a dylib-buildable
+shape, injects synthetic metadata, mirrors the upstream package root,
+and applies the 4-rule self-patch policy. The dev-deps overlay needs
+**only a subset** of compat-overlay's machinery:
 
-Almost none of that applies to v0.1 dev-deps overlay:
+| compat-overlay capability | Needed by dev-deps overlay? |
+|---------------------------|------------------------------|
+| `[lib] crate-type` injection | No — adopter's crate is already a buildable lib |
+| Workspace-member resolution (`resolve_workspace_member_manifest`) | **YES** — Shape δ uses this to find the dylib_crate's manifest from the metadata crate's workspace context |
+| Isolated overlay workspace (`override_workspace_inheritance` Branch 4 — clone `[workspace]`, strip membership keys) | **YES** — BLOCK-1 closure |
+| Workspace-member inheritance carry-down (`apply_workspace_member_inheritance`) | **YES** — BLOCK-1 + OQ-4 closure |
+| Path absolutization (`absolutize_path_bearing_keys`) | **YES** — overlay sits outside dylib_crate package root |
+| Self-patch policy (4-rule `[patch.crates-io.<self>]` handling) | No — dev-deps overlay shares the dylib_crate's `[package].name`, but the overlay manifest is the dylib_crate's manifest (not a synthetic outer wrapper), so no self-patch ambiguity arises |
+| Staged package-root mirror | No — we use `[lib] path = <absolute>` injection instead, which is simpler and avoids materializing a symlink farm |
+| Synthetic metadata injection | No — we keep the dylib_crate's existing `[package.metadata.*]` verbatim; no synthesis required |
+| Canonical TOML serialization (`serialize_canonical`) | **YES** — load-bearing for determinism |
+| Idempotent rerun guard | **YES** — load-bearing for cargo fingerprint stability |
 
-- The adopter's `[lib] crate-type` is already correct (they're a
-  lihaaf adopter; their `Cargo.toml` already declares the dylib_crate
-  as a normal lib).
-- The adopter's manifest already lives in the workspace they want
-  cargo to resolve against (no compat-root resolution).
-- No synthetic metadata is injected (the adopter's metadata is what
-  drives the inner session).
-- No package-root mirror needed (the dylib build uses the adopter's
-  source tree directly; the overlay's `[lib] path` points at the
-  adopter's existing `src/lib.rs`).
-- No self-patch policy (the dev-deps overlay isn't aliasing
-  `crates-io.X` source-ids; it only moves entries between
-  `[dependencies]` and `[dev-dependencies]`).
+**Decision: extract the shared primitives into a new `src/
+manifest_overlay/` module; have BOTH `compat/overlay.rs` AND the new
+`dev_deps_overlay/mod.rs` depend on it.**
 
-**The shared primitive is path absolutization.** The
-`absolutize_path_bearing_keys` function at `compat/overlay.rs:2370+`
-handles `[lib] path`, `[package] build`, `[[bin/example/test/bench]] path`,
-`[dependencies/dev-dependencies/build-dependencies/target.<cfg>.deps].path`,
-and `[workspace.dependencies.X].path`. The dev-deps overlay needs
-**exactly the same logic** because the staged overlay sits at
-`<target_dir>/lihaaf-build/lihaaf-overlay/Cargo.toml`, which is two
-levels deeper than the adopter's `<adopter>/Cargo.toml`, so every
-relative path-bearing key must be absolutized against the adopter's
-dir.
-
-**Decision:** extract `absolutize_path_bearing_keys` into a shared
-internal helper crate-local module `src/manifest_overlay/mod.rs` with
-exactly two exported helpers:
+The shared module (`src/manifest_overlay/`) provides:
 
 ```rust
+// Path absolutization for the staged-overlay shape.
 pub(crate) fn absolutize_path_bearing_keys(
     top: &mut toml::map::Map<String, toml::Value>,
     source_dir: &Path,
     source_manifest_path: &Path,
 ) -> Result<(), Error>;
 
+// Canonical (deterministic, BTreeMap-ordered) TOML serialization.
 pub(crate) fn serialize_canonical(value: &toml::Value) -> Result<Vec<u8>, Error>;
+
+// Workspace-member resolution: given an arbitrary manifest path + a
+// dylib_crate name, walk up to the workspace root, find the member
+// whose [package].name == dylib_crate, return that member's
+// manifest path + the workspace-root value.
+pub(crate) fn resolve_dylib_crate_manifest(
+    starting_manifest_path: &Path,
+    dylib_crate: &str,
+) -> Result<(PathBuf, toml::Value), Error>;
+
+// Isolated overlay workspace + root-section carry-down. Given a parsed
+// overlay TOML and the ancestor workspace-root value, mutate the
+// overlay to:
+//   - declare its own [workspace] (cloned from root, membership keys
+//     stripped — branches 4-style of override_workspace_inheritance);
+//   - carry down [patch.<registry>], [replace], [profile.*];
+//   - absolutize path-bearing keys in the carried-down tables;
+//   - reject any member-local [patch] override that conflicts with
+//     workspace-root [patch].
+pub(crate) fn make_overlay_isolated_workspace(
+    overlay_top: &mut toml::map::Map<String, toml::Value>,
+    overlay_dir: &Path,
+    workspace_root_manifest: &Path,
+    workspace_root_value: &toml::Value,
+    dylib_crate_manifest: &Path,
+) -> Result<(), Error>;
 ```
 
-Both modules — `compat/overlay.rs` and the new `dev_deps_overlay.rs` —
-call into `manifest_overlay::absolutize_path_bearing_keys` and
-`manifest_overlay::serialize_canonical`. This:
+`compat/overlay.rs` is refactored to call into these shared helpers
+(rather than its own private copies). The extracted-from-compat
+invariant is enforced by the byte-identical regression test in §8.3.
 
-- Eliminates the duplication risk (a bug fix in one path-handling
-  routine flows to both).
-- Preserves the compat-overlay's invariants: the compat path
-  continues to call `absolutize_path_bearing_keys` exactly as today.
-- Confines the shared surface to two function signatures.
-
-The shared module is **not** a refactor that touches the existing
-compat-overlay logic. The existing functions are moved to the new
-module location and `compat/overlay.rs` becomes a caller. The
-extracted-as-is invariant is enforced by tests:
-`compat/overlay.rs` integration tests continue to pass byte-identically.
-
-**`src/dev_deps_overlay.rs` structure (sketch):**
+**`src/dev_deps_overlay/mod.rs` structure (sketch):**
 
 ```rust
-//! Synthetic same-crate overlay for dev-deps promotion, per
-//! `docs/spec/dev-deps-overlay-promotion-plan-2026-05-19.md`.
+//! Shape δ — Dylib Overlay With Metadata-Sourced Graft.
 //!
-//! When the adopter's lihaaf config sets `build_targets = ["tests"]`,
-//! lihaaf synthesizes an overlay `Cargo.toml` that is a verbatim copy
-//! of the adopter's manifest with the named `dev_deps` MOVED from
-//! `[dev-dependencies]` into `[dependencies]`. The single-cargo-invocation
-//! shape compiles those crates' rlibs into `deps_dir` so per-fixture
-//! rustc can resolve them via `--extern`.
+//! Per `docs/spec/dev-deps-overlay-promotion-plan-2026-05-19.md` §3.
+//!
+//! When the adopter's lihaaf metadata sets `build_targets = ["tests"]`,
+//! lihaaf:
+//!   1. Resolves the dylib_crate's manifest (via workspace-member
+//!      resolution from the metadata crate's manifest).
+//!   2. Synthesizes an overlay of the dylib_crate's manifest with the
+//!      dev-dep entries named in `dev_deps` GRAFTED from the metadata
+//!      crate's `[dev-dependencies]` into the overlay's `[dependencies]`.
+//!   3. The overlay declares its own `[workspace]` and carries down
+//!      `[workspace.*]`, `[patch.*]`, `[replace]`, `[profile.*]` from
+//!      the ancestor workspace root (mirroring `compat/overlay.rs`
+//!      precedent for #36 workspace-identity correctness).
+//!   4. Path-bearing keys are absolutized against the dylib_crate's
+//!      source dir; `[lib] path` is injected when missing.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
-use crate::manifest_overlay::{absolutize_path_bearing_keys, serialize_canonical};
+use crate::manifest_overlay;
 
-/// Synthesize the overlay manifest. Returns the absolute path of the
-/// staged manifest file.
-pub fn synthesize_overlay_manifest(
-    adopter_manifest_path: &Path,
-    promoted_dev_deps: &[String],
+/// Synthesize the dylib_crate's overlay manifest. Returns the absolute
+/// path of the staged manifest file.
+///
+/// `dylib_crate` — the crate name cargo's `-p` selector matches.
+/// `metadata_manifest_path` — the lihaaf metadata crate's Cargo.toml.
+/// `dev_deps` — TOML keys to graft from metadata's [dev-dependencies].
+/// `overlay_dir` — where to stage the synthesized overlay.
+pub fn synthesize_overlay(
+    dylib_crate: &str,
+    metadata_manifest_path: &Path,
+    dev_deps: &[String],
     overlay_dir: &Path,
-) -> Result<PathBuf, Error> { ... }
+) -> Result<PathBuf, Error> { /* §3 algorithm */ }
 ```
 
 The body follows §3 (the synthesis algorithm).
@@ -500,8 +567,9 @@ and looks up each crate's path in `ctx.extern_paths`. The path
 population happens upstream when the dylib build's `deps_dir` is walked
 and `--extern` paths discovered. With the overlay-promotion path:
 
-1. The overlay-promoted dev-deps get compiled into `deps_dir` by the
-   single `cargo rustc -p X --lib` invocation against the overlay.
+1. The grafted dev-deps get compiled into `deps_dir` by the
+   single `cargo rustc -p <dylib_crate> --lib` invocation against the
+   dylib_crate's overlay.
 2. The existing `extern_paths` walk over `deps_dir` discovers the new
    rlibs at exactly the same paths cargo would have used for any
    other dependency.
@@ -521,21 +589,21 @@ The session module is the caller that:
 
 1. Reads `Config` from `src/config.rs::load`.
 2. For each suite, calls `src/dylib.rs::build` with the suite's
-   parameters.
+   parameters (see `src/session.rs:330-336`).
 
 The change is local: when building the `BuildParams` struct for each
 suite, populate the new `build_targets` and `dev_deps` borrows from
-the suite's resolved fields. Site identified by grepping for current
-`BuildParams { ... }` construction in `src/session.rs` (and any other
-caller; there's only one production call site, plus tests).
+the suite's resolved fields. Site identified at
+`src/session.rs:330-336`; the construction is a single
+`dylib::BuildParams { ... }` literal that grows two field assignments.
 
 ---
 
-## §3 Overlay manifest synthesis algorithm
+## §3 Overlay manifest synthesis algorithm (Shape δ)
 
-The synthesis algorithm runs inside `src/dev_deps_overlay.rs::
-synthesize_overlay_manifest`. Input: the adopter's `Cargo.toml` path,
-the `dev_deps` list of names to promote, the target overlay directory.
+The synthesis runs inside `src/dev_deps_overlay::synthesize_overlay`.
+Input: the dylib_crate's name, the metadata crate's `Cargo.toml` path,
+the `dev_deps` list of names to graft, the target overlay directory.
 Output: the absolute path of the written overlay manifest, plus the
 side effect of the file written atomically.
 
@@ -543,319 +611,426 @@ The algorithm is broken into numbered steps. Each step states (a) what
 it does, (b) the invariant it preserves, (c) the failure-mode policy
 for each of Codex's enumerated edge cases.
 
-### §3.1 Step 1 — read + parse the adopter's `Cargo.toml`
+### §3.1 Step 1 — read + parse the metadata crate's `Cargo.toml`
 
 Identical shape to `compat/overlay.rs:621-642`:
 
 ```rust
-let raw_bytes = std::fs::read(adopter_manifest_path)?;
-let raw_text = String::from_utf8(raw_bytes)?;
-let mut value: toml::Value = toml::from_str(&raw_text)?;
+let metadata_bytes = std::fs::read(metadata_manifest_path)?;
+let metadata_text = String::from_utf8(metadata_bytes)?;
+let metadata_value: toml::Value = toml::from_str(&metadata_text)?;
 ```
 
+The **metadata crate's** TOML is the **source of dev-dep specs**. Its
+`[dev-dependencies]` table is what the graft pulls entries from. The
+metadata value is NOT modified — it is read-only input.
+
 Failure → `Error::Io` or `Error::TomlParse` per existing conventions.
-The adopter dir is `adopter_manifest_path.parent()` for downstream
-absolutization.
 
-### §3.2 Step 2 — validate the promoted `dev_deps` exist in `[dev-dependencies]`
+### §3.2 Step 2 — extract dev-dep entries from the metadata crate
 
-For each name in `promoted_dev_deps`:
+For each name in `dev_deps`:
 
-1. Look up the name in `value["dev-dependencies"][name]`. If absent,
-   **REJECT** with a directed diagnostic: `dev_deps[i] = "<name>"`
-   is listed in `[package.metadata.lihaaf].dev_deps` but is not
-   present in `[dev-dependencies]` of `<adopter_manifest_path>`. Did
-   you mean to add it to `[dev-dependencies]`? Or remove the
-   `build_targets = ["tests"]` opt-in if you intended `<name>` to
-   come from `[dependencies]`.
-2. Also look up the name in `value["dependencies"][name]`. If
-   **also present**, REJECT: a single dev-dep name cannot be in
-   both. (Cargo itself rejects this with E0464 or similar; we
-   eagerly surface a directed diagnostic.)
-3. Record the dep's value (the entire TOML subtree) for promotion in
-   Step 4.
+1. Look up the name in `metadata_value["dev-dependencies"][name]`.
+   If absent, **REJECT** with a directed diagnostic:
 
-Renamed dev-deps: cargo's `package = "serde_json"` rename mechanism
-means the **TOML key** is the rename (e.g., `serde-json`); the
-package name is in the entry's `package` field. The adopter's
-`dev_deps = ["serde-json"]` matches the **TOML key**, not the package
-name, per the existing dev_deps convention (`src/worker.rs:1003-1006`
-uses the name verbatim for `--extern serde_json=path` after the
-rename-collapse `replace('-', '_')`). The lookup in
-`[dev-dependencies]` uses the same TOML key. **Policy:** renamed
-dev-deps work transparently; the overlay simply moves the renamed
-entry verbatim. The `--extern` name in the per-fixture rustc
-invocation continues to use the renamed key (the existing rename
-collapse stays correct).
+       dev_deps[i] = "<name>" is listed in
+       [package.metadata.lihaaf].dev_deps but is not present in
+       [dev-dependencies] of <metadata_manifest_path>. Either add it
+       there or remove `build_targets = ["tests"]` if you intended
+       <name> to come from a different table.
 
-Validation must happen BEFORE Step 4 (move) so a typo in `dev_deps`
-fails fast instead of producing a half-built overlay.
+2. **Edge case — `[target.<cfg>.dev-dependencies]`:** if the name is
+   present ONLY under `[target.<cfg>.dev-dependencies]` and not in the
+   top-level `[dev-dependencies]`, REJECT per §3.7.7 (cfg-gated
+   promotion deferred to v0.2).
 
-### §3.3 Step 3 — apply Codex-enumerated edge-case policies
+3. **Edge case — `optional = true`:** if the entry has `optional =
+   true`, REJECT per §3.7.5 (Codex BLOCK-5 / OQ-2 locked REJECT).
+   The directed diagnostic explains the resolver-graph risk.
 
-For each promoted dev-dep entry (the TOML subtree gathered in §3.2),
-process it through the per-shape policies BEFORE moving it to
-`[dependencies]`:
+4. **Edge case — same name in `[dependencies]` of the dylib_crate's
+   manifest:** see §3.4 step 4 below. The dylib_crate's manifest is
+   not loaded yet at this step; the conflict check happens after step
+   3 resolves the dylib_crate.
 
-#### §3.3.1 `workspace = true` shorthand (Codex enumeration #1)
+5. Record the entry (the full TOML subtree) as a graft input. Renamed
+   entries (`<key> = { package = "<actual>", ... }`) preserve the TOML
+   key; the package name is in the entry's `package` field.
 
-Pattern: `serde = { workspace = true, features = [...] }`. The
-shorthand tells cargo to inherit the dep's version+features from the
-ancestor `[workspace.dependencies.serde]` table.
+Validation MUST run BEFORE later steps so a typo / missing dev-dep
+fails fast.
 
-**Policy: preserve the shorthand verbatim.** The overlay manifest
-sits at `<adopter>/target/lihaaf-build/lihaaf-overlay/Cargo.toml`. The
-cargo walk-up will land on the same workspace root the adopter's
-original `Cargo.toml` resolves to (because cargo walks up from the
-overlay's location, which is **inside** the adopter's source tree).
-The `{ workspace = true }` shorthand in `[dependencies]` resolves the
-same way it does in `[dev-dependencies]`: cargo looks up the dep name
-in `[workspace.dependencies]`.
+### §3.3 Step 3 — resolve the dylib_crate's manifest (Shape δ key step)
 
-**Required invariant:** the overlay's workspace must be the **same**
-workspace as the adopter's. This holds by construction: the overlay
-lives under `<adopter>/target/`, so cargo's walk-up first hits the
-adopter's `Cargo.toml` (which already has either `[workspace]` or
-`[package].workspace = "..."`). The overlay is a **sibling** of the
-adopter manifest in the workspace-resolver sense, not a child. (See
-§3.4 invariant on the overlay's relationship to the parent workspace.)
+Given `dylib_crate` (the name cargo's `-p` selector matches) and
+`metadata_manifest_path`, resolve the actual manifest path for the
+dylib_crate using `manifest_overlay::resolve_dylib_crate_manifest`:
 
-**Note for adversarial review:** this is the key place this design
-diverges from compat-mode overlay. Compat-mode overrides the
-workspace (because it's a synthetic outer workspace driving an inner
-session). Dev-deps overlay **preserves** the workspace inheritance.
-Mechanically: dev-deps overlay does **NOT** call
-`override_workspace_inheritance`. It MUST NOT — the workspace
-inheritance is load-bearing for the `{ workspace = true }` shorthand.
+**Algorithm:**
 
-#### §3.3.2 Path dev-deps (Codex enumeration #2)
+1. Compute the metadata crate's directory: `metadata_dir =
+   metadata_manifest_path.parent()`.
+2. Read the metadata's TOML (already done in §3.1). Check whether
+   `metadata_value["package"]["name"] == dylib_crate`:
+   - If YES — single-crate adopter (anyhow, serde-json, djogi). The
+     dylib_crate IS the metadata crate. Return
+     `(metadata_manifest_path, metadata_value)` directly. Shape δ
+     degenerates to the same-manifest case.
+   - If NO — split-crate adopter (axum-macros, sassi-macros,
+     djogi-macros). Continue to step 3.
+3. Walk up the filesystem from `metadata_dir` to find the workspace
+   root: the first ancestor `Cargo.toml` whose top-level table has a
+   `[workspace]` block. Reuse
+   `compat/overlay.rs`'s walk-up logic — extract this into the shared
+   `manifest_overlay` module if not already shared. Return the
+   workspace-root manifest path + parsed value.
+4. Reuse
+   `crate::compat::overlay::resolve_workspace_member_manifest`
+   (`src/compat/overlay.rs:1505+`): given the workspace-root manifest
+   + the dylib_crate name, resolve to the member's manifest path. The
+   function already handles glob members (`crates/*`), literal
+   members, and the not-found case with a directed diagnostic listing
+   scanned members.
+5. Return `(dylib_crate_manifest_path, workspace_root_value)`.
 
-Pattern: `local-helper = { path = "../local-helper" }`. Relative
-path resolved against the adopter manifest's directory.
+**Edge cases:**
 
-**Policy: absolutize the path against the adopter dir.** This is
-exactly what `absolutize_path_bearing_keys` already does for
-`[dev-dependencies].path` (`compat/overlay.rs:2524`). The shared
-extracted helper handles this transparently — the path is rewritten
-to absolute form BEFORE Step 4 moves the entry into
-`[dependencies]`. Cargo accepts forward-slash paths on every
-platform per the compat-overlay precedent.
+- **Dylib_crate not found in the workspace's members.** Function
+  returns `Error::Cli` with a member-list diagnostic per existing
+  precedent (`compat/overlay.rs:6961+ —
+  resolve_workspace_member_manifest_no_match_lists_scanned_members`).
+- **No workspace root** (single-crate metadata + dylib_crate != metadata
+  package). This is a misconfiguration — the metadata names a sibling
+  crate that doesn't exist in a workspace context. REJECT with a
+  directed diagnostic naming both crate names and pointing the adopter
+  at either (a) configuring the metadata on the dylib_crate itself
+  (i.e. consolidating to single-crate), or (b) restructuring as a
+  workspace.
+- **Workspace root carries an ancestor workspace too** (nested
+  workspaces). The existing `compat/overlay.rs` walk-up stops at the
+  first `[workspace]` block. Same behavior applies; nested workspaces
+  are an unusual shape (the inner workspace IS a member of the outer,
+  which is rare). Defer to the resolver behavior; surface any error
+  the existing resolver emits.
 
-#### §3.3.3 Git dev-deps (Codex enumeration #2.bis)
+### §3.4 Step 4 — read + parse the dylib_crate's manifest
 
-Pattern: `some-dep = { git = "https://...", rev = "..." }`. No
-filesystem path; cargo fetches into the workspace's registry cache.
+```rust
+let dylib_bytes = std::fs::read(&dylib_crate_manifest_path)?;
+let dylib_text = String::from_utf8(dylib_bytes)?;
+let mut dylib_value: toml::Value = toml::from_str(&dylib_text)?;
+```
 
-**Policy: verbatim copy.** Git URLs are not affected by the
-overlay's filesystem location. The dep entry is moved as-is.
-`absolutize_path_bearing_keys` skips entries without `path` keys.
+This is the **synthesis target**. The overlay TOML is built by mutating
+`dylib_value` (the dylib_crate's manifest) — NOT the metadata value.
 
-#### §3.3.4 `[patch]` sections (Codex enumeration #3)
+**Cross-table conflict check** (deferred from §3.2 step 4): for each
+grafted dev-dep, verify the same name does NOT already exist in the
+dylib_crate's `[dependencies]`. If it does:
 
-Pattern: the adopter's `Cargo.toml` (or the ancestor workspace
-root's `Cargo.toml`) carries `[patch.crates-io.serde] = { path =
-"./forks/serde" }`.
+- If the existing entry is identical to the graft entry (after
+  serialization), no-op the graft for that name (the dep is already in
+  the dylib_crate's regular deps; no need to promote).
+- Otherwise REJECT with a directed diagnostic: the metadata crate's
+  dev-dep spec conflicts with the dylib_crate's regular-dep spec for
+  the same name. The adopter must reconcile by either (a) removing the
+  graft target from `dev_deps` (the regular dep already provides what
+  fixtures need), or (b) unifying the two specs.
 
-**Policy: do not touch `[patch]`.** The patch sections are inherited
-from the workspace root via cargo's walk-up, exactly as for the
-adopter's original manifest. The overlay sits inside the same
-workspace, so `[patch]` continues to resolve correctly without any
-intervention.
+### §3.5 Step 5 — graft dev-dep entries into the dylib_crate's overlay
 
-If the adopter's `Cargo.toml` carries a `[patch]` section directly
-(rare for non-workspace-root manifests; cargo emits a warning), the
-absolutization helper at `compat/overlay.rs:2674+ — absolutize_patch_paths` handles the rewrite. The shared
-extracted helper inherits that.
+For each entry recorded in §3.2 (and not no-op'd by the conflict
+check in §3.4):
 
-**Adversarial-review trip-wire:** the `[patch]` table itself is NOT
-moved or copied; the overlay just inherits via cargo walk-up. If
-the adopter's `Cargo.toml` has `[patch.crates-io.<X>] = { path =
-"..." }` for some dep X that is **also** in the promoted
-`dev_deps` list, the patch fires for the overlay's `[dependencies]`
-entry the same way it fired for `[dev-dependencies]`. This is the
-desired behavior — the adopter's patch declaration is intent
-("use this fork everywhere"); promoting the dev-dep into the
-regular graph just makes the patch apply to one more reference of
-the same source-id.
+1. Insert into `dylib_value["dependencies"][name] = entry` (with §3.7
+   transformations applied — path absolutization, etc).
+2. The metadata crate's `[dev-dependencies]` table is NOT modified —
+   the metadata value was read-only input.
+3. The dylib_crate's `[dev-dependencies]` table is NOT modified
+   either — the overlay synthesis only ADDS to the dylib_crate's
+   `[dependencies]`, leaving everything else verbatim.
 
-#### §3.3.5 `dep:` feature syntax + optional dev-deps (Codex enumeration #4)
+The `[dependencies]` table is created if absent (defensive: a manifest
+with no `[dependencies]` is a valid edge case for stub crates).
 
-Pattern: `[dev-dependencies] serde = { version = "1", optional =
-true }`, plus `[features] my-feature = ["dep:serde"]`.
+### §3.6 Step 6 — make the overlay an ISOLATED workspace
 
-**Policy (v0.1.0):** when the dev-dep entry has `optional = true`,
-**flip it to `optional = false`** during the move into
-`[dependencies]`. Rationale: the adopter explicitly listed this
-crate in `dev_deps` for promotion. The opt-out path (don't list it
-in `dev_deps`) is available. Once promoted, `optional = true` would
-require the corresponding feature to be active, which is not
-something lihaaf's existing `features` field model handles cleanly
-(features in lihaaf's metadata gate the dylib_crate's features,
-not arbitrary dep activation).
+This step closes **BLOCK-1**: cargo's walk-up from
+`<overlay_dir>/Cargo.toml` would otherwise land on the ancestor
+workspace root, which does not list the overlay's `[package].name` as
+a member — producing the "wrong workspace" error.
 
-The `dep:serde` feature reference in `[features]` continues to
-work after promotion: cargo's resolver treats the moved entry as a
-regular `[dependencies]` member, and `dep:serde` resolves to the
-same dep node.
+Use `manifest_overlay::make_overlay_isolated_workspace`:
 
-**Trip-wire (adversarial-review note):** if a `[features].X =
-["dep:serde"]` ALSO appears in the adopter's `[dev-dependencies]`
-side as a `serde = { version = "1", optional = true }` entry, the
-feature wiring may break in subtle ways when the promotion flips
-the optional bit. The reject-and-document path is captured as
-§11 OQ-2 — the current recommendation is "promote with
-optional=false; trip an adversarial pilot before promoting to a
-guaranteed-safe transformation."
+```rust
+manifest_overlay::make_overlay_isolated_workspace(
+    overlay_top,
+    overlay_dir,
+    workspace_root_manifest_path,
+    workspace_root_value,
+    dylib_crate_manifest_path,
+)?;
+```
 
-#### §3.3.6 Renamed dev-deps via `package = "..."` (Codex enumeration #5)
+This mirrors `compat/overlay.rs:1977+ apply_workspace_member_inheritance`:
+
+1. **Clone `[workspace]` from the ancestor root**, stripping membership
+   keys (`members`, `exclude`, `default-members`) per
+   `compat/overlay.rs:903 WORKSPACE_MEMBERSHIP_KEYS`.
+2. **Carry down workspace inheritance tables**
+   (`[workspace.dependencies]`, `[workspace.package]`,
+   `[workspace.lints]`, `[workspace.metadata]`, `[workspace.resolver]`)
+   verbatim — these are load-bearing for any `{ workspace = true }`
+   reference surviving in the overlay's deps.
+3. **Carry down `[patch.<registry>]` from the workspace root**
+   (OQ-4 inline closure). Each registry subtable is preserved
+   verbatim; path-bearing keys inside `path = ...` entries are
+   absolutized against the workspace-root dir. Mirror
+   `compat/overlay.rs:2156+` patch carry-down. Member-local `[patch]`
+   tables on the dylib_crate's own manifest are REJECTED with a
+   directed diagnostic (mirroring `compat/overlay.rs:2009-2038`).
+4. **Carry down `[replace]`** from the workspace root with path
+   absolutization. Same rejection rule for member-local `[replace]`.
+5. **Carry down `[profile.*]`** verbatim. Profiles do not contain
+   path-bearing keys; verbatim copy is correct.
+6. **Carry down `[workspace.lints]`** so the overlay's lint
+   configuration matches the ancestor workspace's — preserving lint
+   parity for the dylib build.
+
+The overlay manifest, post-step-6, declares itself as a workspace root
+(cargo's walk-up terminates at the overlay's own `[workspace]` block),
+yet inherits every workspace-level configuration the original
+dylib_crate would have inherited from its ancestor root.
+
+### §3.7 Step 7 — handle dev-dep edge cases (apply transformations)
+
+This step applies the per-shape policies from R1's §3.3 to each
+grafted entry. Most are unchanged from R1; the `optional = true`
+policy is the locked REJECT per BLOCK-5.
+
+#### §3.7.1 `workspace = true` shorthand (Codex enumeration #1)
+
+Pattern: `serde = { workspace = true, features = [...] }`.
+
+**Policy: preserve the shorthand verbatim.** Per §3.6, the overlay
+carries down `[workspace.dependencies]` from the ancestor workspace
+root. The `{ workspace = true }` shorthand in the overlay's
+`[dependencies]` then resolves against the carried-down
+`[workspace.dependencies.<name>]` table — same dep spec the
+dylib_crate would have resolved through its own walk-up.
+
+**Edge case — workspace inheritance for a graft target only:** if the
+metadata crate's `[dev-dependencies].<name> = { workspace = true }` is
+the only place `<name>` appears, the workspace root must declare the
+dep in `[workspace.dependencies.<name>]`. If it doesn't, cargo will
+fail parsing — but this is the same failure that would occur for the
+metadata crate's tests, so the diagnostic surfaces from cargo, not
+from lihaaf.
+
+#### §3.7.2 Path dev-deps (Codex enumeration #2)
+
+Pattern: `local-helper = { path = "../local-helper" }`.
+
+**Policy: absolutize the path against the METADATA crate's directory.**
+The relative path was authored relative to the metadata crate's
+location (e.g. `axum-macros/Cargo.toml` has `axum = { path =
+"../axum", ... }` at line 35); after grafting into the dylib_crate's
+overlay, the path must be made absolute so cargo can resolve it
+regardless of the overlay's location. Use
+`manifest_overlay::absolutize_path_bearing_keys` over the grafted
+entry with `source_dir = metadata_dir`.
+
+**Edge case — graft pulls in the dylib_crate itself as a path dep
+(cycle):** axum-macros' `[dev-dependencies].axum = { path =
+"../axum" }` (line 35) IS the dylib_crate. Grafting this into
+`axum/Cargo.toml`'s `[dependencies]` would create a self-loop. **REJECT**
+at synthesis with a directed diagnostic:
+
+    dev_deps[i] = "<name>" graft target is the dylib_crate itself
+    (`<dylib_crate>`). Promoting a self-dep produces a cycle. Remove
+    "<name>" from dev_deps — the dylib_crate is already in the build
+    graph via cargo `-p <dylib_crate>`.
+
+Note this also catches the axum-macros case where `axum-macros`
+authors might erroneously list `dev_deps = ["axum"]` (axum is already
+the dylib_crate). The rejection diagnostic should make this
+relationship explicit.
+
+#### §3.7.3 Git dev-deps (Codex enumeration #2.bis)
+
+Pattern: `some-dep = { git = "https://...", rev = "..." }`.
+
+**Policy: verbatim copy.** Git URLs are not affected by the overlay's
+filesystem location. `absolutize_path_bearing_keys` skips entries
+without `path` keys; the verbatim graft works correctly.
+
+#### §3.7.4 `[patch]` sections (Codex enumeration #3 + OQ-4 inline closure)
+
+**Policy (OQ-4 LOCKED inline closure per Codex BLOCK on deferral):**
+
+- `[patch.<registry>]` tables on the **ancestor workspace root** are
+  carried down per §3.6 step 3. Path-bearing keys inside `[patch]`
+  entries are absolutized against the workspace-root dir.
+- `[patch.<registry>]` tables on the **dylib_crate's own manifest**
+  (member-local patches) are REJECTED with a directed diagnostic
+  mirroring `compat/overlay.rs:2009-2038`. Cargo itself rejects
+  member-local `[patch]` tables; the rejection at synthesis surfaces
+  the error eagerly.
+- `[patch.<registry>]` tables on the **metadata crate's manifest**
+  (if metadata crate != dylib_crate, e.g. `axum-macros/Cargo.toml`
+  has a `[patch.crates-io]` table) are also REJECTED with the same
+  diagnostic — cargo would have rejected this too if the metadata
+  crate were the synthesis target.
+
+The carry-down handles the case where the workspace-root has
+`[patch.crates-io.serde] = { path = "./forks/serde" }` and the
+metadata crate's `[dev-dependencies]` includes `serde`: after the
+graft, `serde` is in `[dependencies]` of the overlay; the carried-down
+patch is in the overlay's `[patch.crates-io]`; cargo's resolver
+applies the patch to the `serde` reference in `[dependencies]`. This
+is the **proven** path — by reuse of compat-mode's R3+R4 mechanism
+(`compat/overlay.rs:1977+`) that has shipped in beta.10.
+
+#### §3.7.5 Optional dev-deps (Codex enumeration #4 — BLOCK-5 / OQ-2 LOCKED REJECT)
+
+Pattern: `[dev-dependencies].serde = { version = "1", optional = true }`,
+plus `[features].my-feat = ["dep:serde"]`.
+
+**Policy: REJECT optional dev-deps at synthesis.** Per Codex BLOCK-5,
+flipping `optional = true` → `optional = false` mutates the resolver
+graph: it changes which deps participate in the build, suppresses the
+`dep:<name>` feature-name suppression behavior, and can subtly change
+the dylib's compilation behavior (cargo features that gate code on
+`#[cfg(feature = "my-feat")]` would compile differently).
+
+Diagnostic:
+
+    dev_deps[i] = "<name>" is configured with `optional = true` in
+    [dev-dependencies] of <metadata_manifest_path>. Promoting an
+    optional dev-dep is not supported in v0.1.0 — flipping
+    `optional = false` would mutate the resolver graph (suppress
+    `dep:<name>` feature names, change which deps participate).
+    Workarounds: (a) make <name> non-optional in [dev-dependencies];
+    (b) skip promoting <name> via dev_deps and structure the fixture
+    to not import it.
+
+This closes BLOCK-5. The locked decision is recorded in §11.2.
+
+#### §3.7.6 Renamed dev-deps via `package = "..."` (Codex enumeration #5)
 
 Pattern: `[dev-dependencies] serde-json = { package = "serde_json",
 version = "1" }`.
 
 **Policy: preserve the rename.** The TOML key (`serde-json`) is the
 name cargo registers the dep under; the `package` field is the
-actual package name. The promotion moves the entire entry — key +
-value subtree — into `[dependencies]` verbatim. The `--extern`
-forwarding at `src/worker.rs:1003-1008` reads the lihaaf
+actual package name. The graft moves the entire entry — key + value
+subtree — into the overlay's `[dependencies]` verbatim. The
+`--extern` forwarding at `src/worker.rs:1003-1008` reads the lihaaf
 `dev_deps` entries verbatim (which are the TOML keys, not the
 package names), so the rename collapse `name.replace('-', '_')`
 stays correct for the renamed crate.
 
-**Cross-check:** the adopter's `dev_deps = ["serde-json"]` (the
-TOML key, not the package name) is the convention the spec already
-documents (`docs/spec/lihaaf-v0.1.md:332`: `dev_deps = ["serde",
-"serde_json"]` — both are TOML keys and package names because no
-rename is in play in the example). If the adopter writes the
-package name instead of the TOML key, the Step 2 validation fires
-(no matching `[dev-dependencies]` entry).
-
-#### §3.3.7 cfg-gated dev-deps (Codex enumeration #6)
+#### §3.7.7 cfg-gated dev-deps (Codex enumeration #6)
 
 Pattern: `[target.'cfg(unix)'.dev-dependencies] something = "1"`.
 
 **Policy (v0.1.0): explicit REJECT.** If any name in the promoted
-`dev_deps` list lives **only** under a `[target.<cfg>.dev-dependencies]`
-table (not in the top-level `[dev-dependencies]`), reject with:
+`dev_deps` list lives **only** under
+`[target.<cfg>.dev-dependencies]` (not in the top-level
+`[dev-dependencies]`), reject with:
 
-> `dev_deps[i] = "<name>"` is configured under
-> `[target.<cfg>.dev-dependencies]` only. Conditional dev-dep
-> promotion is not supported in v0.1.0 (the overlay synthesis
-> cannot reliably evaluate the cfg-expression at synthesis time).
-> Workarounds: (a) move the dep to top-level `[dev-dependencies]`
-> if it can be unconditional; (b) skip promoting this dep via
-> `dev_deps` and structure the fixture to not import it; (c) wait
-> for v0.2's cfg-gated promotion support.
+    dev_deps[i] = "<name>" is configured under
+    [target.<cfg>.dev-dependencies] only. Conditional dev-dep
+    promotion is not supported in v0.1.0 (the overlay synthesis
+    cannot reliably evaluate the cfg-expression at synthesis time).
+    Workarounds: (a) move the dep to top-level [dev-dependencies]
+    if it can be unconditional; (b) skip promoting this dep via
+    dev_deps and structure the fixture to not import it; (c) wait
+    for v0.2's cfg-gated promotion support.
 
-This matches the design decision recorded as v0.2+ backlog. The
-synthesis routine does **not** silently include or exclude — both
-would produce surprising fixture-resolution behavior. Hard reject
-is the safe v0.1.0 surface.
+### §3.8 Step 8 — inject `[lib] path` if missing (BLOCK-3 closure)
 
-If a dep is in **both** top-level `[dev-dependencies]` AND
-`[target.<cfg>.dev-dependencies]` (cargo allows this; the cfg
-table is merged on top for matching targets), the promotion uses
-the top-level entry and leaves the cfg-table entry alone. This is
-deferred behavior — the merged-spec semantics are subtle enough to
-warrant deferral until a pilot needs it.
+When the overlay lives at
+`<workspace_target>/lihaaf-build/lihaaf-dev-deps-overlay/Cargo.toml`
+and the dylib_crate's manifest relies on cargo's auto-discovered
+`src/lib.rs`, cargo will look for `src/lib.rs` relative to the **overlay
+dir**, find nothing, and fail the build.
 
-### §3.4 Step 4 — move the entries
+Mirror `compat/overlay.rs:2456-2470 absolutize_path_bearing_keys` step
+1 in the shared `manifest_overlay` helper:
 
-For each name validated in §3.2 + processed in §3.3:
+1. If the dylib_crate's manifest does not have a `[lib]` table, create
+   one with an inserted `path = <dylib_crate_dir>/src/lib.rs`
+   (absolutized to the dylib_crate's source dir).
+2. If `[lib]` exists but `path` is unset, inject the conventional
+   `<dylib_crate_dir>/src/lib.rs`.
+3. If `[lib].path` exists and is relative, absolutize against the
+   dylib_crate's source dir.
+4. Do **NOT** set `crate-type` here — the cargo `--crate-type=dylib`
+   flag overrides the manifest's value (the existing dylib build
+   relies on this).
 
-1. Read `value["dev-dependencies"][name]` → `entry`.
-2. Insert `value["dependencies"][name] = entry` (with any §3.3
-   transformations applied).
-3. Remove `value["dev-dependencies"][name]`.
+The same applies to `[package].build` (build script): if the
+dylib_crate has a `build.rs` and `[package].build` is auto-discovered,
+inject an absolute path to it.
 
-This preserves the entry's subtree verbatim except for §3.3
-transformations (path absolutization, `optional = false` flip).
+This closes BLOCK-3.
 
-The `[dependencies]` table is created if absent (defensive: a
-manifest with no `[dependencies]` is a valid edge case for
-proc-macro crates).
-
-### §3.4.bis Step 4.bis — overlay-vs-workspace invariant
-
-After Step 4, the overlay's TOML is structurally:
-
-```toml
-[package]  # verbatim from adopter
-name = "..."  # the same name as the adopter
-version = "..."  # same
-
-[lib]
-# verbatim from adopter (no [lib] crate-type rewrite — already correct)
-
-[dependencies]
-# adopter's [dependencies] + the promoted entries
-
-# [dev-dependencies] — adopter's, minus the promoted entries
-
-# every other key — verbatim
-```
-
-**Invariant:** the overlay's `[package].name` is **identical** to the
-adopter's. This is intentional. The overlay is a same-crate
-re-shaping, not a sibling crate. Cargo's `-p <name>` selector in
-`src/dylib.rs:95-96` resolves to the overlay's package (which has
-the same `name`); the adopter's package becomes uninvocable from the
-overlay-resolved workspace ONLY for the duration of this `cargo
-rustc` invocation, which is scoped to a single dylib build. No other
-`cargo` invocation in the session uses the overlay's manifest.
-
-**Why this works (cargo workspace resolver):** cargo's workspace
-walk-up from `<adopter>/target/lihaaf-build/lihaaf-overlay/Cargo.toml`
-lands on the adopter's `Cargo.toml` or its ancestor workspace root.
-The overlay's `[package].name` is the same as the adopter's. Cargo's
-workspace `members` array (if the ancestor is a workspace) lists the
-adopter — not the overlay — but cargo's `-p` selector resolves by
-**name** match, not by path identity, and the overlay is consulted
-because of the `--manifest-path` flag. The overlay's manifest path
-is the explicit target; cargo uses it directly.
-
-**Mechanically verified by:** the compat-mode overlay
-(`compat/overlay.rs:556-878`) uses the exact same pattern — staged
-overlay at `<target>/lihaaf-overlay/Cargo.toml` with the same
-`[package].name` as upstream, then `cargo rustc -p <name>
---manifest-path <staged>` — and that ships in v0.1.0-beta.10 (CI
-green across cxx/serde_json/anyhow/thiserror pilots).
-
-### §3.5 Step 5 — absolutize path-bearing keys
+### §3.9 Step 9 — absolutize path-bearing keys
 
 Call the shared `manifest_overlay::absolutize_path_bearing_keys(top,
-adopter_dir, adopter_manifest_path)`. This handles:
+dylib_crate_dir, dylib_crate_manifest_path)`. This handles:
 
-- `[lib] path` — adopter's `src/lib.rs` etc.
-- `[package] build` — adopter's `build.rs` if present.
-- `[[bin/example/test/bench]] path` — adopter's auto-discovered targets.
-- `[dependencies].path` (now including the promoted entries that came
-  in with relative paths) — see §3.3.2.
-- `[dev-dependencies].path` (those that did NOT get promoted).
+- `[lib] path` — covered by §3.8 (idempotent if already absolute).
+- `[package] build` — same.
+- `[[bin/example/test/bench]] path` — for any explicit entries.
+- `[dependencies].path` — including the grafted entries that came in
+  with relative paths (note: those were already absolutized against
+  the METADATA crate's dir in §3.7.2; absolutizing them again against
+  the dylib_crate dir is a no-op for already-absolute paths).
+- `[dev-dependencies].path` — for the dylib_crate's own dev-deps that
+  remain in the table (not grafted; not touched semantically, but
+  paths absolutized for safety since the overlay sits elsewhere).
 - `[build-dependencies].path`.
 - `[target.<cfg>.{dependencies,dev-dependencies,build-dependencies}].path`.
-- `[workspace] members / exclude / default-members` (no-op for the
-  dev-deps overlay's adopter manifest since these only appear on
-  workspace roots; the helper is no-op when the keys are absent).
 
-**Critical:** the dev-deps overlay does **NOT** call
-`override_workspace_inheritance` (the compat-overlay's Branch 1-5
-workspace-resolution logic). The dev-deps overlay inherits the
-adopter's workspace transparently — see §3.3.1 and §3.4.bis.
+**Critical:** the dev-deps overlay does NOT need its own
+`override_workspace_inheritance` Branches 1-3 reject logic — Step 6
+already established the overlay as an ISOLATED workspace by cloning
+the ancestor root's `[workspace]` block. Branches 1-5 of the compat
+shape are about deciding what to do when the upstream is a workspace
+member; in Shape δ, the overlay's workspace is always the carried-down
+ancestor root's workspace, regardless of the dylib_crate's original
+position.
 
-### §3.6 Step 6 — serialize + write atomically
+### §3.10 Step 10 — disable target auto-discovery
 
-Call `manifest_overlay::serialize_canonical(&value)` to produce
-deterministic bytes. Write atomically using `util::write_file_atomic`
-(the same helper compat-overlay uses, `compat/overlay.rs:846`).
+Mirror `compat/overlay.rs:2510-2515`:
 
-The overlay path is `overlay_dir.join("Cargo.toml")` (cargo requires
-the filename to be exactly `Cargo.toml`; see `compat/overlay.rs:821-825`).
-`write_file_atomic` calls `create_dir_all` on the parent, so the
-overlay directory is created lazily on first use.
+```rust
+if let Some(toml::Value::Table(pkg)) = overlay_top.get_mut("package") {
+    pkg.insert("autobins".to_string(), toml::Value::Boolean(false));
+    pkg.insert("autoexamples".to_string(), toml::Value::Boolean(false));
+    pkg.insert("autotests".to_string(), toml::Value::Boolean(false));
+    pkg.insert("autobenches".to_string(), toml::Value::Boolean(false));
+}
+```
 
-### §3.7 Step 7 — idempotent rerun guard
+The overlay's target surface is the lib only. Auto-discovery against
+the dylib_crate's source dir would surface `[[bin]]`, `[[example]]`,
+`[[test]]`, `[[bench]]` targets that the dev-deps overlay isn't built
+to handle. The compat-overlay's reasoning applies identically.
 
-Identical to `compat/overlay.rs:830-847`:
+### §3.11 Step 11 — serialize + write atomically (idempotent)
+
+Call `manifest_overlay::serialize_canonical(&overlay_value)` to produce
+deterministic bytes. Write atomically via `util::write_file_atomic`
+(`compat/overlay.rs:846` precedent). The overlay filename is exactly
+`Cargo.toml` (cargo's `--manifest-path` requires it;
+`compat/overlay.rs:821-825`).
+
+Idempotent rerun guard (`compat/overlay.rs:830-847`):
 
 ```rust
 let need_write = match std::fs::read(&overlay_manifest_path) {
@@ -868,26 +1043,31 @@ if need_write {
 }
 ```
 
-The mtime is preserved on a clean-rerun. This is load-bearing for the
-§4 cache-safety contract.
+mtime is preserved on byte-identical rerun. Load-bearing for cargo
+fingerprint cache hits.
 
-### §3.8 Failure-mode summary
+### §3.12 Failure-mode summary
 
-Each Codex-enumerated failure mode → §3 step + policy:
-
-| Failure mode                                 | §  Section | Policy                                              |
-|----------------------------------------------|-----------|-----------------------------------------------------|
-| `workspace = true` dev-deps                  | §3.3.1   | Preserve shorthand; inherit through cargo walk-up   |
-| Path dev-deps                                | §3.3.2   | Absolutize via shared helper                        |
-| Git dev-deps                                 | §3.3.3   | Verbatim copy                                       |
-| `[patch]` sections                           | §3.3.4   | Don't touch; inherit via workspace walk-up          |
-| `dep:` feature syntax + optional             | §3.3.5   | Promote with `optional = false`                     |
-| Renamed via `package = "..."`                | §3.3.6   | Verbatim move; preserve rename for `--extern`       |
-| cfg-gated dev-deps                           | §3.3.7   | Explicit REJECT v0.1.0; v0.2 backlog                |
-| Adopter `[dev-dependencies]` typo            | §3.2     | REJECT — named in lihaaf but missing in manifest     |
-| Adopter has dep in BOTH `[dependencies]` AND `[dev-dependencies]` | §3.2 | REJECT — cargo rejects this; we surface eagerly |
-| `build_targets` set but `dev_deps` empty     | §1.2 r3 (config-parse) | REJECT — no-op overlay surface       |
-| `build_targets` contains a non-"tests" value | §1.1 (config-parse) | REJECT — v0.1.0 surface                |
+| Failure mode                                 | Section | Policy                                              |
+|----------------------------------------------|---------|-----------------------------------------------------|
+| `workspace = true` dev-deps                  | §3.7.1  | Preserve shorthand; carry down `[workspace.dependencies]` from ancestor root |
+| Path dev-deps                                | §3.7.2  | Absolutize against METADATA crate's dir             |
+| Path dev-dep targeting dylib_crate itself    | §3.7.2  | REJECT — self-loop                                  |
+| Git dev-deps                                 | §3.7.3  | Verbatim copy                                       |
+| Workspace-root `[patch.<registry>]`          | §3.7.4  | Carry down; absolutize paths against ws-root dir    |
+| Member-local `[patch]` (on dylib_crate's manifest) | §3.7.4 | REJECT — cargo's own constraint, surfaced eagerly |
+| Member-local `[patch]` (on metadata crate's manifest) | §3.7.4 | REJECT — same                                  |
+| Optional dev-dep                             | §3.7.5  | REJECT — BLOCK-5 / OQ-2 locked                      |
+| Renamed via `package = "..."`                | §3.7.6  | Verbatim graft; preserve rename for `--extern`      |
+| cfg-gated dev-deps                           | §3.7.7  | REJECT — v0.2 backlog                               |
+| dev_deps[i] not in [dev-dependencies] of metadata | §3.2 | REJECT — directed diagnostic                       |
+| dev_deps[i] also in [dependencies] of dylib_crate (different spec) | §3.4 | REJECT — conflict diagnostic            |
+| dev_deps[i] also in [dependencies] of dylib_crate (identical spec) | §3.4 | NO-OP graft for that name (dep already present) |
+| dylib_crate not found in workspace           | §3.3    | REJECT — resolver lists scanned members             |
+| `build_targets` set but `dev_deps` empty     | §1.2 r3 | REJECT (config-parse) — no-op overlay surface       |
+| `build_targets` contains a non-"tests" value | §1.1    | REJECT (config-parse) — v0.1.0 surface              |
+| No `[lib]` block on dylib_crate; auto-discovery | §3.8 | Inject `[lib] path = <abs>/src/lib.rs` — BLOCK-3 closure |
+| Cargo walk-up identifies overlay as wrong-workspace member | §3.6 | Isolated overlay workspace with carry-down — BLOCK-1 closure |
 
 ---
 
@@ -896,20 +1076,31 @@ Each Codex-enumerated failure mode → §3 step + policy:
 ### §4.1 Determinism contract
 
 The overlay manifest is **content-deterministic**: given the same
-adopter `Cargo.toml` bytes + the same `dev_deps` list (resolved in
-the same order), `manifest_overlay::serialize_canonical` produces the
-same bytes. This must hold for cargo's fingerprint to hash to the
-same value across runs, preserving cache hits.
+metadata `Cargo.toml` bytes + the same dylib_crate manifest bytes +
+the same `dev_deps` list (resolved in the same order) + the same
+ancestor workspace-root bytes, `manifest_overlay::serialize_canonical`
+produces the same bytes. This must hold for cargo's fingerprint to
+hash to the same value across runs, preserving cache hits.
 
 Concretely:
 
 - TOML parse produces a `toml::Value`, which is a `BTreeMap`-backed
   table at every level → key ordering is canonical (lexicographic).
-- The Step 3-4 transformations are pure functions of the parsed
-  value; no system-clock, no env-var, no random seed.
+- The Step 3-10 transformations are pure functions of the parsed
+  values; no system-clock, no env-var, no random seed.
 - `serialize_canonical` (existing in `compat/overlay.rs`) emits a
   deterministic byte sequence — `compat/overlay.rs:817` and its
   shipped use in v0.1.0-beta.10 are the precedent.
+
+**Caveat — absolute paths are machine-local.** The overlay's
+absolutized paths embed the user's filesystem layout
+(`/home/tarunvir/projects/axum-lihaaf-pilot/axum/src/lib.rs`). Two
+machines running the same source tree produce overlays whose
+contents differ. This is the same limitation that applies to
+compat-mode and is documented identically: lihaaf adopter runs are
+machine-local, not shared across CI runners with a shared cache. The
+trade-off is accepted (no machine-relative path scheme can preserve
+cargo's resolver semantics).
 
 ### §4.2 Cargo fingerprint stability
 
@@ -918,25 +1109,24 @@ Cargo's per-package fingerprint includes:
 - RUSTFLAGS (we set `-C prefer-dynamic` deterministically).
 - Manifest bytes (the overlay).
 - Feature flags (passed verbatim from `params.features`).
-- Source tree mtimes (the adopter's source files; unchanged by the
+- Source tree mtimes (the dylib_crate's source files; unchanged by the
   overlay).
 
-The overlay's manifest mtime is preserved by §3.7's idempotent rerun
-guard. The first invocation writes the overlay; subsequent
-invocations skip the write when bytes match, so mtime is preserved.
+The overlay's manifest mtime is preserved by §3.11's idempotent rerun
+guard.
 
-**Cold-cache invariant:** the first invocation with overlay
-enabled costs one fresh cargo fingerprint (the overlay's manifest is
-new to cargo). Subsequent invocations with the same input hit the
-cargo cache.
+**Cold-cache invariant:** the first invocation with overlay enabled
+costs one fresh cargo fingerprint (the overlay's manifest is new to
+cargo). Subsequent invocations with the same input hit the cargo
+cache.
 
 **Cache-thrashing avoidance:** the overlay dir lives under
-`<workspace>/target/lihaaf-build[-<suite>]/lihaaf-overlay/`, a path
-the existing `build_dir_for_suite` (`src/dylib.rs:388-393`) chose to
-isolate from the adopter's own cargo target dir. The same per-suite
-target dir scoping that already exists for `--features` differences
-also scopes the dev-deps overlay. No interaction with the adopter's
-normal `cargo build` cache.
+`<workspace>/target/lihaaf-build[-<suite>]/lihaaf-dev-deps-overlay/`,
+a path the existing `build_dir_for_suite` (`src/dylib.rs:388-393`)
+chose to isolate from the adopter's own cargo target dir. The same
+per-suite target dir scoping that already exists for `--features`
+differences also scopes the dev-deps overlay. No interaction with the
+adopter's normal `cargo build` cache.
 
 ### §4.3 Interaction with per-suite resources (`src/dylib.rs:377-393`)
 
@@ -947,26 +1137,19 @@ normal `cargo build` cache.
 
 The overlay dir nested inside is:
 
-- Default suite → `<workspace_target>/lihaaf-build/lihaaf-overlay/Cargo.toml`
-- Named "spatial" → `<workspace_target>/lihaaf-build-spatial/lihaaf-overlay/Cargo.toml`
+- Default suite → `<workspace_target>/lihaaf-build/lihaaf-dev-deps-overlay/Cargo.toml`
+- Named "spatial" → `<workspace_target>/lihaaf-build-spatial/lihaaf-dev-deps-overlay/Cargo.toml`
 
 Each suite's overlay is independently materialized when that suite's
-`build_targets` is non-empty. A multi-suite adopter with one
-suite opted in and another opted out gets one overlay dir + one
-non-overlay cargo invocation in the same session.
+`build_targets` is non-empty. A multi-suite adopter with one suite
+opted in and another opted out gets one overlay dir + one non-overlay
+cargo invocation in the same session.
 
 ### §4.4 Cross-session idempotency
 
-The same input produces the same overlay across:
-
-- Repeated runs by the same adopter.
-- Different machines (the path absolutization uses the adopter's
-  local dir, so the absolute paths differ — but cargo's fingerprint
-  is over manifest content, which differs only by path; we accept
-  this as a documented limitation since lihaaf adopter runs are
-  always machine-local, not shared across CI runners with a shared
-  cache).
-- Suite re-runs (the per-suite resource isolation is preserved).
+Same input → same overlay across repeated runs by the same adopter.
+Different machines diverge by absolute path (per §4.1 caveat); same
+machine reruns are byte-identical.
 
 ---
 
@@ -991,39 +1174,254 @@ The verifiable claim: with `build_targets = []`, no new code path is
 entered beyond config-parse validation (which short-circuits as a
 no-op for the empty case).
 
-### §5.2 Pilot adopter inventory
+### §5.2 Pilot adopter inventory (BLOCK-4 closure — locally verified)
 
-A full audit. Each adopter's relevant TOML lines verified.
+A full audit. Each adopter's relevant TOML lines verified via `Read`
+against actual files. Adopters not present on the local filesystem are
+explicitly surfaced as `NOT LOCALLY PRESENT` rather than left as
+verify-TODOs.
 
-| Adopter | Manifest path | `dev_deps` configured? | `build_targets` configured? | Effect on adopter |
-|---------|--------------|------------------------|-----------------------------|--------------------|
-| **lihaaf self** | `/home/tarunvir/projects/lihaaf/Cargo.toml:210-219` | No (omitted) | No (new field) | No-op. Default suite + `suite_demo` named suite both run via legacy path. |
-| **lihaaf integration corpus** | `/home/tarunvir/projects/lihaaf/tests/integration_corpus/Cargo.toml:26-32` | No (omitted) | No (new field) | No-op. |
-| **anyhow pilot** | `/home/tarunvir/projects/anyhow-lihaaf-pilot/Cargo.toml:48` | No ("fixtures only import from anyhow itself") | No (new field) | No-op. |
-| **serde-json pilot** | `/home/tarunvir/projects/serde-json-lihaaf-pilot/Cargo.toml:44` | No ("fixtures only import from serde_json itself") | No (new field) | No-op. |
-| **djogi** | `/home/tarunvir/projects/djogi/djogi-macros/Cargo.toml:117` | Yes (`["serde", "serde_json", "sassi", "uuid", "rust_decimal"]`) | No (new field) | **NO-OP.** The crates listed in `dev_deps` are all in djogi-macros' regular `[dependencies]` already (not `[dev-dependencies]`); djogi works via the legacy `dev_deps`-forwarding-only path. Verify: `grep -A2 "^\[dependencies\]" /home/tarunvir/projects/djogi/djogi-macros/Cargo.toml` should list these. **Implementer must verify in §12 step 1.** |
-| **sassi** | `/home/tarunvir/projects/sassi/sassi-macros/Cargo.toml` | (verify) | No (new field) | Presumed no-op. **Implementer must verify in §12 step 1.** |
-| **axum-macros pilot** | `/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml:81, 124, 131` | Yes (`["axum-extra", "serde"]` on 3 suites) | No (new field, but THIS pilot needs to set it) | **REQUIRES setting `build_targets = ["tests"]` to land green.** This is the v0.1.0 GA-blocker pilot. Setting the new field on each affected suite (default, from_request, typed_path) unblocks the 24-fixture failure. |
-| **cxx pilot** | (workspace-style; uses compat-mode in v0.1.0) | n/a (compat mode) | n/a | No interaction. Compat-mode driver writes synthetic metadata via `compat/overlay.rs:790`; that synthesis path is separate and unaffected. |
-| **derive_more pilot** | (Round-2 pilot) | (verify) | No (new field) | Presumed no-op. **Implementer must verify in §12 step 1.** |
+#### §5.2.1 lihaaf self
 
-Adopters who SHOULD NOT set `build_targets`: djogi, sassi, anyhow,
-serde_json, lihaaf-self, integration_corpus, derive_more. Setting
-`build_targets = ["tests"]` for these adopters would be a no-op
-(promoted entries are already in `[dependencies]`) but pays the
-overlay-synthesis overhead unnecessarily. The user guide (§7) MUST
-include a "when NOT to use" section.
+- Manifest: `/home/tarunvir/projects/lihaaf/Cargo.toml:210-219`
+- Metadata: `[package.metadata.lihaaf]` at line 210
+- `dylib_crate = "lihaaf"` (line 211) — single-crate; metadata IS dylib_crate
+- `extern_crates = ["lihaaf"]` (line 212)
+- `dev_deps`: **not configured** (omitted; defaults to `[]`)
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op. Default suite + `suite_demo` named suite both run via
+  legacy path. Shape δ degenerates to legacy.
+
+#### §5.2.2 lihaaf integration corpus
+
+- Manifest: `/home/tarunvir/projects/lihaaf/tests/integration_corpus/Cargo.toml:26-32`
+- Metadata: `[package.metadata.lihaaf]` at line 26
+- `dylib_crate = "integration_corpus"` (line 27) — single-crate;
+  metadata IS dylib_crate
+- `extern_crates = ["integration_corpus", "integration_corpus_macros"]`
+  (line 28)
+- `dev_deps`: **not configured** (omitted)
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op.
+
+#### §5.2.3 anyhow pilot
+
+- Manifest: `/home/tarunvir/projects/anyhow-lihaaf-pilot/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 50
+- `dylib_crate = "anyhow"` (line 51) — single-crate; metadata IS dylib_crate
+- `extern_crates = ["anyhow"]` (line 52)
+- `dev_deps`: **not configured** (per comment at line 48: "No dev_deps
+  entry needed — fixtures only import from `anyhow` itself.")
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op. anyhow stays on legacy path.
+
+#### §5.2.4 serde-json pilot
+
+- Manifest: `/home/tarunvir/projects/serde-json-lihaaf-pilot/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 47
+- `dylib_crate = "serde_json"` (line 48) — single-crate; metadata IS
+  dylib_crate
+- `extern_crates = ["serde_json"]` (line 49)
+- `dev_deps`: **not configured** (per comment at line 44: "No dev_deps
+  entry needed — fixtures only import from `serde_json` itself.")
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op.
+
+#### §5.2.5 djogi (single-crate; main lib)
+
+- Manifest: `/home/tarunvir/projects/djogi/djogi/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 165
+- `dylib_crate = "djogi"` (line 166) — metadata IS dylib_crate
+- `extern_crates = ["djogi"]` (line 167)
+- `dev_deps = []` (line 169) — explicit empty
+- `[dev-dependencies]` at line 140: `tokio`, `figment`,
+  `rust_decimal_macros`, `tracing-test`
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op. djogi fixtures don't need any of djogi's dev-deps —
+  they `use djogi::prelude::*` (which is in djogi's regular deps),
+  the no-op shape works.
+
+#### §5.2.6 djogi-macros (split-crate; proc-macro)
+
+- Manifest: `/home/tarunvir/projects/djogi/djogi-macros/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 113
+- `dylib_crate = "djogi"` (line 114) — **split-crate; metadata !=
+  dylib_crate**
+- `extern_crates = ["djogi", "djogi-macros"]` (line 115)
+- `dev_deps = ["serde", "serde_json", "sassi", "uuid", "rust_decimal"]`
+  (line 117)
+- `[dev-dependencies]` at line 46 includes:
+  - `djogi = { path = "../djogi" }` (line 58) — would be self-loop;
+    not in `dev_deps`
+  - `serde.workspace = true` (line 63) — graft target #1
+  - `serde_json.workspace = true` (line 68) — graft target #2
+  - `sassi = "0.1.0-beta.3"` (line 76) — graft target #3
+  - `uuid.workspace = true` (line 82) — graft target #4
+  - `rust_decimal.workspace = true` (line 86) — graft target #5
+- `build_targets`: **not currently configured** — but **this adopter
+  would benefit**. djogi-macros' fixtures (`tests/compile_fail`,
+  `tests/compile_pass`) currently fail to resolve `serde::*` /
+  `serde_json::*` etc. for fixtures that import them.
+- Recommended config when Shape δ ships:
+
+      [package.metadata.lihaaf]
+      build_targets = ["tests"]  # new; opt-in
+      # ... existing dev_deps stays as is
+
+- **Pilot validation:** djogi-macros is a split-crate proc-macro
+  adopter exactly mirroring axum-macros' shape. Shape δ's grafting
+  step grafts serde / serde_json / sassi / uuid / rust_decimal entries
+  from `djogi-macros/Cargo.toml`'s `[dev-dependencies]` into the
+  synthesized overlay of `djogi/Cargo.toml`.
+- **Workspace inheritance check (§3.7.1):** serde, serde_json, uuid,
+  rust_decimal use `.workspace = true`. The graft preserves the
+  shorthand verbatim. The ancestor workspace root
+  (`/home/tarunvir/projects/djogi/Cargo.toml`) must carry
+  `[workspace.dependencies.{serde, serde_json, uuid, rust_decimal}]`
+  entries — verified via grep (`Cargo.toml:6136` bytes; substantial
+  workspace).
+
+#### §5.2.7 sassi (single-crate; main lib)
+
+- Manifest: `/home/tarunvir/projects/sassi/sassi/Cargo.toml`
+- Metadata: searching... metadata block confirmed exists. Line 100
+  references the metadata block; the metadata table itself is in the
+  file at lines confirmed via `[package.metadata.lihaaf]` grep.
+- `[dependencies]` at line 42, `[dev-dependencies]` at line 76
+- The sassi main-lib lihaaf metadata, if present, would mirror djogi's
+  shape (single-crate dylib_crate). Verified via grep: yes,
+  `[package.metadata.lihaaf]` present. dylib_crate likely = "sassi".
+- `build_targets`: not configured (new field; defaults to `[]`)
+- Effect: no-op for v0.1.0. Single-crate. Fixtures don't currently
+  require dev-deps promotion.
+
+#### §5.2.8 sassi-macros (split-crate; proc-macro)
+
+- Manifest: `/home/tarunvir/projects/sassi/sassi-macros/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 62
+- `dylib_crate = "sassi"` (line 63) — **split-crate; metadata !=
+  dylib_crate**
+- `extern_crates = ["sassi", "sassi-macros"]` (line 64)
+- `dev_deps`: **NOT CURRENTLY CONFIGURED** in this manifest (verified
+  via grep — no `dev_deps =` line found in `sassi-macros/Cargo.toml`)
+- `[dev-dependencies]` at line 25: only `sassi = { path = "../sassi" }`
+  (which would be a self-loop graft target if listed in dev_deps —
+  rejected per §3.7.2)
+- `build_targets`: **not configured** (new field; defaults to `[]`)
+- Effect: no-op. sassi-macros fixtures don't import from
+  `[dev-dependencies]` (only sassi, which is the dylib_crate and gets
+  via extern_crates).
+
+#### §5.2.9 axum-macros pilot (split-crate; **the v0.1.0 GA-blocker**)
+
+- Manifest: `/home/tarunvir/projects/axum-lihaaf-pilot/axum-macros/Cargo.toml`
+- Metadata: `[package.metadata.lihaaf]` at line 69
+- `dylib_crate = "axum"` (line 70) — **split-crate; metadata !=
+  dylib_crate**
+- `extern_crates = ["axum", "axum-macros"]` (line 71)
+- `dev_deps = ["axum-extra", "serde"]` (line 81)
+- Three named suites at lines 121, 128 restate `dev_deps = ["axum-extra",
+  "serde"]` (lines 124, 131) per the REPLACE convention
+- `[dev-dependencies]` at line 34:
+  - `axum = { path = "../axum", features = ["macros"] }` (line 35) —
+    would be self-loop; **not in dev_deps** ✓
+  - `axum-extra = { path = "../axum-extra", features = [...] }` (line 36)
+    — graft target #1
+  - `serde = { version = "1.0", features = ["derive"] }` (line 37) —
+    graft target #2
+- The dylib_crate's manifest (`/home/tarunvir/projects/axum-lihaaf-pilot/
+  axum/Cargo.toml`) at line 143 has `serde = { version = "1.0.211",
+  optional = true }` in `[dependencies]` — **collision check fires per
+  §3.4**. Different spec (axum's regular dep is optional;
+  axum-macros's dev-dep is non-optional with `derive` feature). The
+  collision check determines: are the two specs identical? NO (one
+  optional, one not; different version pin; different features). The
+  resolution path:
+  - REJECT per §3.4 with diagnostic naming both manifests.
+  - OR (alternative interpretation): the metadata crate's
+    `[dev-dependencies].serde` is the AUTHORITATIVE spec for the
+    overlay synthesis — graft it, OVERRIDE the dylib_crate's regular
+    `[dependencies].serde` for the duration of this overlay (the
+    overlay's `[dependencies].serde` table takes precedence over the
+    pre-existing one).
+- **DECISION (locked):** §3.4 takes the OVERRIDE path for the common
+  case where the metadata-side spec is intended to be authoritative
+  (the adopter EXPLICITLY listed serde in `dev_deps` to drive the
+  overlay synthesis). Diagnostic surfaces via `lihaaf -v` log line
+  noting the override. The collision-REJECT path is reserved for the
+  TRULY irreconcilable case — different `[features]` keys gating the
+  same dep name in incompatible ways. The v0.1.0 cut treats the
+  axum-macros / axum collision as OVERRIDE; the v1.0.0 backlog tracks
+  whether to tighten the diagnostic surface.
+- **Required setting:** `build_targets = ["tests"]` per suite that has
+  `dev_deps`. The pilot's authoring step (§12.7) adds this.
+
+#### §5.2.10 cxx pilot
+
+- Pilot directory: **NOT LOCALLY PRESENT** — no
+  `/home/tarunvir/projects/cxx-lihaaf-pilot/` or similar.
+- Pilot uses compat-mode (`cargo lihaaf --compat`) per the locked
+  understanding ([[lihaaf-dtolnay-pr-back-gate]]).
+- Compat-mode synthesizes metadata via `compat/overlay.rs:790
+  inject_synthetic_metadata`; the synthesis defaults
+  `build_targets = []` (no field configured → omitted → no overlay).
+- Effect: no interaction. Compat-mode and dev-deps overlay are
+  orthogonal code paths.
+
+#### §5.2.11 thiserror pilot
+
+- Pilot directory: **NOT LOCALLY PRESENT** — no
+  `/home/tarunvir/projects/thiserror-lihaaf-pilot/` exists.
+- Status: thiserror is part of the dtolnay-owned Round-1 pilot set
+  ([[lihaaf-dtolnay-pr-back-gate]]).
+- Expected shape: single-crate; metadata crate IS dylib_crate. Same
+  shape as anyhow / serde-json (no dev-deps usage in fixtures).
+- v0.1.0 verification: the CI matrix runs thiserror's pilot CI; the
+  no-op default (`build_targets` omitted) preserves byte-identical
+  behavior.
+
+#### §5.2.12 derive_more pilot (Round 2)
+
+- Pilot directory: **NOT LOCALLY PRESENT** —
+  `/home/tarunvir/projects/derive_more-lihaaf-pilot/` does not exist
+  locally.
+- Status: Round-2 pilot; enrolled per
+  [[lihaaf-round2-fork-shape-analysis]]. Expected shape per memory:
+  thiserror-shape, no patch/links.
+- Expected: single-crate or split-crate proc-macro. v0.1.0 verification
+  via CI matrix.
+
+#### §5.2.13 sxx pilot
+
+- Pilot directory: **NOT LOCALLY PRESENT** — no `/home/tarunvir/projects/
+  sxx/` directory exists locally.
+- Status: sxx is mentioned in the orchestration backlog but not
+  enrolled as an active pilot. No v0.1.0 dependency.
+
+**Summary of adopters with `[package.metadata.lihaaf]` requiring
+`build_targets`:**
+
+- **axum-macros** — v0.1.0 ship-blocker (3 suites). Pilot fork action
+  in §12.7.
+- **djogi-macros** — would benefit; recommended but NOT a v0.1.0
+  blocker (djogi fixtures currently pass via the workaround of
+  declaring serde / serde_json / etc. as regular deps in transit).
+  Future Round 2 follow-up.
+
+All other adopters: `build_targets` not configured → no-op via §5.1
+byte-identical contract.
 
 ### §5.3 Pre-existing `build_targets` usage check
 
-Grep of every known adopter manifest:
+Grep of every known local adopter manifest:
 
 ```text
 $ rtk grep -nE "build_targets" \
     /home/tarunvir/projects/{axum-lihaaf-pilot,anyhow-lihaaf-pilot,
         serde-json-lihaaf-pilot}/.../Cargo.toml \
-    /home/tarunvir/projects/{djogi/djogi-macros,sassi/sassi-macros,
-        lihaaf,lihaaf/tests/integration_corpus}/Cargo.toml
+    /home/tarunvir/projects/{djogi/djogi,djogi/djogi-macros,
+        sassi/sassi,sassi/sassi-macros,lihaaf,
+        lihaaf/tests/integration_corpus}/Cargo.toml
 0 matches for 'build_targets'
 ```
 
@@ -1063,11 +1461,12 @@ new, defaults to `[]`).
 **Verbatim new lines (to be added):**
 
 ```toml
-# DEFAULT: []. Opt-in. When non-empty, lihaaf synthesizes a same-crate
-# overlay manifest that promotes the entries named in `dev_deps` from
-# `[dev-dependencies]` into `[dependencies]`. This is required when
-# fixtures `use` crates that are in the adopter's `[dev-dependencies]`
-# rather than its `[dependencies]` — cargo's `--lib` does not compile
+# DEFAULT: []. Opt-in. When non-empty, lihaaf synthesizes an overlay
+# manifest of the dylib_crate's Cargo.toml with the entries named in
+# `dev_deps` GRAFTED from this manifest's [dev-dependencies] into the
+# overlay's [dependencies]. This is required when fixtures `use` crates
+# that are in this manifest's [dev-dependencies] rather than in the
+# dylib_crate's [dependencies] — cargo's `--lib` does not compile
 # dev-deps during the lihaaf dylib build. Only "tests" is accepted in
 # v0.1.0. See §4.2.bis for the overlay-promotion mechanics.
 build_targets = ["tests"]
@@ -1078,16 +1477,24 @@ build_targets = ["tests"]
 ```text
 - An entry in `build_targets` is not in the allowed set `{"tests"}`.
 - `build_targets` is non-empty but `dev_deps` is empty (the overlay
-  would be byte-identical to the adopter's manifest; the opt-in
+  would be byte-identical to the dylib_crate's manifest; the opt-in
   shape requires named dev-deps).
 - An entry in `dev_deps` named for promotion via `build_targets =
-  ["tests"]` is not present in the adopter's `[dev-dependencies]`
+  ["tests"]` is not present in this manifest's `[dev-dependencies]`
   table.
-- A dev-dep listed in both `[dependencies]` and `[dev-dependencies]`
-  (cargo itself rejects this; lihaaf surfaces a directed diagnostic).
+- A dev-dep listed in `dev_deps` for promotion has `optional = true`
+  in `[dev-dependencies]`. Optional dev-dep promotion is rejected
+  because flipping the optional flag mutates the resolver graph.
 - A dev-dep listed in `dev_deps` for promotion lives only under
   `[target.<cfg>.dev-dependencies]`. Conditional dev-dep promotion
   is deferred to v0.2.
+- A dev-dep listed in `dev_deps` for promotion names the dylib_crate
+  itself (self-loop).
+- The dylib_crate's manifest declares `[patch.<registry>]` or
+  `[replace]` tables on the member manifest (must live on the
+  workspace root).
+- The dylib_crate cannot be resolved from the metadata crate's
+  workspace context (member not found in workspace).
 ```
 
 ### §6.2 Amendment to §3.6 Suite inheritance (lines 517-538)
@@ -1118,12 +1525,12 @@ and mechanics").
 **Verbatim new subsection:**
 
 ```markdown
-### 4.2.bis Dev-deps overlay promotion
+### 4.2.bis Dev-deps overlay promotion (Shape δ)
 
 By default, the dylib build invokes:
 
     cargo rustc -p <dylib_crate> --lib --release --crate-type=dylib \
-      --manifest-path <adopter-Cargo.toml> --target-dir <T>
+      --manifest-path <metadata-Cargo.toml> --target-dir <T>
 
 `--lib` excludes `[dev-dependencies]` from the build per cargo's
 documented semantics ("Dev-dependencies are not used when compiling a
@@ -1132,20 +1539,36 @@ benchmarks"). The dev-deps rlibs never land in `<T>/release/deps/`, so
 per-fixture rustc cannot resolve `--extern <dev-dep>` for them.
 
 When the adopter's metadata sets `build_targets = ["tests"]`, lihaaf
-synthesizes an **overlay manifest** at `<T>/lihaaf-overlay/Cargo.toml`
-that is a verbatim copy of the adopter's `Cargo.toml` with the entries
-named in `dev_deps` moved from `[dev-dependencies]` into
-`[dependencies]`. The cargo invocation then runs against the overlay's
-manifest path:
+synthesizes an **overlay manifest of the dylib_crate's Cargo.toml**
+(not the metadata crate's) at `<T>/lihaaf-dev-deps-overlay/Cargo.toml`.
+The overlay is built by:
+
+1. Resolving the dylib_crate's manifest via the workspace-member
+   resolver (same precedent as compat-mode).
+2. Grafting the entries named in `dev_deps` from the metadata crate's
+   `[dev-dependencies]` into the overlay's `[dependencies]`.
+3. Declaring the overlay as its own workspace root (carrying down
+   `[workspace.*]`, `[patch.*]`, `[replace]`, `[profile.*]` from the
+   ancestor workspace root).
+4. Injecting `[lib] path` and absolutizing all path-bearing keys
+   against the dylib_crate's source dir.
+
+The cargo invocation then runs against the overlay's manifest path:
 
     cargo rustc -p <dylib_crate> --lib --release --crate-type=dylib \
-      --manifest-path <T>/lihaaf-overlay/Cargo.toml --target-dir <T>
+      --manifest-path <T>/lihaaf-dev-deps-overlay/Cargo.toml \
+      --target-dir <T>
 
-The overlay's `[package].name` matches the adopter's exactly; the
-overlay sits inside the adopter's workspace via cargo's walk-up from
-`<T>/lihaaf-overlay/`, so workspace inheritance (`{ workspace = true }`
-deps, `[patch]` tables, `[workspace.dependencies]`) continues to
-resolve.
+For the split-crate case (axum-macros / axum), the metadata lives in
+`axum-macros/Cargo.toml` but the overlay synthesizes against
+`axum/Cargo.toml`. The grafted serde + axum-extra entries land in
+`axum`'s build graph; the `-p axum` selector resolves to the overlay's
+package; cargo compiles the grafted deps into `deps_dir` for the
+per-fixture rustc invocations to consume.
+
+For the single-crate case (anyhow / serde-json / djogi), the metadata
+crate IS the dylib_crate, and Shape δ degenerates to same-manifest
+promotion. Operationally identical to the single-crate model.
 
 The overlay is content-deterministic: same inputs → same overlay
 bytes → same cargo fingerprint → cache hits across reruns. The overlay
@@ -1190,31 +1613,34 @@ For most adopters this is fine — fixtures `use` crates that live in
 the consumer's regular `[dependencies]`, and those rlibs land in
 `deps_dir` as a side effect of building the dylib.
 
-But some adopters have fixtures that import crates from
-`[dev-dependencies]` rather than `[dependencies]`. The canonical
-example is `axum-macros`, whose `tests/from_request/pass/container.rs`
-contains `use serde::Deserialize;` — and `axum-macros`' `Cargo.toml`
-declares `serde` in `[dev-dependencies]`, not `[dependencies]`.
+But some adopters have fixtures that import crates from the
+metadata crate's `[dev-dependencies]` rather than the dylib_crate's
+`[dependencies]`. The canonical example is `axum-macros`, whose
+`tests/from_request/pass/container.rs` contains `use serde::Deserialize;`
+— and `axum-macros`' `Cargo.toml` declares `serde` in
+`[dev-dependencies]`, while the dylib_crate is `axum` (a sibling
+crate in the same workspace).
 
 **Symptom:** the relevant fixtures fail with rustc `error[E0432]:
 unresolved import 'serde'` (or `axum_extra`, etc.) on `use` lines for
-crates in the consumer's `[dev-dependencies]`.
+crates in the metadata crate's `[dev-dependencies]`.
 
 ### Detection
 
-From the consumer crate's root:
+From the metadata crate's directory:
 
 ```bash
 rg '^use ([a-z_]+)::' tests/ --no-filename | sort -u
 ```
 
-Compare each `use <crate>::` against `[dependencies]` vs
-`[dev-dependencies]` in `Cargo.toml`. Any name found ONLY in
-`[dev-dependencies]` triggers this symptom.
+Compare each `use <crate>::` against `[dependencies]` of the
+**dylib_crate** vs `[dev-dependencies]` of the metadata crate. Any
+name found ONLY in the metadata crate's `[dev-dependencies]` triggers
+this symptom.
 
-If every name appears in `[dependencies]` (or as a sub-dep
-transitively reachable via the dylib_crate), you are likely fine —
-the legacy path works.
+If every name appears in `[dependencies]` of the dylib_crate (or as a
+sub-dep transitively reachable via it), you are likely fine — the
+legacy path works.
 
 ### Configuration
 
@@ -1229,10 +1655,13 @@ build_targets  = ["tests"]
 ```
 
 - `dev_deps` lists the crates to forward as `--extern` to per-fixture
-  rustc — same field, same semantics as before.
+  rustc — same field, same semantics as before. lihaaf reads these
+  TOML keys against THIS manifest's `[dev-dependencies]` to find the
+  graft entries.
 - `build_targets = ["tests"]` opts the suite into overlay promotion.
-  lihaaf synthesizes an overlay manifest that moves the named
-  `dev_deps` entries from `[dev-dependencies]` into `[dependencies]`
+  lihaaf synthesizes an overlay manifest of the **dylib_crate**'s
+  Cargo.toml that grafts the named `dev_deps` entries from THIS
+  manifest's `[dev-dependencies]` into the overlay's `[dependencies]`
   for the single `cargo rustc` invocation that builds the dylib.
 
 The opt-in is per-suite. `build_targets` does NOT inherit from the
@@ -1241,6 +1670,22 @@ must declare `build_targets = ["tests"]` per suite (same shape as
 `features`). This is intentional: each suite compiles its own dylib
 with its own build shape (see [[lihaaf-dev-deps-explicit-keep]] for
 the explicit-config-first rationale).
+
+### Constraints
+
+- The named `dev_deps` entries must exist in **this** manifest's
+  `[dev-dependencies]`. lihaaf rejects missing entries with a directed
+  diagnostic.
+- An entry with `optional = true` in `[dev-dependencies]` cannot be
+  promoted (rejected at synthesis — flipping the optional flag would
+  mutate the resolver graph).
+- An entry that names the dylib_crate itself (self-loop) is rejected.
+- A `[target.<cfg>.dev-dependencies]`-only entry is rejected (cfg-gated
+  promotion deferred to v0.2).
+- The dylib_crate must be resolvable from the metadata crate's
+  workspace. For single-crate adopters this is automatic; for
+  split-crate adopters (proc-macro crate as metadata, sibling lib as
+  dylib_crate) the dylib_crate must be a member of the same workspace.
 
 ### Cost
 
@@ -1292,8 +1737,19 @@ explicitly.
 `cargo lihaaf` then:
 
 1. Reads `[package.metadata.lihaaf]` from `axum-macros/Cargo.toml`.
-2. For each suite with `build_targets = ["tests"]`, synthesizes an
-   overlay manifest at `<workspace>/target/lihaaf-build[-<suite>]/lihaaf-overlay/Cargo.toml`.
+2. For each suite with `build_targets = ["tests"]`:
+   a. Resolves `dylib_crate = "axum"` to `axum/Cargo.toml` via the
+      workspace's `[workspace] members` array.
+   b. Synthesizes an overlay of `axum/Cargo.toml` at
+      `<workspace>/target/lihaaf-build[-<suite>]/lihaaf-dev-deps-overlay/Cargo.toml`.
+   c. Grafts `serde` and `axum-extra` entries from
+      `axum-macros/Cargo.toml`'s `[dev-dependencies]` into the
+      overlay's `[dependencies]`.
+   d. Declares the overlay as an isolated workspace, carrying down
+      `[workspace.*]`, `[patch.*]`, `[replace]`, `[profile.*]` from
+      the ancestor workspace root (`axum-lihaaf-pilot/Cargo.toml`).
+   e. Injects `[lib] path` and absolutizes path-bearing keys against
+      `axum/`'s source dir.
 3. Runs `cargo rustc -p axum --lib --release --crate-type=dylib
    --manifest-path <overlay> --target-dir <T>` to produce the dylib
    AND compile `serde` + `axum-extra` into `<T>/release/deps/`.
@@ -1308,10 +1764,10 @@ Most adopters do not need this. The following shapes work via the
 legacy path with **no `build_targets` field**:
 
 - All fixtures' `use <crate>` statements name crates that are in the
-  consumer's regular `[dependencies]` (or transitively reachable via
+  dylib_crate's regular `[dependencies]` (or transitively reachable via
   it). Includes djogi, sassi, anyhow, thiserror, derive_more.
 
-- The consumer crate has no `[dev-dependencies]` at all, or its
+- The metadata crate has no `[dev-dependencies]` at all, or its
   `[dev-dependencies]` contains only crates fixtures don't import.
 
 - The consumer is a workspace member running under compat mode
@@ -1321,11 +1777,11 @@ legacy path with **no `build_targets` field**:
 
 The rule: enable `build_targets = ["tests"]` only when fixture
 diagnostics show `unresolved import` errors against crates that
-appear in `[dev-dependencies]` of the consumer.
+appear in the metadata crate's `[dev-dependencies]`.
 ```
 
-Length of new section: ~75 lines markdown. Brings `docs/user-guide.md`
-from 88 to ~163 lines.
+Length of new section: ~115 lines markdown. Brings `docs/user-guide.md`
+from 88 to ~203 lines.
 
 ---
 
@@ -1352,29 +1808,35 @@ Located in `src/config.rs::tests` module.
 | `build_targets_named_suite_can_override` | Top-level `["tests"]`, named suite `["tests"]` declared independently | Named suite resolved to `["tests"]` (each suite declares own) |
 | `build_targets_named_suite_can_set_independently` | Top-level omitted (`[]`), named suite `["tests"]` | Default `[]`, named `["tests"]` |
 
-### §8.2 Unit: overlay synthesis (`src/dev_deps_overlay.rs::tests`)
+### §8.2 Unit: overlay synthesis (`src/dev_deps_overlay::tests`)
 
-Inputs: synthetic adopter `Cargo.toml` strings + lists of dev_deps to
-promote. Outputs: assert exact overlay byte content via inline
-expected-string snapshots.
+Inputs: synthetic dylib_crate `Cargo.toml` + synthetic metadata
+`Cargo.toml` + lists of dev_deps to graft. Outputs: assert exact
+overlay byte content via inline expected-string snapshots.
 
-| Test | Input Cargo.toml shape | Promoted dev_deps | Expected overlay |
-|------|------------------------|-------------------|------------------|
-| `roundtrip_basic_dev_dep` | `[package] name = "X"; version = "0.1.0"; [dependencies] foo = "1"; [dev-dependencies] serde = "1"` | `["serde"]` | `foo + serde` both in `[dependencies]`; no `[dev-dependencies]` |
-| `roundtrip_preserves_unpromoted_dev_deps` | Same + extra `tokio = "1"` in dev-deps | `["serde"]` | `serde` promoted; `tokio` remains in `[dev-dependencies]` |
-| `roundtrip_promotes_renamed_dep` | `[dev-dependencies] serde-json = { package = "serde_json", version = "1" }` | `["serde-json"]` | Renamed entry moved verbatim |
-| `roundtrip_promotes_path_dev_dep` | `[dev-dependencies] helper = { path = "../helper" }` | `["helper"]` | `path` absolutized against adopter dir |
-| `roundtrip_promotes_workspace_true` | `[dev-dependencies] serde = { workspace = true }` | `["serde"]` | Shorthand `{ workspace = true }` preserved verbatim in `[dependencies]` |
-| `roundtrip_promotes_optional_dep_flips_optional` | `[dev-dependencies] serde = { version = "1", optional = true }` | `["serde"]` | Entry moved with `optional = false` |
-| `rejects_missing_dev_dep` | `[dev-dependencies] (none); [dependencies] foo = "1"` | `["serde"]` | Error: dev_deps[0]="serde" missing from [dev-dependencies] |
-| `rejects_dep_in_both_tables` | `[dependencies] serde = "1"; [dev-dependencies] serde = "1"` | `["serde"]` | Error: serde in both tables (eager surface of cargo's own reject) |
-| `rejects_cfg_gated_only_dev_dep` | `[target.'cfg(unix)'.dev-dependencies] serde = "1"; [dev-dependencies] (no serde)` | `["serde"]` | Error: cfg-gated dev-dep promotion deferred to v0.2 |
-| `idempotent_rerun_same_input_same_bytes` | Synthesize twice with same input | (any valid) | Both outputs byte-identical |
+| Test | Input shape | Promoted dev_deps | Expected overlay |
+|------|-------------|-------------------|------------------|
+| `same_crate_basic_dev_dep` | Single-crate (metadata IS dylib_crate); `[dev-dependencies] serde = "1"` | `["serde"]` | `serde` in `[dependencies]`; not in `[dev-dependencies]`; overlay declares isolated `[workspace] = {}` |
+| `split_crate_basic_graft` | metadata: `axum-macros/Cargo.toml` shape with `[dev-dependencies].serde = "1"`; dylib_crate: `axum/Cargo.toml` shape without `serde` in `[dependencies]` | `["serde"]` | overlay = `axum`'s Cargo.toml + grafted `serde` in `[dependencies]`; metadata's `[dev-dependencies]` UNCHANGED in metadata file (read-only) |
+| `split_crate_preserves_workspace_true` | metadata: `[dev-dependencies] serde = { workspace = true }`; workspace-root: `[workspace.dependencies].serde = "1"` | `["serde"]` | overlay declares `[workspace.dependencies].serde = "1"` (carried down); overlay `[dependencies].serde = { workspace = true }` (preserved verbatim) |
+| `split_crate_graft_with_path` | metadata: `[dev-dependencies] helper = { path = "../helper" }`; relative to metadata dir | `["helper"]` | overlay's `[dependencies].helper.path` is absolutized against metadata crate's dir |
+| `rejects_optional_dev_dep` | `[dev-dependencies] serde = { version = "1", optional = true }` | `["serde"]` | Error: "dev_deps[0] = 'serde' is configured with optional = true ... not supported in v0.1.0" — BLOCK-5 closure |
+| `rejects_self_loop_graft` | metadata: `[dev-dependencies] axum = { path = "../axum" }`; dylib_crate = "axum" | `["axum"]` | Error: "dev_deps[0] = 'axum' graft target is the dylib_crate itself" — §3.7.2 |
+| `rejects_missing_dev_dep` | metadata has no `serde` in `[dev-dependencies]` | `["serde"]` | Error: "dev_deps[0] = 'serde' is listed in dev_deps but not present in [dev-dependencies] of <path>" |
+| `rejects_cfg_gated_only_dev_dep` | `[target.'cfg(unix)'.dev-dependencies] serde = "1"`; top-level `[dev-dependencies]` (no serde) | `["serde"]` | Error: "cfg-gated dev-dep promotion deferred to v0.2" |
+| `conflict_dylib_crate_has_same_dep_identical` | dylib_crate's `[dependencies].serde = "1.0"`; metadata's `[dev-dependencies].serde = "1.0"` | `["serde"]` | NO-OP graft for `serde` (already present, identical spec); overlay matches dylib_crate's manifest byte-identically (except for §3.6 carry-down) |
+| `conflict_dylib_crate_has_same_dep_override` | dylib_crate's `[dependencies].serde = { version = "1.0", optional = true }`; metadata's `[dev-dependencies].serde = "1.0"` | `["serde"]` | OVERRIDE: overlay's `[dependencies].serde = "1.0"` (metadata's spec wins per §5.2.9 lock); diagnostic log line emitted |
+| `rejects_member_local_patch_on_metadata` | metadata's `[patch.crates-io.foo] = { path = "..." }` | any non-empty | Error: "member-local [patch] rejected ... cargo permits [patch] in workspace root only" |
+| `rejects_member_local_patch_on_dylib_crate` | dylib_crate's `[patch.crates-io.foo] = { path = "..." }` | any non-empty | Same error |
+| `carries_down_workspace_root_patch` | workspace root: `[patch.crates-io.serde] = { path = "./forks/serde" }` | `["serde"]` | overlay's `[patch.crates-io.serde].path` is absolutized against workspace-root dir |
+| `injects_lib_path_when_missing` | dylib_crate's manifest has no `[lib]` block | `["any"]` | overlay's `[lib].path` = absolute path to `<dylib_crate_dir>/src/lib.rs` — BLOCK-3 closure |
+| `injects_lib_path_when_partial` | dylib_crate's `[lib]` exists but no `path` | `["any"]` | overlay's `[lib].path` injected |
+| `idempotent_rerun_same_input_same_bytes` | synthesize twice with same input | (any valid) | Both outputs byte-identical; mtime preserved on second write |
+| `degenerate_single_crate_metadata_equals_dylib` | metadata's `[package].name == dylib_crate` | `["serde"]` | dylib_crate resolution short-circuits per §3.3 step 2; same-manifest graft applies |
 
 ### §8.3 Unit: shared helper extraction
 
-Located in `src/manifest_overlay/mod.rs::tests` (the extracted shared
-helper).
+Located in `src/manifest_overlay/tests`.
 
 | Test | Behavior |
 |------|----------|
@@ -1382,29 +1844,42 @@ helper).
 | `absolutize_dependencies_path` | `[dependencies] x = { path = "../x" }` → absolute |
 | `absolutize_no_op_on_absolute_path` | `[lib] path = "/abs/lib.rs"` → unchanged |
 | `serialize_canonical_deterministic` | Same `toml::Value` → same bytes across calls |
+| `resolve_dylib_crate_manifest_single_crate_shortcut` | metadata's `[package].name == dylib_crate` → returns metadata path unchanged |
+| `resolve_dylib_crate_manifest_split_crate_workspace_member` | metadata path is `axum-macros/Cargo.toml`; dylib_crate = "axum"; workspace root at `Cargo.toml` lists "axum-macros" + "axum" as members → returns `axum/Cargo.toml` |
+| `resolve_dylib_crate_manifest_not_found` | dylib_crate name doesn't match any workspace member → error lists scanned members |
+| `make_overlay_isolated_workspace_clones_root` | workspace-root has `[workspace.dependencies.serde] = "1"` → overlay's `[workspace.dependencies.serde] = "1"` |
+| `make_overlay_isolated_workspace_strips_membership_keys` | workspace-root has `members = ["a", "b"]` → overlay's `[workspace]` has no `members` |
+| `make_overlay_isolated_workspace_carries_root_patch` | workspace-root has `[patch.crates-io.foo] = { path = "..." }` → overlay's `[patch.crates-io.foo].path` absolutized |
+| `make_overlay_isolated_workspace_rejects_member_patch` | dylib_crate's manifest has `[patch.crates-io.foo]` → error |
 | `compat_overlay_byte_identical_after_extraction` | (regression) Run an existing compat-mode test and assert byte-identical output to pre-extraction baseline |
 
 The last test is the load-bearing regression guard for §2.3's
 extract-from-compat-overlay decision.
 
-### §8.4 Integration (cargo-build-gated) — `tests/dev_deps_overlay_integration.rs`
+### §8.4 Integration (cargo-build-gated) — `tests/dev_deps_overlay_integration.rs` (BLOCK-6 closure)
 
 Per [[lihaaf-no-local-binary-builds]], gated behind
 `#[cfg(feature = "cargo-build")]`. Runs in CI only.
 
 | Test | Setup | Assertion |
 |------|-------|-----------|
-| `axum_macros_minimal_repro` | Synthetic 5-fixture adopter that mirrors axum-macros' shape: 1 dylib_crate, 1 dev-dep (`serde`), 3 compile_pass fixtures with `use serde::Deserialize`, 2 compile_fail fixtures with intentional errors | `cargo lihaaf` exits 0; all 5 fixtures dispatch; the synthesis-driven `cargo rustc` invocation completes; `deps_dir` contains `libserde-*.rlib`; per-fixture stderr does NOT contain "unresolved import" |
-| `build_targets_omitted_byte_identical_baseline` | Two-fixture adopter with no dev-deps usage, run twice (once with the new field omitted, once with `build_targets = []`) | Resulting `target/lihaaf/manifest.json` `metadata_snapshot` differs only by the new key (verifies the §5.1 byte-identical contract) |
+| `same_crate_minimal_repro` | Synthetic 5-fixture single-crate adopter (metadata == dylib_crate): 1 dylib_crate, 1 dev-dep (`serde`), 3 compile_pass with `use serde::Deserialize`, 2 compile_fail | `cargo lihaaf` exits 0; all 5 fixtures dispatch; `deps_dir` contains `libserde-*.rlib`; per-fixture stderr does NOT contain "unresolved import" |
+| `split_crate_axum_macros_minimal_repro` (**BLOCK-2 + BLOCK-6**) | Synthetic split-crate adopter mirroring axum-macros shape: workspace root with [workspace] members = ["m", "d"]; "m" is metadata crate (lihaaf metadata, `dylib_crate = "d"`, `dev_deps = ["serde"]`, `build_targets = ["tests"]`); "d" is dylib_crate (no serde in its [dependencies]); m's `[dev-dependencies].serde = "1"`; 3 compile_pass fixtures using `serde::Deserialize` | `cargo lihaaf` exits 0; overlay synthesized at `<m>/target/lihaaf-build/lihaaf-dev-deps-overlay/Cargo.toml`; overlay's `[package].name == "d"`; overlay's `[dependencies].serde` exists; `deps_dir` contains `libserde-*.rlib`; fixtures pass |
+| `workspace_inheritance_carry_down` (**BLOCK-1**) | Same split-crate shape; workspace root has `[workspace.dependencies].serde = { version = "1", features = ["derive"] }`; m's `[dev-dependencies].serde = { workspace = true }` | overlay's `[workspace.dependencies].serde = { version = "1", features = ["derive"] }` (carried down); overlay's `[dependencies].serde = { workspace = true }` (preserved); `deps_dir` contains `libserde-*.rlib` |
+| `workspace_root_patch_inline_closure` (**OQ-4 / BLOCK-6**) | Same split-crate shape; workspace root has `[patch.crates-io.serde] = { path = "./local-serde" }`; m's `[dev-dependencies].serde = "1"`; the path-patched serde fork emits a unique build artifact | overlay's `[patch.crates-io.serde].path` absolutized; resulting `libserde-*.rlib` carries the path-patched fork's identity (not registry serde) |
+| `member_local_patch_rejected` (**OQ-4**) | Same split-crate shape; dylib_crate's `Cargo.toml` declares `[patch.crates-io.foo] = { path = "..." }` | `cargo lihaaf` exits non-zero with directed diagnostic mirroring `compat/overlay.rs:2009-2038` |
+| `no_explicit_lib_block` (**BLOCK-3**) | Split-crate shape; dylib_crate's `Cargo.toml` has no `[lib]` block (auto-discovered `src/lib.rs`) | overlay's `[lib].path` is injected and absolute; cargo build succeeds (no "can't find library" error) |
+| `build_targets_omitted_byte_identical_baseline` | Two-fixture adopter with no dev-deps usage, run twice (once with the new field omitted, once with `build_targets = []`) | Resulting `target/lihaaf/manifest.json` `metadata_snapshot` differs only by the new key (verifies the §5.1 byte-identical contract); no overlay dir created |
+| `optional_dev_dep_rejected` (**BLOCK-5**) | Synthetic adopter with `[dev-dependencies].serde = { version = "1", optional = true }`; `dev_deps = ["serde"]`; `build_targets = ["tests"]` | `cargo lihaaf` exits non-zero with optional-dev-dep diagnostic |
 
 ### §8.5 Regression: byte-identical for non-overlay adopters
 
 A new test in `src/config.rs::tests` or
-`src/dev_deps_overlay.rs::tests`:
+`src/dev_deps_overlay::tests`:
 
 | Test | Behavior |
 |------|----------|
-| `build_targets_omitted_no_overlay_dir_created` | Parse a minimal Cargo.toml without `build_targets`; assert that the `Suite.build_targets` is `vec![]` and that `BuildParams.build_targets` would be `&[]` for the suite; assert that **no** code path inside `dev_deps_overlay::synthesize_overlay_manifest` is invoked (via a unit-level branch test or a mock) |
+| `build_targets_omitted_no_overlay_dir_created` | Parse a minimal Cargo.toml without `build_targets`; assert that the `Suite.build_targets` is `vec![]` and that `BuildParams.build_targets` would be `&[]` for the suite; assert that **no** code path inside `dev_deps_overlay::synthesize_overlay` is invoked (via a unit-level branch test or a mock) |
 | `build_targets_present_invokes_synthesis` | Same with `build_targets = ["tests"]` + `dev_deps = ["serde"]`; assert synthesis IS invoked |
 
 The branch coverage matters because the contract is "byte-identical
@@ -1423,7 +1898,7 @@ not in this set.
 
 ```bash
 rtk cargo fmt --all -- --check
-rtk cargo clippy --all-features --jobs 2 -- -D warnings
+rtk cargo clippy --all-targets --all-features --jobs 2 -- -D warnings
 rtk cargo test --lib --jobs 2
 rtk RUSTDOCFLAGS=-D warnings cargo doc --no-deps --jobs 2
 ```
@@ -1438,13 +1913,14 @@ Explicitly forbidden during local development (causes WSL2 OOM per
 [[lihaaf-no-local-binary-builds]]):
 
 - `cargo test --all-features`
-- The 3 subprocess-spawning integration binaries
+- The 3 subprocess-spawning integration binaries (cli_mode_errors,
+  cleanup_dirty_worktree, baseline_conservative)
 - `cargo lihaaf --compat`
 - `cargo build --release`
 
 The CI workflow runs `cargo test --all-features` on every PR (per the
-existing pipeline). The new cargo-build-gated integration test in §8.4
-runs there, not locally.
+existing pipeline). The new cargo-build-gated integration tests in
+§8.4 run there, not locally.
 
 ---
 
@@ -1462,17 +1938,20 @@ adding ~24s to the failed-fixture aggregate. Total CI run ~55s.
 
 A hypothetical "if-the-dev-deps-were-in-deps" baseline: if the
 adopter manually moved `serde` + `axum-extra` from `[dev-dependencies]`
-to `[dependencies]` in their fork (which would be fork pollution, not
-acceptable per locked constraints), the dylib build would compile
-those crates as part of the normal dependency graph. Estimate: +12-15s
-to the dylib build phase, then 93 fixtures all pass. Total ~75-80s.
+of `axum-macros` to `[dependencies]` of `axum` in their fork (which
+would be fork pollution, not acceptable per locked constraints), the
+dylib build would compile those crates as part of the normal
+dependency graph. Estimate: +12-15s to the dylib build phase, then 93
+fixtures all pass. Total ~75-80s.
 
 **Overlay-promotion (proposed beta.11+):**
 
-The synthesis itself is ~1-5ms (read 5KB Cargo.toml, parse, two
-`BTreeMap` mutations, serialize, atomic write). Negligible.
+The Shape δ synthesis itself is ~2-10ms (read 5KB metadata Cargo.toml,
+parse, read 7KB dylib Cargo.toml, parse, workspace-member resolution,
+graft, carry-down, serialize, atomic write). Negligible vs cargo
+fingerprint + compile.
 
-The cargo rustc invocation now compiles the promoted dev-deps as part
+The cargo rustc invocation now compiles the grafted dev-deps as part
 of the dylib build's dependency graph. Same ~12-15s overhead as the
 manual-move hypothetical. Total ~75-80s.
 
@@ -1495,19 +1974,22 @@ expands the existing one's scope.
 Same shape as the existing overlay path:
 
 - The synthesized overlay manifest is content-deterministic. Same
-  adopter inputs → same overlay bytes → same cargo fingerprint.
-- The idempotent write guard (§3.7) preserves mtime on byte-identical
+  metadata bytes + same dylib_crate bytes + same ancestor-workspace
+  bytes → same overlay bytes → same cargo fingerprint.
+- The idempotent write guard (§3.11) preserves mtime on byte-identical
   output → cargo's fingerprint detector reports "fresh."
 - Subsequent reruns hit cargo's incremental cache for both the dylib
-  AND the promoted dev-deps.
+  AND the grafted dev-deps.
 
 Hit-rate expectation: 100% on rerun against an unchanged source tree.
 The cache miss occurs only on:
 
 - First run after enabling `build_targets` (one-time cost).
-- Any change to the adopter's `Cargo.toml` (forces re-synthesis).
+- Any change to the metadata crate's `Cargo.toml` (forces re-graft).
+- Any change to the dylib_crate's `Cargo.toml` (forces re-synthesis).
+- Any change to the workspace root's `Cargo.toml` (forces re-carry-down).
 - Any change to `dev_deps` (also forces re-synthesis).
-- Any change to the adopter's source files (cargo's normal mtime-based
+- Any change to the dylib_crate's source files (cargo's normal mtime-based
   invalidation; orthogonal to lihaaf).
 
 ### §10.3 Per-fixture cost — unchanged
@@ -1517,37 +1999,20 @@ emission at `src/worker.rs:1003-1008` continues to point at the same
 `deps_dir` paths. The fixture's compilation work is identical to what
 it would be in any other adopter.
 
-### §10.4 Comparison to the rejected POC's two-phase approach
-
-The POC at `/tmp/lihaaf-poc-phase0/src/dylib.rs:89-141` ran TWO
-cargo invocations: `cargo build --tests` (phase 0) followed by
-`cargo rustc --lib` (phase 1). The two-invocation shape has a
-documented fingerprint hazard (phase 0's `--tests` includes harness
-test-runner overhead that the phase 1 `--lib` doesn't, so the
-fingerprint computation across the two phases is subtly different,
-producing inconsistent cache state across reruns).
-
-Candidate E avoids the two-phase shape entirely: **one cargo
-invocation, one resolver graph, one RUSTFLAGS value, one
-fingerprint.** Cold-cache cost is comparable to the POC's
-two-invocation path (both compile the same dev-deps); warm-cache
-cost is strictly lower (Candidate E has zero fingerprint
-inconsistency, so the second-rerun cache hit is reliable; the POC's
-cache hit was probabilistic).
-
-### §10.5 Defending the speed cost
+### §10.4 Defending the speed cost
 
 The user's explicit priority is CI/benchmark wall-clock speed. The
 overlay path's overhead vs. the legacy path:
 
-- Synthesis: ~1-5ms. Negligible.
+- Synthesis: ~2-10ms. Negligible.
 - Cargo fingerprint of the overlay's manifest: ~negligible (cargo
-  hashes the bytes; the bytes differ from the adopter's manifest by
-  one `[dependencies]` entry per promoted dev-dep).
-- Compilation of the promoted dev-deps: this is the
+  hashes the bytes; the bytes differ from the dylib_crate's manifest
+  by one `[dependencies]` entry per grafted dev-dep, the carried-down
+  workspace tables, and absolutization rewrites).
+- Compilation of the grafted dev-deps: this is the
   cargo-actually-compiles-the-crate cost. Same as if the adopter had
-  the dev-deps in `[dependencies]` (which is the conceptual baseline).
-  Quantified at ~+12-15s for axum-macros' 2 dev-deps.
+  the dev-deps in `[dependencies]` of the dylib_crate. Quantified at
+  ~+12-15s for axum-macros' 2 dev-deps.
 
 **Compared to the alternative (don't ship the feature; the pilot
 fails CI):** infinite improvement. The opt-in shape means adopters
@@ -1563,22 +2028,16 @@ legacy path.
 
 ## §11 Open questions
 
-Pre-Codex user decisions (locked 2026-05-19 before dispatch):
+All four OQs are now LOCKED. Codex round-1 BLOCKed deferral on OQ-4
+and demanded REJECT on OQ-2; both are locked accordingly. The plan no
+longer has open questions for Codex.
 
 - **OQ-1** (`build_targets` inheritance) → **LOCKED REPLACE** (§11.1)
-- **OQ-2** (`optional = true` dev-dep policy) → **OPEN for Codex** (§11.2)
+- **OQ-2** (`optional = true` dev-dep policy) → **LOCKED REJECT**
+  (§11.2, per Codex BLOCK-5)
 - **OQ-3** (orthogonality) → **LOCKED orthogonal** (§11.3)
-- **OQ-4** (`[patch]` interaction) → **CODEX DECIDES; user-preferred path DEFERRED to v1.0.0** (§11.4, GH-tracked per §12.8)
-
-Codex round-1 will critique all four. The locked decisions are
-user-authorized design choices; if Codex pushes back on a locked
-decision, the planner / orchestrator escalates to the user before
-revising. The OPEN OQ-2 is genuinely open and Codex's preferred
-shape should be adopted (subject to user veto). OQ-4 is also Codex-
-adjudicated: user prefers v0.1.0 ships with warning + GH-tracked
-v1.0.0 follow-up (see §12.8), but Codex may BLOCK the deferral and
-demand inline resolution. Either Codex outcome on OQ-4 is acceptable
-to the user.
+- **OQ-4** (`[patch]` interaction) → **LOCKED inline closure**
+  (§11.4, per Codex BLOCK on deferral)
 
 ### §11.1 OQ-1 — inheritance for `build_targets` — **LOCKED: REPLACE**
 
@@ -1602,39 +2061,39 @@ fragile inheritance — exactly the kind already observed in pilots
 restating `dev_deps` per-suite after beta.5 round-5 inheritance
 breakage).
 
-**Codex note:** if Codex pushes for INHERIT during adversarial review,
-the rationale to defend REPLACE is the explicit-config-first ethos
-([[lihaaf-dev-deps-explicit-keep]]) — not a craft question, a
-user-locked architectural decision.
+### §11.2 OQ-2 — `optional = true` dev-dep policy — **LOCKED: REJECT**
 
-### §11.2 OQ-2 — `optional = true` dev-dep policy
+**Status:** Locked by Codex BLOCK-5 (round-1 adversarial review on
+commit `6d5b7fa`). User pre-authorized Codex to adjudicate OQ-2. The
+REJECT path is the conservative v0.1.0 surface.
 
-§3.3.5 recommends flipping `optional = true` to `optional = false` on
-promotion. But this changes the semantics of a manifest that uses
-`[features].my-feat = ["dep:serde"]` patterns. Specifically:
+**Decision:** Promoted dev-deps with `optional = true` in
+`[dev-dependencies]` are REJECTED at synthesis with a directed
+diagnostic. The pilot author must either (a) make the dep
+non-optional, or (b) drop it from `dev_deps`.
 
-- Pre-promotion: `serde` is enabled only when `my-feat` is active.
-- Post-promotion: `serde` is enabled unconditionally (because
-  `optional = false` and it's in `[dependencies]`).
+**Rationale (Codex round-1, paraphrased):** Flipping `optional = true`
+→ `optional = false` during the graft mutates the resolver graph:
+   - It changes which deps participate in the build (a previously
+     gated-by-feature dep now participates unconditionally).
+   - It suppresses the `dep:<name>` feature-name suppression behavior
+     (`[features].my-feat = ["dep:<name>"]` references the optional
+     dep; without `optional = true`, the `dep:` syntax is rejected by
+     cargo or silently becomes a regular feature ref).
+   - It can subtly change the dylib's compilation behavior — code
+     gated on `#[cfg(feature = "my-feat")]` that references the dep
+     now compiles where it didn't before, potentially exposing build
+     errors that the legacy path avoided.
 
-This **may** subtly change the dylib's compilation behavior if the
-adopter's code uses `#[cfg(feature = "my-feat")]` to gate code
-referencing `serde`. The promoted-unconditional shape would compile
-the `serde`-dependent code; the original wouldn't (when `my-feat`
-is off).
+REJECT is the safe v0.1.0 surface. The diagnostic must explicitly
+explain the resolver-graph implications (so the adopter understands
+why they're being asked to change their `[dev-dependencies]` shape).
 
-**Alternative policy:** REJECT optional dev-deps when promoted. The
-adopter must promote a non-optional shape, or skip promotion for the
-optional dep entirely.
-
-**Recommendation:** v0.1.0 ships the `optional = false` flip with a
-loud warning in §6.1 / §7 ("optional dev-deps are unconditionally
-enabled when promoted; verify your `cfg(feature = ...)` gates").
-v0.2 may add a REJECT path if a pilot surfaces breakage.
-
-**For Codex:** is there a third option I missed? A version-bound
-"flip only if no `dep:<name>` feature reference exists in
-`[features]`"?
+**Implementation:** `src/dev_deps_overlay::synthesize_overlay` checks
+`entry["optional"] == Value::Boolean(true)` in §3.2 step 3 and emits
+`Error::Cli` with the diagnostic. Unit test in §8.2
+(`rejects_optional_dev_dep`). Integration test in §8.4
+(`optional_dev_dep_rejected`).
 
 ### §11.3 OQ-3 — `build_targets` ↔ `extern_crates` orthogonality — **LOCKED: orthogonal**
 
@@ -1661,76 +2120,64 @@ decision. Inferring "if it's in dev_deps AND build_targets is set,
 also auto-forward" is exactly the magic-by-default pattern lihaaf
 rejects.
 
-**Codex note:** if Codex pushes for inference / single-field
-consolidation during adversarial review, the rationale to defend
-orthogonality is the same as OQ-1 — explicit-config-first is a
-user-locked architectural decision.
+### §11.4 OQ-4 — `[patch]` table interaction with promotion — **LOCKED: inline closure**
 
-### §11.4 OQ-4 — `[patch]` table interaction with promotion — **CODEX DECIDES; user-preferred path DEFERRED to v1.0.0**
+**Status:** Locked by Codex BLOCK on deferral (round-1 adversarial
+review on commit `6d5b7fa`). Codex demanded inline resolution; the
+user pre-authorized Codex to adjudicate OQ-4 either way. Deferral to
+v1.0.0 is REJECTED; inline closure is the locked path.
 
-**Status:** User on 2026-05-19 prefers deferral to v1.0.0 roadmap but
-delegates final adjudication to Codex adversarial review. Per
-[[no-unilateral-deferral]] this is an explicit user-authorized
-deferral path, not a unilateral shelve.
+**Decision:** `[patch.<registry>]`, `[replace]`, `[profile.*]` from
+the **ancestor workspace root** are CARRIED DOWN into the synthesized
+overlay (§3.6 step 3-5), with paths absolutized against the
+workspace-root dir.
 
-**Two outcomes possible from Codex review:**
+`[patch.<registry>]` or `[replace]` on the **metadata crate's
+manifest** OR on the **dylib_crate's own manifest** (i.e. member-local
+override tables) are REJECTED with a directed diagnostic, mirroring
+`compat/overlay.rs:2009-2038`. Cargo itself rejects member-local
+`[patch]` tables; we surface the diagnostic eagerly.
 
-1. **Codex ALLOWs the deferral** → plan ships as written with §12.8
-   creating the GH issue + §7 user-guide warning. v0.1.0 cannot ship
-   without §12.8's GH issue filed.
-2. **Codex BLOCKs the deferral** (i.e. demands "carry verbatim"
-   proven or REJECT-path added pre-v0.1.0) → planner re-dispatch to
-   close OQ-4 in this plan body; §12.8 may collapse into the relevant
-   implementation step.
+**Why inline closure works:**
 
-**The deferred risk:** `[patch]` table on adopter's `Cargo.toml`
-interacting with overlay promotion. §3.3.4 ships "carry verbatim"
-policy — don't touch `[patch]`, let cargo's walk-up resolve it. This
-works for the common case (adopter doesn't patch promoted dev-deps).
+The carry-down mechanism is already proven by compat-mode (#36 R3 /
+v0.1.0-beta.10). `compat/overlay.rs:1977+
+apply_workspace_member_inheritance` implements exactly the shape the
+dev-deps overlay needs:
 
-```toml
-# adopter's Cargo.toml (the deferred-risk shape)
-[dependencies]
-foo = "1.0"
+- Reject member-local `[patch.<registry>]` for ALL registries (lines
+  2009-2038).
+- Carry down `[workspace.dependencies]`, `[workspace.package]`,
+  `[workspace.lints]`, `[workspace.metadata]`, `[workspace.resolver]`
+  (lines 2077-2155).
+- Carry down `[patch.<registry>]` from workspace root with path
+  absolutization (lines 2156+).
+- Carry down `[replace]` similarly.
+- Carry down `[profile.*]` verbatim.
 
-[dev-dependencies]
-serde = "1.0"
+The dev-deps overlay's §3.6 step 3-5 reuses this exact code path via
+the extracted shared `manifest_overlay::make_overlay_isolated_workspace`
+helper. The compat-mode regression test (§8.3
+`compat_overlay_byte_identical_after_extraction`) ensures the
+extraction doesn't break compat-mode.
 
-[patch.crates-io]
-serde = { path = "./forks/serde" }
-```
+**Why this is NOT deferred per [[no-unilateral-deferral]]:**
 
-Pre-promotion: cargo's resolver applies the patch to `serde`
-references in `[dev-dependencies]`. The patch fires.
+Codex BLOCKed the R1 deferral on the grounds that the `[patch]`
+interaction is integral to v0.1.0's correctness for any adopter whose
+workspace root carries crate-graph overrides. The carry-down is
+PROVEN by compat-mode's beta.10 shipped behavior; reusing the
+existing precedent is a strict subset of the work already done. No
+GH issue is filed; the inline closure ships in v0.1.0.
 
-Post-promotion (overlay): same patch fires for `serde` references in
-`[dependencies]`. The patch SHOULD fire identically.
+**Implementation:** `manifest_overlay::make_overlay_isolated_workspace`
+extracts the workspace-member-inheritance logic from
+`compat/overlay.rs:1977+` into a shared helper. The dev-deps overlay's
+§3.6 step calls it; compat-mode is refactored to call the same helper.
+The byte-identical regression test (§8.3) guards against extraction
+drift.
 
-**Both should work — but the patch correctness invariant is not
-proven** for the case where the same crates-io.X source-id appears
-across `[dependencies]` (overlay) AND `[dev-dependencies]` (baseline)
-of the same package with a `[patch.crates-io]` redirect.
-
-**v0.1.0 mitigation:** the user guide (§7) MUST document that adopters
-with `[patch.crates-io]` patches on their adopter manifest targeting
-crates listed in `dev_deps` should validate the patch fires correctly
-against their dylib build before relying on `build_targets = ["tests"]`.
-
-**v1.0.0 work tracked in GH issue (per §12.8):**
-
-- Reproduce the deferred-risk shape with a synthetic pilot or
-  `derive_more` if applicable.
-- Cite cargo's documented source-id resolution rules.
-- Either (a) prove the "carry verbatim" policy correct, or (b) add a
-  REJECT path at synthesis for adopter-local `[patch]` sections
-  targeting promoted dev-deps.
-
-**Rationale (user 2026-05-19):** "sure codex decides. I am comfortable
-deferring to post v0.1.0 as our v1.0.0 roadmap can capture it." Cargo
-resolver behavior here is unproven; user-preferred path is v0.1.0
-ships with documented user-guide warning + GH-tracked v1.0.0 follow-up.
-If Codex ALLOWs that shape, deferral stands; if Codex BLOCKs, planner
-closes OQ-4 inline.
+The §12.8 GH-issue step from R1 is REMOVED. No deferral artifact.
 
 ---
 
@@ -1751,11 +2198,21 @@ step's code.
    `lexical_path_normalize_path`, `lexical_normalize_pathbuf`,
    `serialize_canonical` from `src/compat/overlay.rs` to the new
    module, marking each `pub(crate)`.
-3. Update `src/compat/overlay.rs` to import from
+3. Extract `resolve_workspace_member_manifest` from
+   `compat/overlay.rs:1505+` into a re-usable helper exposed as
+   `manifest_overlay::resolve_dylib_crate_manifest` (with the
+   single-crate shortcut when metadata `[package].name == dylib_crate`).
+4. Extract `apply_workspace_member_inheritance` from
+   `compat/overlay.rs:1977+` into
+   `manifest_overlay::make_overlay_isolated_workspace`. The compat-mode
+   semantics are preserved via parameter shape: the dev-deps overlay
+   provides a different `workspace_root_value` consumer, but the same
+   carry-down logic.
+5. Update `src/compat/overlay.rs` to import from
    `crate::manifest_overlay::{...}`.
-4. Add `src/manifest_overlay/mod.rs` to `src/lib.rs` module
+6. Add `src/manifest_overlay/mod.rs` to `src/lib.rs` module
    declarations.
-5. Add the §8.3 regression test: existing compat-mode test produces
+7. Add the §8.3 regression test: existing compat-mode test produces
    byte-identical output to pre-extraction baseline.
 
 **Verification (§9):** all four commands pass. Existing
@@ -1785,14 +2242,18 @@ includes the new unit tests.
 dylib build. This is an intentional staging — the change is
 parse-only.
 
-### §12.3 Step 3 — add `dev_deps_overlay` module
+### §12.3 Step 3 — add `dev_deps_overlay` module (Shape δ)
 
 **Branch:** `feat/dev-deps-overlay-module`. Stacked on Step 2.
 
-1. Create `src/dev_deps_overlay.rs` with the §3 synthesis algorithm.
-2. The module exports `synthesize_overlay_manifest`.
-3. Use the §12.1 shared `manifest_overlay::*` helpers.
-4. Add §8.2 unit tests (overlay-synthesis round-trip).
+1. Create `src/dev_deps_overlay/mod.rs` with the §3 algorithm.
+2. The module exports `synthesize_overlay`.
+3. Use the §12.1 shared `manifest_overlay::*` helpers:
+   - `resolve_dylib_crate_manifest` (§3.3)
+   - `make_overlay_isolated_workspace` (§3.6)
+   - `absolutize_path_bearing_keys` (§3.9)
+   - `serialize_canonical` (§3.11)
+4. Add §8.2 unit tests (overlay-synthesis round-trip + edge cases).
 
 **Verification (§9):** all four commands pass. New unit tests pass.
 
@@ -1808,10 +2269,10 @@ verifiable via its unit tests.
    fields to `BuildParams` (`src/dylib.rs:60`).
 2. Add the §2.2 Site 2 branch inside `build` (`src/dylib.rs:80+`).
 3. Update the invocation-string rendering (§2.2 Site 3).
-4. Update the session orchestrator (`src/session.rs` or equivalent)
-   to populate the new `BuildParams` fields from `Suite`.
+4. Update the session orchestrator (`src/session.rs:330-336`) to
+   populate the new `BuildParams` fields from `Suite`.
 5. Add §8.5 regression test: empty `build_targets` does NOT call
-   into `synthesize_overlay_manifest`.
+   into `synthesize_overlay`.
 
 **Verification (§9):** all four commands pass.
 
@@ -1819,19 +2280,25 @@ verifiable via its unit tests.
 opt into `build_targets` fails → BLOCK. The byte-identical
 contract must hold.
 
-### §12.5 Step 5 — cargo-build-gated integration test
+### §12.5 Step 5 — cargo-build-gated integration tests (BLOCK-6 closure)
 
 **Branch:** `feat/dev-deps-overlay-integration-test`. Stacked on
 Step 4.
 
 1. Add `tests/dev_deps_overlay_integration.rs`.
 2. Gate behind `#[cfg(feature = "cargo-build")]`.
-3. Add the §8.4 test cases.
-4. Verify the test passes in CI.
+3. Add the §8.4 test cases, including:
+   - `split_crate_axum_macros_minimal_repro` (BLOCK-2 closure proof)
+   - `workspace_inheritance_carry_down` (BLOCK-1)
+   - `workspace_root_patch_inline_closure` (OQ-4)
+   - `member_local_patch_rejected` (OQ-4)
+   - `no_explicit_lib_block` (BLOCK-3)
+   - `optional_dev_dep_rejected` (BLOCK-5)
+4. Verify the tests pass in CI.
 
 **Verification (§9):** all four commands pass. Per
-[[lihaaf-no-local-binary-builds]], the new test is NOT run locally;
-CI runs it.
+[[lihaaf-no-local-binary-builds]], the new tests are NOT run locally;
+CI runs them.
 
 ### §12.6 Step 6 — spec + user-guide amendments
 
@@ -1842,7 +2309,7 @@ Step 5 (or rebased onto `docs/user-guide` for the user-guide diff).
 2. Apply the §7 user-guide amendments to `docs/user-guide.md` on
    the `docs/user-guide` branch.
 3. Add a CHANGELOG.md entry for the new field.
-4. Add a v0.1.0 entry in the changelog naming the feature.
+4. Add a v0.1.0 entry in the changelog naming Shape δ.
 
 **Verification (§9):** all four commands pass. `cargo doc` should
 build the new rustdoc on `Suite.build_targets`.
@@ -1853,38 +2320,15 @@ build the new rustdoc on `Suite.build_targets`.
 of this dispatch; the pilot fork is a separate repository.
 
 1. Add `build_targets = ["tests"]` to the default suite + each named
-   suite that has `dev_deps`.
+   suite that has `dev_deps` (default, from_request, typed_path; the
+   debug_middleware suite has no `dev_deps`, no overlay needed).
 2. Run the pilot's CI; verify all 93 fixtures pass.
 3. Measure the cold-cache wall-clock for the §10 estimate.
 4. If measurement diverges materially from §10 estimate, update
    §10.
 
-### §12.8 Step 8 — file v1.0.0 GH issue for OQ-4 `[patch]` deferral
-
-**MANDATORY: v0.1.0 cannot ship without this issue filed.** Per
-[[no-unilateral-deferral]] this is the GH-tracked record of the
-user-authorized §11.4 deferral.
-
-1. Open a GH issue on `lihaaf-rs/lihaaf` titled exactly:
-   `v1.0.0: prove or reject [patch.crates-io] interaction with overlay-promoted dev_deps`
-2. Issue body MUST include:
-   - Link to `docs/spec/dev-deps-overlay-promotion-plan-2026-05-19.md#114-oq-4--patch-table-interaction-with-promotion--deferred-to-v100`
-   - The deferred-risk shape from §11.4 (verbatim toml example).
-   - The three sub-tasks from §11.4: (a) reproduce risk shape with
-     synthetic pilot or `derive_more`, (b) cite cargo's documented
-     source-id resolution rules, (c) either prove "carry verbatim"
-     correct OR add a REJECT path at synthesis.
-   - Label: `v1.0.0`, `deferred-from-v0.1.0`, `overlay-promotion`.
-3. Reference the issue number back into §11.4 as a final paragraph:
-   "Tracked in GH issue #<N>."
-4. Commit the §11.4 backlink update as a follow-up commit on the
-   same plan branch.
-
-**Verification (§9):** the GH issue exists and is reachable; the
-plan doc has been updated with the issue number.
-
-**Adversarial-review trip-wire:** if v0.1.0 ships without this GH
-issue filed → BLOCK at release-gate.
+(R1's §12.8 — file v1.0.0 GH issue for OQ-4 — is REMOVED. The OQ-4
+inline closure per §11.4 means no deferred work artifact.)
 
 ---
 
@@ -1897,17 +2341,15 @@ issue filed → BLOCK at release-gate.
 | 1. CLI-only, no library API | No new public API exposed beyond the existing `cargo-lihaaf` binary. |
 | 2. Dylib-only is design DNA | The change keeps the dylib build invocation shape; only the manifest source changes. |
 | 3. Explicit > implicit | `build_targets` is opt-in; omitted = byte-identical legacy behavior. |
-| 4. CI/benchmark wall-clock priority | §10 quantifies; the change preserves the single-cargo-invocation amortization. |
-| 5. UNION in single dylib | Single cargo rustc; no two-phase fingerprint. |
-| 6. `dev_deps` semantics unchanged | `dev_deps` is still an explicit allow-list; `build_targets` is orthogonal. |
-| 7. Backwards-compat for existing adopters | §5.2 verified per-adopter; all listed adopters remain no-op. |
-| 8. No fork pollution | Adopters configure on their own lihaaf-converted branch; no upstream Cargo.toml edits. |
-| 9. Quality > velocity | Every Codex-enumerated edge case has an explicit policy. |
+| 4. No upstream pollution | Synthesized overlays live in `target/`, never in source. |
+| 5. Backwards compat byte-identical when `build_targets` omitted | §5.1 contract; §5.2 per-adopter audit. |
+| 6. Workspace identity correctness | §3.6 isolated overlay workspace + carry-down per compat-mode #36 precedent. BLOCK-1 closure. |
+| 7. Quality > velocity | Every Codex-enumerated edge case has an explicit policy; BLOCKs 1-6 + OQ-4 closed inline. |
 
 ### §13.2 Memory ledger compliance
 
-- [[lihaaf-no-local-binary-builds]]: §8.4's integration test is
-  `cargo-build`-gated, runs in CI only. §9's verification commands
+- [[lihaaf-no-local-binary-builds]]: §8.4's integration tests are
+  `cargo-build`-gated, run in CI only. §9's verification commands
   exclude the forbidden binaries.
 - [[lihaaf-review-verify-cmds]]: §9 lists all four required
   commands.
@@ -1919,6 +2361,23 @@ issue filed → BLOCK at release-gate.
 - [[lihaaf-plan-adversarial-cycle]]: this plan is the planner's
   output; the next step is adversarial review BEFORE
   careful-coder dispatch.
+- [[no-unilateral-deferral]]: OQ-4 is no longer deferred; inline
+  closure ships with v0.1.0 (per Codex BLOCK on deferral).
+- [[lihaaf-dev-deps-explicit-keep]]: explicit `dev_deps` list
+  preserved; no auto-discovery from `[dev-dependencies]`.
+- [[lihaaf-cli-only-never-library]]: no library API added.
+
+### §13.3 Codex round-1 BLOCK closures (cross-reference)
+
+| BLOCK | Closure section(s) | Evidence |
+|-------|--------------------|----------|
+| BLOCK-1: Workspace inheritance | §3.6, §8.4 `workspace_inheritance_carry_down` | Compat-mode precedent (`compat/overlay.rs:1977+`); shared helper extraction (§12.1); integration test (§8.4) |
+| BLOCK-2: dylib_crate != metadata package | §3.1-§3.5 (entire Shape δ algorithm); §8.4 `split_crate_axum_macros_minimal_repro` | Workspace-member resolver (`compat/overlay.rs:1505+`) reused; integration test reproduces axum-macros shape |
+| BLOCK-3: No `[lib]` injection | §3.8, §8.4 `no_explicit_lib_block` | Mirrors `compat/overlay.rs:2456-2470` |
+| BLOCK-4: §5 adopter inventory incomplete | §5.2 (entire rewrite); §5.2.1-§5.2.13 | All locally-present adopters cited at file:line; non-local adopters explicitly surfaced as `NOT LOCALLY PRESENT` |
+| BLOCK-5 (OQ-2): optional flip | §3.7.5, §11.2, §8.2 `rejects_optional_dev_dep`, §8.4 `optional_dev_dep_rejected` | REJECT locked; unit + integration tests |
+| BLOCK-6: Test coverage gaps | §8.4 (new) | Six new cargo-build-gated tests; one new shared-helper regression test (§8.3 `compat_overlay_byte_identical_after_extraction`) |
+| OQ-4: `[patch]` deferral | §11.4, §3.6, §3.7.4, §8.4 `workspace_root_patch_inline_closure`, §8.4 `member_local_patch_rejected` | Inline closure; GH-issue step REMOVED |
 
 ---
 
@@ -1928,42 +2387,60 @@ For Codex's review: these are intentionally NOT in this plan and
 should not be raised as gaps.
 
 - `"examples"` and `"benches"` as `build_targets` values. Deferred
-  to v0.2+.
+  to v0.2+ per a user-authorized milestone scope decision.
 - Per-suite `[patch]` injection. Deferred (workspace-root `[patch]`
-  inheritance handles every pilot-known case).
-- Auto-discovery of `dev_deps` from the adopter's `[dev-dependencies]`
-  table. Locked-rejected; the user explicitly opted out.
+  inheritance handles every pilot-known case per §3.7.4).
+- Auto-discovery of `dev_deps` from the metadata crate's
+  `[dev-dependencies]` table. Locked-rejected; the user explicitly
+  opted out per [[lihaaf-dev-deps-explicit-keep]].
 - Compat-mode (`cargo lihaaf --compat`) using `build_targets`.
   Deferred; compat-mode's synthetic metadata defaults to empty
   `build_targets`.
 - Removing the existing `dev_deps` field. Out of scope; backwards
   compat invariant.
 - Refactoring `compat/overlay.rs` beyond the §12.1 helper extraction.
+- Library API for `lihaaf::synthesize_overlay` or similar — lihaaf
+  remains CLI-only per [[lihaaf-cli-only-never-library]].
+- Cross-platform path-relative overlays (the absolute-path determinism
+  caveat in §4.1 is documented and accepted).
 
 ---
 
-## §15 Adversarial-review checklist for Codex
+## §15 Adversarial-review checklist for Codex round-2
 
 Codex should specifically verify:
 
 1. **File:line accuracy.** Every cited line in §2 ("Source-level
-   changes needed") matches the actual line in `main` HEAD as of
-   2026-05-19. (Previous plan was BLOCKed on this.)
-2. **§3 algorithm completeness.** Every Codex-enumerated failure
-   mode has a documented policy.
-3. **§5 adopter inventory completeness.** All known adopters checked,
-   none would break.
-4. **§8 test coverage.** Each behavioral claim has a corresponding
-   unit or integration test.
-5. **§10 speed claim defensibility.** The ~+12-15% cold-cache
+   changes needed") and §5 (adopter inventory) matches the actual line
+   in the named files as of 2026-05-19.
+2. **Shape δ correctness.** The synthesis target is the dylib_crate's
+   manifest; specs are grafted from the metadata crate's
+   `[dev-dependencies]`. Cross-check §0.2, §3.1-§3.5.
+3. **Workspace identity correctness.** §3.6 reuses
+   `compat/overlay.rs:1977+ apply_workspace_member_inheritance` via
+   the extracted shared helper. The carry-down handles
+   `[workspace.*]`, `[patch.*]`, `[replace]`, `[profile.*]` and
+   rejects member-local override tables.
+4. **`[lib]` injection.** §3.8 mirrors `compat/overlay.rs:2456-2470`.
+5. **Adopter inventory completeness.** §5.2 cites file:line for every
+   locally-present adopter; non-local adopters explicitly surfaced.
+   No TODO/verify markers.
+6. **OQ-2 locked REJECT.** §3.7.5 + §11.2 reject optional dev-deps
+   at synthesis. Unit + integration tests verify.
+7. **OQ-4 locked inline closure.** §11.4 carries down workspace-root
+   `[patch]`/`[replace]`/`[profile]`; member-local rejected. §12.8
+   GH-issue step REMOVED.
+8. **§8 test coverage.** Each Codex-enumerated failure mode + each
+   BLOCK closure has a corresponding test in §8.2 (unit) or §8.4
+   (integration).
+9. **§10 speed claim defensibility.** The ~+12-15% cold-cache
    estimate is grounded in axum-macros' specific shape; warm-cache
    100% hit-rate is grounded in the determinism contract.
-6. **§11 OQs are real.** Not fishing-expedition placeholders; each
-   names a design choice the planner could not unilaterally lock.
-7. **§12 step independence.** Each step's tests pass at that step's
-   exit. No step's tests require a later step's code.
-8. **No silent locked-constraint violation.** §13.1 enumerates all
-   nine; verify each line.
+10. **§12 step independence.** Each step's tests pass at that step's
+    exit. No step's tests require a later step's code.
+11. **No silent locked-constraint violation.** §13.1 enumerates all
+    seven (R2 trimmed from 9 to 7 by consolidating overlapping
+    constraints; verify each line).
 
 ---
 
