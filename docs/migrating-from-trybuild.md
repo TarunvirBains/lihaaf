@@ -382,6 +382,69 @@ Fields not specified on a named suite (`extern_crates`, `dev_deps`, `edition`,
 `compile_fail_marker`, `fixture_timeout_secs`, `per_fixture_memory_mb`,
 `allow_lints`) inherit from the top-level `[package.metadata.lihaaf]` table.
 
+### Grouped per-group layouts (upstream `tests/<group>/{fail,pass}/`)
+
+Some upstream crates organize fixtures into per-group subdirectories rather than
+the flat `tests/ui/` shape. The axum-macros pilot (`axum-lihaaf-pilot`,
+`lihaaf-converted` branch) keeps the upstream layout:
+
+```
+axum-macros/tests/
+  debug_handler/{fail,pass}/
+  debug_middleware/{fail,pass}/
+  from_ref/{fail,pass}/
+  from_request/{fail,pass}/
+  typed_path/{fail,pass}/
+```
+
+Two spec rules from §3.6 shape how to configure this:
+
+1. The implicit **default suite** (top-level `[package.metadata.lihaaf]` table)
+   must have a non-empty `fixture_dirs` resolving to ≥1 existing directory.
+2. `fixture_dirs` across all suites must be **disjoint** — no fixture directory
+   may appear in two suites.
+
+Combining these: you cannot have an empty default + every group as a named
+suite. The correct shape is **one group as the default suite; remaining groups
+as named suites**. axum-macros picks `debug_handler` (the largest group) as
+the default:
+
+```toml
+[package.metadata.lihaaf]
+dylib_crate          = "axum"
+extern_crates        = ["axum", "axum-macros"]
+features             = []
+dev_deps             = ["axum-extra", "serde"]
+edition              = "2021"
+compile_fail_marker  = "fail"
+fixture_dirs         = ["tests/debug_handler/fail", "tests/debug_handler/pass"]
+
+[[package.metadata.lihaaf.suite]]
+name         = "debug_middleware"
+fixture_dirs = ["tests/debug_middleware/fail", "tests/debug_middleware/pass"]
+
+[[package.metadata.lihaaf.suite]]
+name         = "from_ref"
+fixture_dirs = ["tests/from_ref/fail", "tests/from_ref/pass"]
+
+# ...four more named suites
+```
+
+Two extra patterns this surfaces:
+
+- **`compile_fail_marker = "fail"`** — upstream uses `fail/` and `pass/` rather
+  than `compile_fail/` and `compile_pass/`. The marker is a substring match
+  (default `"compile_fail"`); setting it to `"fail"` makes directories ending in
+  `/fail` classify as compile_fail and `/pass` as compile_pass. Named suites
+  inherit this via the §3.6 inheritance rule.
+
+- **Default-suite naming** — `cargo lihaaf --suite default` runs the chosen
+  default group (`debug_handler` here), not a "default" alias. If you want all
+  groups callable by their natural group name, you'd have to duplicate the
+  default group as a named suite — which the disjoint rule rejects. Pick the
+  default group based on how often it'll be invoked alone (largest, most
+  failure-prone, fastest to compile — whatever fits your workflow).
+
 ### Toolchain-pinned fixtures
 
 If your trybuild driver was wrapped in a `#[rustversion::attr(nightly, test)]`
