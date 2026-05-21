@@ -3,7 +3,10 @@ set -e
 ROOT="$(git rev-parse --show-toplevel)"
 HOOK_PATH="$ROOT/.git/hooks/pre-commit"
 EXPECTED_CONTENT='#!/usr/bin/env bash
-exec "$(git rev-parse --show-toplevel)/scripts/scan-secrets.sh"'
+set -e
+ROOT="$(git rev-parse --show-toplevel)"
+"$ROOT/scripts/scan-secrets.sh"
+"$ROOT/scripts/check-public-docs.sh"'
 
 if [ -e "$HOOK_PATH" ]; then
     if [ "$(cat "$HOOK_PATH")" = "$EXPECTED_CONTENT" ]; then
@@ -22,4 +25,4 @@ mkdir -p "$ROOT/.git/hooks"
 printf '%s\n' "$EXPECTED_CONTENT" > "$HOOK_PATH"
 chmod +x "$HOOK_PATH"
 echo "Installed pre-commit hook at $HOOK_PATH."
-echo "It will call scripts/scan-secrets.sh on every git commit."
+echo "It will call scripts/scan-secrets.sh and scripts/check-public-docs.sh on every git commit."
