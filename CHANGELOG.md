@@ -8,8 +8,8 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [0.1.2] — 2026-05-21
 
-Documentation/help release. No runtime behavior change, no API change, no
-manifest schema change, no exit-code change.
+Improve the user guide and CLI help. No runtime behavior change, no API
+change, no manifest schema change, no exit-code change.
 
 ### Fixed (documentation)
 
@@ -953,4 +953,3 @@ should subprocess-spawn `cargo lihaaf` rather than depend on
   The four §4.5 invariants now share §4.6's hard-fail behavior
   (exit code 67) explicitly. This brings the spec text in line with
   shipping behavior.
-
