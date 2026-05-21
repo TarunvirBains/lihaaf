@@ -124,11 +124,10 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
     let selected_indexes = select_suites_by_cli(&config.suites, &cli.suite)?;
     let multi_suite = selected_indexes.len() > 1;
 
-    // List mode short-circuits before the dylib build (the policy).
+    // List mode short-circuits before the dylib build.
     // Multi-suite list mode walks each selected suite and prints its
     // fixtures; the per-suite header is only emitted when more than
-    // one suite is selected so the single-suite output stays
-    // byte-identical to v0.1.0-alpha.2.
+    // one suite is selected.
     if cli.list {
         for &idx in &selected_indexes {
             let suite = &config.suites[idx];
@@ -217,10 +216,9 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
 
     let cleanup_residue = all_results.iter().any(|r| r.cleanup_failure.is_some());
 
-    // Print the cross-suite aggregate report. Same shape as the v0.1.0-alpha.2
-    // single-suite aggregate so CI scripts that grep on the existing
-    // `lihaaf: N ok, N failed, N timeout, N memory_exhausted` line keep
-    // working.
+    // Print the cross-suite aggregate report. The output format is stable:
+    // CI scripts that grep on `lihaaf: N ok, N failed, N timeout, N memory_exhausted`
+    // keep working.
     print_aggregate(&all_results, wall_ms, cleanup_residue);
 
     // Preserve the per-session temp directory in two cases:
@@ -411,11 +409,11 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     // RAM cap is derived from the suite's `per_fixture_memory_mb`, which
     // adopters may set higher for a heavier feature set.
     //
-    // v0.1.0-alpha.3 intentionally does not carry `ParallelismGate`
-    // OOM reductions across suite boundaries: each suite gets a fresh
-    // dispatch pool and a fresh gate. Sharing that state would require
-    // plumbing a mutable gate through `worker::dispatch_pool`; defer
-    // until a real adopter reports cross-suite OOM cascades.
+    // `ParallelismGate` OOM reductions are not carried across suite
+    // boundaries: each suite gets a fresh dispatch pool and a fresh gate.
+    // Sharing that state would require plumbing a mutable gate through
+    // `worker::dispatch_pool`; defer until a real adopter reports
+    // cross-suite OOM cascades.
     let parallelism = compute_parallelism(cli, suite);
     if !cli.quiet {
         eprintln!("lihaaf: parallelism = {parallelism}");
