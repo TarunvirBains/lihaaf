@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-21
+
+Documentation/help release. No runtime behavior change, no API change, no
+manifest schema change, no exit-code change.
+
+### Fixed (documentation)
+
+- **Trybuild migration playbook**: clarified that `build_targets = ["tests"]`
+  is not required for most sassi/djogi-style conversions, but is needed for the
+  axum-macros split metadata/dylib shape where fixtures import metadata-side
+  dev-deps such as `serde` or `axum-extra`.
+
+- **Axum-macros grouped layout example**: mirrored the working conversion shape:
+  repeat `features = ["macros"]` per suite, clear `dev_deps = []` on suites that
+  do not need staged dev-dep collection, and set `build_targets = ["tests"]` on
+  suites that do.
+
+- **CLI help**: added short setup guidance for new users and surfaced the
+  split-crate trybuild migration `build_targets = ["tests"]` rescue path in
+  `cargo lihaaf --help`.
+
 ## [0.1.1] — 2026-05-21
 
 Documentation-only release. No behavior change, no API change, no new

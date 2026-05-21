@@ -44,8 +44,8 @@ use crate::error::Error;
                   Trybuild migration note: most conversions only need `dev_deps`; \
                   for split metadata/dylib crates whose fixtures cannot resolve \
                   metadata-side dev-deps, set `build_targets = [\"tests\"]` on \
-                  each suite that needs staged dev-dep collection. See \
-                  `docs/migrating-from-trybuild.md`."
+                  each suite that needs staged dev-dep collection. See the \
+                  repository migration guide at `docs/migrating-from-trybuild.md`."
 )]
 pub struct Cli {
     /// Overwrite `.stderr` snapshots whose normalized output differs
