@@ -38,6 +38,7 @@
 //! | [`config`] | Parse + validate `[package.metadata.lihaaf]`. |
 //! | `toolchain` | Capture `rustc --version --verbose` for drift checks. (pub(crate)) |
 //! | `dylib` | `cargo rustc --crate-type=dylib` invocation, copy mechanic. (pub(crate)) |
+//! | `suite_workspace` | Opted-in staged Cargo workspace that builds fixture `dev_deps` beside the dylib. (pub(crate)) |
 //! | `manifest` | `target/lihaaf/manifest.json` schema + atomic write. (pub(crate)) |
 //! | `freshness` | Per-dispatch the policy invariant re-check (mtime / SHA-256 / rustc). (pub(crate)) |
 //! | `lock` | Session-wide advisory file lock on `target/lihaaf/.session.lock`. (pub(crate)) |
@@ -72,6 +73,7 @@ pub(crate) mod manifest;
 pub(crate) mod normalize;
 pub(crate) mod session;
 pub(crate) mod snapshot;
+pub(crate) mod suite_workspace;
 pub(crate) mod toolchain;
 pub(crate) mod util;
 pub mod verdict;
@@ -102,11 +104,8 @@ pub use compat::cli::CompatArgs;
 #[doc(hidden)]
 pub use compat::run as run_compat;
 
-// Compat-mode overlay (GH #11). Re-exported for the same reason as
-// `CompatArgs` above — `tests/compat/overlay_determinism.rs` lives in
-// a separate test crate and reaches the overlay module through this
-// `#[doc(hidden)]` re-export. The stability contract is the same:
-// NOT part of any v0.1 surface.
+// Compat-mode overlay helper for integration tests. Hidden re-export;
+// not part of the supported v0.1 Rust API.
 //
 // Only `materialize_overlay` is re-exported because that is what the
 // integration tests exercise; the canonicalizer, key-order helper, and
@@ -116,11 +115,9 @@ pub use compat::run as run_compat;
 #[doc(hidden)]
 pub use compat::overlay::materialize_overlay as compat_overlay_materialize;
 
-// Issue #53 — re-export the workspace-member-context-aware materializer
-// + the resolver result types so `tests/compat/overlay_determinism.rs`
-// can exercise the `workspace_member_with_package` corpus fixture. The
-// stability contract is the same: NOT part of any v0.1 surface; the
-// supported entry to compat mode is `cargo lihaaf --compat`.
+// Workspace-member compat helpers for integration tests. Hidden
+// re-exports; the supported entry to compat mode is
+// `cargo lihaaf --compat`.
 #[doc(hidden)]
 pub use compat::overlay::WorkspaceMemberContext as CompatWorkspaceMemberContext;
 #[doc(hidden)]
@@ -128,22 +125,15 @@ pub use compat::overlay::materialize_overlay_with_metadata_and_workspace_member_
 #[doc(hidden)]
 pub use compat::overlay::resolve_workspace_member_manifest as compat_resolve_workspace_member_manifest;
 
-// Compat-mode baseline runner (GH #8). Re-exported for the same
-// reason as the overlay above — `tests/compat/argv_baseline_no_shell.rs`
-// lives in a separate test crate and reaches the baseline module
-// through these `#[doc(hidden)]` re-exports. The stability contract
-// is the same: NOT part of any v0.1 surface.
+// Compat-mode baseline runner for integration tests. Hidden re-export;
+// not part of the supported v0.1 Rust API.
 #[doc(hidden)]
 pub use compat::baseline::BaselineResult as CompatBaselineResult;
 #[doc(hidden)]
 pub use compat::baseline::run_baseline as compat_baseline_run;
 
-// Compat-mode conservative trybuild baseline extraction (GH #9).
-// Re-exported so `tests/compat/baseline_conservative.rs` can reach the
-// conservative parser, the fixture-recognition input type, the
-// mismatch record, and the v2 runner entry point through stable names.
-// The stability contract is the same as the other compat re-exports:
-// NOT part of any v0.1 surface; the supported entry to compat mode is
+// Compat-mode conservative trybuild baseline extraction for integration
+// tests. Hidden re-exports; the supported entry to compat mode is
 // `cargo lihaaf --compat`.
 #[doc(hidden)]
 pub use compat::baseline::BaselineMismatch as CompatBaselineMismatch;
@@ -179,12 +169,12 @@ pub use compat::discovery::FixtureKind as CompatFixtureKind;
 #[doc(hidden)]
 pub use compat::discovery::discover as compat_discover;
 
-// Compat-mode dirty-worktree cleanup (GH #10). Re-exported for the
-// same reason as the overlay above — `tests/compat/cleanup_dirty_worktree.rs`
-// lives in a separate test crate and reaches the cleanup types through
-// these `#[doc(hidden)]` re-exports. The stability contract is the
-// same: NOT part of any v0.1 surface; the supported entry to compat
-// mode is `cargo lihaaf --compat`.
+// Compat-mode dirty-worktree cleanup. Re-exported for the same reason
+// as the overlay above — `tests/compat/cleanup_dirty_worktree.rs` lives
+// in a separate test crate and reaches the cleanup types through these
+// `#[doc(hidden)]` re-exports. The stability contract is the same: NOT
+// part of any v0.1 surface; the supported entry to compat mode is
+// `cargo lihaaf --compat`.
 //
 // `install_panic_hook` is re-exported alongside the guard types
 // because `compat::run` calls it and integration tests may need to

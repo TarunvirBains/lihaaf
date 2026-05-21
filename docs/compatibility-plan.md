@@ -4,6 +4,17 @@ Goal: reach v0.1 with confidence before release by proving lihaaf in the same fi
 
 This plan starts with deterministic, repeatable checks and grows into a CI matrix.
 
+For dev-dep-heavy fixture suites, the normal v0.1 adopter path is
+`build_targets = ["tests"]`, not the compat overlay mechanism below.
+That path synthesizes one isolated
+suite workspace per opted-in suite, builds the staged dylib package and
+a synthetic dev-deps collector in the same Cargo resolver graph, and
+does not insert promoted `dev_deps` into the dylib crate manifest.
+Compat-mode Option H/self-patch policy remains scoped to the
+`cargo lihaaf --compat` overlay design in §3.2.3; it is not part of
+the direct `build_targets` suite workspace path used by the current
+axum-macros gate.
+
 ## 1) Design principle
 
 Treat the compatibility runner as a **feature of lihaaf itself**: one consistent command path that produces one deterministic report.
@@ -172,7 +183,7 @@ When the upstream manifest already declares dylib crate-type, the driver still m
 
 **Why a staged-target overlay (vs. sibling, rewrite-then-restore, or `[patch]`).**
 
-- **Sibling-manifest overlay** (`<upstream>/Cargo.lihaaf.toml` next to the upstream `Cargo.toml`) was the original v0.1.0-beta.4 shape. Cargo's `--manifest-path` filename check rejects any path whose last component is not literally `Cargo.toml` — every stage-2 pilot run failed with `lihaaf_session_failed` / detail "the manifest-path must be a path to a Cargo.toml file" until the PR #34 redesign moved the overlay under `target/lihaaf-overlay/`.
+- **Sibling-manifest overlay** (`<upstream>/Cargo.lihaaf.toml` next to the upstream `Cargo.toml`) fails Cargo's `--manifest-path` filename check because the last component is not literally `Cargo.toml`.
 - **Rewrite-then-restore** touches the upstream `Cargo.toml` mid-run; a concurrent file watcher, IDE, or another `cargo` process observing the worktree sees the modified state, and a crash before restore leaves the worktree dirty.
 - **`[patch]` overlays** target dependency resolution, not crate-type declaration; they cannot add `crate-type = ["dylib"]`. The overlay passes through `[patch.<registry>.X]` `git`/`branch`/`tag`/`rev` keys verbatim. For `[patch.<registry>.X]` entries whose key names a crate OTHER than the crate-under-test, the `path` sub-key is absolutized with the same semantics as `[dependencies.X] path`. For the self-crate key (`[patch.crates-io.<overlay-package-name>]`), lihaaf applies the Option H intent-aware self-patch policy (REMAP or INJECT — see §3.2.3.1 below) rather than plain absolutization — plain absolutization would produce a self-loop or leave the resolver unable to find the correct source.
 
@@ -186,7 +197,7 @@ When the upstream Cargo.toml contains `[patch.crates-io]` entries relevant to th
 
 - **Rule 3 (no action by self-patch policy):** If your upstream has `[patch.crates-io.<other>]` entries for crates OTHER than the crate-under-test (e.g., cxx's `[patch.crates-io.cxx-build] = { path = "gen/build" }`), lihaaf preserves them untouched (the existing path-absolutization scheme applies). These entries are orthogonal to the self-patch policy.
 
-- **Rule 4 (REJECT):** If your upstream has `[patch.crates-io.<crate>]` pointing somewhere else — a vendored fork, a git source, a non-root path — lihaaf rejects with a clear error. To opt into overwriting your upstream's intent with lihaaf's preferred staged-overlay-dir target, use the `--compat-allow-patch-override` flag (v0.2/v1.1, not yet available; see issue #X for tracking).
+- **Rule 4 (REJECT):** If your upstream has `[patch.crates-io.<crate>]` pointing somewhere else — a vendored fork, a git source, a non-root path — lihaaf rejects with a clear error. An explicit override policy is outside the v0.1 scope.
 
 **Emission form.** Both Rule 1 (INJECT) and Rule 2 (REMAP) emit `[patch.crates-io.<crate>] = { path = "<absolutized-staged-overlay-dir>" }` — the same absolute-path form used everywhere else in the overlay for determinism. This matches the §3.2.3 byte-determinism guarantee: two compat-mode runs from clean state against the same upstream, using the same lihaaf binary, produce a byte-identical overlay.
 
@@ -203,7 +214,7 @@ When the upstream Cargo.toml contains `[patch.crates-io]` entries relevant to th
 4. Table key order sorted in cargo's canonical order (`package`, `lib`, `bin`, `dependencies`, `dev-dependencies`, `build-dependencies`, `features`, `workspace`, then alphabetical for the long tail).
 5. No comments — upstream `Cargo.toml` comments are dropped in the overlay. If a comment carries load-bearing meaning (e.g. a `[patch]` rationale), the overlay records the comment text in the §3.3 envelope under `overlay.dropped_comments` rather than preserving it in the TOML. No trailing whitespace, line endings `\n`.
 
-**Serializer choice.** The compat driver serializes the overlay through the existing `toml` crate dependency (`Cargo.toml:39`, currently `toml = "1"`), pinned to the same major version lihaaf itself depends on. Adopting `toml_edit` or any other serializer is out of scope for v0.1.0 GA — a change here would break the byte-determinism guarantee below across lihaaf versions and is a v0.2 conversation. Two lihaaf binaries built against the same `toml` 1.x patch level produce byte-identical overlays; two binaries built against different `toml` 1.x patch levels are expected to match in practice but are only guaranteed by the test below.
+**Serializer choice.** The compat driver serializes the overlay through the existing `toml` crate dependency (`Cargo.toml:39`, currently `toml = "1"`), pinned to the same major version lihaaf itself depends on. Adopting `toml_edit` or any other serializer is outside the v0.1 scope because it would change the byte-determinism surface across lihaaf versions. Two lihaaf binaries built against the same `toml` 1.x patch level produce byte-identical overlays; two binaries built against different `toml` 1.x patch levels are expected to match in practice but are only guaranteed by the test below.
 
 **Determinism guarantee.** Two compat-mode runs from clean state against the same upstream `Cargo.toml`, run by the same lihaaf binary, produce a byte-identical `target/lihaaf-overlay/Cargo.toml`. A test asserting this lives at `tests/compat/overlay_determinism.rs`. Cross-binary determinism (across `toml` 1.x patch upgrades) is asserted by a second test against a small fixture corpus checked into `tests/compat/overlay_corpus/`; the corpus is regenerated whenever the `toml` dependency is bumped, and divergence triggers an `overlay_serializer_drift` error in the §3.3 envelope rather than silently changing the overlay bytes.
 
@@ -217,7 +228,7 @@ When the upstream Cargo.toml contains `[patch.crates-io]` entries relevant to th
 
 The staged overlay is built at `<workspace-root>/<member-dir>/target/lihaaf-overlay/Cargo.toml` (the per-member staging dir, not the workspace-root's `target/`). The workspace root's `[workspace.dependencies]`, `[workspace.package]`, `[workspace.lints]`, `[workspace.metadata]`, `[workspace.resolver]`, `[replace]`, and `[profile.*]` tables are carried down into the staged overlay's `[workspace]` and top-level tables, along with ALL `[patch.<registry>]` subtables (crates-io, vendored aliases, named alt registries), so `{ workspace = true }` inheritance references in the member's manifest resolve, and the dependency-graph + patch resolution match baseline cargo's behavior at the workspace-root level. Path-bearing keys (`[workspace.dependencies.<name>].path`, `[workspace.package.readme]`, `[workspace.package.license-file]`, `[patch.<registry>.<name>].path`, `[replace.<id>].path`) are absolutized against the WORKSPACE ROOT directory before write so cargo at overlay build time resolves them correctly from the deeper staging dir.
 
-The over-broad implicit-ancestor REJECT (PR #37 R4) is suppressed when `--package` is supplied: the adopter has explicitly named the target, so the "accidental member entry" hypothesis no longer applies and the carry-down closes the divergent-dependency-graph risk the REJECT was designed to catch. Without `--package`, the REJECT continues to fire for workspace-member subdirectory entries — that case remains the "accidental entry" guard, and the augmented diagnostic suggests `--compat-root <ws-root> --package <pkg-name>` as the actionable fix.
+The over-broad implicit-ancestor REJECT is suppressed when `--package` is supplied: the adopter has explicitly named the target, so the "accidental member entry" hypothesis no longer applies and the carry-down closes the divergent-dependency-graph risk the REJECT was designed to catch. Without `--package`, the REJECT continues to fire for workspace-member subdirectory entries — that case remains the "accidental entry" guard, and the augmented diagnostic suggests `--compat-root <ws-root> --package <pkg-name>` as the actionable fix.
 
 Cargo's own `[package].name` field is NOT workspace-inheritable (see https://doc.rust-lang.org/cargo/reference/workspaces.html#the-package-table for the inheritable-keys list), so the resolver can trust the literal string at the member's `package.name`. The match is case-sensitive.
 
@@ -273,7 +284,7 @@ Write one deterministic JSON envelope:
 - `schema_version` is the integer envelope schema version (currently `1`). A breaking change to the envelope shape increments this; additive fields do not.
 - `mismatch_examples` is sorted by `fixture` (repo-relative, forward-slash, ASCII byte order). `errors` is sorted by `file` then `line`. `excluded_fixtures` is sorted by `fixture`.
 - All `fixture` and `file` paths are repo-relative, forward-slash, never absolute. The target crate's repo root is the relative root. Structured path conversion uses a fallible prefix strip; an out-of-root absolute trybuild literal is rendered with an explicit non-absolute `outside-base/...` diagnostic prefix rather than serializing the runner's absolute path.
-- `errors[].detail` free-text strings are normalized: the absolute `compat_root` prefix is stripped from any embedded path before serialization. Infrastructure errors (e.g. `DylibBuildFailed`) embed the cargo invocation, which uses absolute `--manifest-path` and `--target-dir` values. The normalization is applied at the envelope write boundary via the same prefix-stripping mechanism as `commands.lihaaf` (R3 FIX class III / R5 FIX class V). Local terminal output from `cargo lihaaf --compat` still shows absolute paths; only the §3.3 envelope artifact is normalized.
+- `errors[].detail` free-text strings are normalized: the absolute `compat_root` prefix is stripped from any embedded path before serialization. Infrastructure errors (e.g. `DylibBuildFailed`) embed the cargo invocation, which uses absolute `--manifest-path` and `--target-dir` values. The normalization is applied at the envelope write boundary via the same prefix-stripping mechanism as `commands.lihaaf`. Local terminal output from `cargo lihaaf --compat` still shows absolute paths; only the §3.3 envelope artifact is normalized.
 - `dur_ms` fields are non-deterministic and explicitly excluded from determinism checks (per §2 item 4, Determinism). Every other field is part of the determinism guarantee.
 
 **Fields the §5 gate reads.**

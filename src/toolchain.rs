@@ -35,7 +35,7 @@
 //! canonical user-visible identifier), but it is no longer the sole
 //! comparator — `host`, `commit_hash`, and `sysroot` close the
 //! same-release-line / different-toolchain gap that a release-only key
-//! left open (issue #4).
+//! left open.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -288,9 +288,8 @@ LLVM version: 22.1.2";
     }
 
     /// Same release line, different host (cross-compile or architecture
-    /// migration). This is the case Codex slice B called out: two
-    /// materially different toolchains with the same release_line
-    /// previously compared equal.
+    /// migration). Two materially different toolchains with the same
+    /// release_line must compare unequal.
     #[test]
     fn matches_compares_full_key_host_differs() {
         assert_field_mutation_differs(|b| {

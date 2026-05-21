@@ -1,4 +1,4 @@
-//! Mode-error matrix integration tests — closes GH issue #12.
+//! Mode-error matrix integration tests.
 //!
 //! Most tests in this file spawn `cargo-lihaaf` as a subprocess via
 //! [`env!("CARGO_BIN_EXE_cargo-lihaaf")`] (so the test binary path is
@@ -204,12 +204,12 @@ fn compat_run_requires_compat_report() {
 
 #[test]
 fn compat_run_accepts_pass_through_flags() {
-    // Round-2 simplify pass: this assertion used to spawn the binary
-    // and expect exit 0 from the stub `compat::run`. The stub is now
-    // a full end-to-end driver — the spawn would run `cargo test` →
-    // `rustc` against lihaaf's own tree (because the test passes
-    // `--compat-root .`), and the parallel fan-out OOMs WSL2-class
-    // hosts. The assertion now operates at the CLI parser layer: a
+    // This assertion used to spawn the binary and expect exit 0 from a
+    // minimal compat driver. The driver now runs end to end, so the
+    // spawn would run `cargo test` -> `rustc` against lihaaf's own tree
+    // (because the test passes `--compat-root .`), and the parallel
+    // fan-out can exhaust constrained hosts. The assertion now operates
+    // at the CLI parser layer: a
     // fully-formed compat invocation including every v0.1
     // pass-through flag must parse cleanly AND survive the
     // mode-consistency validator. That is the behavior the test
@@ -269,7 +269,7 @@ fn compat_run_accepts_pass_through_flags() {
     assert!(cli.verbose, "-v / --verbose must propagate");
 }
 
-/// **Round-4 FIX regression: `--compat-cargo-test-argv` is optional.**
+/// **`--compat-cargo-test-argv` is optional.**
 ///
 /// The doc comment on `Cli::compat_cargo_test_argv` previously said
 /// "Required when `--compat` is set"; the actual behavior in

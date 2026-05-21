@@ -10,7 +10,9 @@
 //! 2. Toolchain capture → [`crate::toolchain::capture`].
 //! 3. Suite selection — apply `--suite` filtering across `config.suites`.
 //! 4. For each selected suite (in declared metadata order):
-//!    a. Dylib build for the suite's feature set → [`crate::dylib::build`].
+//!    a. Dylib build for the suite's feature set → [`crate::dylib::build`]
+//!    or [`crate::suite_workspace::build`] for opted-in dev-dep
+//!    collector suites.
 //!    b. Dylib copy → [`crate::dylib::copy_dylib`] / `symlink_dylib`.
 //!    c. Manifest refresh — per-suite manifest path under
 //!    `target/lihaaf/manifest{,-<suite>}.json`.
@@ -32,7 +34,7 @@
 //! Each suite's build artifacts live under a suite-namespaced
 //! `target/lihaaf-build{-<name>}` cargo target dir so different feature
 //! sets do not thrash each other's incremental cache. The default suite
-//! retains the legacy `target/lihaaf-build/` and `target/lihaaf/manifest.json`
+//! retains the default `target/lihaaf-build/` and `target/lihaaf/manifest.json`
 //! paths so adopters who never add a named suite see no cache-key change.
 //!
 //! ## Why one function (and not a builder)
@@ -53,6 +55,7 @@ use crate::freshness::FreshnessSnapshot;
 use crate::lock;
 use crate::manifest::{self, Manifest};
 use crate::normalize::NormalizationContext;
+use crate::suite_workspace;
 use crate::toolchain::{self, Toolchain};
 use crate::util;
 use crate::verdict::FixtureResult;
@@ -69,8 +72,8 @@ pub struct Report {
     pub cleanup_residue: bool,
     /// Total wall-clock for the worker pool dispatch loop across every
     /// suite that ran, in milliseconds. Excludes per-suite dylib build
-    /// time and discovery so the value is comparable to the legacy
-    /// single-suite report.
+    /// time and discovery so the value is comparable across single-suite
+    /// and multi-suite runs.
     pub wall_ms: u64,
     /// Names of suites that actually ran, in execution order. Useful
     /// for tests and CI scripts that want to confirm a `--suite NAME`
@@ -150,15 +153,11 @@ pub fn run(cli: Cli) -> Result<Report, Error> {
 
     let workspace_target = dylib::workspace_target_dir(&manifest_path);
 
-    // Session lock (FIX_BEFORE_BETA Spec B, issue #1). Held for the
-    // remainder of `run` to serialize concurrent `cargo lihaaf`
-    // sessions that share a `CARGO_TARGET_DIR`. Acquired AFTER the
-    // `--list` short-circuit above so read-only `--list` invocations
-    // do not block on a busy target dir. Acquired BEFORE the
-    // `--no-cache` deletion block below so a second session cannot
-    // observe `target/lihaaf/` mid-delete. The underscore prefix
-    // keeps clippy happy about the unused-binding ("used only for
-    // its `Drop`") — releasing on session-end is the entire point.
+    // Held for the remainder of `run` to serialize concurrent
+    // `cargo lihaaf` sessions that share a `CARGO_TARGET_DIR`. Acquire
+    // after read-only `--list`, but before `--no-cache` can remove
+    // generated session state. The binding is intentionally kept only
+    // for its `Drop`.
     let _session_lock = lock::SessionLock::acquire(&workspace_target)?;
 
     // `--no-cache` (the policy): force a fresh dylib build by removing
@@ -319,7 +318,7 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
         session_temp,
     } = input;
 
-    // Per-suite cargo target dir. The default suite uses the legacy
+    // Per-suite cargo target dir. The default suite uses the unsuffixed
     // `target/lihaaf-build/` for cache-key stability; named suites get
     // `target/lihaaf-build-<suite>/` so different feature sets do not
     // thrash each other's incremental cache.
@@ -327,13 +326,23 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
 
     // Stage 4a — dylib build with this suite's features.
     let build_started = std::time::Instant::now();
-    let build_out = dylib::build(&dylib::BuildParams {
-        crate_name: &config.dylib_crate,
-        features: &suite.features,
-        manifest_path,
-        target_dir: &lihaaf_build_dir,
-        toolchain,
-    })?;
+    let build_out = if suite.build_targets.is_empty() {
+        dylib::build(&dylib::BuildParams {
+            crate_name: &config.dylib_crate,
+            features: &suite.features,
+            manifest_path,
+            target_dir: &lihaaf_build_dir,
+            toolchain,
+        })?
+    } else {
+        suite_workspace::build(&suite_workspace::BuildParams {
+            dylib_crate: &config.dylib_crate,
+            suite,
+            metadata_manifest_path: manifest_path,
+            target_dir: &lihaaf_build_dir,
+            toolchain,
+        })?
+    };
     if !cli.quiet {
         let secs = build_started.elapsed().as_secs_f64();
         eprintln!("lihaaf: built {} dylib in {:.1}s", config.dylib_crate, secs);
@@ -418,7 +427,8 @@ fn run_one_suite(input: SuiteRunInput<'_>) -> Result<Vec<FixtureResult>, Error> 
     // short-form `$CARGO/<crate>-<ver>/...` snapshots per §3.2.2. Non-
     // compat callers leave the flag at its default `false` and observe
     // byte-identical v0.1 normalizer output.
-    let norm_ctx = NormalizationContext::new(crate_root.to_path_buf(), toolchain.sysroot.clone())
+    let normalization_root = normalization_root_for_suite(suite, manifest_path, crate_root)?;
+    let norm_ctx = NormalizationContext::new(normalization_root, toolchain.sysroot.clone())
         .with_compat_short_cargo(cli.inner_compat_normalize);
     let mut worker_ctx = WorkerContext::new(
         crate_root.to_path_buf(),
@@ -620,8 +630,8 @@ fn print_aggregate(results: &[FixtureResult], wall_ms: u64, cleanup_residue: boo
 }
 
 /// One-line per-suite aggregate emitted between suites in a multi-suite
-/// run. Skipped on single-suite runs so the legacy output stays
-/// byte-identical for adopters who never declare a named suite.
+/// run. Skipped on single-suite runs so output stays byte-identical for
+/// adopters who never declare a named suite.
 ///
 /// Format pinned to:
 /// `lihaaf: suite "<name>": <n> ok, <n> failed, <n> timeout, <n> memory_exhausted`
@@ -734,7 +744,7 @@ fn resolve_manifest_path(cli: &Cli) -> Result<PathBuf, Error> {
         // Cargo's own `CARGO_MANIFEST_DIR` is absolute, so we match
         // that shape by joining against `current_dir()` (lexical
         // absolutization, no symlink resolution — Cargo itself does
-        // not canonicalize). Issue #14, gpt-5.5 xhigh PR-15 review.
+        // not canonicalize).
         return absolutize_manifest_path(p);
     }
     // Walk up from CWD looking for Cargo.toml. `current_dir()` is
@@ -780,21 +790,69 @@ fn absolutize_manifest_path(p: &Path) -> Result<PathBuf, Error> {
 /// Production callers route through [`resolve_manifest_path`], which
 /// absolutizes `--manifest-path` inputs, so `manifest_path.parent()`
 /// is always non-empty on that path. The defensive `is_empty` guard
-/// below pins the issue-14 invariant for direct callers and for any
-/// future refactor that bypasses the absolutize step: a single-component
-/// relative path like `PathBuf::from("Cargo.toml")` has
-/// `parent() == Some("")` (not `None`), so the bare
-/// `.unwrap_or_else(|| ".".into())` fallback never fires and the env
-/// var would be set to the empty string. Falling back to `.` keeps
-/// downstream `cmd.env("CARGO_MANIFEST_DIR", &crate_root)` working
-/// against the rustc child's current working directory rather than
-/// silently emitting an empty value — itself a non-Cargo-equivalent
-/// path shape. Issue #14, gpt-5.5 xhigh PR-15 review.
+/// below handles direct callers and any future refactor that bypasses
+/// the absolutize step: a single-component relative path like
+/// `PathBuf::from("Cargo.toml")` has `parent() == Some("")` (not
+/// `None`), so the bare `.unwrap_or_else(|| ".".into())` fallback
+/// never fires and the env var would be set to the empty string.
+/// Falling back to `.` keeps downstream
+/// `cmd.env("CARGO_MANIFEST_DIR", &crate_root)` working against the
+/// rustc child's current working directory rather than silently
+/// emitting an empty value — itself a non-Cargo-equivalent path shape.
 fn derive_crate_root(manifest_path: &Path) -> PathBuf {
     match manifest_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     }
+}
+
+fn normalization_root_for_suite(
+    suite: &Suite,
+    manifest_path: &Path,
+    crate_root: &Path,
+) -> Result<PathBuf, Error> {
+    if suite.build_targets.is_empty() {
+        return Ok(crate_root.to_path_buf());
+    }
+
+    staged_suite_normalization_root(manifest_path, crate_root)
+}
+
+fn staged_suite_normalization_root(
+    manifest_path: &Path,
+    crate_root: &Path,
+) -> Result<PathBuf, Error> {
+    for dir in crate_root.ancestors() {
+        let candidate = dir.join("Cargo.toml");
+        if !candidate.is_file() {
+            continue;
+        }
+        let text = std::fs::read_to_string(&candidate).map_err(|e| {
+            Error::io(
+                e,
+                "reading ancestor Cargo.toml for staged-suite normalization root",
+                Some(candidate.clone()),
+            )
+        })?;
+        let value: toml::Value =
+            toml::from_str(&text).map_err(|e: toml::de::Error| Error::TomlParse {
+                path: candidate.clone(),
+                message: format!(
+                    "{e}\nWhy this matters: manifest `{}` belongs to a suite with \
+                     build_targets, so lihaaf needs the ancestor workspace root to normalize \
+                     sibling-member diagnostics.",
+                    manifest_path.display()
+                ),
+            })?;
+        if value
+            .as_table()
+            .is_some_and(|table| table.contains_key("workspace"))
+        {
+            return Ok(dir.to_path_buf());
+        }
+    }
+
+    Ok(crate_root.to_path_buf())
 }
 
 fn toml_value_to_json(v: &toml::Value) -> serde_json::Value {
@@ -833,6 +891,7 @@ mod tests {
             allow_lints: vec![],
             edition: "2021".into(),
             dev_deps: vec![],
+            build_targets: Default::default(),
             compile_fail_marker: "compile_fail".into(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: per_fixture_mb,
@@ -954,31 +1013,22 @@ mod tests {
 
     /// Run `derive_crate_root` against `input` and assert:
     /// 1. The returned path equals `PathBuf::from(expected)`.
-    /// 2. The returned path is NEVER the empty path — this pins the
-    ///    issue #14 / xhigh PR-15 invariant: a bare `Cargo.toml` (single
-    ///    segment) has `parent() == Some("")`, so the original
-    ///    `.unwrap_or_else(|| ".".into())` fallback was bypassed and
-    ///    `CARGO_MANIFEST_DIR=""` propagated to the per-fixture rustc.
-    ///    `derive_crate_root` keeps the invariant intact even when callers
-    ///    skip the absolutize step.
+    /// 2. The returned path is NEVER the empty path. A bare `Cargo.toml`
+    ///    has `parent() == Some("")`, so callers must not let the empty
+    ///    parent propagate to `CARGO_MANIFEST_DIR`.
     fn assert_derive_crate_root_equals(input: &str, expected: &str) {
         let root = derive_crate_root(&PathBuf::from(input));
         assert_eq!(root, PathBuf::from(expected));
         assert!(
             !root.as_os_str().is_empty(),
-            "crate root must never be the empty path (issue #14 / xhigh PR-15 review)"
+            "crate root must never be the empty path"
         );
     }
 
-    /// Regression for the issue-14 follow-up (gpt-5.5 xhigh PR-15 review):
-    /// the single-component-relative manifest path
-    /// `PathBuf::from("Cargo.toml")` must not yield an empty
+    /// A single-component manifest path must not yield an empty
     /// crate-root. `Path::parent()` returns `Some("")` for such inputs,
-    /// not `None`, so the original
-    /// `.parent().unwrap_or_else(|| ".".into())` fallback was bypassed
-    /// and `CARGO_MANIFEST_DIR=""` propagated to the per-fixture rustc.
-    /// `derive_crate_root` keeps the invariant intact even when callers
-    /// skip the absolutize step.
+    /// not `None`, so `derive_crate_root` must normalize the empty parent
+    /// to the current directory.
     #[test]
     fn derive_crate_root_handles_bare_cargo_toml() {
         assert_derive_crate_root_equals("Cargo.toml", ".");
@@ -1008,6 +1058,70 @@ mod tests {
     #[test]
     fn derive_crate_root_returns_parent_of_relative_workspace_member() {
         assert_derive_crate_root_equals("member/Cargo.toml", "member");
+    }
+
+    #[test]
+    fn default_suite_normalization_root_stays_at_crate_root_under_workspace() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path();
+        let member_dir = workspace_root.join("axum-macros");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"axum-macros\"]\n",
+        )
+        .unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        std::fs::write(&member_manifest, "[package]\nname = \"axum-macros\"\n").unwrap();
+        let crate_root = derive_crate_root(&member_manifest);
+
+        let root = normalization_root_for_suite(
+            &suite(DEFAULT_SUITE_NAME, 1024),
+            &member_manifest,
+            &crate_root,
+        )
+        .unwrap();
+
+        assert_eq!(root, member_dir);
+    }
+
+    #[test]
+    fn staged_suite_normalization_root_uses_ancestor_workspace_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace_root = tmp.path();
+        let member_dir = workspace_root.join("axum-macros");
+        let sibling_dir = workspace_root.join("axum").join("src");
+        std::fs::create_dir_all(&member_dir).unwrap();
+        std::fs::create_dir_all(&sibling_dir).unwrap();
+        std::fs::write(
+            workspace_root.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"axum-macros\", \"axum\"]\n",
+        )
+        .unwrap();
+        let member_manifest = member_dir.join("Cargo.toml");
+        std::fs::write(&member_manifest, "[package]\nname = \"axum-macros\"\n").unwrap();
+        let crate_root = derive_crate_root(&member_manifest);
+        let mut staged = suite("from_request", 1024);
+        staged.build_targets = crate::config::BuildTargets::try_from(vec!["tests".into()]).unwrap();
+        staged.dev_deps = vec!["axum".into()];
+
+        let root = normalization_root_for_suite(&staged, &member_manifest, &crate_root).unwrap();
+        let ctx = NormalizationContext::new(root.clone(), PathBuf::from("/rust"));
+        let actual = crate::normalize::normalize(
+            &format!(
+                "note: required by a bound\n   --> {}/method_routing.rs:167:16\n",
+                sibling_dir.display()
+            ),
+            &ctx,
+            &member_dir.join("tests/from_request/fail"),
+        );
+
+        assert_eq!(root, workspace_root);
+        assert!(actual.contains("$WORKSPACE/axum/src/method_routing.rs:167:16"));
+        assert!(
+            !actual.contains(workspace_root.to_string_lossy().as_ref()),
+            "local absolute workspace path leaked through: {actual}"
+        );
     }
 
     /// `resolve_manifest_path` must absolutize a relative

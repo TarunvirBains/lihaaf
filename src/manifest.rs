@@ -99,10 +99,9 @@ pub struct Manifest {
     pub metadata_snapshot: serde_json::Value,
 }
 
-/// Default for the [`Manifest::suite_name`] field on legacy manifests.
-/// `serde` uses this when deserializing a manifest from a lihaaf
-/// release that predated the suite concept. Kept in sync with
-/// [`crate::config::DEFAULT_SUITE_NAME`].
+/// Default for the [`Manifest::suite_name`] field on manifests that
+/// predate the suite concept. `serde` uses this when the field is
+/// absent. Kept in sync with [`crate::config::DEFAULT_SUITE_NAME`].
 fn default_suite_name_field() -> String {
     crate::config::DEFAULT_SUITE_NAME.to_string()
 }
@@ -110,9 +109,9 @@ fn default_suite_name_field() -> String {
 /// Compute the on-disk path for a per-suite manifest under
 /// `<workspace_target>/lihaaf/`.
 ///
-/// The default suite uses the legacy unsuffixed name (`manifest.json`)
-/// to keep manifest paths stable across the suite-introducing release;
-/// named suites get a `manifest-<name>.json` filename. The suite name
+/// The default suite uses the unsuffixed name (`manifest.json`) for
+/// cache-key stability; named suites get a `manifest-<name>.json`
+/// filename. The suite name
 /// is validated by [`crate::config::parse`] to contain only ASCII
 /// alphanumerics, hyphens, and underscores, so this string substitution
 /// is safe to use as a filename component on every supported platform.
@@ -200,12 +199,12 @@ mod tests {
     }
 
     #[test]
-    fn legacy_manifest_without_suite_name_round_trips_with_default() {
+    fn manifest_without_suite_name_round_trips_with_default_suite() {
         // Manifests written by lihaaf <0.1.0-alpha.3 (pre-suite) had no
         // `suite_name` field. The `serde(default)` annotation must
         // backfill the reserved "default" name so older on-disk state
         // continues to deserialize without manual migration.
-        let legacy_json = r#"{
+        let default_suite_json = r#"{
             "lihaaf_version": "0.1.0-alpha.2",
             "rustc_release": "rustc 1.95.0 (abc 2026-01-01)",
             "rustc_commit_hash": "abc",
@@ -222,12 +221,13 @@ mod tests {
             "edition": "2021",
             "metadata_snapshot": {"dylib_crate": "consumer"}
         }"#;
-        let m: Manifest = serde_json::from_str(legacy_json).expect("legacy manifest must parse");
+        let m: Manifest =
+            serde_json::from_str(default_suite_json).expect("default-suite manifest must parse");
         assert_eq!(m.suite_name, crate::config::DEFAULT_SUITE_NAME);
     }
 
     #[test]
-    fn manifest_path_for_default_suite_uses_legacy_name() {
+    fn manifest_path_for_default_suite_uses_default_name() {
         let p = manifest_path_for_suite(Path::new("/p/target"), crate::config::DEFAULT_SUITE_NAME);
         assert_eq!(p, PathBuf::from("/p/target/lihaaf/manifest.json"));
     }

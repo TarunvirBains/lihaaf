@@ -82,15 +82,14 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     cleanup::install_panic_hook();
 
     let compat_report = args.compat_report.clone();
-    // Issue #53 — `resolve_dual_root` returns the dual-root vocabulary
-    // (workspace_root / member_root) and the optional
+    // `resolve_dual_root` returns the dual-root vocabulary
+    // (workspace_root / member_root) and optional
     // `WorkspaceMemberContext`. Every downstream consumer reads the
-    // explicit role from `DualRoot` instead of the legacy single
-    // `compat_root` field. The collapse invariant (workspace_root ==
-    // member_root when workspace_member_context is None) means
-    // non-`--package` pilots see the same paths as pre-#53.
+    // explicit role from `DualRoot`; when the context is absent, the
+    // two roots collapse and non-`--package` runs keep the single-root
+    // path shape.
     //
-    // Workspace-member entry via `--package` (issue #53): the adopter
+    // Workspace-member entry via `--package`: the adopter
     // invokes from the workspace root + names a member explicitly; the
     // resolver maps the package name to the member manifest path. The
     // overlay materializer takes a WorkspaceMemberContext that carries
@@ -102,12 +101,11 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     //      so the dependency graph + patch resolution match baseline cargo.
     // See docs/compatibility-plan.md §3.2.3 (workspace-member entry).
     let dual_root = resolve_dual_root(&args)?;
-    // `compat_root` (legacy name preserved for diff minimality) now
-    // points at `workspace_root` per the §3.1.bis routing table.
-    // Consumers that need member-anchored paths route through
-    // `member_root` explicitly below. In the non-`--package` collapse
-    // case (`workspace_member_context.is_none()`) both paths are
-    // identical and behavior is unchanged from pre-#53.
+    // `compat_root` points at `workspace_root` per the §3.1.bis
+    // routing table. Consumers that need member-anchored paths route
+    // through `member_root` explicitly below. In the non-`--package`
+    // collapse case (`workspace_member_context.is_none()`) both paths
+    // are identical and behavior stays single-root.
     let compat_root = dual_root.workspace_root.clone();
     let member_root = dual_root.member_root.clone();
     let upstream_manifest = dual_root.member_manifest.clone();
@@ -131,7 +129,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // `compile_pass/` / `compile_fail/` and the inner session would see
     // zero fixtures.
     //
-    // **Why ABSOLUTE paths here (approach A from the PR #34 redesign).**
+    // **Why ABSOLUTE paths here.**
     // The overlay now lives at `<compat_root>/target/lihaaf-overlay/Cargo.toml`,
     // two dirs deeper than the upstream `Cargo.toml`. lihaaf's
     // [`crate::discovery::collect`] resolves relative `fixture_dirs`
@@ -142,23 +140,23 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // — a double-`target/` path that does not exist (fixture-conversion
     // writes to `<compat_root>/target/lihaaf-compat-converted/...`).
     //
-    // Approach A absolutizes the two paths against `compat_root` here,
-    // so the inner session sees the real on-disk locations regardless
-    // of where the overlay manifest is staged. The cross-platform
+    // Absolutizing the two paths against `compat_root` here lets the
+    // inner session see the real on-disk locations regardless of where
+    // the overlay manifest is staged. The cross-platform
     // §3.2.3 byte-determinism requirement (no platform-dependent
     // absolute paths in the §3.3 envelope) is preserved because these
     // paths flow into the OVERLAY MANIFEST, not the envelope —
     // `render_inner_command` shows the overlay manifest path itself but
     // never the synthesized `fixture_dirs`, and the envelope's
     // `crate_name` / `commit` / `commands.lihaaf` fields contain no
-    // absolute paths. Approach B (carry upstream root through the
-    // inner-session struct) would be semantically cleaner but
-    // significantly more invasive — every call site of
+    // absolute paths. Carrying the upstream root through the
+    // inner-session struct would be significantly more invasive —
+    // every call site of
     // `discovery::collect` would need a second path argument, and the
     // existing v0.1 surface only exposes one root. Approach A keeps
     // the §3.2.3 invariants while landing the GA fix in the smallest
     // possible change.
-    // Issue #53 — fixture conversion + discovery anchor on `member_root`
+    // Fixture conversion + discovery anchor on `member_root`
     // (per §3.1.bis routing table). The overlay is staged at
     // `<member_root>/target/lihaaf-overlay/`; converted fixtures live
     // at `<member_root>/target/lihaaf-compat-converted/` so the inner
@@ -205,7 +203,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     // the workspace root, which is the natural form for the envelope.
     guard.track(overlay_plan.sibling_manifest.clone(), &compat_root);
 
-    // Issue #53 — discovery walks `<member_root>/tests/*.rs`. The
+    // Discovery walks `<member_root>/tests/*.rs`. The
     // workspace root has no `tests/` of its own in the virtual-
     // workspace shape, so anchoring on `compat_root` (= workspace_root)
     // would find zero fixtures. Anchor on `member_root` per §3.1.bis
@@ -379,8 +377,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
     Ok(())
 }
 
-/// Resolve the dual-root vocabulary from `CompatArgs` (issue #53 — see
-/// plan §3.1.bis routing table + §4.2 driver wire-up).
+/// Resolve the dual-root vocabulary from `CompatArgs`.
 ///
 /// Decision tree:
 ///
@@ -393,8 +390,7 @@ pub fn run(args: cli::CompatArgs) -> Result<(), Error> {
 /// 2. **No `--package`: single-root collapse.** When `--package` is
 ///    absent, the four paths collapse: `workspace_root == member_root`
 ///    and `workspace_root_manifest == member_manifest`. The overlay
-///    materializer's existing single-root logic runs unchanged. Round-1
-///    pilots (cxx, serde_json, anyhow, thiserror) all hit this branch.
+///    materializer's existing single-root logic runs unchanged.
 ///
 /// 3. **`--package` supplied: dual-root resolver.** The default
 ///    manifest at `<compat_root>/Cargo.toml` MUST be a virtual
@@ -552,7 +548,7 @@ fn render_inner_command(
 ) -> String {
     // Strip the compat_root prefix and convert to forward-slash form so the
     // envelope field is the same on every runner regardless of its absolute
-    // checkout path (e.g. `/home/runner/work/...` vs `/home/tarunvir/...`).
+    // checkout path (e.g. `/home/runner/work/...` vs `/workspace/local/...`).
     let rel_manifest = overlay_manifest
         .strip_prefix(compat_root)
         .unwrap_or_else(|_| {
@@ -621,12 +617,11 @@ fn render_argv(argv: &[String]) -> String {
 /// Build the §3.3 envelope's `mismatch_examples` list from the
 /// baseline-side mismatch entries.
 ///
-/// For v0.1.0-beta.4 the comparison surface is conservative: each
+/// The comparison surface is conservative: each
 /// baseline-side `BaselineMismatch` becomes one `MismatchExample` with
 /// `mismatch_type = "baseline_only_fail"` / `"baseline_only_pass"`
 /// derived from the baseline verdict alone. The lihaaf-side outcome is
-/// not joined yet — that is the v0.2 "compare per-fixture verdicts"
-/// surface. The §5 gate reads only `results.mismatch_count` for v0.1.
+/// not joined yet. The §5 gate reads only `results.mismatch_count`.
 fn build_mismatch_examples(
     baseline_result: &baseline::BaselineResult,
     _converted: &[fixture_convert::ConvertedFixture],
@@ -671,11 +666,10 @@ fn inner_error_exit_code(e: &Error) -> i32 {
 /// baseline parser's `unknown_count` is a diagnostic counter that lives
 /// in `results.baseline.unknown_count` for the operator to inspect; it
 /// is NOT an envelope-level error condition. Pushing a `baseline_unknown`
-/// entry into `errors[]` from a positive `unknown_count` is what
-/// recreates the §5 gate coupling that was explicitly removed in
-/// `89fec16` (round-3): every trybuild adopter run produces
-/// `unknown_count >= 1` (the libtest wrapper line) so making the gate
-/// key off `errors.is_empty()` would always block. Encoding the
+/// entry into `errors[]` from a positive `unknown_count` would
+/// recreate the unwanted §5 gate coupling: every trybuild adopter run
+/// produces `unknown_count >= 1` (the libtest wrapper line), so making
+/// the gate key off `errors.is_empty()` would always block. Encoding the
 /// invariant in the function signature ensures that future edits to
 /// the envelope-construction path cannot reintroduce the coupling.
 ///
@@ -807,14 +801,12 @@ mod tests {
         // cannot regress silently. A renamed flag, a typo'd `true`/`false`,
         // or an inverted builder argument bites here.
         //
-        // Issue #45 / v0.1.0-beta.10 note: the three adopter-defined
-        // normalizer override keys (`extra_substitutions`, `strip_lines`,
-        // `strip_line_prefixes`) are intentionally NOT chained here. The
-        // compat driver synthesizes `[package.metadata.lihaaf]` entirely
-        // and does not surface adopter TOML into the inner session, so
-        // there is no Suite-level value to forward. Compat-mode adopter
-        // extras are unsupported in v0.1.0-beta.10 (OQ-4 deferral) —
-        // see docs/spec/lihaaf-v0.1.md §6.6.
+        // The three adopter-defined normalizer override keys
+        // (`extra_substitutions`, `strip_lines`, `strip_line_prefixes`)
+        // are intentionally NOT chained here. The compat driver
+        // synthesizes `[package.metadata.lihaaf]` entirely and does not
+        // surface adopter TOML into the inner session, so there is no
+        // Suite-level value to forward.
         let ctx_compat =
             crate::normalize::NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/r"))
                 .with_compat_short_cargo(true);
@@ -832,9 +824,8 @@ mod tests {
     }
 
     /// **Diagnostic-errors do NOT couple to `baseline.unknown_count`.**
-    /// Round-3 commit `89fec16` removed the direct `unknown_count != 0`
-    /// rule from the §5 gate, but a positive `unknown_count` was still
-    /// pushing a `baseline_unknown` entry into `envelope.errors[]`. Every
+    /// A positive `unknown_count` must not push a `baseline_unknown`
+    /// entry into `envelope.errors[]`. Every
     /// trybuild adopter run produces `unknown_count >= 1` (the libtest
     /// wrapper line), so any gate that keys off `errors.is_empty()`
     /// would always block. This test pins the invariant in the function
@@ -876,16 +867,16 @@ mod tests {
     /// produce byte-identical `--manifest-path` values.
     ///
     /// Without the relativization fix, `overlay_manifest.to_string_lossy()` is
-    /// used directly — producing `/home/runner/work/.../target/lihaaf-overlay/Cargo.toml`
-    /// on one runner and `/home/tarunvir/.../target/lihaaf-overlay/Cargo.toml` on
-    /// another. This test would fail before the fix.
+    /// used directly — producing runner-specific
+    /// `/.../target/lihaaf-overlay/Cargo.toml` paths. This test would
+    /// fail without the repo-relative rendering.
     #[test]
     fn render_inner_command_manifest_path_is_repo_relative() {
         // Two hypothetical compat_root values with the same repo layout but
         // different absolute prefixes — simulates two different CI runners
         // that checked out at different absolute paths.
         let compat_root_a = PathBuf::from("/home/runner/work/my-crate");
-        let compat_root_b = PathBuf::from("/home/tarunvir/projects/my-crate");
+        let compat_root_b = PathBuf::from("/workspace/local/my-crate");
 
         // The overlay is staged at `<compat_root>/target/lihaaf-overlay/Cargo.toml`
         // on both runners.

@@ -92,13 +92,12 @@ pub enum Error {
     /// Surfaced by the compat overlay materializer's Rule 4 (REJECT)
     /// branch. The §3.3 envelope renders this as an overlay-stage
     /// error; the operator sees the structured message verbatim so
-    /// they can resolve by either reshaping their upstream's
-    /// `[patch.crates-io]` table or waiting for the v0.2/v1.1
-    /// `--compat-allow-patch-override` escape hatch.
+    /// they can resolve by reshaping their upstream's
+    /// `[patch.crates-io]` table or filing an issue with the manifest
+    /// shape they need.
     ///
     /// See `src/compat/overlay.rs::apply_self_patch_policy` for the
-    /// 4-rule decision tree and issues #40 / #47 for the failure
-    /// shapes this policy resolves.
+    /// 4-rule decision tree.
     CompatPatchOverrideConflict {
         /// The crate name (the upstream's `[package].name`) keying the
         /// rejected `[patch.crates-io.<crate_name>]` entry.
@@ -109,8 +108,7 @@ pub enum Error {
         upstream_entry: String,
         /// Human-readable explanation of what compat-mode would have
         /// done (Rule 1 INJECT / Rule 2 REMAP) and why the upstream's
-        /// existing entry blocks it. References the v0.2/v1.1 escape
-        /// hatch.
+        /// existing entry blocks it.
         expected_resolution: String,
     },
 
@@ -167,7 +165,7 @@ pub enum Outcome {
     },
 
     /// cargo succeeded but no `compiler-artifact` message named the
-    /// dylib whose `target.name` matches `dylib_crate`.
+    /// dylib package matching `dylib_crate`.
     DylibNotFound {
         /// The cargo invocation, for repro.
         invocation: String,

@@ -1,6 +1,6 @@
 [package]
 name = "lihaaf"
-version = "0.1.0-beta.10"
+version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 authors = ["Tarunvir Bains"]
@@ -13,9 +13,9 @@ categories = ["development-tools::testing", "development-tools::procedural-macro
 documentation = "https://docs.rs/lihaaf"
 readme = "README.md"
 
-# Exclude the FIX_BEFORE_BETA Spec D integration corpus from the
-# published package and from cargo's implicit single-package
-# workspace discovery. The corpus lives under `tests/integration_corpus/`
+# Exclude the integration corpus from the published package and from
+# cargo's implicit single-package workspace discovery. The corpus lives
+# under `tests/integration_corpus/`
 # and has its own nested Cargo.toml (a regular library) plus a sibling
 # `macros/` proc-macro crate. Without the exclude, `cargo build` /
 # `cargo publish` for lihaaf itself would try to interpret the nested
@@ -160,11 +160,11 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
-# Windows FFI — `LockFileEx` / `UnlockFileEx` for the session lock
-# (FIX_BEFORE_BETA Spec B, issue #1). `windows-sys` is the Microsoft-
-# published curated bindings crate; same justification shape as the
-# Unix `libc` block above (canonical FFI source, audited externally,
-# small compile cost, no transitive deps).
+# Windows FFI — `LockFileEx` / `UnlockFileEx` for the session lock.
+# `windows-sys` is the Microsoft-published curated bindings crate;
+# same justification shape as the Unix `libc` block above (canonical
+# FFI source, audited externally, small compile cost, no transitive
+# deps).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Storage_FileSystem",     # Spec B

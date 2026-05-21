@@ -129,7 +129,7 @@ pub struct CompatEnvelope {
     /// Fixtures intentionally skipped, sorted by `fixture`.
     pub excluded_fixtures: Vec<ExcludedFixture>,
     /// Generated paths, sorted by `path`. Populated by the cleanup
-    /// guard's finalize step (issue #10).
+    /// guard's finalize step.
     pub generated_paths: Vec<GeneratedPath>,
     /// Overlay metadata (`dropped_comments`, etc.).
     pub overlay: OverlayMetadata,
@@ -177,9 +177,9 @@ pub struct BaselineCounts {
     pub pass: u32,
     /// Number of fixtures the baseline reported `fail` for.
     pub fail: u32,
-    /// Number of libtest output lines the conservative parser
-    /// (issue #9) could not correlate to a recognized fixture. Always
-    /// present (`0` when every line correlated).
+    /// Number of libtest output lines the conservative parser could
+    /// not correlate to a recognized fixture. Always present (`0` when
+    /// every line correlated).
     pub unknown_count: u32,
     /// `cargo test`'s process exit code.
     pub exit_code: i32,
@@ -283,8 +283,7 @@ pub struct GeneratedPath {
     pub class: String,
 }
 
-/// Overlay metadata recorded by the overlay materialization step
-/// (issue #11).
+/// Overlay metadata recorded by the overlay materialization step.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OverlayMetadata {
     /// `true` when the overlay was materialized this run. Always
@@ -385,10 +384,10 @@ pub fn generated_path_from_cleanup(
 /// ## Relationship to other path normalizations
 ///
 /// This mirrors the `commands.lihaaf` normalization in
-/// `render_inner_command` (R3 FIX class III), which used
-/// `Path::strip_prefix` on a structured path value. `detail` is a
-/// free-text display string, so structured stripping is not available;
-/// substring replacement is the equivalent mechanism.
+/// `render_inner_command`, which uses `Path::strip_prefix` on a
+/// structured path value. `detail` is a free-text display string, so
+/// structured stripping is not available; substring replacement is the
+/// equivalent mechanism.
 pub fn normalize_error_detail_paths(envelope: &mut CompatEnvelope, compat_root: &Path) {
     let root_str = compat_root.to_string_lossy();
     // Pre-compute both replacement targets so we allocate the strings

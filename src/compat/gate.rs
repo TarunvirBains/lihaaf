@@ -57,13 +57,11 @@
 //! diagnostic signal so adopters can inspect parser-correlation issues;
 //! the gate just does not enforce it.
 //!
-//! ## v0.1.0-beta.4 dry-run note
+//! ## Empty baseline behavior
 //!
-//! The shipped `compat/baseline.toml` at the repo root is empty for
-//! v0.1.0-beta.4 — no pilot crates are enrolled. The gate is a NO-OP
-//! until pilot PRs add entries; the workflow YAML wires up the dry-run
-//! shape so subsequent PRs can populate the table without the workflow
-//! itself being net-new.
+//! An empty `compat/baseline.toml` enrolls no crates. The gate returns
+//! [`GateOutcome::NotEnrolled`] until rows are added; the workflow can
+//! then keep the same shape while individual pilot crates opt in.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -145,7 +143,7 @@ pub enum GateOutcome {
 /// the gate to pass. Omitting the key leaves the rule at "both exit
 /// codes must be `0`".
 ///
-/// Empty input (the v0.1.0-beta.4 default) produces an empty map.
+/// Empty input produces an empty map.
 ///
 /// **Errors.** Returns [`Error::TomlParse`] on malformed TOML, missing
 /// or negative `n_max`, or a non-integer `expected_exit_code` value.

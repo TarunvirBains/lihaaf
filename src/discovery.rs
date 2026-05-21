@@ -164,6 +164,7 @@ mod tests {
             allow_lints: vec![],
             edition: "2021".into(),
             dev_deps: vec![],
+            build_targets: Default::default(),
             compile_fail_marker: marker.to_string(),
             fixture_timeout_secs: 90,
             per_fixture_memory_mb: 1024,
