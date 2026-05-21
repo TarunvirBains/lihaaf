@@ -240,10 +240,6 @@ Constraints (validated at config parse time):
   `per_fixture_memory_mb`, `allow_lints`) inherit from the top-level
   table when omitted on a named suite.
 
-See `docs/spec/lihaaf-v0.1.md` §3.6 for the full design.
-
-Flag behavior aligns with the v0.1 contract documented in the spec companion.
-
 ## Verdicts and exit codes
 
 Every fixture produces exactly one verdict. The run exits with the most
@@ -271,9 +267,6 @@ severe code from the fixture verdicts and session-level outcomes.
   lihaaf` subcommand. There is no `#[test]` integration;
   the `cargo test` scheduler would compromise lihaaf's parallelism,
   OOM containment, and drift detection.
-- **Coverage / multi-target / IDE / watch.** Those are deferred on
-  purpose. Each cut has a concrete reason and a future-trigger or
-  explicit "never" classification.
 
 ## Tradeoffs and choices
 
@@ -290,8 +283,7 @@ felt easiest to keep stable and debuggable in day-to-day use:
   adopters that do not opt in.
 
 - **File copy primitive**: `std::fs::copy`. It's plain and predictable:
-  POSIX semantics on Linux/macOS, `CopyFileW` on Windows. Reflink is
-  still deferred for v0.2.
+  POSIX semantics on Linux/macOS, `CopyFileW` on Windows.
 
 - **Per-platform RSS sampling**:
   - Linux: `/proc/<pid>/statm` (2nd field × `sysconf(_SC_PAGESIZE)`).
@@ -328,7 +320,7 @@ felt easiest to keep stable and debuggable in day-to-day use:
   curated source for POSIX FFI signatures.
 - `windows-sys` 0.59 (Windows only) — `OpenProcess` + `GetProcessMemoryInfo`
   for RSS sampling; `LockFileEx` / `UnlockFileEx` for the session lock.
-- `syn` 2 — compat-mode fixture discovery via AST analysis (spec §3.2.1).
+- `syn` 2 — compat-mode fixture discovery via AST analysis.
 - `proc-macro2` 1 — span-location support for compat-mode discovery
   (line-number citations in `discovery_unrecognized` entries).
 

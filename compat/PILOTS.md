@@ -7,7 +7,7 @@ contract.
 ## Enrolled pilots (v0.1)
 
 Four crates are on the stage-2 ladder. None are stage-3 enrolled in
-`compat/baseline.toml` yet — that table ships empty in v0.1.0-beta.4.
+`compat/baseline.toml` yet — that table ships empty.
 
 | upstream crate | pilot fork |
 | --- | --- |
@@ -64,10 +64,9 @@ token carries zero scope on the fork repo. The four v0.1 forks
 default to public. Verify each fork's **Settings → General → Danger
 Zone** shows "Public repository" before enrolling.
 
-Private-fork support is **v0.2 work** and requires a PAT-based
-dispatch design (the orchestrator would need a PAT scoped across each
-fork, with the corresponding rotation procedure — out of scope for
-v0.1 GA).
+Private-fork support presently requires a PAT-based dispatch design (the
+orchestrator would need a PAT scoped across each fork, with the
+corresponding rotation procedure).
 
 ## One-time fork setup
 
@@ -274,16 +273,3 @@ called workflow is the orchestrator's, scoped by the orchestrator's
 four pilots; all four forks are owned by `TarunvirBains`, so
 cross-org governance does not apply.
 
-### v0.2 work
-
-- **Windows runner**: the KNOWN_DIFFS Windows-cleanup divergence is
-  v0.2 work. v0.1 stage-2 runs `ubuntu-24.04` only.
-- **Scheduled refresh**: `schedule: - cron: '0 6 * * 1'` is the
-  intended v0.2 cadence (Mondays 06:00 UTC), gated on the
-  dispatch-surface audit above.
-- **Aggregated summary**: v0.2 may add a downstream summarize job
-  that re-downloads each pilot's envelope artifact and emits a
-  single-page summary. Designed-around-Actions-matrix-output limits.
-- **Asymmetric `expected_exit_code`**: per-side baseline/lihaaf exit
-  code expectation lives in v0.2 (see `KNOWN_DIFFS.md`
-  schema-version section).

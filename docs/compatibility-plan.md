@@ -388,7 +388,7 @@ The compat workflow assumes `cargo lihaaf` is callable inside the fork's CI envi
      run: cargo install lihaaf --version 0.1.0-alpha.2 --locked
    ```
    Trade-off: 30–60s install cost per CI run, paid every run unless cached. Cache key includes the lihaaf version and the rustc version. No upstream-manifest modification.
-2. **Pinned binary from a release asset** (deferred to v0.1.0 GA): the lihaaf release workflow attaches a static-linked `cargo-lihaaf` binary to GitHub releases; fork CI downloads it directly. Trade-off: faster install, requires lihaaf to maintain the release-asset pipeline.
+2. **Pinned binary from a release asset**: the lihaaf release workflow attaches a static-linked `cargo-lihaaf` binary to GitHub releases; fork CI downloads it directly. Trade-off: faster install, requires lihaaf to maintain the release-asset pipeline.
 
 The compat plan does **not** support adding lihaaf as a dev-dependency in the fork's upstream `Cargo.toml`. That would touch the upstream manifest, which §3.2.3 forbids. Forks that need a deeper integration than `cargo install` carry that integration in the fork's own `Cargo.toml` only when the fork itself authors the change deliberately (and accepts that the staged overlay will canonicalize that dependency through its own re-serialization); the v0.1 compat driver never injects dependencies into the staged overlay on behalf of the fork.
 
