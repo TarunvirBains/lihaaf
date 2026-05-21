@@ -89,6 +89,13 @@ edition = "2021"
 # main crate. Other entries (e.g. unexpected_cfgs) become active when
 # rustc is invoked with --check-cfg; today lihaaf does not pass --check-cfg.
 allow_lints = ["unused_imports", "dead_code"]
+# Note: allow_lints inherits from the default suite when omitted on a named suite.
+# Optional — literal-substring substitutions applied after built-in path placeholders.
+# extra_substitutions = [{ from = "/nix/store/...", to = "$NIX_STORE" }]
+# Optional — drop full lines that exactly match any of these strings.
+# strip_lines = ["For more information about this error, try `rustc --explain E0308`"]
+# Optional — drop full lines that begin with any of these prefixes.
+# strip_line_prefixes = ["note: this error originates from"]
 ```
 
 Layout:
@@ -132,6 +139,51 @@ laptop).
 | `--verbose` / `-v` | Print each fixture's `rustc` command + captured stderr. |
 | `--use-symlink` | Skip the lihaaf-managed dylib copy; symlink instead. Saves disk + time, but unsafe under concurrent cargo activity. |
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
+| `--package <NAME>` / `-p <NAME>` | Compat-mode workspace-member selector. Required when `--compat-root` points at a workspace root that declares `[workspace]` without `[package]`. Single package per invocation. |
+
+## Compat mode
+
+`cargo lihaaf --compat` is a migration workflow for proc-macro crates that
+already have a [trybuild](https://github.com/dtolnay/trybuild) fixture corpus.
+It runs lihaaf against your existing trybuild fixtures and generates a
+deterministic JSON comparison envelope that captures both the trybuild baseline
+and lihaaf's per-fixture verdicts side by side.
+
+The typical invocation:
+
+```bash
+cargo lihaaf \
+  --compat \
+  --compat-root <PATH-TO-CRATE-CHECKOUT> \
+  --compat-report compat-report.json
+```
+
+For workspace-member crates where `--compat-root` points at a workspace root
+(a manifest that declares `[workspace]` without `[package]`), add
+`--package <NAME>` to select the target member:
+
+```bash
+cargo lihaaf \
+  --compat \
+  --compat-root /path/to/workspace-root \
+  --package my-crate \
+  --compat-report compat-report.json
+```
+
+Key flags:
+
+| Flag | Purpose |
+|---|---|
+| `--compat` | Enable compat mode. Mutually exclusive with normal `--filter` / `--manifest-path` flags. |
+| `--compat-root <PATH>` | Path to the target crate checkout. Required in compat mode. |
+| `--compat-report <PATH>` | Output path for the JSON comparison envelope. Required in compat mode. |
+| `--package <NAME>` / `-p <NAME>` | Workspace-member selector. Required when `--compat-root` is a workspace root without `[package]`. |
+
+The JSON envelope is byte-deterministic: two CI runners at the same commit
+produce identical envelope bytes. It is suitable for committing as a baseline
+artifact and comparing across runs with `diff` or `jq`.
+
+See `docs/compatibility-plan.md` for the full compat-mode design.
 
 ## Multi-suite
 
@@ -216,9 +268,9 @@ severe code from the fixture verdicts and session-level outcomes.
 ## What lihaaf is not
 
 - **A `cargo test` replacement.** lihaaf ships as a separate `cargo
-  lihaaf` subcommand. There is no `#[test]` integration yet;
-  the `cargo test` scheduler would compromise lihaaf's parallelism +
-  OOM containment + drift detection.
+  lihaaf` subcommand. There is no `#[test]` integration;
+  the `cargo test` scheduler would compromise lihaaf's parallelism,
+  OOM containment, and drift detection.
 - **Coverage / multi-target / IDE / watch.** Those are deferred on
   purpose. Each cut has a concrete reason and a future-trigger or
   explicit "never" classification.
@@ -245,11 +297,11 @@ felt easiest to keep stable and debuggable in day-to-day use:
   - Linux: `/proc/<pid>/statm` (2nd field × `sysconf(_SC_PAGESIZE)`).
     Verified against rustc child processes on `rustc 1.95.0` on Linux
     6.x x86_64.
-  - macOS / Windows: returns `None` from the sampler. The OS
-    OOMkiller / jetsam still backstops; a runaway worker on those
-    platforms surfaces as `WORKER_CRASHED` rather than
-    `MEMORY_EXHAUSTED`. v0.x lands proper macOS / Windows sampling
-    APIs.
+  - macOS: `libc::proc_pidinfo(PROC_PIDTASKINFO)` — same semantics as
+    the Linux path. Runaway workers correctly surface as
+    `MEMORY_EXHAUSTED`.
+  - Windows: `OpenProcess` + `GetProcessMemoryInfo` (via `windows-sys`).
+    Runaway workers correctly surface as `MEMORY_EXHAUSTED`.
 
 - **Sampling interval**: 100 ms. Short enough to catch a
   runaway monomorphization before the OS OOMkiller fires; long enough
@@ -270,9 +322,15 @@ felt easiest to keep stable and debuggable in day-to-day use:
 - `serde` + `serde_json` — manifest write/read.
 - `sha2` — dylib SHA-256 for stale-state checks.
 - `tempfile` — per-session temporary directory.
-- `libc` 0.2 (Unix only) — `kill(2)` for worker termination and
-  `sysconf(_SC_PAGESIZE)` for RSS unit conversion. The canonical curated
-  source for POSIX FFI signatures.
+- `libc` 0.2 (Unix only) — `kill(2)` for worker termination,
+  `sysconf(_SC_PAGESIZE)` for RSS unit conversion, and
+  `proc_pidinfo(PROC_PIDTASKINFO)` for macOS RSS sampling. The canonical
+  curated source for POSIX FFI signatures.
+- `windows-sys` 0.59 (Windows only) — `OpenProcess` + `GetProcessMemoryInfo`
+  for RSS sampling; `LockFileEx` / `UnlockFileEx` for the session lock.
+- `syn` 2 — compat-mode fixture discovery via AST analysis (spec §3.2.1).
+- `proc-macro2` 1 — span-location support for compat-mode discovery
+  (line-number citations in `discovery_unrecognized` entries).
 
 ## Stability
 
