@@ -35,7 +35,17 @@ use crate::error::Error;
                   per-fixture rustc invocation that links the dylib via --extern. \
                   See `target/lihaaf/manifest.json` for the dylib metadata after \
                   the first run. Configuration: `[package.metadata.lihaaf]` in the \
-                  consumer's Cargo.toml."
+                  consumer's Cargo.toml.\n\n\
+                  New setup: add `dylib_crate`, `extern_crates`, and `fixture_dirs` \
+                  to `[package.metadata.lihaaf]`, then place `.rs` fixtures and \
+                  matching `.stderr` snapshots under the configured fixture dirs. \
+                  Run `cargo lihaaf --bless` once to create or refresh snapshots, \
+                  then `cargo lihaaf` in CI.\n\n\
+                  Trybuild migration note: most conversions only need `dev_deps`; \
+                  for split metadata/dylib crates whose fixtures cannot resolve \
+                  metadata-side dev-deps, set `build_targets = [\"tests\"]` on \
+                  each suite that needs staged dev-dep collection. See \
+                  `docs/migrating-from-trybuild.md`."
 )]
 pub struct Cli {
     /// Overwrite `.stderr` snapshots whose normalized output differs
