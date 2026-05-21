@@ -23,6 +23,10 @@
 //! - A small set of crate-root re-exports for adopters who do want to
 //!   drive lihaaf from Rust: [`Cli`], [`Config`], [`Verdict`],
 //!   [`ExitCode`], [`Error`], [`Outcome`], [`run`], [`Report`].
+//! - **Compat mode** (`cargo lihaaf --compat`): a migration workflow for
+//!   trybuild fixture corpora that generates a deterministic JSON comparison
+//!   envelope. The compat mode Rust API surface is intentionally
+//!   `#[doc(hidden)]`; the supported entry is always the CLI.
 //!
 //! All other modules are `pub(crate)` and may evolve freely across
 //! v0.1.x point releases. Adopters who want to drive lihaaf from Rust

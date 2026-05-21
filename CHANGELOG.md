@@ -6,6 +6,49 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-21
+
+Documentation-only release. No behavior change, no API change, no new
+features. All gates (CLI surface, exit codes, snapshot byte format,
+`[package.metadata.lihaaf]` schema) are byte-identical to 0.1.0.
+
+### Fixed (documentation)
+
+- **RSS sampling platform support** (README "Per-platform RSS sampling"):
+  corrected stale "returns `None` / `WORKER_CRASHED`" language. macOS uses
+  `libc::proc_pidinfo(PROC_PIDTASKINFO)` and Windows uses `OpenProcess` +
+  `GetProcessMemoryInfo`; both platforms correctly surface runaway workers as
+  `MEMORY_EXHAUSTED`. The forward-looking "v0.x lands proper sampling APIs"
+  sentence is removed — this shipped in 0.1.0-beta.1.
+
+- **Compat mode section added** (README "Compat mode"): `cargo lihaaf --compat`
+  was a headline beta.4 feature with no README coverage. New section documents
+  the migration workflow, key flags (`--compat`, `--compat-root`,
+  `--compat-report`, `--package`), and the deterministic JSON envelope output.
+
+- **Quick Start config keys** (README `[package.metadata.lihaaf]` snippet):
+  added `extra_substitutions`, `strip_lines`, and `strip_line_prefixes` as
+  commented-out optional entries with one-line descriptions. These keys shipped
+  in beta.10 but were absent from the quick-start snippet. Also added a comment
+  noting that `allow_lints` inherits from the default suite when omitted on a
+  named suite.
+
+- **`--package`/`-p` in Common flags table** (README): added the compat-mode
+  workspace-member selector row, which was missing from the flags reference.
+
+- **Dependencies section** (README): added `windows-sys` 0.59 (Windows RSS +
+  session lock), `syn` 2 (compat fixture discovery), and `proc-macro2` 1
+  (span-location support). Updated `libc` entry to mention macOS
+  `proc_pidinfo` in addition to the existing Unix items.
+
+- **`#[test]` integration classification** (README "What lihaaf is not"):
+  removed "yet" and the implication of future support. This is classified
+  as "NEVER" in spec §11.5; the sentence now reads without the qualifier.
+
+- **Compat mode in crate-root docs** (`src/lib.rs` "Public surface"): added
+  a bullet noting that `cargo lihaaf --compat` exists as a CLI feature for
+  trybuild migration and that its Rust API surface is `#[doc(hidden)]`.
+
 ## [0.1.0-beta.10] — 2026-05-19
 
 Delivers the `extra_substitutions` adopter-configuration framework (issue #45,
