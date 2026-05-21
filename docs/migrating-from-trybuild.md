@@ -4,7 +4,7 @@ This guide walks existing trybuild users through converting a compile-fail and/o
 compile-pass fixture suite to lihaaf. It is based on three real-world conversions:
 sassi ([`c143f373`](https://github.com/TarunvirBains/sassi/commit/c143f373)),
 djogi ([`fbc80b52`](https://github.com/TarunvirBains/djogi/commit/fbc80b52)),
-and the anyhow pilot fork (branch `lihaaf-converted`).
+and the anyhow conversion branch (`lihaaf-converted`).
 
 ## Who this guide is for
 
@@ -46,7 +46,7 @@ binary. The full key reference is in
 [`docs/spec/lihaaf-v0.1.md` §3.2](spec/lihaaf-v0.1.md).
 
 **Minimal example** — single crate, fixtures only import from the crate itself
-(like the anyhow pilot: 7 fixtures, `use anyhow::...`, no macro sibling):
+(like anyhow: 7 fixtures, `use anyhow::...`, no macro sibling):
 
 ```toml
 [package.metadata.lihaaf]
@@ -85,6 +85,10 @@ Key points:
 - `dev_deps` lists extra crates that fixtures import directly but that are not
   in `extern_crates` — commonly `serde`, `serde_json`, or test-utility crates.
   Each entry is resolved via `cargo metadata` and forwarded as `--extern`.
+- Most migrations do not need `build_targets`. If a split-crate migration fails
+  to make a metadata-side dev-dep available to the per-fixture
+  `rustc` loop, use the staged workspace shape described in the axum-macros
+  grouped-layout section below.
 - `features` controls which Cargo features are enabled for both the dylib build
   and every per-fixture `rustc` invocation. Use it when test helpers are gated
   behind a feature (e.g. `features = ["testing"]`).
@@ -112,7 +116,7 @@ git mv tests/ui/foo.stderr tests/compile_fail/foo.stderr
 
 You do **not** need to rename files. Hyphens in fixture filenames are valid
 identifiers for lihaaf — `chained-comparison.rs` stays `chained-comparison.rs`.
-The anyhow pilot kept every upstream filename verbatim during conversion.
+The anyhow conversion kept every upstream filename verbatim.
 
 Once all files are moved, remove the now-empty directory:
 
@@ -199,7 +203,7 @@ In `Cargo.toml`, drop `trybuild` from `[dev-dependencies]` and any explicit
 
 **`rustversion` — keep or drop?** Drop it only if it was used exclusively by the
 trybuild gate (e.g. `#[rustversion::attr(stable, test)]` wrapping the trybuild
-test function). The anyhow pilot kept `rustversion` because `test_ensure.rs` and
+test function). The anyhow conversion kept `rustversion` because `test_ensure.rs` and
 `test_backtrace.rs` use `#[rustversion::...]` attributes directly, independently
 of the trybuild driver. When in doubt, check if any non-fixture test file imports
 `rustversion` before removing it.
@@ -237,7 +241,7 @@ When you upgrade lihaaf, bump the pin and re-bless snapshots in the same commit.
 `$RUST/` (a stdlib span reference), because lihaaf needs the sysroot sources to
 resolve those paths. Drop it if no snapshot references `$RUST/`. The sassi
 conversion dropped `rust-src` (its fixtures don't reference stdlib internals);
-djogi and the anyhow pilot kept it (their snapshots reference `$RUST/core/...`).
+djogi and the anyhow conversion kept it (their snapshots reference `$RUST/core/...`).
 
 ```diff
        - uses: dtolnay/rust-toolchain@master
@@ -307,9 +311,9 @@ colliding. Once trybuild is removed, the `lihaaf/` infix is dead namespace that
 serves no purpose. The no-infix layout is cleaner and matches how you would lay
 out `tests/compile_fail/` for any other testing tool.
 
-Note that the lihaaf spec currently documents the infix shape as the default.
-This guide recommends the no-infix shape and the spec will be updated to match in
-a future revision.
+Note that the lihaaf spec documents the infix shape as the default. This guide
+recommends the no-infix shape for completed migrations; set `fixture_dirs`
+explicitly when using it.
 
 ## Adoption pattern: single-commit vs two-step
 
@@ -319,7 +323,7 @@ pattern. It works well for small to medium repos where the full conversion can b
 reviewed as a unit and the snapshot re-bless is fast.
 
 **Two-step** — add the lihaaf harness first (parallel with trybuild), then excise
-trybuild in a follow-up. Djogi and the anyhow pilot both used this pattern:
+trybuild in a follow-up. Djogi and the anyhow conversion both used this pattern:
 
 1. **Step A** — add `[package.metadata.lihaaf]`, move or symlink fixtures, bless
    lihaaf snapshots. Both trybuild and lihaaf pass CI. The lihaaf fixtures use
@@ -385,8 +389,7 @@ Fields not specified on a named suite (`extern_crates`, `dev_deps`, `edition`,
 ### Grouped per-group layouts (upstream `tests/<group>/{fail,pass}/`)
 
 Some upstream crates organize fixtures into per-group subdirectories rather than
-the flat `tests/ui/` shape. The axum-macros pilot (`axum-lihaaf-pilot`,
-`lihaaf-converted` branch) keeps the upstream layout:
+the flat `tests/ui/` shape. The axum-macros conversion keeps the upstream layout:
 
 ```
 axum-macros/tests/
@@ -413,21 +416,38 @@ the default:
 [package.metadata.lihaaf]
 dylib_crate          = "axum"
 extern_crates        = ["axum", "axum-macros"]
-features             = []
+features             = ["macros"]
 dev_deps             = ["axum-extra", "serde"]
+build_targets        = ["tests"]
 edition              = "2021"
 compile_fail_marker  = "fail"
 fixture_dirs         = ["tests/debug_handler/fail", "tests/debug_handler/pass"]
 
 [[package.metadata.lihaaf.suite]]
 name         = "debug_middleware"
+features     = ["macros"]
+dev_deps     = []
 fixture_dirs = ["tests/debug_middleware/fail", "tests/debug_middleware/pass"]
 
 [[package.metadata.lihaaf.suite]]
 name         = "from_ref"
+features     = ["macros"]
+dev_deps     = []
 fixture_dirs = ["tests/from_ref/fail", "tests/from_ref/pass"]
 
-# ...four more named suites
+[[package.metadata.lihaaf.suite]]
+name          = "from_request"
+features      = ["macros"]
+dev_deps      = ["axum-extra", "serde"]
+build_targets = ["tests"]
+fixture_dirs  = ["tests/from_request/fail", "tests/from_request/pass"]
+
+[[package.metadata.lihaaf.suite]]
+name          = "typed_path"
+features      = ["macros"]
+dev_deps      = ["axum-extra", "serde"]
+build_targets = ["tests"]
+fixture_dirs  = ["tests/typed_path/fail", "tests/typed_path/pass"]
 ```
 
 Two extra patterns this surfaces:
@@ -445,13 +465,20 @@ Two extra patterns this surfaces:
   default group based on how often it'll be invoked alone (largest, most
   failure-prone, fastest to compile — whatever fits your workflow).
 
+- **`build_targets` is per-suite** — `dev_deps` inherits from the default suite,
+  but `build_targets` does not. In the axum-macros conversion, suites whose fixtures
+  import `serde` or `axum-extra` need `build_targets = ["tests"]`; suites that do
+  not need those crates should set `dev_deps = []` so they stay on the default
+  dylib-only build path. This distinction is what keeps the grouped layout from
+  compiling against an incomplete dev-dep graph.
+
 ### Toolchain-pinned fixtures
 
 If your trybuild driver was wrapped in a `#[rustversion::attr(nightly, test)]`
 gate (or similar), you simply run `cargo lihaaf` on the same toolchain the gate
 was targeting. lihaaf inherits whatever toolchain the invoking shell has on PATH
 — the toolchain selection is Cargo's job, not lihaaf's. In CI, install the
-matching toolchain before the `cargo lihaaf` step. The anyhow pilot's nightly-only
+matching toolchain before the `cargo lihaaf` step. The anyhow conversion's nightly-only
 fixtures work this way: the CI step uses `dtolnay/rust-toolchain@nightly` and
 then runs `cargo lihaaf`.
 
@@ -475,17 +502,24 @@ flag on the per-fixture `rustc` invocation. If a fixture fails with
 `error[E0432]: unresolved import` for a crate that is in `[dev-dependencies]`
 but not in `extern_crates` or `dev_deps`, add it to `dev_deps`.
 
+When the default dylib build already leaves the needed rlibs in Cargo's deps dir,
+`dev_deps` is usually enough. If the fixture still fails to resolve a
+metadata-side dev-dep after adding it to `dev_deps`, opt that suite into
+`build_targets = ["tests"]`. Named suites inherit `dev_deps` when they omit it,
+but they do not inherit `build_targets`, so add the opt-in to each named suite
+that needs the staged dev-dep collector.
+
 ## Benchmarking your conversion
 
-The anyhow pilot fork includes a reference benchmark workflow at
+The anyhow conversion branch includes a reference benchmark workflow at
 `.github/workflows/benchmark.yml` (branch `lihaaf-converted`). It runs a matrix
 job — one branch with trybuild, one with lihaaf — and uploads a timing JSON with
 wall-clock milliseconds and peak RSS for each. Use it as a template for timing
 your own conversion.
 
-Record your own before/after numbers in the conversion PR or release notes.
+Record your own before/after numbers in the conversion change or release notes.
 Fixture count, target-dir state, and enabled features affect the ratio enough
-that the pilot workflow is a template, not a universal benchmark.
+that the benchmark workflow is a template, not a universal benchmark.
 
 Note that the dylib build amortizes over the full fixture count. For very small
 fixture sets the upfront dylib build dominates and the per-fixture savings are
@@ -499,7 +533,7 @@ Before merging, confirm:
 - [ ] `cargo lihaaf` exits 0 with no snapshot mismatches.
 - [ ] `git status` is clean after re-blessing (`cargo lihaaf --bless` produced no
       new diffs, or all diffs have been staged and committed).
-- [ ] CI is green on the PR — both the normal `cargo test` gate and the new
+- [ ] CI is green on the change — both the normal `cargo test` gate and the new
       `cargo lihaaf` step.
 - [ ] `grep -r trybuild .` returns no actionable references (only narrative
       migration notes are acceptable, not unconverted driver calls or live deps).
@@ -519,5 +553,5 @@ Before merging, confirm:
   - djogi [`fbc80b52`](https://github.com/TarunvirBains/djogi/commit/fbc80b52) —
     two-step excision, no-infix layout (after infix transitional phase), kept
     `rust-src`.
-  - anyhow pilot (`lihaaf-converted` branch) — two-step, no-infix, kept `rust-src`,
+  - anyhow (`lihaaf-converted` branch) — two-step, no-infix, kept `rust-src`,
     nightly-only, minimal single-crate with no proc-macro sibling.
