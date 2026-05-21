@@ -1,5 +1,7 @@
 # Local-only working docs (mirrors sister-repo convention)
 docs/superpowers/
+docs/spec/
+docs/*.md
 
 # Rust build artifacts
 /target
