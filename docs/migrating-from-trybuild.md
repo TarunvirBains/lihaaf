@@ -222,7 +222,7 @@ same whether you're on GitHub Actions or another CI system.
 
 ```diff
 +      - name: Install cargo-lihaaf
-+        run: cargo install lihaaf --version 0.1.0-beta.9 --locked
++        run: cargo install lihaaf --version 0.1.1 --locked
 
        - name: Compile-fixture suite
 -        run: cargo test --test compiletest
@@ -483,9 +483,9 @@ job — one branch with trybuild, one with lihaaf — and uploads a timing JSON 
 wall-clock milliseconds and peak RSS for each. Use it as a template for timing
 your own conversion.
 
-Expected speedups are still being measured on real adopter crates. The first
-reference benchmark (anyhow pilot, 7 fixtures) is forthcoming; numbers will land
-in a follow-up commit.
+Record your own before/after numbers in the conversion PR or release notes.
+Fixture count, target-dir state, and enabled features affect the ratio enough
+that the pilot workflow is a template, not a universal benchmark.
 
 Note that the dylib build amortizes over the full fixture count. For very small
 fixture sets the upfront dylib build dominates and the per-fixture savings are
