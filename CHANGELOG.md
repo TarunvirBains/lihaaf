@@ -6,6 +6,27 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-21
+
+Documentation/help release. No runtime behavior change, no API change, no
+manifest schema change, no exit-code change.
+
+### Fixed (documentation)
+
+- **Trybuild migration playbook**: clarified that `build_targets = ["tests"]`
+  is not required for most sassi/djogi-style conversions, but is needed for the
+  axum-macros split metadata/dylib shape where fixtures import metadata-side
+  dev-deps such as `serde` or `axum-extra`.
+
+- **Axum-macros grouped layout example**: mirrored the working conversion shape:
+  repeat `features = ["macros"]` per suite, clear `dev_deps = []` on suites that
+  do not need staged dev-dep collection, and set `build_targets = ["tests"]` on
+  suites that do.
+
+- **CLI help**: added short setup guidance for new users and surfaced the
+  split-crate trybuild migration `build_targets = ["tests"]` rescue path in
+  `cargo lihaaf --help`.
+
 ## [0.1.1] — 2026-05-21
 
 Documentation-only release. No behavior change, no API change, no new
@@ -52,12 +73,7 @@ features. All gates (CLI surface, exit codes, snapshot byte format,
 ## [0.1.0-beta.10] — 2026-05-19
 
 Delivers the `extra_substitutions` adopter-configuration framework (issue #45,
-PR #68) with disjoint path-shape and banner-shape allowlists. The plan went
-through 6 rounds of strict-swe Opus PLANNER + Codex 5.5 xhigh adversarial
-review (3 adversarial cycles + 3 DOC cleanup rounds). The PR went through
-Codex final-review BLOCK→FIX→ALLOW iteration: round-1 ALLOW with one
-FIX_BEFORE_BETA (serde `Deserialize` bypass surface); round-2 BLOCK on
-validation-ordering drift between TOML and serde paths; round-3 ALLOW.
+PR #68) with disjoint path-shape and banner-shape allowlists.
 
 ### Added
 
@@ -130,7 +146,7 @@ validation-ordering drift between TOML and serde paths; round-3 ALLOW.
   as *unsupported in compat mode*. Adopter manifests using them with
   `cargo lihaaf --compat ...` are silently no-op'd at the overlay
   layer; this is the documented v0.1.0 contract, not an implementation
-  gap. Compat-mode support is a v0.2 deliverable.
+  gap. Compat-mode support is presently unavailable.
 
 - **76 new tests** added (444 → 451 lib tests since beta.9; 76 new
   reflects the full plan §7 surface plus 6 round-1-fixup regression
@@ -151,18 +167,17 @@ validation-ordering drift between TOML and serde paths; round-3 ALLOW.
 
 ## [0.1.0-beta.9] — 2026-05-18
 
-Delivers workspace-member entry via `--package` / `-p` flag (issue #53, PR #61),
-unblocking Round-2 enrollment of axum-macros and similar workspace-member-shape
-pilots. PR #61 also closes a 26-item post-merge punch list across four classes:
-resolver path normalization (BLOCK-1, 12 sites), workspace-root non-table hard
-rejection (BLOCK-2, 8 sites), multi-registry `[patch.<registry>]` carry-down
-(BLOCK-3 / COUNTER_SIGNAL), and non-table member-local patch rejection.
+Delivers workspace-member entry via `--package` / `-p` flag (issue #53, PR #61).
+PR #61 also closes a 26-item follow-up across four classes: resolver path
+normalization (12 sites), workspace-root non-table hard rejection (8 sites),
+multi-registry `[patch.<registry>]` carry-down, and non-table member-local
+patch rejection.
 
 ### Added
 
-- Compat-mode `--package <pkg>` / `-p <pkg>` flag for workspace-member entry (PR #61). When `--compat-root` points at a workspace root, `--package` resolves the upstream manifest to the named workspace member. The workspace's `[workspace.*]`, ALL `[patch.<registry>]` subtables (crates-io and alt registries), `[replace]`, and `[profile.*]` tables are carried down into the staged overlay so the member's `{ workspace = true }` references and patch resolution match baseline cargo's behavior. Closes #53 — unblocks Round-2 enrollment of axum-macros and similar workspace-member-shape pilots. PR #61 also includes: 12-site resolver path normalization (BLOCK-1), workspace-root non-table `[patch.<registry>]` hard rejection at 8 sites (BLOCK-2), multi-registry carry-down for all `[patch.<registry>]` subtables (BLOCK-3 / COUNTER_SIGNAL), and non-table member-local patch rejection for all registries.
+- Compat-mode `--package <pkg>` / `-p <pkg>` flag for workspace-member entry (PR #61). When `--compat-root` points at a workspace root, `--package` resolves the upstream manifest to the named workspace member. The workspace's `[workspace.*]`, ALL `[patch.<registry>]` subtables (crates-io and alt registries), `[replace]`, and `[profile.*]` tables are carried down into the staged overlay so the member's `{ workspace = true }` references and patch resolution match baseline cargo's behavior. Closes #53. Also includes: 12-site resolver path normalization, workspace-root non-table `[patch.<registry>]` hard rejection at 8 sites, multi-registry carry-down for all `[patch.<registry>]` subtables, and non-table member-local patch rejection for all registries.
 
-  See `docs/compatibility-plan.md` §3.2.3 ("Workspace-member entry via `--package`") and `docs/spec/lihaaf-v0.1.md` §8.2 for the adopter-facing surface. v0.1.0 scope is virtual workspaces only (workspace root declares `[workspace]` without `[package]`); the package+workspace shape is deferred to v0.2 / v1.0 with a directed REJECT diagnostic.
+  See `docs/compatibility-plan.md` §3.2.3 ("Workspace-member entry via `--package`") and `docs/spec/lihaaf-v0.1.md` §8.2 for the adopter-facing surface. v0.1.0 scope is virtual workspaces only (workspace root declares `[workspace]` without `[package]`); the package+workspace shape is presently not supported and is rejected with a directed REJECT diagnostic.
 
 ## [0.1.0-beta.8] — 2026-05-18
 
@@ -176,7 +191,7 @@ Closes #40 (serde-json `ambiguous specification`) and #47 (cxx
   - Rule 1 (INJECT): if your upstream Cargo.toml does not self-patch the package-under-test, lihaaf injects `[patch.crates-io.<overlay-package-name>] = { path = "<staged-overlay-dir>" }`. Resolves the previously-failing serde-json case (`ambiguous specification`) and the family-completeness equivalents on anyhow-shape pilots.
   - Rule 2 (REMAP): if your upstream self-patches the package-under-test to a path that resolves to the upstream root crate (cxx-style `path = "."`), lihaaf rewrites the entry to point at the staged overlay directory. Resolves the previously-failing cxx case (`links = "cxxbridge1"` collision).
   - Rule 3: non-target `[patch.crates-io.<X>]` entries are preserved untouched.
-  - Rule 4 (REJECT): if your upstream self-patches the package-under-test to a non-root path (vendored fork) or to a git source, lihaaf rejects with a clear error. The escape hatch (`--compat-allow-patch-override`) is deferred to v0.2/v1.1; if you hit this case, file an issue.
+  - Rule 4 (REJECT): if your upstream self-patches the package-under-test to a non-root path (vendored fork) or to a git source, lihaaf rejects with a clear error. The escape hatch (`--compat-allow-patch-override`) is presently unavailable; if you hit this case, file an issue.
 
   See `docs/compatibility-plan.md` §3.2.3 for the adopter-facing rule table.
 
@@ -186,13 +201,8 @@ Closes #40 (serde-json `ambiguous specification`) and #47 (cxx
 
 ## [0.1.0-beta.7] — 2026-05-18
 
-Bundles the `allow_lints` feature (issue #43) plus a class-sweep fix for
-NUL-byte rejection across argv-bound config string fields. The `allow_lints`
-feature landed via PR #54 across two adversarial-review rounds; Codex round-1
-flagged a single NUL gap in `validate_allow_lints`, and the subsequent
-class-enumeration sweep surfaced three additional sibling instances of the
-same gap (features, dylib_crate, test corpus). All four were closed in one
-atomic follow-up commit before merge.
+Bundles the `allow_lints` feature (issue #43) plus a NUL-byte rejection fix
+across argv-bound config string fields (PR #54).
 
 ### Added
 - **`allow_lints` config key** (#43, mirrors trybuild #302): new optional
@@ -227,15 +237,15 @@ atomic follow-up commit before merge.
 
 Targeted GA-blocker fix for compat-mode workspace identity. v0.1.0-beta.5
 correctly resolved the manifest-name + envelope-determinism bugs, but the
-post-publish refresh-pilots run
+post-publish refresh run
 ([Actions run 26000403851](https://github.com/TarunvirBains/lihaaf/actions/runs/26000403851))
-revealed a NEW bug class: the staged overlay at
+revealed a new bug class: the staged overlay at
 `<upstream>/target/lihaaf-overlay/Cargo.toml` collided with upstream
-workspace identity for workspace-style pilots. Three of four Round-1
-pilots (cxx, serde-json, thiserror) failed with
+workspace identity for workspace-style crates. Three conversion attempts
+(cxx, serde-json, thiserror) failed with
 `package <X> is a member of the wrong workspace`; only anyhow
 (single-crate, no `[workspace]`) succeeded. Tracked as issue #36; fixed
-by PR #37 across four adversarial-panel rounds.
+by PR #37.
 
 ### Fixed
 - **Workspace-identity collision in staged overlay** (`src/compat/overlay.rs`):
@@ -291,21 +301,19 @@ by PR #37 across four adversarial-panel rounds.
 ### Known limitations
 - Issue #38 — ancestor `workspace.exclude` array not honored in
   implicit-ancestor detection. Conservative false-positive rejection
-  on intentionally-excluded descendants; low likelihood. POST_BETA.
+  on intentionally-excluded descendants; low likelihood.
 - Issue #39 — ancestor-walk doesn't follow symlinks. If upstream is
   reached via a symlink and the ancestor `[workspace]` lives only on
   the real path side, the walk misses it and the silent-divergence
-  failure mode survives. Low likelihood. POST_BETA.
+  failure mode survives. Low likelihood.
 - Issue #40 — serde_json `specification serde_json is ambiguous`
-  remains. A SEPARATE failure mode (resolution-time, not
-  manifest-parse-time) not addressed by this PR. May be collateral-
-  fixed by the new workspace handling; refresh-pilots against beta.6
-  will reveal.
+  remains. A separate failure mode (resolution-time, not
+  manifest-parse-time) not addressed by this PR.
 - Workspace-member case (lihaaf invoked from a sub-crate within a
   workspace, NOT from the workspace root) is explicitly rejected with
   a clean diagnostic. Ancestor-workspace inheritance flattening is
   out-of-scope for v0.1 (would require cross-manifest reads).
-- Windows path portability deferred to v0.2 (carried over from beta.5).
+- Windows path portability is presently limited to the Linux and macOS paths.
 
 ### Tests
 - `tests/compat/overlay_determinism.rs`: new
@@ -346,21 +354,10 @@ by PR #37 across four adversarial-panel rounds.
   clobbered by the override; the unit tests on the absolutize pass
   call it directly so they remain pinned.
 - **`src/compat/overlay.rs` module-level docs**: expanded with the
-  R1 → R2 → R3 → R4 decision-tree rationale; explains why empty
-  workspace was wrong (R1), why preserving inheritance tables matters
-  (R2), why implicit-via-refs needs rejection (R3), why ancestor-walk
-  is required for correctness (R4), and why the workspace-member case
-  is intentionally out-of-scope for v0.1.
-
-### Process
-- 4-round adversarial-panel review (Codex xhigh + Gemini 3.1-pro-preview
-  + strict-swe Opus); each BLOCK was investigated, fixed, and
-  re-reviewed:
-  - R1 (`1f6520b`) BLOCK by Codex + Gemini → R2 (`cc19ecc`)
-  - R2 BLOCK by Codex with Gemini COUNTER → R3 (`83ca8d9`)
-  - R3 BLOCK by Codex → R4 (`8d2517a`)
-  - R4 triple-ALLOW with 3 informational COUNTERs filed as issues
-    #38, #39, #40
+  decision-tree rationale; explains why empty workspace was wrong,
+  why preserving inheritance tables matters, why implicit-via-refs
+  needs rejection, why ancestor-walk is required for correctness, and
+  why the workspace-member case is intentionally out-of-scope for v0.1.
 
 ## [0.1.0-beta.5] — 2026-05-17
 
@@ -455,7 +452,7 @@ manifest-path must be a path to a Cargo.toml file" on every CI run
   silently serializing a runner-specific absolute path (R5 FIX class VI).
 
 ### Known limitations
-- Windows path portability in `errors[].detail` and `mismatch_examples[].fixture` normalization is v0.2 work. v0.1 stage-2 runs ubuntu-24.04 only.
+- Windows path portability in `errors[].detail` and `mismatch_examples[].fixture` normalization is presently limited to the Linux and macOS paths.
 
 ### Changed
 - **`docs/compatibility-plan.md` §3.2.3** rewritten to describe the
@@ -636,31 +633,6 @@ mode is a NEW surface, not a modification of existing ones.
   code pointed at the parent and used `to_string_lossy()` (platform-
   dependent backslashes on Windows).
 
-### Internal
-- **5 rounds of adversarial review** converged on triple-ALLOW. Codex
-  (xhigh) + Gemini 3.1-pro-preview (plan mode) + strict-swe (Opus,
-  --effort max for round 3+; Sonnet for rounds 1-2). Round 1 surfaced
-  8 critical bugs (incl. the fixture_dirs / non-recursive discovery
-  mismatch that defeated the entire driver, and the `compat_short_cargo`
-  flag never reaching the inner session); rounds 2-5 progressively
-  surfaced smaller real bugs as family-completeness sweeps deepened.
-- Strict-swe was escalated from Sonnet to Opus mid-cycle after Sonnet
-  missed Codex's critical fixture_dirs finding in round 1 — the diff
-  needed multi-file context Sonnet couldn't sustain.
-- Codex round-3 caught the deepest finding of the cycle: the
-  `unknown_count == 0` gate rule that was nominally removed in round-2
-  commit `89fec16` was still firing via `errors.is_empty()` because
-  `compat::run` was still pushing `baseline_unknown` into `errors[]`.
-  Type-system fix in round-4 commit `e851d94`: `assemble_diagnostic_errors`
-  helper's signature CANNOT take `unknown_count` as a parameter.
-- Test parallelism: added `static SPAWN_LOCK: Mutex<()>` in
-  `tests/compat/cli_mode_errors.rs` to serialize cargo-lihaaf
-  subprocess spawns within the binary (root cause of WSL2 global OOM
-  observed in the development cycle).
-- Two `compat_run_accepts_*` tests in `cli_mode_errors.rs` rewritten
-  at parser layer using `Cli::try_parse_from` — no longer spawn
-  cargo-lihaaf against the lihaaf repo itself (Phase-1-stub-era
-  assumption broken by the real Phase-10 driver).
 
 ## [0.1.0-beta.3] — 2026-05-14
 
@@ -687,13 +659,6 @@ unchanged from v0.1.0-beta.2.
   two of the four tests carried the explicit guard; the helper
   uniformizes the family.
 
-### Internal
-- Codex's beta-2 round-2 adversarial review surfaced three
-  informational SIBLING findings (config / normalize / session test
-  parameterization opportunities). All three are now addressed
-  across four atomic commits.
-- Adversarial review for beta-3: Codex + Gemini 3.1-pro-preview +
-  Sonnet-tier strict reviewer, all ALLOW on round 1.
 
 ## [0.1.0-beta.2] — 2026-05-13
 
@@ -729,22 +694,6 @@ text, public API surface, exit codes, snapshot byte format, and
   `buf.chunks_mut(4096)` instead of a manual stride index for
   page-touching. LLVM-equivalent codegen; reads as the documented
   intent.
-
-### Internal
-- Dead `_ensure_dir_exists` helper deleted from `session.rs` (was
-  `#[allow(dead_code)]` + `_`-prefixed double signal; zero callers).
-- Broken comment fragment in `compute_parallelism` fixed.
-- `FreshnessFailure::RustcDrift` now documents the `Box<Toolchain>`
-  × 2 rationale (clippy `result_large_err` mitigation; unboxing
-  re-trips the lint).
-- 43 simplify-pass findings reviewed (Reuse 4 / Quality 27 /
-  Efficiency 12). 8 high-certainty items applied across 4 atomic
-  commits; 11 lower-certainty items deferred; 1 (`EFFICIENCY-1`)
-  retained per the existing module-level rationale (defense-in-depth
-  against in-session toolchain swap).
-- Triple-reviewer adversarial panel: Codex + Gemini 3.1-pro-preview +
-  Sonnet-tier strict reviewer. Family-completeness sweeps confirmed
-  no remaining sibling sites in the crate.
 
 ## [0.1.0-beta.1] — 2026-05-13
 
@@ -1000,13 +949,8 @@ should subprocess-spawn `cargo lihaaf` rather than depend on
 - Unix `kill(2)` and `sysconf(_SC_PAGESIZE)` route through the
   `libc` crate instead of hand-rolled `extern "C"` blocks.
 - Spec §4.5 amended to acknowledge the v0.1 hard-fail policy on
-  freshness divergence and to defer the in-session rebuild path to
-  v0.2. The four §4.5 invariants now share §4.6's hard-fail behavior
-  (exit code 67) explicitly. Previously the spec mandated rebuild
-  while the implementation hard-failed; this brings the spec text in
-  line with shipping behavior + the deferral note in
-  `src/freshness.rs` rustdoc. (Codex delta-review A3.)
+  freshness divergence; in-session rebuild is presently not supported.
+  The four §4.5 invariants now share §4.6's hard-fail behavior
+  (exit code 67) explicitly. This brings the spec text in line with
+  shipping behavior.
 
-### Pending before v0.1.0 release
-- (Resolved in `0.1.0-beta.1`) macOS / Windows RSS sampling APIs are
-  not yet wired (KR-5).
