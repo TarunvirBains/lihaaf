@@ -143,6 +143,20 @@ laptop).
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
 | `--package <NAME>` / `-p <NAME>` | Compat-mode workspace-member selector. Required when `--compat-root` points at a workspace root that declares `[workspace]` without `[package]`. Single package per invocation. |
 
+## Blessing snapshots
+
+When you intentionally change a procedural macro's error output—or when a new `rustc` toolchain version alters how compiler diagnostics are formatted—your snapshot tests will fail because your saved `.stderr` files no longer match.
+
+To overwrite your existing snapshots with the current compiler output:
+
+```bash
+cargo lihaaf --bless
+```
+
+**Why "bless"?** The term traces back to the Rust compiler's own UI testing. When rustc developers change error formatting across thousands of test fixtures, they don't edit them by hand. They pass `--bless` to the compiler's build system (`./x test --bless`), which instructs the test harness to trust the new compiler output and overwrite the old snapshots. Snapshot-testing libraries in the ecosystem—like trybuild and insta—adopted this design philosophy. lihaaf explicitly exposes `--bless` to keep workflows idiomatic for Rust developers. When you pass the flag, you are acting as the authority—consecrating the current compiler output as the new golden master.
+
+**Hygiene check**: Always run `git diff` after blessing. Ensure the changed text aligns with your macro edits, rather than masking an unintended compiler regression or panic.
+
 ## Compat mode
 
 `cargo lihaaf --compat` is a migration workflow for proc-macro crates that

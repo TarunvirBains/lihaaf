@@ -164,14 +164,26 @@ from scratch:
 cargo lihaaf --bless
 ```
 
-`--bless` runs every fixture, captures the compiler output, normalizes it, and
-writes (or overwrites) the corresponding `.stderr` file. Commit the resulting
-snapshot files alongside your source changes.
+### Understanding `--bless`
 
-If your snapshots reference stdlib spans (lines like
-`--> $RUST/core/src/fmt/mod.rs`), the `$RUST` token will appear in the re-blessed
-output automatically — no manual editing needed. See the [CI section](#step-5-update-ci) for
-the `rust-src` component requirement that goes with this.
+The `--bless` flag runs every fixture, captures the compiler output, normalizes
+it, and writes (or overwrites) the corresponding `.stderr` file. The term "bless"
+traces back to the Rust compiler's own UI testing workflow: when rustc developers
+change error formatting across thousands of test fixtures, they pass `--bless` to
+the compiler's build system to trust the new compiler output and overwrite the old
+snapshots. Snapshot-testing libraries in the ecosystem—like trybuild and insta—
+adopted this design. When you pass `--bless`, you are acting as the authority,
+consecrating the current compiler output as the new golden master.
+
+**Hygiene check**: Always run `git diff` after blessing. Ensure the text changes
+align with your migration edits (file paths, marker changes, etc.), rather than
+masking an unintended compiler regression.
+
+Commit the resulting snapshot files alongside your source changes. If your
+snapshots reference stdlib spans (lines like `--> $RUST/core/src/fmt/mod.rs`),
+the `$RUST` token will appear in the re-blessed output automatically — no manual
+editing needed. See the [CI section](#step-5-update-ci) for the `rust-src`
+component requirement that goes with this.
 
 After re-blessing, run `cargo lihaaf` without `--bless` to confirm all fixtures
 pass with the committed snapshots.
