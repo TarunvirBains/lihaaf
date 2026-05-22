@@ -48,8 +48,14 @@ use crate::error::Error;
                   repository migration guide at `docs/migrating-from-trybuild.md`."
 )]
 pub struct Cli {
-    /// Overwrite `.stderr` snapshots whose normalized output differs
-    /// from disk. Equivalent env: `LIHAAF_OVERWRITE=1`.
+    /// Overwrite `.stderr` snapshots whose normalized output differs from disk.
+    ///
+    /// Use when you intentionally change a proc macro's error output or when a
+    /// rustc toolchain version changes how compiler diagnostics are formatted.
+    /// Always run `git diff` after blessing to verify the changes match your
+    /// macro edits, rather than masking an unintended compiler regression.
+    ///
+    /// Equivalent env: `LIHAAF_OVERWRITE=1`.
     #[arg(long)]
     pub bless: bool,
 
