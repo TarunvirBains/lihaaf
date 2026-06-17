@@ -573,6 +573,24 @@ fn has_path_marker(line: &str) -> bool {
     line.contains("--> ") || line.contains("::: ")
 }
 
+#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes this
+fn is_foreign_pointer(line: &str) -> Option<SpanKind> {
+    let rest = line.trim_start_matches([' ', '\t']);
+    let after_marker = rest
+        .strip_prefix("--> ")
+        .or_else(|| rest.strip_prefix("::: "))?;
+    // `after_marker` starts at the path (the marker included a trailing space).
+    if after_marker.starts_with("$RUST/") {
+        Some(SpanKind::Rust)
+    } else if after_marker.starts_with("$CARGO/") {
+        Some(SpanKind::Cargo)
+    } else if after_marker.starts_with("$WORKSPACE/") {
+        Some(SpanKind::Workspace)
+    } else {
+        None
+    }
+}
+
 /// Rewrite the volatile path inside rustc's "long-type written to"
 /// note to a stable `$LONGTYPE_FILE` placeholder.
 ///
@@ -750,6 +768,39 @@ mod tests {
             SpanKind::Workspace.placeholder_line(),
             "   | $WORKSPACE_SRC"
         );
+    }
+
+    #[test]
+    fn is_foreign_pointer_detects_anchored_foreign_markers() {
+        assert_eq!(
+            is_foreign_pointer("  ::: $RUST/library/core/src/option.rs:1:1"),
+            Some(SpanKind::Rust)
+        );
+        assert_eq!(
+            is_foreign_pointer("--> $CARGO/serde-1.0.0/src/lib.rs:3:1"),
+            Some(SpanKind::Cargo)
+        );
+        assert_eq!(
+            is_foreign_pointer("   ::: $WORKSPACE/axum/src/method_routing.rs:1:1"),
+            Some(SpanKind::Workspace)
+        );
+    }
+
+    #[test]
+    fn is_foreign_pointer_rejects_dir_and_non_pointer_and_midline() {
+        // $DIR is the fixture's own dir — not foreign.
+        assert_eq!(is_foreign_pointer("  --> $DIR/foo.rs:3:1"), None);
+        // mid-line marker is not a pointer (spec §4.2 anchoring requirement).
+        assert_eq!(is_foreign_pointer("= note: see --> for the closure syntax"), None);
+        assert_eq!(is_foreign_pointer("something ::: some/path"), None);
+        assert_eq!(
+            is_foreign_pointer("error: bad span --> $RUST/library/core/src/option.rs:1:1 here"),
+            None
+        );
+        // marker with no trailing space must not match.
+        assert_eq!(is_foreign_pointer("  -->$RUST/x"), None);
+        // plain text.
+        assert_eq!(is_foreign_pointer("error[E0277]: the trait bound is not satisfied"), None);
     }
 
     #[test]
