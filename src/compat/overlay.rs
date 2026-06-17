@@ -3616,61 +3616,81 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
 /// subdirectory is removed before the copy to honour decision 5 of
 /// the idempotency contract (no merge — destination-only files must
 /// not persist).
+fn ensure_path_within_base(base: &Path, candidate: &Path) -> std::io::Result<()> {
+    let canonical_base = base.canonicalize()?;
+    let canonical_candidate = candidate.canonicalize()?;
+    if canonical_candidate.starts_with(&canonical_base) {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "copy-fallback: source path escapes allowed root",
+        ))
+    }
+}
+
 fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(src)?;
-    let ftype = meta.file_type();
-    if ftype.is_file() {
-        // Ensure parent dir exists; on the staged-overlay top level
-        // the parent is the staged-overlay-dir itself, but the helper
-        // is also used recursively for nested entries below.
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(src, dst)?;
-        Ok(())
-    } else if ftype.is_dir() {
-        // Exact-sync: if `dst` already exists (e.g. from a partial
-        // prior run), remove it before re-copying. Decision 5 of
-        // §4.5.6: NO MERGE — destination-only files must not
-        // persist.
-        if dst.exists() {
-            std::fs::remove_dir_all(dst)?;
-        }
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let child_src = entry.path();
-            let child_dst = dst.join(entry.file_name());
-            copy_fallback(&child_src, &child_dst)?;
-        }
-        Ok(())
-    } else if ftype.is_symlink() {
-        // Resolve the symlink target and copy the dereferenced
-        // content. Build scripts that read package-root files don't
-        // care whether the underlying file came from a symlink; the
-        // dereferenced contents are what they read.
-        let target_meta = std::fs::metadata(src)?;
-        if target_meta.is_file() {
+    fn copy_fallback_inner(base_src: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
+        ensure_path_within_base(base_src, src)?;
+
+        let meta = std::fs::symlink_metadata(src)?;
+        let ftype = meta.file_type();
+        if ftype.is_file() {
+            // Ensure parent dir exists; on the staged-overlay top level
+            // the parent is the staged-overlay-dir itself, but the helper
+            // is also used recursively for nested entries below.
+            if let Some(parent) = dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             std::fs::copy(src, dst)?;
-        } else {
-            // Target is a dir; recurse.
+            Ok(())
+        } else if ftype.is_dir() {
+            // Exact-sync: if `dst` already exists (e.g. from a partial
+            // prior run), remove it before re-copying. Decision 5 of
+            // §4.5.6: NO MERGE — destination-only files must not
+            // persist.
+            if dst.exists() {
+                std::fs::remove_dir_all(dst)?;
+            }
             std::fs::create_dir_all(dst)?;
             for entry in std::fs::read_dir(src)? {
                 let entry = entry?;
                 let child_src = entry.path();
                 let child_dst = dst.join(entry.file_name());
-                copy_fallback(&child_src, &child_dst)?;
+                copy_fallback_inner(base_src, &child_src, &child_dst)?;
             }
+            Ok(())
+        } else if ftype.is_symlink() {
+            // Resolve the symlink target and copy the dereferenced
+            // content. Build scripts that read package-root files don't
+            // care whether the underlying file came from a symlink; the
+            // dereferenced contents are what they read.
+            let target_meta = std::fs::metadata(src)?;
+            if target_meta.is_file() {
+                std::fs::copy(src, dst)?;
+            } else {
+                // Target is a dir; recurse.
+                std::fs::create_dir_all(dst)?;
+                for entry in std::fs::read_dir(src)? {
+                    let entry = entry?;
+                    let child_src = entry.path();
+                    let child_dst = dst.join(entry.file_name());
+                    copy_fallback_inner(base_src, &child_src, &child_dst)?;
+                }
+            }
+            Ok(())
+        } else {
+            // Other (block device, fifo, socket): unrecognised at the
+            // Cargo-package level. Surface as an I/O error.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "copy-fallback: unsupported file type at upstream path",
+            ))
         }
-        Ok(())
-    } else {
-        // Other (block device, fifo, socket): unrecognised at the
-        // Cargo-package level. Surface as an I/O error.
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "copy-fallback: unsupported file type at upstream path",
-        ))
     }
+
+    let canonical_base_src = src.canonicalize()?;
+    copy_fallback_inner(&canonical_base_src, src, dst)
 }
 
 /// Platform-dispatched symlink creation.
