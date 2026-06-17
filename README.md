@@ -17,7 +17,7 @@ crate as a dynamic library once per session, then dispatches each fixture to
 fixture suites this usually means seconds instead of minutes, because fixtures
 share that one build.
 
-There's a short companion document in [`docs/spec/lihaaf-v0.1.md`](docs/spec/lihaaf-v0.1.md).
+There's a short companion document in [`docs/spec/lihaaf-v0.2.md`](docs/spec/lihaaf-v0.2.md).
 Most of the code aims to stay readable first, not process-centric.
 
 ## lihaaf vs trybuild
@@ -311,7 +311,7 @@ Constraints (validated at config parse time):
   `per_fixture_memory_mb`, `allow_lints`) inherit from the top-level
   table when omitted on a named suite.
 
-See `docs/spec/lihaaf-v0.1.md` §3.6 for the full design.
+See `docs/spec/lihaaf-v0.2.md` §3.6 for the full design.
 
 Flag behavior aligns with the v0.1 contract documented in the spec companion.
 

@@ -6,6 +6,37 @@ project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-06-17
+
+Foreign diagnostic span bodies are now normalized so snapshots stay stable
+across rustc versions and platforms. This is an additive normalization rule
+under the README stability contract (minor-version bump); existing snapshots
+that quote foreign source, or that carry a foreign span pointer tail, require a
+one-time `cargo lihaaf --bless`.
+
+### Added
+
+- **Foreign-span body normalization** (default-on). When a `-->` or `:::` span
+  pointer resolves to a non-fixture placeholder (`$RUST`, `$CARGO`,
+  `$WORKSPACE`), the quoted source body collapses to a single kind-matched
+  placeholder line (`$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC`) and the
+  pointer's volatile `:LINE:COL` tail is stripped. Fixes the cross-version /
+  cross-platform snapshot drift reported in #92. Fires on both primary `-->`
+  and secondary `:::` spans; the fixture's own `$DIR` spans are untouched.
+- **`keep_foreign_span_bodies`** per-suite boolean (default `false`). Opt a
+  suite out of body-content suppression for upstream-regression detection. The
+  pointer-tail strip stays unconditional. Per-suite REPLACE semantics.
+- **Registry index hash collapse** in non-compat mode: the volatile
+  `<host>-<16hex>` registry segment (for the `index.crates.io` and `github.com`
+  hosts) collapses to the stable `$CARGO_HASH` token, making registry-path
+  snapshots portable across machines.
+
+### Changed
+
+- Non-compat normalizer output is no longer byte-identical to v0.1 on registry
+  paths that carried an index hash (now collapsed to `$CARGO_HASH`) or on
+  foreign span pointer lines (tail stripped). A one-time re-bless is expected.
+
 ## [0.1.2] — 2026-05-21
 
 Improve the user guide and CLI help. No runtime behavior change, no API

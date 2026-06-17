@@ -62,14 +62,17 @@ cargo lihaaf \
   --compat-report compat-report.json
 ```
 
-Use compat mode on your stable and nightly toolchains to confirm that trybuild and lihaaf behave identically on the same source code. This gives you a clear diff of any minor normalizer differences before you fully commit to the migration steps below.
+Use compat mode on your stable and nightly toolchains to see the normalizer
+differences, including lihaaf's foreign-span body suppression (which trybuild
+does not apply). This gives you a clear diff before you fully commit to the
+migration steps below.
 
 ## Step 1: Add lihaaf's `[package.metadata.lihaaf]` block
 
 lihaaf is driven entirely by `[package.metadata.lihaaf]` in the crate's
 `Cargo.toml`. There is no library import — you run `cargo lihaaf` as a standalone
 binary. The full key reference is in
-[`docs/spec/lihaaf-v0.1.md` §3.2](spec/lihaaf-v0.1.md).
+[`docs/spec/lihaaf-v0.2.md` §3.2](spec/lihaaf-v0.2.md).
 
 **Minimal example** — single crate, fixtures only import from the crate itself
 (like anyhow: 7 fixtures, `use anyhow::...`, no macro sibling):
@@ -620,7 +623,7 @@ Before merging, confirm:
 
 ## Further reading
 
-- [`docs/spec/lihaaf-v0.1.md`](spec/lihaaf-v0.1.md) — full specification: metadata
+- [`docs/spec/lihaaf-v0.2.md`](spec/lihaaf-v0.2.md) — full specification: metadata
   schema, normalizer rules, verdict types, named suites, workspace-member entry.
 - README [lihaaf vs trybuild](#lihaaf-vs-trybuild) section — rationale and measured
   timing from the djogi-macros conversion (237 fixtures).

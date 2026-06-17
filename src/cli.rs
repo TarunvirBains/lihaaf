@@ -118,7 +118,7 @@ pub struct Cli {
     ///
     /// Mutually exclusive with `--compat-manifest` (which supplies an
     /// explicit manifest path, bypassing the workspace-member resolver).
-    /// See `docs/spec/lihaaf-v0.1.md` §8.2 and `docs/compatibility-plan.md`
+    /// See `docs/spec/lihaaf-v0.2.md` §8.2 and `docs/compatibility-plan.md`
     /// §3.2.3 ("Workspace-member entry via `--package`") for the
     /// adopter-facing surface.
     #[arg(short = 'p', long = "package", value_name = "PACKAGE", value_parser = parse_compat_package)]
