@@ -41,6 +41,7 @@ use crate::error::Error;
 use crate::freshness::{self, FreshnessFailure, FreshnessSnapshot};
 use crate::normalize::{self, NormalizationContext};
 use crate::snapshot;
+use crate::util;
 use crate::verdict::{CleanupFailure, FixtureResult, FixtureWarning, MalformedSource, Verdict};
 
 /// Per-session worker context. Shared (read-only) across all worker
@@ -339,7 +340,14 @@ pub fn resolve_extern_paths(
     if crate_names.is_empty() {
         return Ok(out);
     }
-    let entries = std::fs::read_dir(deps_dir).map_err(|e| {
+    let deps_dir_real = deps_dir.canonicalize().map_err(|e| {
+        Error::io(
+            e,
+            "canonicalizing deps dir for extern resolution",
+            Some(deps_dir.to_path_buf()),
+        )
+    })?;
+    let entries = std::fs::read_dir(&deps_dir_real).map_err(|e| {
         Error::io(
             e,
             "reading deps dir for extern resolution",
@@ -350,10 +358,19 @@ pub fn resolve_extern_paths(
     for entry in entries {
         let entry =
             entry.map_err(|e| Error::io(e, "iterating deps dir", Some(deps_dir.to_path_buf())))?;
-        let p = entry.path();
-        if p.is_file() {
-            all_files.push(p);
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        if !file_type.is_file() {
+            continue;
         }
+        let p = entry.path();
+        let p_real = match util::canonicalize_within_base(&deps_dir_real, &p) {
+            Ok(cp) => cp,
+            Err(_) => continue,
+        };
+        all_files.push(p_real);
     }
     for name in crate_names {
         // Cargo's lib name uses `_` for `-` in crate names.
@@ -1833,6 +1850,28 @@ plain text line
             args,
             vec!["-A", "clippy::needless_collect"],
             "namespaced lint must be forwarded verbatim as a single argv token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_extern_paths_skips_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let deps_dir = tmp.path().join("deps");
+        std::fs::create_dir(&deps_dir).unwrap();
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let outside_rlib = outside.join("libdemo-abc.rlib");
+        std::fs::write(&outside_rlib, b"stub").unwrap();
+        symlink(&outside_rlib, deps_dir.join("libdemo-abc.rlib")).unwrap();
+
+        let resolved = resolve_extern_paths(&deps_dir, &["demo".to_string()]).unwrap();
+        assert!(
+            !resolved.contains_key("demo"),
+            "symlinked artifacts escaping deps dir must be ignored"
         );
     }
 }

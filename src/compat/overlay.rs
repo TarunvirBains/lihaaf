@@ -602,18 +602,36 @@ fn materialize_overlay_inner<F>(
 where
     F: FnOnce(Option<&str>) -> Option<SyntheticMetadata>,
 {
-    let raw_bytes = std::fs::read(upstream_manifest_path).map_err(|e| {
+    // Validate upstream manifest stays within its parent directory.
+    let upstream_dir = upstream_manifest_path.parent().ok_or_else(|| {
+        Error::io(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "manifest has no parent"),
+            "upstream manifest path validation",
+            Some(upstream_manifest_path.to_path_buf()),
+        )
+    })?;
+
+    let canonical_upstream_manifest =
+        util::canonicalize_within_base(upstream_dir, upstream_manifest_path).map_err(|e| {
+            Error::io(
+                e,
+                "validating upstream manifest containment",
+                Some(upstream_manifest_path.to_path_buf()),
+            )
+        })?;
+
+    let raw_bytes = std::fs::read(&canonical_upstream_manifest).map_err(|e| {
         Error::io(
             e,
             "reading upstream Cargo.toml for overlay",
-            Some(upstream_manifest_path.to_path_buf()),
+            Some(canonical_upstream_manifest.clone()),
         )
     })?;
     let raw_text = String::from_utf8(raw_bytes).map_err(|e| {
         Error::io(
             std::io::Error::new(std::io::ErrorKind::InvalidData, e),
             "decoding upstream Cargo.toml as UTF-8",
-            Some(upstream_manifest_path.to_path_buf()),
+            Some(canonical_upstream_manifest.clone()),
         )
     })?;
 
@@ -664,7 +682,7 @@ where
     // absolutization below joins against this so cargo can resolve the
     // overlay's path-bearing keys from the staged manifest dir (which is
     // two directories deeper than the upstream `Cargo.toml`).
-    let upstream_dir: PathBuf = upstream_manifest_path
+    let upstream_dir: PathBuf = canonical_upstream_manifest
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -1180,11 +1198,15 @@ fn override_workspace_inheritance(
 ///   problem reading an ancestor is something the user should see.
 ///
 /// The walk terminates at the filesystem root (`Path::parent` returns
-/// `None`). The `Path::canonicalize` call is intentionally NOT made:
-/// the upstream manifest path is already absolutized at the CLI layer
-/// ([`crate::compat::args::CompatArgs::from_cli`]), and re-canonicalizing
-/// would require the path to exist on disk (which fails for test
-/// dummies and for legitimate non-existent ancestor manifests).
+/// `None`). A canonicalization-based containment guard ensures no
+/// symlink in an intermediate walk-up directory can redirect the walk
+/// outside the expected tree: if the starting directory cannot be
+/// canonicalized (e.g., test dummies), the function returns `Ok(None)`
+/// conservatively; each walk-up directory is verified to be a true
+/// ancestor of the canonical starting directory (by checking that the
+/// canonical start path starts with the logical directory), so a symlink
+/// that redirects to a different part of the filesystem causes the walk
+/// to skip that candidate and continue upward.
 fn detect_implicit_ancestor_workspace(
     upstream_manifest_path: &Path,
 ) -> Result<Option<PathBuf>, Error> {
@@ -1192,10 +1214,51 @@ fn detect_implicit_ancestor_workspace(
         // No parent — e.g. root-level manifest. Nothing to walk.
         return Ok(None);
     };
+
+    // Canonicalize starting directory at entry — establishes containment anchor.
+    // If canonicalization fails (e.g., test dummies), return Ok(None) conservatively.
+    let Ok(start_canon) = std::fs::canonicalize(manifest_dir) else {
+        // Cannot establish trust anchor — bail out conservatively.
+        return Ok(None);
+    };
+
     let mut current = manifest_dir.parent();
     while let Some(dir) = current {
         let candidate = dir.join("Cargo.toml");
-        match std::fs::read_to_string(&candidate) {
+
+        let candidate_canon = match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist — normal walk-up behavior, try next ancestor.
+                current = dir.parent();
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::io(
+                    e,
+                    "reading ancestor Cargo.toml during workspace detection",
+                    Some(candidate),
+                ));
+            }
+        };
+
+        // Containment guard: verify the canonical starting directory is actually
+        // inside (or equal to) the logical walk-up directory. This catches symlinks
+        // in intermediate directories that redirect outside the expected tree: if
+        // a/b/c/Cargo.toml walks up and b/ is a symlink to /malicious/, then
+        // start_canon resolves to /malicious/c but the logical dir is a/b — they
+        // don't match, so we detect the redirect. Using the logical dir (not its
+        // canonical form) is key: canonicalizing both would resolve through the
+        // same symlink and always appear contained.
+        if !start_canon.starts_with(dir) {
+            // Canonical starting directory is not inside this walk-up directory —
+            // a symlink in the path redirected us outside the trusted tree.
+            // Stop the walk; do not read or follow any candidate here.
+            current = dir.parent();
+            continue;
+        }
+
+        match std::fs::read_to_string(&candidate_canon) {
             Ok(text) => {
                 match toml::from_str::<toml::Value>(&text) {
                     Ok(value) => {
@@ -1219,10 +1282,6 @@ fn detect_implicit_ancestor_workspace(
                         );
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Most directories on the walk-up have no Cargo.toml.
-                // Continue silently.
             }
             Err(e) => {
                 return Err(Error::io(
@@ -1485,8 +1544,27 @@ pub fn resolve_workspace_member_manifest(
     workspace_root_manifest: &Path,
     package_name: &str,
 ) -> Result<(PathBuf, toml::Value), Error> {
-    // Step 1 — read + parse workspace-root manifest.
-    let raw_bytes = std::fs::read(workspace_root_manifest).map_err(|e| {
+    // Canonicalize workspace root manifest at entry — establishes trust anchor.
+    // All derived member paths will be validated against this canonical path.
+    let canonical_root = std::fs::canonicalize(workspace_root_manifest).map_err(|e| {
+        Error::io(
+            e,
+            "canonicalizing workspace-root Cargo.toml",
+            Some(workspace_root_manifest.to_path_buf()),
+        )
+    })?;
+
+    // Canonical workspace root directory — used as both containment anchor
+    // and as the base passed to expand_workspace_member_entry so that all
+    // returned paths are built from a canonical base (prevents mixed
+    // canonical/lexical comparison).
+    let canonical_ws_dir = canonical_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Step 1 — read + parse workspace-root manifest (use canonical path).
+    let raw_bytes = std::fs::read(&canonical_root).map_err(|e| {
         Error::io(
             e,
             "reading workspace-root Cargo.toml for `--package` resolver",
@@ -1522,10 +1600,7 @@ pub fn resolve_workspace_member_manifest(
         });
     }
 
-    let workspace_root_dir = workspace_root_manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace_root_dir = &canonical_ws_dir; // borrow, not clone — canonical anchor
 
     // Step 3 — read `[workspace.members]`.
     let members_array = value
@@ -1585,7 +1660,7 @@ pub fn resolve_workspace_member_manifest(
             // lexically-normalized PathBufs; the normalize call here
             // is a defense-in-depth idempotent re-normalization.
             let expanded =
-                expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+                expand_workspace_member_entry(normalized, workspace_root_dir, package_name)?;
             for path in expanded {
                 exclude_dirs.insert(lexical_normalize_pathbuf(&path));
             }
@@ -1616,19 +1691,42 @@ pub fn resolve_workspace_member_manifest(
         let normalized = entry_str.trim_end_matches('/');
         validate_workspace_member_entry(normalized, package_name)?;
         scanned_member_names.push(normalized.to_string());
-        let expanded =
-            expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+        let expanded = expand_workspace_member_entry(normalized, workspace_root_dir, package_name)?;
         for path in expanded {
+            // Canonicalize at entry — resolves symlinks so the
+            // containment check below catches members that redirect
+            // outside the workspace root. Non-existent paths are
+            // skipped here (cargo silently skips missing members).
+            let Ok(canonical_fs) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+
+            // Containment guard: member path must stay within canonical
+            // workspace root directory. Rejects symlinks that escape.
+            if !canonical_fs.starts_with(&canonical_ws_dir) {
+                return Err(Error::io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "member path escapes workspace root: {}",
+                            canonical_fs.display()
+                        ),
+                    ),
+                    "workspace member containment violation",
+                    Some(canonical_fs),
+                ));
+            }
+
             // Lexically normalize for stable map-key + exclude
             // intersection. `expand_workspace_member_entry` already
             // normalizes; the call here is the canonical comparison
             // shape and is idempotent.
-            let canonical = lexical_normalize_pathbuf(&path);
+            let key = lexical_normalize_pathbuf(&path);
             // Apply exclude subtraction here (step 4 / §4.3 step 3.5).
-            if exclude_dirs.contains(&canonical) {
+            if exclude_dirs.contains(&key) {
                 continue;
             }
-            candidate_dirs.insert(canonical, ());
+            candidate_dirs.insert(key, ());
         }
     }
 
@@ -1845,10 +1943,28 @@ fn expand_workspace_member_entry(
     // Parent segments cannot be `.` (filtered above) and have been
     // glob-validated by `validate_workspace_member_entry` — the join
     // produces a path without verbatim-preserved `./` artifacts.
-    let mut parent_dir = workspace_root_dir.to_path_buf();
+    let mut lexical_parent = workspace_root_dir.to_path_buf();
     for seg in &parent_segments {
-        parent_dir.push(seg);
+        lexical_parent.push(seg);
     }
+
+    // Validate containment using canonicalize_within_base (Pattern D).
+    // Resolves symlinks in parent segments and ensures the resulting
+    // path stays within the workspace root. If the parent doesn't exist
+    // yet, canonicalizes the nearest existing ancestor and rejoins.
+    let parent_dir = match util::canonicalize_within_base(workspace_root_dir, &lexical_parent) {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                "workspace member expansion: parent directory containment check",
+                Some(lexical_parent),
+            ));
+        }
+    };
 
     if has_glob_chars(last) {
         // Glob in the last segment — enumerate `parent_dir` and match
@@ -3349,12 +3465,31 @@ fn mirror_upstream_into_overlay(
     upstream_dir: &Path,
     staged_overlay_dir: &Path,
 ) -> Result<(), Error> {
-    // Per-entry forward pass: reconcile every non-excluded top-level
-    // upstream entry into the staged overlay dir.
-    let upstream_entries = std::fs::read_dir(upstream_dir).map_err(|e| {
+    // Canonicalize both dirs upfront (Alert #10): prevents symlink-based
+    // path confusion so the stale-cleanup pass can validate containment.
+    let canonical_upstream = std::fs::canonicalize(upstream_dir).map_err(|e| {
         Error::overlay_mirror_failed(
             upstream_dir.to_path_buf(),
             staged_overlay_dir.to_path_buf(),
+            "canonicalize-upstream-dir",
+            Some(e),
+        )
+    })?;
+    let canonical_staged = std::fs::canonicalize(staged_overlay_dir).map_err(|e| {
+        Error::overlay_mirror_failed(
+            upstream_dir.to_path_buf(),
+            staged_overlay_dir.to_path_buf(),
+            "canonicalize-staged-dir",
+            Some(e),
+        )
+    })?;
+
+    // Per-entry forward pass: reconcile every non-excluded top-level
+    // upstream entry into the staged overlay dir.
+    let upstream_entries = std::fs::read_dir(&canonical_upstream).map_err(|e| {
+        Error::overlay_mirror_failed(
+            canonical_upstream.clone(),
+            canonical_staged.clone(),
             "read-upstream-dir",
             Some(e),
         )
@@ -3365,8 +3500,8 @@ fn mirror_upstream_into_overlay(
     for entry_res in upstream_entries {
         let entry = entry_res.map_err(|e| {
             Error::overlay_mirror_failed(
-                upstream_dir.to_path_buf(),
-                staged_overlay_dir.to_path_buf(),
+                canonical_upstream.clone(),
+                canonical_staged.clone(),
                 "iter-upstream-dir",
                 Some(e),
             )
@@ -3379,6 +3514,9 @@ fn mirror_upstream_into_overlay(
             // such entries are intentionally not mirrored.
             continue;
         };
+        // Track name before any skip — preserves idempotent stale-cleanup
+        // behavior (R-2): even excluded or symlinked entries count as
+        // "present upstream" so their staged counterparts aren't removed.
         upstream_names.insert(name.to_string());
 
         if MIRROR_EXCLUDED_TOP_LEVEL.contains(&name) {
@@ -3390,19 +3528,34 @@ fn mirror_upstream_into_overlay(
             continue;
         }
 
-        let upstream_path = upstream_dir.join(name);
-        let staged_path = staged_overlay_dir.join(name);
+        let upstream_path = canonical_upstream.join(name);
+        // Reject upstream symlinks — the mirror creates its own canonical
+        // symlinks from staged → upstream. Following an upstream symlink
+        // could read content from outside the trusted source tree.
+        let entry_meta = std::fs::symlink_metadata(&upstream_path).map_err(|e| {
+            Error::overlay_mirror_failed(
+                upstream_path.clone(),
+                canonical_staged.join(name).to_path_buf(),
+                "stat-upstream-entry",
+                Some(e),
+            )
+        })?;
+        if entry_meta.file_type().is_symlink() {
+            continue; // defense-in-depth: skip symlinked upstream entries
+        }
+
+        let staged_path = canonical_staged.join(name);
         reconcile_one_entry(&upstream_path, &staged_path)?;
     }
 
     // Stale-cleanup pass (CASE 9 + CASE 14b): remove staged entries
     // that have no upstream counterpart, plus the must-be-absent
     // entries even if they have an upstream counterpart.
-    if staged_overlay_dir.is_dir() {
-        let staged_iter = std::fs::read_dir(staged_overlay_dir).map_err(|e| {
+    if canonical_staged.is_dir() {
+        let staged_iter = std::fs::read_dir(&canonical_staged).map_err(|e| {
             Error::overlay_mirror_failed(
-                staged_overlay_dir.to_path_buf(),
-                staged_overlay_dir.to_path_buf(),
+                canonical_staged.clone(),
+                canonical_staged.clone(),
                 "read-staged-dir",
                 Some(e),
             )
@@ -3410,8 +3563,8 @@ fn mirror_upstream_into_overlay(
         for entry_res in staged_iter {
             let entry = entry_res.map_err(|e| {
                 Error::overlay_mirror_failed(
-                    staged_overlay_dir.to_path_buf(),
-                    staged_overlay_dir.to_path_buf(),
+                    canonical_staged.clone(),
+                    canonical_staged.clone(),
                     "iter-staged-dir",
                     Some(e),
                 )
@@ -3430,10 +3583,10 @@ fn mirror_upstream_into_overlay(
             // CASE 14b: explicit must-be-absent removal even if the
             // upstream carries one.
             if MIRROR_MUST_REMOVE_IF_PRESENT.contains(&name) {
-                let stale = staged_overlay_dir.join(name);
+                let stale = canonical_staged.join(name);
                 remove_path_any(&stale).map_err(|e| {
                     Error::overlay_mirror_failed(
-                        upstream_dir.join(name),
+                        canonical_upstream.join(name),
                         stale.clone(),
                         "stale-cleanup-must-absent",
                         Some(e),
@@ -3444,10 +3597,14 @@ fn mirror_upstream_into_overlay(
 
             // CASE 9: staged entry without an upstream counterpart.
             if !upstream_names.contains(name) {
-                let stale = staged_overlay_dir.join(name);
+                let stale = canonical_staged.join(name);
+                // Validate stale path stays within staged dir (Alert #11).
+                if util::canonicalize_within_base(&canonical_staged, &stale).is_err() {
+                    continue; // skip entries that escaped via symlink
+                }
                 remove_path_any(&stale).map_err(|e| {
                     Error::overlay_mirror_failed(
-                        upstream_dir.join(name),
+                        canonical_upstream.join(name),
                         stale.clone(),
                         "stale-cleanup-orphan",
                         Some(e),
@@ -3461,10 +3618,10 @@ fn mirror_upstream_into_overlay(
     // regular file, not a symlink. Type-only structural check; content
     // correctness is `write_file_atomic`'s contract (overlay.rs:527-543
     // bytes-match skip path).
-    let manifest = staged_overlay_dir.join("Cargo.toml");
+    let manifest = canonical_staged.join("Cargo.toml");
     let meta = std::fs::symlink_metadata(&manifest).map_err(|e| {
         Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-stat",
             Some(e),
@@ -3472,7 +3629,7 @@ fn mirror_upstream_into_overlay(
     })?;
     if meta.file_type().is_symlink() {
         return Err(Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-cargo-toml-is-symlink",
             None,
@@ -3480,7 +3637,7 @@ fn mirror_upstream_into_overlay(
     }
     if !meta.file_type().is_file() {
         return Err(Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-cargo-toml-not-regular-file",
             None,
@@ -3582,6 +3739,20 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
         )
     };
 
+    // Reject upstream symlinks — creating a symlink-to-symlink chain is unsafe
+    // (chain resolution risk: staged → upstream_symlink → external_target).
+    let upstream_meta =
+        std::fs::symlink_metadata(upstream_path).map_err(|e| mirror_err("stat-upstream", e))?;
+    if upstream_meta.file_type().is_symlink() {
+        return Err(mirror_err(
+            "upstream-is-symlink",
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to mirror symlink from upstream",
+            ),
+        ));
+    }
+
     // Try symlink first; on failure fall back to a recursive copy.
     match symlink_platform(upstream_path, staged_path) {
         Ok(()) => Ok(()),
@@ -3602,7 +3773,9 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 let _ = std::fs::remove_file(staged_path);
             }
-            copy_fallback(upstream_path, staged_path).map_err(|e| mirror_err("copy-fallback", e))
+            let staged_root = staged_path.parent().unwrap_or_else(|| Path::new("."));
+            copy_fallback_within(upstream_path, staged_path, staged_root)
+                .map_err(|e| mirror_err("copy-fallback", e))
         }
         Err(e) => Err(mirror_err("symlink", e)),
     }
@@ -3616,61 +3789,64 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
 /// subdirectory is removed before the copy to honour decision 5 of
 /// the idempotency contract (no merge — destination-only files must
 /// not persist).
-fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(src)?;
-    let ftype = meta.file_type();
-    if ftype.is_file() {
-        // Ensure parent dir exists; on the staged-overlay top level
-        // the parent is the staged-overlay-dir itself, but the helper
-        // is also used recursively for nested entries below.
-        if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::copy(src, dst)?;
-        Ok(())
-    } else if ftype.is_dir() {
-        // Exact-sync: if `dst` already exists (e.g. from a partial
-        // prior run), remove it before re-copying. Decision 5 of
-        // §4.5.6: NO MERGE — destination-only files must not
-        // persist.
-        if dst.exists() {
-            std::fs::remove_dir_all(dst)?;
-        }
-        std::fs::create_dir_all(dst)?;
-        for entry in std::fs::read_dir(src)? {
-            let entry = entry?;
-            let child_src = entry.path();
-            let child_dst = dst.join(entry.file_name());
-            copy_fallback(&child_src, &child_dst)?;
-        }
-        Ok(())
-    } else if ftype.is_symlink() {
-        // Resolve the symlink target and copy the dereferenced
-        // content. Build scripts that read package-root files don't
-        // care whether the underlying file came from a symlink; the
-        // dereferenced contents are what they read.
-        let target_meta = std::fs::metadata(src)?;
-        if target_meta.is_file() {
-            std::fs::copy(src, dst)?;
-        } else {
-            // Target is a dir; recurse.
-            std::fs::create_dir_all(dst)?;
-            for entry in std::fs::read_dir(src)? {
+fn copy_fallback_within(src: &Path, dst: &Path, dst_base: &Path) -> std::io::Result<()> {
+    fn copy_fallback_inner(
+        base_src: &Path,
+        base_dst: &Path,
+        src: &Path,
+        dst: &Path,
+    ) -> std::io::Result<()> {
+        let canonical_src = util::canonicalize_within_base(base_src, src)?;
+        let canonical_dst = util::canonicalize_within_base(base_dst, dst)?;
+
+        let meta = std::fs::symlink_metadata(&canonical_src)?;
+        let ftype = meta.file_type();
+        if ftype.is_file() {
+            // Ensure parent dir exists; on the staged-overlay top level
+            // the parent is the staged-overlay-dir itself, but the helper
+            // is also used recursively for nested entries below.
+            if let Some(parent) = canonical_dst.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::copy(&canonical_src, &canonical_dst)?;
+            Ok(())
+        } else if ftype.is_dir() {
+            // Exact-sync: if `dst` already exists (e.g. from a partial
+            // prior run), remove it before re-copying. Decision 5 of
+            // §4.5.6: NO MERGE — destination-only files must not
+            // persist.
+            if canonical_dst.exists() {
+                std::fs::remove_dir_all(&canonical_dst)?;
+            }
+            std::fs::create_dir_all(&canonical_dst)?;
+            for entry in std::fs::read_dir(&canonical_src)? {
                 let entry = entry?;
                 let child_src = entry.path();
-                let child_dst = dst.join(entry.file_name());
-                copy_fallback(&child_src, &child_dst)?;
+                let child_dst = canonical_dst.join(entry.file_name());
+                copy_fallback_inner(base_src, base_dst, &child_src, &child_dst)?;
             }
+            Ok(())
+        } else if ftype.is_symlink() {
+            // Reject symlinks: the symlink target may resolve outside
+            // base_src. copy_fallback is a fallback for platforms where
+            // symlink creation fails; on such platforms, rejecting
+            // upstream symlinks is conservative correct.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "copy-fallback: refusing to follow source symlink (potential containment escape)",
+            ))
+        } else {
+            // Other (block device, fifo, socket): unrecognised at the
+            // Cargo-package level. Surface as an I/O error.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "copy-fallback: unsupported file type at upstream path",
+            ))
         }
-        Ok(())
-    } else {
-        // Other (block device, fifo, socket): unrecognised at the
-        // Cargo-package level. Surface as an I/O error.
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "copy-fallback: unsupported file type at upstream path",
-        ))
     }
+
+    let canonical_base_src = src.canonicalize()?;
+    copy_fallback_inner(&canonical_base_src, dst_base, src, dst)
 }
 
 /// Platform-dispatched symlink creation.
@@ -5637,6 +5813,69 @@ version = "0.1.0"
         );
     }
 
+    /// **containment guard: `detect_implicit_ancestor_workspace` rejects symlink escape.**
+    ///
+    /// When an ancestor directory in the walk-up chain is a symlink pointing
+    /// to a location outside the canonical starting directory, the containment
+    /// guard must stop the walk and return `None` rather than resolving an
+    /// external workspace. This prevents path injection via symlinks placed
+    /// in intermediate directories (e.g., `/tmp/a/b` → `/malicious`).
+    #[test]
+    #[cfg(unix)]
+    fn detect_implicit_ancestor_workspace_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlink-escape test");
+
+        // External workspace — lives outside the nested structure.
+        let external_ws = tmp.path().join("external_ws");
+        std::fs::create_dir_all(&external_ws).expect("creating external_ws/");
+        std::fs::write(
+            external_ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"target\"]\n",
+        )
+        .expect("writing external workspace Cargo.toml");
+
+        // Build a nested directory with a symlinked intermediate level.
+        // Layout:
+        //   tmp/
+        //     external_ws/Cargo.toml    (real workspace)
+        //     a/
+        //       b -> ../external_ws    (symlink pointing outside the tree)
+        //       c/Cargo.toml           (upstream manifest in b/c/)
+        let a_dir = tmp.path().join("a");
+        std::fs::create_dir_all(&a_dir).expect("creating a/");
+
+        let real_b = a_dir.join("b");
+        let c_dir = real_b.join("c");
+        std::fs::create_dir_all(&c_dir).expect("creating a/b/c/");
+
+        // Upstream manifest inside the symlinked path.
+        let upstream_manifest = c_dir.join("Cargo.toml");
+        std::fs::write(
+            &upstream_manifest,
+            "[package]\nname = \"nested\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing nested Cargo.toml");
+
+        // Remove the real b/ directory and replace it with a symlink.
+        std::fs::remove_dir_all(&real_b).expect("removing real b/");
+        let link_target = tmp.path().join("external_ws");
+        symlink(&link_target, &real_b).expect("creating symlink a/b -> external_ws");
+
+        // The walk-up from a/b/c/Cargo.toml goes to parent a/b/ which is a
+        // symlink to external_ws/. The containment guard compares start_canon
+        // (resolved through the symlink) against the logical walk-up directory:
+        // start_canon = <tmp>/external_ws/c, dir = <tmp>/a/b — they don't match,
+        // so the redirect is detected and the candidate is skipped.
+        let result = detect_implicit_ancestor_workspace(&upstream_manifest)
+            .expect("ancestor walk must not error on symlink");
+        assert!(
+            result.is_none(),
+            "symlink-escaped ancestor must be rejected; got: {result:?}"
+        );
+    }
+
     /// Verify `manifest_has_inheritance_reference` returns `false`
     /// for the negative cases: empty manifest, manifest with only
     /// `[package].name` (no inheritance), manifest with regular
@@ -6752,7 +6991,8 @@ demo = { path = "." }
 
         let staged_src = tmp.path().join("staged-src");
         // First copy: both files land in staged.
-        copy_fallback(&upstream_src, &staged_src).expect("first copy must succeed");
+        copy_fallback_within(&upstream_src, &staged_src, tmp.path())
+            .expect("first copy must succeed");
         assert!(staged_src.join("a.rs").exists());
         assert!(staged_src.join("b.rs").exists());
 
@@ -6760,7 +7000,8 @@ demo = { path = "." }
         std::fs::remove_file(upstream_src.join("b.rs")).expect("remove upstream b.rs");
 
         // Second copy: exact-sync must purge b.rs from staged.
-        copy_fallback(&upstream_src, &staged_src).expect("second copy must succeed");
+        copy_fallback_within(&upstream_src, &staged_src, tmp.path())
+            .expect("second copy must succeed");
         assert!(
             staged_src.join("a.rs").exists(),
             "CASE 6 copy-fallback exact-sync: surviving upstream file must remain"
@@ -7037,7 +7278,101 @@ demo = { path = "." }
         drop(tmp);
     }
 
-    // ── §7.2 #11: override_workspace_inheritance skips Branch 2 with ctx ─
+    // ── §7.2 #11: symlinked member outside workspace root rejected ─
+
+    /// Workspace declares a member that is a symlink to a directory
+    /// outside the workspace root → containment guard rejects with
+    /// PermissionDenied error rather than reading the external manifest.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_workspace_member_manifest_symlinked_member_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlinked-member test");
+
+        // External directory — lives outside the workspace root.
+        let external_pkg = tmp.path().join("external_pkg");
+        std::fs::create_dir_all(&external_pkg).expect("creating external_pkg/");
+        std::fs::write(
+            external_pkg.join("Cargo.toml"),
+            "[package]\nname = \"evil\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing external Cargo.toml");
+
+        // Workspace root with a member that will be symlinked.
+        let ws_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).expect("creating ws/");
+        let ws_manifest = ws_dir.join("Cargo.toml");
+        std::fs::write(&ws_manifest, "[workspace]\nmembers = [\"member-link\"]\n")
+            .expect("writing workspace Cargo.toml");
+
+        // Create symlink: ws/member-link -> ../external_pkg (escapes ws/)
+        let link_path = ws_dir.join("member-link");
+        symlink(&external_pkg, &link_path).expect("creating symlink member-link -> external_pkg");
+
+        // Resolution must reject the symlinked member with PermissionDenied.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "evil")
+            .expect_err("symlinked member escaping workspace root must be rejected");
+        match err {
+            Error::Io { context, path, .. } => {
+                assert!(
+                    context.contains("workspace member containment violation"),
+                    "error context must name containment violation: {context}"
+                );
+                assert!(path.is_some(), "error must carry the escaped path");
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// `members = ["crates/*"]` where `crates/` is a symlink pointing
+    /// outside the workspace root → containment guard rejects during
+    /// parent directory expansion (expand_workspace_member_entry).
+    #[test]
+    #[cfg(unix)]
+    fn resolve_workspace_member_manifest_symlinked_parent_dir_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlinked-parent test");
+
+        // External directory with a package, outside the workspace.
+        let external_crates = tmp.path().join("external_crates");
+        std::fs::create_dir_all(&external_crates).expect("creating external_crates/");
+        std::fs::create_dir_all(external_crates.join("some-pkg")).unwrap();
+        std::fs::write(
+            external_crates.join("some-pkg").join("Cargo.toml"),
+            "[package]\nname = \"some-pkg\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing external Cargo.toml");
+
+        // Workspace root with a symlinked parent directory.
+        let ws_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).expect("creating ws/");
+        let ws_manifest = ws_dir.join("Cargo.toml");
+        std::fs::write(&ws_manifest, "[workspace]\nmembers = [\"crates/*\"]\n")
+            .expect("writing workspace Cargo.toml");
+
+        // Symlink: ws/crates -> ../../external_crates (escapes ws/)
+        let link_path = ws_dir.join("crates");
+        symlink(&external_crates, &link_path).expect("creating symlink crates -> external_crates");
+
+        // Resolution must reject the escape during parent-dir expansion.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "some-pkg")
+            .expect_err("symlinked parent dir escaping workspace root must be rejected");
+        match err {
+            Error::Io { context, .. } => {
+                assert!(
+                    context.contains("containment check"),
+                    "error context must mention containment: {context}"
+                );
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #12: override_workspace_inheritance skips Branch 2 with ctx ─
 
     /// With `workspace_member_context: Some(_)`, the implicit-ancestor
     /// REJECT (Branch 2) is suppressed and the function succeeds.
@@ -8723,5 +9058,231 @@ demo = { path = "." }
             }
             other => panic!("expected TomlParse, got {other:?}"),
         }
+    }
+
+    // ── Path containment tests ──────────────────────────────────────
+
+    #[test]
+    fn ensure_path_within_base_normal_containment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("file.txt");
+        std::fs::write(&child, "data").unwrap();
+
+        assert!(util::canonicalize_within_base(tmp.path(), &child).is_ok());
+    }
+
+    #[test]
+    fn ensure_path_within_base_dotdot_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create base as a subdirectory so we can escape with `..`
+        let base_dir = tmp.path().join("base");
+        std::fs::create_dir(&base_dir).unwrap();
+        let nested = base_dir.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        // Create an existing file outside the base (in tmp but not in base_dir)
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "data").unwrap();
+
+        // Construct a path via `..` that resolves to the outside file
+        let candidate = nested.join("..").join("..").join("outside.txt");
+        match util::canonicalize_within_base(&base_dir, &candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_path_within_base_symlink_escape() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        let outside_file = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside_file, "data").unwrap();
+
+        let symlink = base_dir.path().join("escape_link");
+        std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+
+        match util::canonicalize_within_base(base_dir.path(), &symlink) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_within_base_nonexisting_valid_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexist = tmp.path().join("will_be_created.txt");
+
+        let result = util::canonicalize_within_base(tmp.path(), &nonexist);
+        assert!(
+            result.is_ok(),
+            "expected Ok for non-existing file in valid parent"
+        );
+        let resolved = result.unwrap();
+        assert!(
+            resolved.starts_with(tmp.path().canonicalize().unwrap()),
+            "resolved path must be within base"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_within_base_symlink_parent_escape() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink inside base_dir that points to a dir outside.
+        let escape_link = base_dir.path().join("escape");
+        std::os::unix::fs::symlink(outside_dir.path(), &escape_link).unwrap();
+
+        let target = escape_link.join("target.txt");
+
+        match util::canonicalize_within_base(base_dir.path(), &target) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    // ── Symlink rejection tests (Alerts #10, #11, R-2) ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn mirror_rejects_upstream_symlinks_preserves_staged() {
+        // Verifies that mirror_upstream_into_overlay skips symlinked
+        // upstream entries but does NOT remove their staged counterparts
+        // as orphans (R-2: name tracked before skip).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        let staged_dir = tmp.path().join("staged");
+
+        // Create an outside file and a symlink to it inside upstream.
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside content").unwrap();
+        std::fs::create_dir(&upstream_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_file, upstream_dir.join("linked.txt")).unwrap();
+
+        // Create a regular file upstream (non-symlink, will be reconciled).
+        std::fs::write(upstream_dir.join("real.txt"), "real content").unwrap();
+
+        // Pre-seed staged dir with a regular file for the symlink entry
+        // and a Cargo.toml (required by CASE 15 post-condition).
+        std::fs::create_dir(&staged_dir).unwrap();
+        std::fs::write(staged_dir.join("linked.txt"), "pre-staged").unwrap();
+        std::fs::write(
+            staged_dir.join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        // Run the mirror.
+        let result = mirror_upstream_into_overlay(&upstream_dir, &staged_dir);
+        assert!(result.is_ok(), "mirror should succeed: {result:?}");
+
+        // The symlink entry should NOT have been removed as an orphan
+        // because its name was tracked in upstream_names before the skip.
+        assert!(
+            staged_dir.join("linked.txt").exists(),
+            "staged entry for symlinked upstream file must be preserved (R-2)"
+        );
+
+        // No new symlink should have been created for the skipped entry.
+        let linked_meta = std::fs::symlink_metadata(staged_dir.join("linked.txt")).unwrap();
+        assert!(
+            !linked_meta.file_type().is_symlink(),
+            "staged linked.txt must not be a symlink"
+        );
+
+        // The real file should have been reconciled (symlinked).
+        let real_meta = std::fs::symlink_metadata(staged_dir.join("real.txt")).unwrap();
+        assert!(
+            real_meta.file_type().is_symlink(),
+            "staged real.txt must be a canonical symlink to upstream"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_fallback_rejects_source_symlinks() {
+        // Verifies that copy_fallback returns PermissionDenied when the
+        // source tree contains symlinks (containment escape prevention).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_src = tmp.path().join("upstream-src");
+        std::fs::create_dir(&upstream_src).unwrap();
+
+        // Create an outside file and a symlink to it inside the source.
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside content").unwrap();
+        std::os::unix::fs::symlink(&outside_file, upstream_src.join("linked.txt")).unwrap();
+
+        // Also add a regular file so the dir is non-empty.
+        std::fs::write(upstream_src.join("real.txt"), "real content").unwrap();
+
+        let staged_dst = tmp.path().join("staged-dst");
+
+        match copy_fallback_within(&upstream_src, &staged_dst, tmp.path()) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => {
+                panic!("expected PermissionDenied when source contains symlinks, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn copy_fallback_rejects_destination_escape() {
+        // Verifies that copy_fallback rejects a destination path that escapes
+        // the intended staged root via `..`.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_src = tmp.path().join("upstream-src");
+        std::fs::create_dir(&upstream_src).unwrap();
+        std::fs::write(upstream_src.join("real.txt"), "real content").unwrap();
+
+        let staged_root = tmp.path().join("staged-root");
+        std::fs::create_dir(&staged_root).unwrap();
+
+        // This destination resolves outside staged_root.
+        let escaped_dst = staged_root.join("..").join("escape");
+
+        match copy_fallback_within(&upstream_src, &escaped_dst, &staged_root) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied for escaped destination, got {other:?}"),
+        }
+
+        assert!(
+            !tmp.path().join("escape").exists(),
+            "escaped destination must not be created"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_canonical_mirror_rejects_upstream_symlink() {
+        // Verifies that create_canonical_mirror rejects an upstream path
+        // that is itself a symlink (Alert #14: symlink chain prevention).
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a real file and a symlink to it.
+        let real_file = tmp.path().join("real.txt");
+        std::fs::write(&real_file, "content").unwrap();
+        let symlink_path = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).unwrap();
+
+        let staged_dst = tmp.path().join("staged_link.txt");
+
+        match create_canonical_mirror(&symlink_path, &staged_dst) {
+            Err(Error::OverlayMirrorFailed {
+                source: Some(e), ..
+            }) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => {
+                panic!("expected PermissionDenied when upstream is a symlink, got {other:?}")
+            }
+        }
+
+        // Verify no staged file was created.
+        assert!(
+            !staged_dst.exists(),
+            "staged path must not be created when upstream is a symlink"
+        );
     }
 }
