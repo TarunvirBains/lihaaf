@@ -59,9 +59,22 @@ pub struct Cli {
     #[arg(long)]
     pub bless: bool,
 
-    /// Switch the binary into compat mode. See `docs/compatibility-plan.md` §3.1.
-    /// When set, only the `--compat*` flags govern fixture/manifest selection;
-    /// `--filter` and `--manifest-path` are mode errors.
+    /// Switch the binary into compat mode.
+    ///
+    /// Compat mode is a migration and validation workflow for proc-macro crates
+    /// that already use trybuild. It executes the existing trybuild suite via
+    /// `cargo test` as a baseline, statically discovers fixtures via AST analysis,
+    /// runs them under a staged lihaaf overlay, and aggregates outcomes into a
+    /// byte-deterministic comparison report.
+    ///
+    /// This allows verifying diagnostic output and behavior parity across toolchains
+    /// prior to committing to a full migration.
+    ///
+    /// Under compat mode, only `--compat*` flags (e.g. `--compat-root`, `--compat-report`,
+    /// `--compat-filter`, `--compat-manifest`, etc.) govern manifest and fixture selection.
+    /// Standard flags `--filter` and `--manifest-path` are rejected as mode errors,
+    /// while formatting, caching, and execution flags (`--bless`, `--no-cache`, `-q`,
+    /// `-v`, `--use-symlink`, `--keep-output`, `-j`) remain valid as pass-throughs.
     #[arg(long)]
     pub compat: bool,
 
@@ -117,8 +130,13 @@ pub struct Cli {
     pub compat_trybuild_macro: Vec<String>,
 
     /// Run only fixtures whose relative path contains the substring.
-    /// Multiple `--filter` flags are OR'd. Substring match is
-    /// case-sensitive.
+    ///
+    /// Substring match is case-sensitive. Multiple `--filter` flags are OR'd.
+    ///
+    /// # Examples
+    ///
+    /// - `--filter ui` runs fixtures containing `ui` in their relative path.
+    /// - `--filter pass --filter fail` runs fixtures containing either `pass` OR `fail`.
     #[arg(long)]
     pub filter: Vec<String>,
 
@@ -169,14 +187,40 @@ pub struct Cli {
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Skip the lihaaf-managed dylib copy; create a symbolic link
-    /// instead. Saves ~30 MB disk + ~few hundred ms; the caller asserts
-    /// no concurrent cargo activity will modify `target/`.
+    /// Skip the lihaaf-managed dylib copy; create a symbolic link instead.
+    ///
+    /// Saves ~30 MB disk space per run and several hundred milliseconds by skipping
+    /// the file copy operation.
+    ///
+    /// # Safety Assertion
+    ///
+    /// The caller must ensure that **no concurrent cargo activity** (such as IDE
+    /// background compilation, cargo check/build/test in another terminal, or
+    /// concurrent CI jobs) is modifying the target directory. If cargo rebuilds or
+    /// overwrites the underlying dylib during test execution, parallel rustc workers
+    /// may encounter compilation errors, undefined behavior, or link failures.
     #[arg(long)]
     pub use_symlink: bool,
 
-    /// Preserve per-fixture work directories after verdict capture.
-    /// Local-development escape hatch only — never set in CI.
+    /// Preserve per-fixture work directories and generated staging files after verdict capture.
+    ///
+    /// # What is preserved
+    ///
+    /// - **Standard runs:** Preserves the temporary compilation work directories for each
+    ///   fixture (containing compiled artifacts, dependency info, and transient objects)
+    ///   under the session's temporary directory.
+    /// - **Compat-mode runs:** Preserves all generated compat sidecars, staged/converted
+    ///   fixture files, and the generated manifest overlay under `target/lihaaf-overlay/`
+    ///   instead of cleaning them up upon completion or panic.
+    ///
+    /// # Debugging Use Cases
+    ///
+    /// Useful for local development when a fixture fails to compile or links incorrectly,
+    /// allowing developers to inspect intermediate compiler outputs or manually run the
+    /// generated `rustc` command in the preserved work directory.
+    ///
+    /// Note: This is a local-development escape hatch only — never set this flag in CI,
+    /// as it prevents cleanup and will leak directories/files, consuming disk space.
     #[arg(long)]
     pub keep_output: bool,
 

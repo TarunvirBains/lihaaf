@@ -38,6 +38,32 @@ The fixtures themselves (`.rs` files) require no changes. The `.stderr` snapshot
 need a one-time re-bless because lihaaf's normalizer applies slightly different
 substitutions.
 
+## Pre-migration validation: Paving the way with Compat Mode
+
+Before doing the actual migration (changing configuration files and moving directories), you can run `cargo lihaaf` in compatibility mode. Compat mode helps you assess how close lihaaf's diagnostic output is to your existing trybuild baseline. 
+
+This is particularly useful for measuring baseline behavior across different Rust compiler versions before making any code modifications.
+
+### What compat mode does
+
+When you run with `--compat`, `lihaaf`:
+1. Executes your existing trybuild suite via `cargo test` to gather baseline results.
+2. Performs a static AST walk of your test files to discover fixture files, copying them and their existing `.stderr` snapshots to a staging directory.
+3. Generates a temporary, staged manifest overlay in the cargo target directory (avoiding any edits to your upstream `Cargo.toml`).
+4. Dispatches the staged fixtures through lihaaf.
+5. Produces a byte-deterministic comparison report (`compat-report.json`) detailing fixture parity, mismatches, and exclusions.
+
+### Example invocation
+
+```bash
+cargo lihaaf \
+  --compat \
+  --compat-root /path/to/target-crate \
+  --compat-report compat-report.json
+```
+
+Use compat mode on your stable and nightly toolchains to confirm that trybuild and lihaaf behave identically on the same source code. This gives you a clear diff of any minor normalizer differences before you fully commit to the migration steps below.
+
 ## Step 1: Add lihaaf's `[package.metadata.lihaaf]` block
 
 lihaaf is driven entirely by `[package.metadata.lihaaf]` in the crate's
@@ -274,6 +300,9 @@ cargo lihaaf --manifest-path sassi-macros/Cargo.toml
 cargo lihaaf --manifest-path djogi-macros/Cargo.toml
 ```
 
+> [!TIP]
+> **Performance optimization for large suites:** If you are migrating a large test suite and want to maximize speed and save disk space, you can pass the `--use-symlink` flag. This replaces the default dynamic library copy with a symbolic link, saving ~30 MB and several hundred milliseconds per run. However, ensure that no concurrent cargo builds are running (e.g., IDE background tasks) while this flag is active to avoid linker errors or compiler crashes.
+
 ## Step 6: Verify
 
 Run these three commands in order:
@@ -292,6 +321,35 @@ cargo lihaaf
 If `cargo lihaaf` exits 0 and `git status` shows a clean tree after `--bless`,
 the conversion is complete. Run `cargo test` as well to verify your non-fixture
 unit tests still pass independently.
+
+## Filtering and Test Selection
+
+In a trybuild setup, filtering to run a specific subset of tests or a single test is typically done via the `cargo test` filter:
+```bash
+cargo test --test compile_fail my_specific_fixture
+```
+This performs a substring match on the generated test case name.
+
+With `lihaaf`, there is no integration with `cargo test`'s harness filter because `lihaaf` runs as a standalone CLI tool. Instead, you filter fixtures directly on the command line using the `--filter` flag:
+```bash
+cargo lihaaf --filter my_specific_fixture
+```
+The filter matches case-sensitively against the relative path of the `.rs` fixture file.
+
+### Migration-Specific Filter Patterns
+
+- **Targeting a group of tests:** If you have organized your tests into subdirectories (e.g., `tests/compile_fail/debug_handler/`), you can run only that group:
+  ```bash
+  cargo lihaaf --filter debug_handler
+  ```
+- **Running a single specific test:** To isolate a single failing fixture:
+  ```bash
+  cargo lihaaf --filter bad_attribute.rs
+  ```
+- **OR behavior (combining filters):** You can specify multiple `--filter` flags to run fixtures matching any of the substrings:
+  ```bash
+  cargo lihaaf --filter debug_handler --filter from_ref
+  ```
 
 ## Layout choice: no-infix vs `tests/lihaaf/` infix
 
@@ -520,6 +578,14 @@ metadata-side dev-dep after adding it to `dev_deps`, opt that suite into
 `build_targets = ["tests"]`. Named suites inherit `dev_deps` when they omit it,
 but they do not inherit `build_targets`, so add the opt-in to each named suite
 that needs the staged dev-dep collector.
+
+## Troubleshooting and Debugging with `--keep-output`
+
+During migration, you might encounter compilation errors, unresolved imports, or unexpected snapshot mismatches. The `--keep-output` flag acts as an escape hatch to help you diagnose these migration-specific scenarios:
+
+- **Inspecting staged manifests:** In compat mode, `lihaaf` generates a staged manifest overlay inside `target/lihaaf-overlay/Cargo.toml`. If a compat run complains about workspace dependencies or ambiguous specifications, you can pass `--keep-output` to inspect this generated file and check if path-dependencies, workspaces, or patches were absolutized correctly.
+- **Investigating failing compiler invocations:** When a fixture fails with unexpected compiler output, you can find its preserved work directory in the system's temporary folder (the exact path will be logged). This directory contains the exact compiled objects, dependency files, and stderr records. You can navigate into the directory and manually run the `rustc` command (print it via `cargo lihaaf -v`) to tweak arguments, isolate failures, or check header linkages.
+- **Reviewing staged/copied fixtures:** If AST-based fixture discovery in compat mode behaves unexpectedly, `--keep-output` preserves the copied test fixture files and their snapshots. This lets you confirm that the AST traversal mapped trybuild's `t.compile_fail(...)` calls to the correct directory structures.
 
 ## Benchmarking your conversion
 

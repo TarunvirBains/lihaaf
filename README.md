@@ -142,6 +142,63 @@ laptop).
 | `--use-symlink` | Skip the lihaaf-managed dylib copy; symlink instead. Saves disk + time, but unsafe under concurrent cargo activity. |
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
 | `--package <NAME>` / `-p <NAME>` | Compat-mode workspace-member selector. Required when `--compat-root` points at a workspace root that declares `[workspace]` without `[package]`. Single package per invocation. |
+## Filtering fixtures
+
+You can use the `--filter` flag to select a subset of fixtures to run by path substring. The filter matches case-sensitively against the relative path of the fixtures.
+
+### Examples
+
+- **Single filter:** Run only fixtures whose path contains `compile_fail`:
+  ```bash
+  cargo lihaaf --filter compile_fail
+  ```
+- **Multiple filters (OR behavior):** Run fixtures whose path contains either `pass` or `fail` (multiple `--filter` flags are OR'd together):
+  ```bash
+  cargo lihaaf --filter pass --filter fail
+  ```
+- **Filter and list:** Combine `--filter` with `--list` to print all matched fixtures without building the dylib or invoking rustc:
+  ```bash
+  cargo lihaaf --filter parse --list
+  ```
+
+## Symlink execution and safety (`--use-symlink`)
+
+By default, `lihaaf` copies the prebuilt dynamic library (dylib) of the consumer crate into a dedicated temporary directory before running the per-fixture test loop. This isolates test execution from concurrent modifications in your target directory.
+
+Setting the `--use-symlink` flag replaces this copy operation with a symbolic link:
+
+- **Disk/Performance Trade-off:** Saves approximately 30 MB of disk space per test session and shaves off a few hundred milliseconds of overhead.
+- **Safety Requirement:** When enabled, the caller guarantees that **no concurrent Cargo activity** (e.g. background IDE compilation, automatic `cargo check` on save, concurrent CI jobs, or manual builds in other terminals) will modify or rebuild items in the `target/` directory.
+
+> [!WARNING]
+> If Cargo modifies the dylib in `target/` while the test loop is actively running, the symbolic link will resolve to a half-compiled or missing library, causing link errors or undefined behavior in parallel worker threads. Do not use `--use-symlink` in environments with active file watchers or concurrent build processes.
+## Preserving output for debugging (`--keep-output`)
+
+By default, `lihaaf` removes all temporary compilation work directories and generated staging files as soon as a fixture is evaluated. This prevents cluttering the disk.
+
+If you pass `--keep-output`, `lihaaf` disables this automatic cleanup:
+
+- **What is preserved:**
+  - **Standard Mode:** The temporary compilation directory for each fixture (containing object files, dependency info, and build artifacts) is preserved under the system's temporary directory.
+  - **Compat Mode:** The staged manifest overlay (under `target/lihaaf-overlay/`), sidecar files, and copied/converted test fixtures are preserved in the worktree.
+- **Debugging Use Cases:** If a test fails in an unexpected way, you can navigate to the preserved directories, inspect the compiled outputs, check dependency configurations, or manually copy and execute the `rustc` command-line invocation to diagnose the issue.
+
+> [!CAUTION]
+> `--keep-output` is designed as a local-development escape hatch only. **Never enable `--keep-output` in CI systems or automated scripts**, as it prevents cleanup and will leak temporary files and build artifacts, eventually exhausting disk space.
+
+## Blessing snapshots
+
+When you intentionally change a procedural macro's error output—or when a new `rustc` toolchain version alters how compiler diagnostics are formatted—your snapshot tests will fail because your saved `.stderr` files no longer match.
+
+To overwrite your existing snapshots with the current compiler output:
+
+```bash
+cargo lihaaf --bless
+```
+
+**Why "bless"?** The term traces back to the Rust compiler's own UI testing. When rustc developers change error formatting across thousands of test fixtures, they don't edit them by hand. They pass `--bless` to the compiler's build system (`./x test --bless`), which instructs the test harness to trust the new compiler output and overwrite the old snapshots. Snapshot-testing libraries in the ecosystem—like trybuild and insta—adopted this design philosophy. lihaaf explicitly exposes `--bless` to keep workflows idiomatic for Rust developers. When you pass the flag, you are acting as the authority—consecrating the current compiler output as the new golden master.
+
+**Hygiene check**: Always run `git diff` after blessing. Ensure the changed text aligns with your macro edits, rather than masking an unintended compiler regression or panic.
 
 ## Blessing snapshots
 
@@ -159,45 +216,43 @@ cargo lihaaf --bless
 
 ## Compat mode
 
-`cargo lihaaf --compat` is a migration workflow for proc-macro crates that
-already have a [trybuild](https://github.com/dtolnay/trybuild) fixture corpus.
-It runs lihaaf against your existing trybuild fixtures and generates a
-deterministic JSON comparison envelope that captures both the trybuild baseline
-and lihaaf's per-fixture verdicts side by side.
+`cargo lihaaf --compat` is a migration and validation workflow for proc-macro crates that already have a [trybuild](https://github.com/dtolnay/trybuild) fixture corpus.
 
-The typical invocation:
+### What it does
 
-```bash
-cargo lihaaf \
-  --compat \
-  --compat-root <PATH-TO-CRATE-CHECKOUT> \
-  --compat-report compat-report.json
-```
+Compat mode runs both halves of the comparison:
+- **Baseline capture:** It runs the existing trybuild suite via `cargo test` and captures the outcome.
+- **lihaaf execution:** It discovers trybuild fixtures from the AST, copies them to a temporary staging area, creates an overlay manifest under `target/` without touching your code or `Cargo.toml`, runs `cargo lihaaf`, and captures the verdicts.
+- **Parity comparison:** It aggregates the results and outputs a byte-deterministic comparison report (`compat-report.json`) detailing matching outcomes, mismatches, errors, and exclusions.
 
-For workspace-member crates where `--compat-root` points at a workspace root
-(a manifest that declares `[workspace]` without `[package]`), add
-`--package <NAME>` to select the target member:
+### When to use it
 
-```bash
-cargo lihaaf \
-  --compat \
-  --compat-root /path/to/workspace-root \
-  --package my-crate \
-  --compat-report compat-report.json
-```
+- **Pre-migration validation:** Before modifying your codebase, use compat mode to check how closely lihaaf's diagnostic output matches trybuild.
+- **Cross-toolchain validation:** Run the compat comparison across multiple Rust compiler versions (e.g. stable, nightly) to measure and verify diagnostic stability before fully converting.
+- **CI Gating:** Run compat mode in a pull request or CI environment to guarantee that no behavioral or diagnostic changes are introduced during migration.
 
-Key flags:
+### Basic workflow
 
-| Flag | Purpose |
-|---|---|
-| `--compat` | Enable compat mode. Mutually exclusive with normal `--filter` / `--manifest-path` flags. |
-| `--compat-root <PATH>` | Path to the target crate checkout. Required in compat mode. |
-| `--compat-report <PATH>` | Output path for the JSON comparison envelope. Required in compat mode. |
-| `--package <NAME>` / `-p <NAME>` | Workspace-member selector. Required when `--compat-root` is a workspace root without `[package]`. |
-
-The JSON envelope is byte-deterministic: two CI runners at the same commit
-produce identical envelope bytes. It is suitable for committing as a baseline
-artifact and comparing across runs with `diff` or `jq`.
+1. **Invoke the compat runner:** Run `cargo lihaaf` with the `--compat` flag, specifying the root of the target crate and the path where you want the JSON report written:
+   ```bash
+   cargo lihaaf \
+     --compat \
+     --compat-root <PATH-TO-CRATE-CHECKOUT> \
+     --compat-report compat-report.json
+   ```
+2. **Handle workspace members:** If the target crate is a member of a virtual Cargo workspace, you must specify the workspace root as the root, and select the package via the `-p` / `--package` flag:
+   ```bash
+   cargo lihaaf \
+     --compat \
+     --compat-root /path/to/workspace-root \
+     --package my-crate \
+     --compat-report compat-report.json
+   ```
+3. **Inspect the comparison report:** Parse and inspect the generated `compat-report.json`. Check for any entries in `mismatch_examples` or `errors` to see if there are minor formatting differences or unrecognized AST patterns.
+4. **Iterate:** If there are accepted diagnostic differences, you can use the standard `--bless` flag in combination with `--compat` to update or record them:
+   ```bash
+   cargo lihaaf --compat --compat-root . --compat-report compat-report.json --bless
+   ```
 
 See `docs/compatibility-plan.md` for the full compat-mode design.
 
