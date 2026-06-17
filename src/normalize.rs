@@ -67,7 +67,6 @@ pub struct Substitution {
 /// Which foreign tree a `-->`/`:::` pointer resolved to. Selects the
 /// kind-matched placeholder token emitted for a suppressed body.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes them
 enum SpanKind {
     Rust,
     Cargo,
@@ -77,7 +76,6 @@ enum SpanKind {
 impl SpanKind {
     /// The placeholder line a collapsed foreign body emits for this kind:
     /// the canonical gutter frame plus the kind-matched `$<KIND>_SRC` token.
-    #[allow(dead_code)] // removed in Task 8 when the suppression loop consumes them
     fn placeholder_line(self) -> &'static str {
         match self {
             SpanKind::Rust => "   | $RUST_SRC",
@@ -85,6 +83,18 @@ impl SpanKind {
             SpanKind::Workspace => "   | $WORKSPACE_SRC",
         }
     }
+}
+
+/// Per-block suppression state, threaded through the per-line loop as
+/// `Option<ActiveBlock>` (`None` between blocks). See §5.2 of the design spec.
+struct ActiveBlock {
+    /// Lines still to consume in the active block (frame + content),
+    /// including the current line. Drained one per consumed line.
+    remaining: usize,
+    /// Which foreign tree the pointer resolved to; selects the placeholder.
+    kind: SpanKind,
+    /// Whether the first content line of THIS block has emitted the placeholder.
+    placeholder_emitted: bool,
 }
 
 /// Substring prefixes the normalizer rewrites to placeholders.
@@ -267,8 +277,11 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     // rustc summary and explain-pointer lines are preserved; they pass
     // through like other diagnostic text unless one of the explicit
     // normalization categories applies.
-    let mut intermediate: Vec<String> = Vec::with_capacity(unified_le.lines().count() + 1);
-    for line in unified_le.lines() {
+    let raw_lines: Vec<&str> = unified_le.lines().collect();
+    let mut intermediate: Vec<String> = Vec::with_capacity(raw_lines.len() + 1);
+    let mut active_block: Option<ActiveBlock> = None;
+
+    for (idx, &line) in raw_lines.iter().enumerate() {
         let mut s = line.to_string();
         // Backslashes inside path-shaped substrings: the policy says to
         // rewrite "backslashes in paths" — restricted to `--> ` and
@@ -315,17 +328,78 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         for sub in &ctx.extra_substitutions {
             s = replace_advancing(&s, &sub.from, &sub.to);
         }
-        // D-3a: strip the volatile :LINE:COL tail off every foreign pointer
-        // line, unconditionally (independent of body presence and of
-        // keep_foreign_span_bodies). The full body-suppression stage is added
-        // around this in a later step; this is the unconditional tail strip.
-        if is_foreign_pointer(&s).is_some() {
-            s = strip_pointer_tail(&s);
+
+        // -- Span body suppression (Step 8) --
+
+        // Step 1: inside an active block, distinguish frame vs content lines.
+        if let Some(mut block) = active_block.take() {
+            // Frame line: pipe-only (optionally preceded by whitespace).
+            // Emits canonical "   |" without consuming a placeholder slot.
+            // Drained one per consumed line (spec §5.2) — frames are body lines.
+            if line.trim_start_matches([' ', '\t']) == "|" {
+                s = "   |".to_string();
+                block.remaining = block.remaining.saturating_sub(1);
+                if block.remaining > 0 {
+                    active_block = Some(block);
+                }
+                // Step 3: TypeId + trailing trim for this emitted line.
+                s = rewrite_type_ids(&s);
+                let trimmed = s.trim_end_matches([' ', '\t']);
+                intermediate.push(trimmed.to_string());
+                continue;
+            }
+            // Content lines: first emits placeholder, rest are dropped.
+            if !block.placeholder_emitted {
+                block.placeholder_emitted = true;
+                s = block.kind.placeholder_line().to_string();
+                block.remaining = block.remaining.saturating_sub(1);
+                if block.remaining > 0 {
+                    active_block = Some(block);
+                }
+                // Step 3: TypeId + trailing trim.
+                s = rewrite_type_ids(&s);
+                let trimmed = s.trim_end_matches([' ', '\t']);
+                intermediate.push(trimmed.to_string());
+                continue;
+            } else {
+                // Subsequent content line → DROP.
+                block.remaining = block.remaining.saturating_sub(1);
+                if block.remaining > 0 {
+                    active_block = Some(block);
+                }
+                continue;
+            }
         }
-        s = rewrite_type_ids(&s);
-        // Trailing whitespace.
-        let trimmed = s.trim_end_matches([' ', '\t']);
-        intermediate.push(trimmed.to_string());
+
+        // Step 2: foreign pointer detection (only when not already in a block).
+        if let Some(kind) = is_foreign_pointer(&s) {
+            // 2a: unconditional :LINE:COL tail strip.
+            s = strip_pointer_tail(&s);
+            // 2b: count body lines for block sizing.
+            let body_count = if idx + 1 < raw_lines.len() {
+                count_body_lines(&raw_lines, idx + 1)
+            } else {
+                0
+            };
+            // 2c: arm ActiveBlock if not opted out AND body exists.
+            if !ctx.keep_foreign_span_bodies && body_count > 0 {
+                let min_block = std::cmp::min(body_count, 4);
+                active_block = Some(ActiveBlock {
+                    remaining: min_block,
+                    kind,
+                    placeholder_emitted: false,
+                });
+            }
+            // Step 3: TypeId + trailing trim for this pointer line.
+            s = rewrite_type_ids(&s);
+            let trimmed = s.trim_end_matches([' ', '\t']);
+            intermediate.push(trimmed.to_string());
+        } else {
+            // Step 3: non-pointer, non-active line — standard path.
+            s = rewrite_type_ids(&s);
+            let trimmed = s.trim_end_matches([' ', '\t']);
+            intermediate.push(trimmed.to_string());
+        }
     }
 
     // Step 10: adopter-defined line-drop (`strip_lines` /
@@ -580,7 +654,6 @@ fn has_path_marker(line: &str) -> bool {
     line.contains("--> ") || line.contains("::: ")
 }
 
-#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes this
 fn is_foreign_pointer(line: &str) -> Option<SpanKind> {
     let rest = line.trim_start_matches([' ', '\t']);
     let after_marker = rest
@@ -622,7 +695,6 @@ fn strip_pointer_tail(line: &str) -> String {
     line[..end].to_string()
 }
 
-#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes this
 fn count_body_lines(lines: &[&str], start: usize) -> usize {
     let mut count = 0;
     let mut i = start;
@@ -1519,16 +1591,141 @@ error: aborting due to 1 previous error
         assert!(!d.keep_foreign_span_bodies, "default is false");
     }
 
+    // -- §8 span body suppression coverage tests --
+    // These tests verify that foreign -->/::: pointer bodies collapse
+    // to kind-matched $*_SRC placeholders. They will fail RED until
+    // Task 8 implements the interleaved suppression loop.
+
+    #[test]
+    fn foreign_primary_arrow_body_is_suppressed() {
+        // §8.1a: primary --> with body gets collapsed
+        let input = "  --> /home/u/.rustup/x/lib/core/src/option.rs:512:9\n   |\n512 | pub enum Option<T> {\n513 |     None,\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  --> $RUST/lib/core/src/option.rs\n   |\n   | $RUST_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn compat_mode_suppresses_primary_arrow_foreign_body() {
+        // §8.3a: primary --> with compat-short $CARGO gets collapsed
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:9\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  --> $CARGO/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn compat_mode_default_context_suppresses_foreign_body() {
+        // §8.2: compat-default ::: with body gets collapsed
+        let input = "  ::: /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:1\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $CARGO/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn foreign_cargo_registry_span_body_is_suppressed() {
+        // §8.1 Class B non-compat: ::: with cargo registry path
+        let input = "  ::: /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:1\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $CARGO/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn foreign_cargo_short_span_body_is_suppressed() {
+        // §8.1 Class B compat-short: ::: with cargo registry, compat mode on
+        let input = "  ::: /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:1\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx_compat("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $CARGO/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn opt_out_keeps_extra_substitution_remapped_foreign_body() {
+        // §8.4 cross-key: extra_substitution remaps nix path to $RUST,
+        // keep_foreign_span_bodies = true keeps the body (no placeholder),
+        // tail still stripped, path still remapped.
+        let input = "  ::: /nix/store/abc-rust-stdlib/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let extras = vec![Substitution {
+            from: "/nix/store/abc-rust-stdlib/lib/rustlib/src/rust".into(),
+            to: "$RUST".into(),
+        }];
+        let c = NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/sysroot"))
+            .with_extra_substitutions(extras)
+            .with_keep_foreign_span_bodies(true);
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        // Body lines kept (no $RUST_SRC), tail stripped, path remapped.
+        assert_eq!(
+            out,
+            "  ::: $RUST/library/alloc/src/vec/mod.rs\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |"
+        );
+    }
+
+    #[test]
+    fn extra_substitution_remap_alone_triggers_suppression() {
+        // §8.4 D-7: same input as above but WITHOUT keep_foreign_span_bodies.
+        // Extra sub remaps to $RUST, then suppression step detects foreign
+        // pointer → body collapsed.
+        let input = "  ::: /nix/store/abc-rust-stdlib/lib/rustlib/src/rust/library/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let extras = vec![Substitution {
+            from: "/nix/store/abc-rust-stdlib/lib/rustlib/src/rust".into(),
+            to: "$RUST".into(),
+        }];
+        let c = NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/sysroot"))
+            .with_extra_substitutions(extras);
+        // keep_foreign_span_bodies defaults to false.
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        // Body collapsed to $RUST_SRC.
+        assert_eq!(
+            out,
+            "  ::: $RUST/library/alloc/src/vec/mod.rs\n   |\n   | $RUST_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn default_behavior_byte_identical_when_no_foreign_spans() {
+        // §8.4 zero-blast-radius: no foreign span → output unchanged
+        // (no suppression fires). May already pass pre-Task-8.
+        let input = "error[E0277]: the trait bound is not satisfied\n  --> $DIR/tests/foo.rs:3:1\n   |\n3 | let x = bad();\n   | ^^^\n";
+        assert_normalizes(
+            input,
+            "error[E0277]: the trait bound is not satisfied\n  --> $DIR/tests/foo.rs:3:1\n   |\n3 | let x = bad();\n   | ^^^",
+        );
+    }
+
     // -- count_body_lines look-ahead tests --
 
     #[test]
     fn count_body_lines_counts_frame_and_content_until_blank() {
         let lines = vec![
-            "   |",                       // open frame
-            "438 | pub struct Vec<T> {",  // gutter/source content
-            "   | ^^^ ...",               // caret content
-            "   |",                       // close frame
-            "",                           // blank — terminates
+            "   |",                      // open frame
+            "438 | pub struct Vec<T> {", // gutter/source content
+            "   | ^^^ ...",              // caret content
+            "   |",                      // close frame
+            "",                          // blank — terminates
             "error: aborting due to 1 previous error",
         ];
         assert_eq!(count_body_lines(&lines, 0), 4);

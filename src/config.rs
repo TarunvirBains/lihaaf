@@ -1789,8 +1789,8 @@ mod tests {
                 "strip_line_prefixes": []
             }]
         });
-        let cfg: Config = serde_json::from_value(v)
-            .expect("Suite must deserialize with the key omitted");
+        let cfg: Config =
+            serde_json::from_value(v).expect("Suite must deserialize with the key omitted");
         assert!(!cfg.suites[0].keep_foreign_span_bodies);
     }
 
@@ -1817,7 +1817,10 @@ mod tests {
             }]
         });
         let result: Result<Config, _> = serde_json::from_value(v);
-        assert!(result.is_err(), "present non-boolean must fail typed decode");
+        assert!(
+            result.is_err(),
+            "present non-boolean must fail typed decode"
+        );
     }
 
     #[test]
