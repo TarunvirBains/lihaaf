@@ -62,7 +62,10 @@ cargo lihaaf \
   --compat-report compat-report.json
 ```
 
-Use compat mode on your stable and nightly toolchains to confirm that trybuild and lihaaf behave identically on the same source code. This gives you a clear diff of any minor normalizer differences before you fully commit to the migration steps below.
+Use compat mode on your stable and nightly toolchains to see the normalizer
+differences, including lihaaf's foreign-span body suppression (which trybuild
+does not apply). This gives you a clear diff before you fully commit to the
+migration steps below.
 
 ## Step 1: Add lihaaf's `[package.metadata.lihaaf]` block
 

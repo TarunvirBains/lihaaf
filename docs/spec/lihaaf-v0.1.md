@@ -381,6 +381,17 @@ strip_line_prefixes = [
     "$WORKSPACE/.cargo-cache/",
     "For more information about this error",
 ]
+
+# DEFAULT: false. When false (the default), lihaaf normalizes the
+# source body of any foreign secondary/primary span — a `-->`/`:::`
+# pointer resolving to `$RUST`, `$CARGO`, or `$WORKSPACE` — collapsing
+# the quoted source text + caret to a single `$RUST_SRC` / `$CARGO_SRC`
+# / `$WORKSPACE_SRC` placeholder line. Set true to PRESERVE those
+# bodies (upstream-regression detection — "fail when stdlib source
+# changes"). The pointer's `:LINE:COL` tail is stripped regardless of
+# this key (it is always volatile). Per-suite; a named suite that omits
+# it gets false, not an inherited value. See §6.6.
+keep_foreign_span_bodies = false
 ```
 
 ### 3.3 Worked example
@@ -450,6 +461,11 @@ doing any work. Any of these conditions hard-error with a non-zero exit:
 - An entry in `strip_lines` or `strip_line_prefixes` is neither
   path-shaped nor banner-shaped (see §6.6 for the
   `is_path_like || is_banner_shape` disjunction).
+- `keep_foreign_span_bodies` is present but not a boolean (`true` /
+  `false`). A non-boolean value (`"yes"`, `1`, `[]`) fails typed
+  deserialization and hard-errors as `CONFIG_INVALID`, the same path the
+  typed integer/string keys use — there is no separate hand-rolled
+  validator; serde's typed decode is the contract.
 
 Unknown lint names are NOT pre-validated — rustc surfaces
 `warning: unknown lint: X` on the per-fixture stderr.
@@ -540,6 +556,11 @@ at session startup with the list of valid names.
   NOT inherit. Per-suite REPLACE semantics match the `features`
   precedent: a named suite that omits these keys gets `[]`, not the
   default suite's value. See §6.6 for the rationale.
+- `keep_foreign_span_bodies` does NOT inherit. A named suite that omits
+  it gets the default `false` (= suppress), NOT the default suite's
+  value — the same REPLACE scope as the substitution keys above. This
+  keeps a suite that only varies fixture layout from silently inheriting
+  an upstream-watch suite's body-preservation. See §6.6.
 - `extern_crates`, `dev_deps`, `edition`, `compile_fail_marker`,
   `fixture_timeout_secs`, `per_fixture_memory_mb`, and `allow_lints`
   DO inherit from the default suite when omitted.
@@ -1502,12 +1523,20 @@ intermediate output and can rewrite it further (e.g.,
 `{ from = "$RUST/lib/rust-1.95.0", to = "$RUST" }` collapses an
 inner version-stamped sub-tree to bare `$RUST`).
 
-**Compat-mode boundary.** The three keys are unsupported in compat mode.
-The compat driver (`cargo lihaaf --compat`) synthesizes
-`[package.metadata.lihaaf]` and does not carry adopter TOML into the
-inner session, so the keys have no effect there. Adopters who need
-extra-substitution or strip behavior must run the direct lihaaf path
-without `--compat`.
+**Compat-mode boundary.** The four per-suite keys (`extra_substitutions`,
+`strip_lines`, `strip_line_prefixes`, `keep_foreign_span_bodies`) are
+unsupported in compat mode. The compat driver (`cargo lihaaf --compat`)
+synthesizes `[package.metadata.lihaaf]` and does not carry adopter TOML into
+the inner session, so all four keys have no effect there. Adopters who need
+extra-substitution or strip behavior must run the direct lihaaf path without
+`--compat`. Note that foreign-span source-body suppression IS active in compat
+mode as a core normalization behavior; because `keep_foreign_span_bodies` is
+stripped along with the other three keys, compat-mode foreign-span suppression
+is non-optional (it cannot be disabled from inside a `--compat` run). This is
+intentional — compat mode normalizes foreign span bodies (both primary `-->`
+and secondary `:::` spans) for the same cross-version/cross-platform stability
+reason as the direct path, and the resulting trybuild-vs-lihaaf diff is
+surfaced honestly in the compat envelope (§3.2.2, §9.2).
 
 ---
 
@@ -1866,6 +1895,14 @@ For a fixture, agreement requires:
   implementations; the spec's success criterion is that both
   implementations agree on the canonical adopter's checked-in
   snapshots after Section 6.2's normalization rules are applied.
+  Foreign span source bodies — for BOTH primary `-->` and secondary `:::`
+  spans whose pointer resolves to `$RUST` / `$CARGO` / `$WORKSPACE`, and
+  the `:LINE:COL` tail on those pointer lines — are an intentional
+  lihaaf-only normalization (§6.2): trybuild does not suppress them, so any
+  fixture that triggers a foreign span (primary or secondary) will show a
+  lihaaf-side difference in the compat comparison. That is correct behavior,
+  not a disagreement — the adopter re-blesses once under lihaaf and the
+  verdict (pass/fail) is what agreement requires (§9.2 "Scope and bounds").
 
 If lihaaf normalizes more aggressively than trybuild and produces a
 shorter normalized output, the snapshot would need re-blessing under
