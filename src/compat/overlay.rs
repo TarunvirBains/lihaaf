@@ -612,7 +612,7 @@ where
     })?;
 
     let canonical_upstream_manifest =
-        canonicalize_within_base(upstream_dir, upstream_manifest_path).map_err(|e| {
+        util::canonicalize_within_base(upstream_dir, upstream_manifest_path).map_err(|e| {
             Error::io(
                 e,
                 "validating upstream manifest containment",
@@ -1952,7 +1952,7 @@ fn expand_workspace_member_entry(
     // Resolves symlinks in parent segments and ensures the resulting
     // path stays within the workspace root. If the parent doesn't exist
     // yet, canonicalizes the nearest existing ancestor and rejoins.
-    let parent_dir = match canonicalize_within_base(workspace_root_dir, &lexical_parent) {
+    let parent_dir = match util::canonicalize_within_base(workspace_root_dir, &lexical_parent) {
         Ok(canonical) => canonical,
         Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
             return Ok(Vec::new());
@@ -3599,7 +3599,7 @@ fn mirror_upstream_into_overlay(
             if !upstream_names.contains(name) {
                 let stale = canonical_staged.join(name);
                 // Validate stale path stays within staged dir (Alert #11).
-                if ensure_path_within_base(&canonical_staged, &stale).is_err() {
+                if util::canonicalize_within_base(&canonical_staged, &stale).is_err() {
                     continue; // skip entries that escaped via symlink
                 }
                 remove_path_any(&stale).map_err(|e| {
@@ -3773,7 +3773,9 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 let _ = std::fs::remove_file(staged_path);
             }
-            copy_fallback(upstream_path, staged_path).map_err(|e| mirror_err("copy-fallback", e))
+            let staged_root = staged_path.parent().unwrap_or_else(|| Path::new("."));
+            copy_fallback_within(upstream_path, staged_path, staged_root)
+                .map_err(|e| mirror_err("copy-fallback", e))
         }
         Err(e) => Err(mirror_err("symlink", e)),
     }
@@ -3787,88 +3789,46 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
 /// subdirectory is removed before the copy to honour decision 5 of
 /// the idempotency contract (no merge — destination-only files must
 /// not persist).
-fn ensure_path_within_base(base: &Path, candidate: &Path) -> std::io::Result<()> {
-    let canonical_base = base.canonicalize()?;
-    let canonical_candidate = candidate.canonicalize()?;
-    if canonical_candidate.starts_with(&canonical_base) {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "copy-fallback: source path escapes allowed root",
-        ))
-    }
-}
-
-/// Containment check with parent-canonicalize fallback for non-existing paths.
-///
-/// Canonicalizes both `base` and `candidate`. If `candidate` does not yet
-/// exist, canonicalizes its parent directory and rejoins the final component
-/// (Pattern D: non-existing path containment). Returns an error if the
-/// resulting path is not contained within the canonical base.
-fn canonicalize_within_base(base: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
-    let canonical_base = std::fs::canonicalize(base)?;
-
-    let canonical_candidate = match std::fs::canonicalize(candidate) {
-        Ok(path) => path,
-        Err(_) => {
-            let parent = candidate.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("containment check: no parent for {}", candidate.display()),
-                )
-            })?;
-            let canonical_parent = std::fs::canonicalize(parent)?;
-            canonical_parent.join(candidate.file_name().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "containment check: no file_name for {}",
-                        candidate.display()
-                    ),
-                )
-            })?)
-        }
-    };
-
-    if !canonical_candidate.starts_with(&canonical_base) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "path escapes allowed root",
-        ));
-    }
-    Ok(canonical_candidate)
-}
-
 fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
-    fn copy_fallback_inner(base_src: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
-        ensure_path_within_base(base_src, src)?;
+    let dst_base = dst.parent().unwrap_or_else(|| Path::new("."));
+    copy_fallback_within(src, dst, dst_base)
+}
 
-        let meta = std::fs::symlink_metadata(src)?;
+fn copy_fallback_within(src: &Path, dst: &Path, dst_base: &Path) -> std::io::Result<()> {
+    fn copy_fallback_inner(
+        base_src: &Path,
+        base_dst: &Path,
+        src: &Path,
+        dst: &Path,
+    ) -> std::io::Result<()> {
+        let canonical_src = util::canonicalize_within_base(base_src, src)?;
+        let canonical_dst = util::canonicalize_within_base(base_dst, dst)?;
+
+        let meta = std::fs::symlink_metadata(&canonical_src)?;
         let ftype = meta.file_type();
         if ftype.is_file() {
             // Ensure parent dir exists; on the staged-overlay top level
             // the parent is the staged-overlay-dir itself, but the helper
             // is also used recursively for nested entries below.
-            if let Some(parent) = dst.parent() {
+            if let Some(parent) = canonical_dst.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            std::fs::copy(src, dst)?;
+            std::fs::copy(&canonical_src, &canonical_dst)?;
             Ok(())
         } else if ftype.is_dir() {
             // Exact-sync: if `dst` already exists (e.g. from a partial
             // prior run), remove it before re-copying. Decision 5 of
             // §4.5.6: NO MERGE — destination-only files must not
             // persist.
-            if dst.exists() {
-                std::fs::remove_dir_all(dst)?;
+            if canonical_dst.exists() {
+                std::fs::remove_dir_all(&canonical_dst)?;
             }
-            std::fs::create_dir_all(dst)?;
-            for entry in std::fs::read_dir(src)? {
+            std::fs::create_dir_all(&canonical_dst)?;
+            for entry in std::fs::read_dir(&canonical_src)? {
                 let entry = entry?;
                 let child_src = entry.path();
-                let child_dst = dst.join(entry.file_name());
-                copy_fallback_inner(base_src, &child_src, &child_dst)?;
+                let child_dst = canonical_dst.join(entry.file_name());
+                copy_fallback_inner(base_src, base_dst, &child_src, &child_dst)?;
             }
             Ok(())
         } else if ftype.is_symlink() {
@@ -3891,7 +3851,7 @@ fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
 
     let canonical_base_src = src.canonicalize()?;
-    copy_fallback_inner(&canonical_base_src, src, dst)
+    copy_fallback_inner(&canonical_base_src, dst_base, src, dst)
 }
 
 /// Platform-dispatched symlink creation.
@@ -9111,7 +9071,7 @@ demo = { path = "." }
         let child = tmp.path().join("file.txt");
         std::fs::write(&child, "data").unwrap();
 
-        assert!(ensure_path_within_base(tmp.path(), &child).is_ok());
+        assert!(util::canonicalize_within_base(tmp.path(), &child).is_ok());
     }
 
     #[test]
@@ -9129,7 +9089,7 @@ demo = { path = "." }
 
         // Construct a path via `..` that resolves to the outside file
         let candidate = nested.join("..").join("..").join("outside.txt");
-        match ensure_path_within_base(&base_dir, &candidate) {
+        match util::canonicalize_within_base(&base_dir, &candidate) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             other => panic!("expected PermissionDenied, got {other:?}"),
         }
@@ -9147,7 +9107,7 @@ demo = { path = "." }
         let symlink = base_dir.path().join("escape_link");
         std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
 
-        match ensure_path_within_base(base_dir.path(), &symlink) {
+        match util::canonicalize_within_base(base_dir.path(), &symlink) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             other => panic!("expected PermissionDenied, got {other:?}"),
         }
@@ -9158,7 +9118,7 @@ demo = { path = "." }
         let tmp = tempfile::tempdir().unwrap();
         let nonexist = tmp.path().join("will_be_created.txt");
 
-        let result = canonicalize_within_base(tmp.path(), &nonexist);
+        let result = util::canonicalize_within_base(tmp.path(), &nonexist);
         assert!(
             result.is_ok(),
             "expected Ok for non-existing file in valid parent"
@@ -9182,7 +9142,7 @@ demo = { path = "." }
 
         let target = escape_link.join("target.txt");
 
-        match canonicalize_within_base(base_dir.path(), &target) {
+        match util::canonicalize_within_base(base_dir.path(), &target) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             other => panic!("expected PermissionDenied, got {other:?}"),
         }
@@ -9270,6 +9230,32 @@ demo = { path = "." }
                 panic!("expected PermissionDenied when source contains symlinks, got {other:?}")
             }
         }
+    }
+
+    #[test]
+    fn copy_fallback_rejects_destination_escape() {
+        // Verifies that copy_fallback rejects a destination path that escapes
+        // the intended staged root via `..`.
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_src = tmp.path().join("upstream-src");
+        std::fs::create_dir(&upstream_src).unwrap();
+        std::fs::write(upstream_src.join("real.txt"), "real content").unwrap();
+
+        let staged_root = tmp.path().join("staged-root");
+        std::fs::create_dir(&staged_root).unwrap();
+
+        // This destination resolves outside staged_root.
+        let escaped_dst = staged_root.join("..").join("escape");
+
+        match copy_fallback_within(&upstream_src, &escaped_dst, &staged_root) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied for escaped destination, got {other:?}"),
+        }
+
+        assert!(
+            !tmp.path().join("escape").exists(),
+            "escaped destination must not be created"
+        );
     }
 
     #[cfg(unix)]

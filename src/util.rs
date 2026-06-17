@@ -155,6 +155,46 @@ pub fn relative_to(path: &Path, base: &Path) -> Result<String, RelativePathError
         })
 }
 
+/// Canonicalize `candidate` and ensure it stays within `base`.
+///
+/// If `candidate` does not yet exist, canonicalize its parent directory and
+/// rejoin the final path component. This keeps callers from having to special
+/// case non-existent leaf paths while still rejecting symlink escapes.
+pub(crate) fn canonicalize_within_base(base: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
+    let canonical_base = std::fs::canonicalize(base)?;
+
+    let canonical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            let parent = candidate.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("containment check: no parent for {}", candidate.display()),
+                )
+            })?;
+            let canonical_parent = std::fs::canonicalize(parent)?;
+            canonical_parent.join(candidate.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "containment check: no file_name for {}",
+                        candidate.display()
+                    ),
+                )
+            })?)
+        }
+    };
+
+    if !canonical_candidate.starts_with(&canonical_base) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes allowed root",
+        ));
+    }
+
+    Ok(canonical_candidate)
+}
+
 /// Remove `path` from the filesystem without relying on a prior
 /// `symlink_metadata` stat. Best-effort: a non-existent path is treated
 /// as already-cleaned (no error) so cleanup is idempotent across reruns.
@@ -395,5 +435,40 @@ mod tests {
         let p = std::path::PathBuf::from("/y/z.rs");
         let err = relative_to(&p, &base).unwrap_err();
         assert_eq!(err.non_absolute_path(), "outside-base/y/z.rs");
+    }
+
+    #[test]
+    fn canonicalize_within_base_accepts_existing_path() {
+        let tmp = tempdir().unwrap();
+        let child = tmp.path().join("file.txt");
+        std::fs::write(&child, "data").unwrap();
+
+        let resolved = canonicalize_within_base(tmp.path(), &child).unwrap();
+        assert_eq!(resolved, child.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn canonicalize_within_base_accepts_nonexisting_child() {
+        let tmp = tempdir().unwrap();
+        let child = tmp.path().join("nested").join("file.txt");
+        std::fs::create_dir(tmp.path().join("nested")).unwrap();
+
+        let resolved = canonicalize_within_base(tmp.path(), &child).unwrap();
+        assert_eq!(resolved, tmp.path().join("nested").join("file.txt"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_within_base_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let escape = base.path().join("escape");
+        symlink(outside.path(), &escape).unwrap();
+        let target = escape.join("child.txt");
+
+        let err = canonicalize_within_base(base.path(), &target).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::PermissionDenied);
     }
 }

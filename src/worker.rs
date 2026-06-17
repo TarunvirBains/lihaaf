@@ -41,6 +41,7 @@ use crate::error::Error;
 use crate::freshness::{self, FreshnessFailure, FreshnessSnapshot};
 use crate::normalize::{self, NormalizationContext};
 use crate::snapshot;
+use crate::util;
 use crate::verdict::{CleanupFailure, FixtureResult, FixtureWarning, MalformedSource, Verdict};
 
 /// Per-session worker context. Shared (read-only) across all worker
@@ -365,13 +366,11 @@ pub fn resolve_extern_paths(
         if !meta.file_type().is_file() {
             continue;
         }
-        let p_real = match p.canonicalize() {
+        let p_real = match util::canonicalize_within_base(&deps_dir_real, &p) {
             Ok(cp) => cp,
             Err(_) => continue,
         };
-        if p_real.starts_with(&deps_dir_real) {
-            all_files.push(p_real);
-        }
+        all_files.push(p_real);
     }
     for name in crate_names {
         // Cargo's lib name uses `_` for `-` in crate names.
@@ -1851,6 +1850,28 @@ plain text line
             args,
             vec!["-A", "clippy::needless_collect"],
             "namespaced lint must be forwarded verbatim as a single argv token"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_extern_paths_skips_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let deps_dir = tmp.path().join("deps");
+        std::fs::create_dir(&deps_dir).unwrap();
+
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        let outside_rlib = outside.join("libdemo-abc.rlib");
+        std::fs::write(&outside_rlib, b"stub").unwrap();
+        symlink(&outside_rlib, deps_dir.join("libdemo-abc.rlib")).unwrap();
+
+        let resolved = resolve_extern_paths(&deps_dir, &["demo".to_string()]).unwrap();
+        assert!(
+            !resolved.contains_key("demo"),
+            "symlinked artifacts escaping deps dir must be ignored"
         );
     }
 }
