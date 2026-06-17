@@ -1097,7 +1097,7 @@ surface for negligible gain.
 rustc stderr contains environment-dependent text that would otherwise
 make snapshots non-portable across machines, toolchain versions, and
 working directories. The normalizer rewrites these to placeholders.
-The categories the harness handles in v0.1:
+The categories the harness normalizes:
 
 - **Absolute paths to the fixture's directory** → `$DIR`. Any path
   prefix matching the fixture directory (the directory holding the
@@ -1107,7 +1107,27 @@ The categories the harness handles in v0.1:
 - **rustc sysroot paths** → `$RUST`. Any path prefix matching the
   captured sysroot (Section 4.1 stage 2).
 - **Cargo registry paths** → `$CARGO/registry/`. Any path prefix
-  matching `<CARGO_HOME>/registry/`.
+  matching `<CARGO_HOME>/registry/`. The volatile registry index hash
+  segment (`<host>-<16hex>`) that follows the prefix is collapsed to the
+  stable placeholder token `$CARGO_HASH` so registry-path snapshots are
+  portable across machines, for the two cargo-used registry hosts
+  `index.crates.io` and `github.com` — e.g.
+  `$CARGO/registry/src/index.crates.io-<16hex>/serde-1.0.0/src/lib.rs`
+  normalizes to `$CARGO/registry/src/$CARGO_HASH/serde-1.0.0/src/lib.rs`.
+- **Foreign span source bodies** (both primary `-->` and secondary `:::`
+  spans) → replaced with a kind-matched placeholder (`$RUST_SRC` / `$CARGO_SRC`
+  / `$WORKSPACE_SRC`). When a `-->` or `:::` span pointer resolves to a
+  non-fixture placeholder (`$RUST`, `$CARGO`, `$WORKSPACE`), the pointer's
+  trailing `:LINE:COL` is ALWAYS stripped (even if no body follows), and any
+  quoted source content beneath it — the gutter line number, the source text,
+  and the caret/underline — collapses to a SINGLE placeholder line matching the
+  pointer's tree, so stdlib/registry/workspace source drift across rustc
+  versions and platforms does not break snapshots. This applies equally to a
+  primary `-->` span (e.g. an error whose primary location lands in a dependency
+  macro) and a secondary `:::` span — both are normalized the same way. The
+  fixture's OWN spans (`$DIR/...`) are NOT affected — their line/column numbers
+  remain pinned by fixture content (§6.3). Default-on; opt out per suite with
+  `keep_foreign_span_bodies` (§6.6).
 - **Backslashes in paths** → forward slashes. Windows path output is
   rewritten to POSIX form so snapshots are byte-identical across OS.
 - **Line endings** — `\r\n` → `\n` everywhere.
@@ -1126,13 +1146,23 @@ The categories the harness handles in v0.1:
 
 ### 6.3 What does NOT get normalized
 
-- **Diagnostic text** — error codes, message text, span pointers
-  (`^^^`), help text. Preserved byte-for-byte; a change in rustc's
+- **Diagnostic text outside foreign span source bodies** — error codes,
+  message text, help text, and the span pointers (`^^^`) of the fixture's
+  OWN (`$DIR`) spans. Preserved byte-for-byte; a change in rustc's
   wording IS a snapshot change and adopters use `--bless` to accept
-  it. Hiding wording drift would weaken the snapshot signal.
-- **Line and column numbers in spans** — pinned by fixture content.
-  Editing a fixture shifts line numbers and the snapshot
-  legitimately needs re-blessing.
+  it. Hiding wording drift would weaken the snapshot signal. (Exception:
+  span pointers and caret/underline lines WITHIN a foreign span source body —
+  a `-->`/`:::` block whose pointer resolves to `$RUST` / `$CARGO` /
+  `$WORKSPACE` — are NOT preserved; they are normalized under §6.2 as part of
+  the body suppression: the source-text gutter line collapses to a single
+  `$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC` placeholder line and the
+  caret/underline line is dropped, because foreign source content drifts across
+  rustc versions and platforms.)
+- **Line and column numbers in the fixture's own spans** (`--> $DIR/...`)
+  — pinned by fixture content. Editing a fixture shifts its line numbers
+  and the snapshot legitimately needs re-blessing. (Line and column numbers
+  in FOREIGN spans — `$RUST` / `$CARGO` / `$WORKSPACE` — are normalized away
+  with the foreign-span source body; see §6.2.)
 - **Suggestion text** ("help: there is a method `foo` with a similar
   name") — preserved. Part of a fixture's observable behavior;
   adopters often pin the suggestion shape.
@@ -1266,9 +1296,15 @@ placeholder references, and are ACCEPTED via the path-separator
 branch — the recognized-placeholder convention governs LEADING
 placeholder tokens, not arbitrary `$` occurrences inside path text.
 This convention matches lihaaf's built-in placeholders (`$DIR`,
-`$WORKSPACE`, `$RUST`, `$CARGO`, `$TYPEID`, `$LONGTYPE_FILE`) and
+`$WORKSPACE`, `$RUST`, `$CARGO`, `$TYPEID`, `$LONGTYPE_FILE`,
+`$CARGO_HASH`, `$RUST_SRC`, `$CARGO_SRC`, `$WORKSPACE_SRC`) and
 keeps placeholder tokens visually distinct from environment variable
 expansions or shell variable references in surrounding documentation.
+The last four are the registry-index-hash collapse (`$CARGO_HASH`) and
+the kind-matched foreign span source-body placeholders (`$RUST_SRC` /
+`$CARGO_SRC` / `$WORKSPACE_SRC`, used for both primary `-->` and secondary
+`:::` foreign spans); see §6.2 for the normalization behavior each
+represents.
 
 **Bare placeholder patterns are full-string anchored.** A pattern
 like `$DIR` is accepted because the entire string matches the
