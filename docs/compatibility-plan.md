@@ -93,9 +93,9 @@ Optional options when `--compat` is set:
 - `--compat-filter` shadows `--filter` (in compat mode, the standard `--filter` is a mode error)
 - `--compat-manifest` shadows `--manifest-path` (same shadowing rule)
 
-When `--compat` is unset, every `--compat-*` flag is rejected as a mode error. This preserves the v0.1 stable contract (`docs/spec/lihaaf-v0.1.md` §8.5): existing scripts that use `--filter` and `--manifest-path` continue to work, and new compat-mode users learn the compat-prefixed surface without polluting it from non-compat flags.
+When `--compat` is unset, every `--compat-*` flag is rejected as a mode error. This preserves the v0.1 stable contract (`docs/spec/lihaaf-v0.2.md` §8.5): existing scripts that use `--filter` and `--manifest-path` continue to work, and new compat-mode users learn the compat-prefixed surface without polluting it from non-compat flags.
 
-**Compat-mode interactions with other v0.1 flags.** The remaining v0.1 stable flags (`docs/spec/lihaaf-v0.1.md` §8.2) carry the same semantics in compat mode unless explicitly shadowed above. The table below records the policy for every v0.1 stable flag so adopters do not have to guess:
+**Compat-mode interactions with other v0.1 flags.** The remaining v0.1 stable flags (`docs/spec/lihaaf-v0.2.md` §8.2) carry the same semantics in compat mode unless explicitly shadowed above. The table below records the policy for every v0.1 stable flag so adopters do not have to guess:
 
 | v0.1 flag | Compat-mode policy | Rationale |
 |---|---|---|
@@ -301,7 +301,7 @@ Write one deterministic JSON envelope:
 Compat mode interacts with two toolchain-drift mechanisms:
 
 1. **Pilot pinning** (§4 — "one pinned toolchain") — every pilot fork runs against a toolchain recorded in the fork's `rust-toolchain.toml`.
-2. **Lihaaf freshness check** (`docs/spec/lihaaf-v0.1.md` §4.5, §4.6) — every fixture dispatch re-validates `rustc --version --verbose` against the dylib's build-time rustc and hard-fails with exit code 67 on drift.
+2. **Lihaaf freshness check** (`docs/spec/lihaaf-v0.2.md` §4.5, §4.6) — every fixture dispatch re-validates `rustc --version --verbose` against the dylib's build-time rustc and hard-fails with exit code 67 on drift.
 
 These two mechanisms are compatible if and only if the dylib build and every fixture dispatch resolve to the same `rust-toolchain.toml`. Compat mode enforces this:
 

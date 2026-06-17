@@ -1,12 +1,12 @@
-# lihaaf v0.1 — design specification
+# lihaaf v0.2 — design specification
 
 > **lihaaf** ("quilt", Urdu) — a Rust test harness purpose-built for fast,
 > parallel, non-flaky compile-fail and compile-pass testing of proc-macros
 > and macro-emitted code. Named after Ismat Chughtai's 1942 short story.
 
-Status: v0.1.0 implementation and release-gate spec. Target: a
+Status: v0.2.0 implementation and release-gate spec. Target: a
 single-binary `cargo lihaaf` subcommand publishable to crates.io from
-v0.1.
+v0.2.
 
 This document stands alone. It does not require any prior conversation or
 internal note to be understood, and it is the authoritative design source

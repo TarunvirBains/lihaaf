@@ -72,7 +72,7 @@ migration steps below.
 lihaaf is driven entirely by `[package.metadata.lihaaf]` in the crate's
 `Cargo.toml`. There is no library import — you run `cargo lihaaf` as a standalone
 binary. The full key reference is in
-[`docs/spec/lihaaf-v0.1.md` §3.2](spec/lihaaf-v0.1.md).
+[`docs/spec/lihaaf-v0.2.md` §3.2](spec/lihaaf-v0.2.md).
 
 **Minimal example** — single crate, fixtures only import from the crate itself
 (like anyhow: 7 fixtures, `use anyhow::...`, no macro sibling):
@@ -623,7 +623,7 @@ Before merging, confirm:
 
 ## Further reading
 
-- [`docs/spec/lihaaf-v0.1.md`](spec/lihaaf-v0.1.md) — full specification: metadata
+- [`docs/spec/lihaaf-v0.2.md`](spec/lihaaf-v0.2.md) — full specification: metadata
   schema, normalizer rules, verdict types, named suites, workspace-member entry.
 - README [lihaaf vs trybuild](#lihaaf-vs-trybuild) section — rationale and measured
   timing from the djogi-macros conversion (237 fixtures).

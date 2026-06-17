@@ -202,7 +202,7 @@ pub struct Suite {
 
     /// Adopter-defined extra substitutions applied to normalized stderr
     /// AFTER built-in path placeholders and BEFORE TypeId collapse
-    /// (see `docs/spec/lihaaf-v0.1.md` §6.6). Empty by default.
+    /// (see `docs/spec/lihaaf-v0.2.md` §6.6). Empty by default.
     ///
     /// **Per-suite REPLACE semantics.** A named suite that omits
     /// `extra_substitutions` does NOT inherit the default suite's
@@ -224,7 +224,7 @@ pub struct Suite {
     /// **Per-suite REPLACE semantics** — same as
     /// [`Self::extra_substitutions`]. Each entry must pass
     /// `is_path_like` OR `is_banner_shape` per config-parse validation
-    /// (see `docs/spec/lihaaf-v0.1.md` §6.6).
+    /// (see `docs/spec/lihaaf-v0.2.md` §6.6).
     ///
     /// The [`StripPattern`] wrapper guarantees this invariant holds on
     /// every construction path, including direct serde deserialization.
@@ -314,7 +314,7 @@ impl TryFrom<String> for StripPattern {
                 "\"{s}\" is neither path-shaped nor banner-shaped \
                  (must contain '/', '\\\\', start with a $X placeholder token where X is an \
                  ASCII uppercase letter, OR match the banner allowlist — \
-                 see docs/spec/lihaaf-v0.1.md §6.6). \
+                 see docs/spec/lihaaf-v0.2.md §6.6). \
                  Patterns starting with '$' must have an ASCII uppercase letter immediately after, \
                  regardless of path separators — '$lowercase/path' is rejected. \
                  Bare placeholder patterns are full-string anchored: \
@@ -517,7 +517,7 @@ impl TryFrom<RawSubstitution> for Substitution {
             return Err("extra_substitutions entry `from` is empty. \
                  An empty `from` would match the start of every byte and rewrite arbitrary \
                  content. extra_substitutions is for path-shaped substitution only. \
-                 See docs/spec/lihaaf-v0.1.md §6.6."
+                 See docs/spec/lihaaf-v0.2.md §6.6."
                 .to_string());
         }
         if !is_path_like(&from) {
@@ -532,7 +532,7 @@ impl TryFrom<RawSubstitution> for Substitution {
                  '$DIR-', '$RUST.', '$A!' are rejected; '$DIR/x' is accepted \
                  via the path-separator branch. \
                  extra_substitutions is for path-shaped substitution only, \
-                 not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
+                 not arbitrary text rewriting. See docs/spec/lihaaf-v0.2.md §6.6.",
             ));
         }
         if to.contains('\n') {
@@ -1053,7 +1053,7 @@ fn validate_features(suite_label: &str, features: &[String]) -> Result<(), Error
     Ok(())
 }
 
-/// True iff `s` is path-shaped per `docs/spec/lihaaf-v0.1.md` §6.6:
+/// True iff `s` is path-shaped per `docs/spec/lihaaf-v0.2.md` §6.6:
 ///
 /// 1. `s.len() >= 2` (bytes).
 /// 2. `s` contains no `\n` byte.
@@ -1192,7 +1192,7 @@ const STRUCTURAL_BANNER_MARKERS: &[&str] = &[
     "end-of-life",
 ];
 
-/// True iff `s` is banner-shaped per `docs/spec/lihaaf-v0.1.md` §6.6
+/// True iff `s` is banner-shaped per `docs/spec/lihaaf-v0.2.md` §6.6
 /// (planner design from `docs/spec/extra-substitutions-plan-2026-05-19.md`
 /// §3.3.2):
 ///
@@ -1270,7 +1270,7 @@ fn validate_extra_substitutions(suite_label: &str, subs: &[Substitution]) -> Res
                 message: format!(
                     "{suite_label}.extra_substitutions[{i}].from is empty.\n\
                      Why this matters: an empty `from` would match the start of every byte and rewrite arbitrary content.\n\
-                     extra_substitutions is for path-shaped substitution only. See docs/spec/lihaaf-v0.1.md §6.6."
+                     extra_substitutions is for path-shaped substitution only. See docs/spec/lihaaf-v0.2.md §6.6."
                 ),
             }));
         }
@@ -1285,7 +1285,7 @@ fn validate_extra_substitutions(suite_label: &str, subs: &[Substitution]) -> Res
                      Bare placeholder patterns are full-string anchored: '$DIR-', '$RUST.', '$A!' \
                      are rejected; '$DIR/x' is accepted via the path-separator branch. \
                      extra_substitutions is for path-shaped substitution only, \
-                     not arbitrary text rewriting. See docs/spec/lihaaf-v0.1.md §6.6.",
+                     not arbitrary text rewriting. See docs/spec/lihaaf-v0.2.md §6.6.",
                     from = sub.from,
                 ),
             }));
@@ -1328,7 +1328,7 @@ fn validate_strip_patterns(
                 message: format!(
                     "{suite_label}.{key_label}[{i}] = \"{pat}\" is neither path-shaped nor banner-shaped \
                      (must contain '/', '\\\\', start with a $X placeholder token where X is an \
-                     ASCII uppercase letter, OR match the banner allowlist — see docs/spec/lihaaf-v0.1.md §6.6). \
+                     ASCII uppercase letter, OR match the banner allowlist — see docs/spec/lihaaf-v0.2.md §6.6). \
                      Patterns starting with '$' must have an ASCII uppercase letter immediately after, \
                      regardless of path separators — '$lowercase/path' is rejected. \
                      Bare placeholder patterns are full-string anchored: '$DIR-', '$RUST.', '$A!' \

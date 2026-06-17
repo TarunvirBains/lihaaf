@@ -127,7 +127,7 @@ pub struct NormalizationContext {
     /// removes the shell and the hash together.
     pub compat_short_cargo: bool,
     /// Adopter-defined `extra_substitutions` (per-suite, REPLACE
-    /// semantics — see `docs/spec/lihaaf-v0.1.md` §3.6). Applied
+    /// semantics — see `docs/spec/lihaaf-v0.2.md` §3.6). Applied
     /// left-to-right in declared order, AFTER built-in path
     /// substitutions and BEFORE TypeId collapse. Empty by default;
     /// when empty, no adopter substitutions are applied.
@@ -136,7 +136,7 @@ pub struct NormalizationContext {
     /// Full-line exact-match drops applied after trim-trailing-whitespace
     /// and before blank-line collapse. Empty by default. Each entry
     /// must be `is_path_like` OR `is_banner_shape` per config-parse
-    /// validation — see `docs/spec/lihaaf-v0.1.md` §6.6.
+    /// validation — see `docs/spec/lihaaf-v0.2.md` §6.6.
     pub strip_lines: Vec<String>,
     /// Adopter-defined `strip_line_prefixes` (per-suite, REPLACE
     /// semantics). Prefix-match drops applied after trim-trailing-
@@ -145,7 +145,7 @@ pub struct NormalizationContext {
     /// config-parse validation.
     pub strip_line_prefixes: Vec<String>,
     /// Adopter-defined `keep_foreign_span_bodies` (per-suite, REPLACE
-    /// semantics — see `docs/spec/lihaaf-v0.1.md` §6.6). When `false` (the
+    /// semantics — see `docs/spec/lihaaf-v0.2.md` §6.6). When `false` (the
     /// default), the source body of any `-->`/`:::` span whose pointer
     /// resolves to a non-fixture placeholder (`$RUST` / `$CARGO` /
     /// `$WORKSPACE`) is collapsed to a single kind-matched placeholder line
@@ -244,7 +244,7 @@ impl NormalizationContext {
     /// Set `keep_foreign_span_bodies` (the foreign-span body-suppression
     /// opt-out). Defaults to `false` (= suppress); pass `true` to preserve
     /// foreign span source bodies. See the field doc and
-    /// `docs/spec/lihaaf-v0.1.md` §6.6 for the body-content-only scope (the
+    /// `docs/spec/lihaaf-v0.2.md` §6.6 for the body-content-only scope (the
     /// pointer `:LINE:COL` tail is stripped regardless of this flag).
     pub fn with_keep_foreign_span_bodies(mut self, enabled: bool) -> Self {
         self.keep_foreign_span_bodies = enabled;
@@ -261,7 +261,7 @@ impl NormalizationContext {
 /// ## No silent drops
 ///
 /// Every line this normalizer removes or rewrites belongs to a documented
-/// normalization category (see `docs/spec/lihaaf-v0.1.md` §6.2). Nothing is
+/// normalization category (see `docs/spec/lihaaf-v0.2.md` §6.2). Nothing is
 /// dropped silently. In particular, the rustc summary lines `error: aborting
 /// due to N previous error[s]` and `For more information about this error, try
 /// \`rustc --explain ...\`` are PRESERVED byte-for-byte — they are diagnostic
