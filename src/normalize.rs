@@ -306,6 +306,14 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             // match occurs inside the placeholder.
             s = replace_advancing(&s, needle, repl);
         }
+        // Class K-fix (composition step 4, non-compat only): collapse the
+        // registry index hash to $CARGO_HASH. Runs as part of the
+        // $CARGO/registry substitution — only when that prefix was pushed,
+        // i.e. non-compat. In compat mode the prefix is not pushed and
+        // rewrite_cargo_short (below) removes the whole segment instead.
+        if !ctx.compat_short_cargo {
+            s = collapse_registry_hash(&s);
+        }
         // Compat-mode post-pass (§3.2.2): rewrite
         // `<cargo_registry>/src/<host>-<16hex>/` to `$CARGO/` so the
         // output matches trybuild's short form
@@ -571,6 +579,64 @@ fn rewrite_cargo_short(s: &str, cargo_registry: &Path) -> String {
         // No match at this offset — copy one char (UTF-8 boundary safe;
         // the byte at `i` starts a UTF-8 sequence so the continuation
         // bytes `(b & 0xC0) == 0x80` follow).
+        let mut j = i + 1;
+        while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
+            j += 1;
+        }
+        out.push_str(&s[i..j]);
+        i = j;
+    }
+    out
+}
+
+/// Class K-fix (NON-COMPAT only): collapse the volatile registry index hash
+/// segment `<host>-<16hex>` to the stable placeholder token `$CARGO_HASH`,
+/// retaining the `$CARGO/registry/src/.../` shell. Operates on a line that has
+/// ALREADY had the `$CARGO/registry` literal prefix substituted (composition
+/// step 4). Recognizes only `index.crates.io` and `github.com` hosts, with the
+/// same structural rules as [`rewrite_cargo_short`]: exactly 16 lowercase-hex
+/// bytes after the `<host>-`, followed by `/`. No regex; pure byte-walk.
+fn collapse_registry_hash(s: &str) -> String {
+    const PREFIX: &str = "$CARGO/registry/src/";
+    const HOSTS: [&str; 2] = ["index.crates.io-", "github.com-"];
+    const HEX_LEN: usize = 16;
+    if !s.contains(PREFIX) {
+        return s.to_string();
+    }
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut consumed = 0usize;
+        if s[i..].starts_with(PREFIX) {
+            let after_prefix = i + PREFIX.len();
+            for host in &HOSTS {
+                let h = host.as_bytes();
+                let host_end = after_prefix + h.len();
+                let hex_end = host_end + HEX_LEN;
+                if hex_end + 1 > bytes.len() {
+                    continue;
+                }
+                if &bytes[after_prefix..host_end] != h {
+                    continue;
+                }
+                let hex = &bytes[host_end..hex_end];
+                if !hex.iter().all(|&b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+                    continue;
+                }
+                if bytes[hex_end] != b'/' {
+                    continue;
+                }
+                out.push_str(PREFIX);
+                out.push_str("$CARGO_HASH");
+                consumed = PREFIX.len() + h.len() + HEX_LEN;
+                break;
+            }
+        }
+        if consumed > 0 {
+            i += consumed;
+            continue;
+        }
         let mut j = i + 1;
         while j < bytes.len() && (bytes[j] & 0xC0) == 0x80 {
             j += 1;
@@ -1269,22 +1335,18 @@ error: aborting due to 1 previous error
     }
 
     #[test]
-    fn compat_d_flag_off_byte_identical_to_v0_1() {
-        // With `compat_short_cargo = false`, the literal-prefix path
-        // (`$CARGO/registry`) substitution fires exactly as in v0.1.
-        // D-3a unconditionally strips the :LINE:COL tail from every
-        // foreign pointer line, including non-compat $CARGO outputs.
-        // Task 13 (Class K-fix) will additionally collapse the hash
-        // segment to $CARGO_HASH; that combined update replaces this
-        // intermediate expected value with:
-        //   "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
+    fn compat_d_flag_off_collapses_registry_hash() {
+        // Non-compat mode: the literal-prefix substitution rewrites the
+        // registry path to $CARGO/registry, then the Class K-fix collapses
+        // the volatile `<host>-<16hex>` hash segment to $CARGO_HASH. The
+        // :LINE:COL tail is stripped by D-3a for foreign pointers.
         let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
         let c = ctx_non_compat_no_collision("/p", "/sysroot");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
         assert_eq!(
             out,
-            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs"
+            "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
         );
     }
 
@@ -1688,7 +1750,7 @@ error: aborting due to 1 previous error
         let out = normalize(input, &c, &dir);
         assert_eq!(
             out,
-            "  ::: $CARGO/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
+            "  ::: $CARGO/registry/src/$CARGO_HASH/serde-1.0.0/src/lib.rs\n   |\n   | $CARGO_SRC\n   |"
         );
     }
 
@@ -1750,6 +1812,19 @@ error: aborting due to 1 previous error
     }
 
     #[test]
+    fn opt_out_body_is_pipeline_normalized_not_raw_bypass() {
+        // §8.4 — kept body still flows through TypeId.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | struct Foo(Bar#0);\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x").with_keep_foreign_span_bodies(true);
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(
+            out.contains("438 | struct Foo(Bar$TYPEID);"),
+            "TypeId still fires; got: {out:?}"
+        );
+    }
+
+    #[test]
     fn default_behavior_byte_identical_when_no_foreign_spans() {
         // §8.4 zero-blast-radius: no foreign span → output unchanged
         // (no suppression fires). May already pass pre-Task-8.
@@ -1800,5 +1875,107 @@ error: aborting due to 1 previous error
         let lines = vec!["   |", "   ", "438 | x"];
         // Second line is whitespace-only (empty after strip) — terminates at 1.
         assert_eq!(count_body_lines(&lines, 0), 1);
+    }
+
+    // -- Class K-fix: non-compat registry hash collapse to $CARGO_HASH --
+
+    #[test]
+    fn non_compat_collapses_index_crates_io_registry_hash() {
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:5:1\n";
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn non_compat_collapses_github_com_registry_hash() {
+        let input = "  --> /home/u/.cargo/registry/src/github.com-1234567890abcdef/foo-1.0.0/src/lib.rs:5:1\n";
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
+        );
+    }
+
+    #[test]
+    fn non_compat_registry_hash_collapse_is_machine_independent() {
+        let in_a = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:5:1\n";
+        let in_b = "  --> /home/u/.cargo/registry/src/index.crates.io-fedcba0987654321/foo-1.0.0/src/lib.rs:5:1\n";
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        assert_eq!(normalize(in_a, &c, &dir), normalize(in_b, &c, &dir));
+    }
+
+    #[test]
+    fn non_compat_registry_hash_collapse_rejects_non_matching_shapes() {
+        let c = ctx_non_compat_no_collision("/p", "/sysroot");
+        let dir = PathBuf::from("/p/x");
+        // uppercase hex — not collapsed.
+        let upper = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890ABCDEF/foo-1.0.0/src/lib.rs\n";
+        assert_eq!(
+            normalize(upper, &c, &dir),
+            "  --> $CARGO/registry/src/index.crates.io-1234567890ABCDEF/foo-1.0.0/src/lib.rs"
+        );
+        // 15-hex (too short) — not collapsed.
+        let short = "  --> /home/u/.cargo/registry/src/index.crates.io-123456789abcdef/foo-1.0.0/src/lib.rs\n";
+        assert_eq!(
+            normalize(short, &c, &dir),
+            "  --> $CARGO/registry/src/index.crates.io-123456789abcdef/foo-1.0.0/src/lib.rs"
+        );
+        // 17-hex (slash-check fails) — not collapsed.
+        let long = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef0/foo-1.0.0/src/lib.rs\n";
+        assert_eq!(
+            normalize(long, &c, &dir),
+            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef0/foo-1.0.0/src/lib.rs"
+        );
+        // missing trailing slash — not collapsed.
+        let nos =
+            "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef-suffix/whatever\n";
+        assert_eq!(
+            normalize(nos, &c, &dir),
+            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef-suffix/whatever"
+        );
+    }
+
+    #[test]
+    fn extra_substitution_matching_cargo_hash_fires_after_collapse() {
+        // §8.2a — K-fix (step 4) runs BEFORE extras (step 6).
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:5:1\n";
+        let extras = vec![
+            Substitution {
+                from: "$CARGO/registry/src/$CARGO_HASH/".into(),
+                to: "$REG/".into(),
+            },
+            Substitution {
+                from: "index.crates.io-1234567890abcdef/".into(),
+                to: "MATCHED".into(),
+            },
+        ];
+        // Use inline context with cargo_registry = /home/u/.cargo/registry so the
+        // $CARGO/registry prefix substitution actually fires.
+        let c = NormalizationContext {
+            workspace_root: PathBuf::from("/lihaaf_test_ws_root"),
+            sysroot: PathBuf::from("/lihaaf_test_sysroot"),
+            cargo_registry: Some(PathBuf::from("/home/u/.cargo/registry")),
+            compat_short_cargo: false,
+            extra_substitutions: extras,
+            strip_lines: vec![],
+            strip_line_prefixes: vec![],
+            keep_foreign_span_bodies: false,
+        };
+        let out = normalize(input, &c, &test_fixture_dir());
+        // The remap rewrote $CARGO_HASH-bearing prefix to $REG/; the :5:1 tail is
+        // RETAINED because by step 7 the prefix is $REG/, not a foreign prefix.
+        assert_eq!(out, "  --> $REG/foo-1.0.0/src/lib.rs:5:1");
+        assert!(
+            !out.contains("MATCHED"),
+            "raw-hash rule must not fire post-collapse"
+        );
     }
 }

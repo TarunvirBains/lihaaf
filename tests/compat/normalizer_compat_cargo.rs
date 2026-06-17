@@ -77,22 +77,16 @@ fn compat_mode_leaves_non_registry_paths_unchanged() {
 }
 
 #[test]
-fn non_compat_mode_byte_identical_to_v0_1() {
-    // Regression bite: with the flag off, the literal-prefix
-    // substitution at `$CARGO/registry` fires exactly as in v0.1 and
-    // the host-name + 16-hex + path-tail substring is preserved
-    // verbatim. Future edits to the compat post-pass must not perturb
-    // this output.
+fn non_compat_mode_collapses_registry_hash_and_strips_foreign_tail() {
+    // Non-compat mode: the literal-prefix substitution rewrites the
+    // registry path to $CARGO/registry, then the Class K-fix collapses
+    // the volatile `<host>-<16hex>` hash segment to $CARGO_HASH. The
+    // :LINE:COL tail is stripped by D-3a for foreign pointers.
     let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
     let out = normalize(input, &ctx_non_compat(), &PathBuf::from("/p/x"));
-    // D-3a unconditionally strips the :LINE:COL tail from foreign pointers.
-    // Task 13 (Class K-fix) will additionally collapse the hash segment
-    // to $CARGO_HASH; that combined update replaces this intermediate
-    // expected value with:
-    //   "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
     assert_eq!(
         out,
-        "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs"
+        "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
     );
 }
 
