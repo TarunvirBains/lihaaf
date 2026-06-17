@@ -27,8 +27,10 @@
 //!
 //! Suite-level keys mostly inherit from the top-level table when omitted.
 //! Exceptions are `name` (always required on a named suite), `fixture_dirs`
-//! (required and disjoint across suites), `features` (replacement), and
-//! `build_targets` (replacement; omitted named suites get `[]`).
+//! (required and disjoint across suites), `features` (replacement),
+//! `build_targets` (replacement; omitted named suites get `[]`), and
+//! `keep_foreign_span_bodies` (replacement; omitted named suites get
+//! `false`, not the default suite's value).
 
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
@@ -239,6 +241,20 @@ pub struct Suite {
     /// The [`StripPattern`] wrapper guarantees this invariant holds on
     /// every construction path, including direct serde deserialization.
     pub strip_line_prefixes: Vec<StripPattern>,
+
+    /// Adopter-defined foreign-span body-suppression opt-out. When `false`
+    /// (the default), the source body of any `-->`/`:::` span whose pointer
+    /// resolves to a non-fixture placeholder (`$RUST` / `$CARGO` /
+    /// `$WORKSPACE`) collapses to a single kind-matched placeholder line. Set
+    /// `true` to PRESERVE those bodies (upstream-regression detection).
+    /// Governs body CONTENT only — the pointer's `:LINE:COL` tail is stripped
+    /// regardless of this flag.
+    ///
+    /// **Per-suite REPLACE semantics.** A named suite that omits it gets the
+    /// default `false`, NOT the default suite's value — same precedent as
+    /// `features`.
+    #[serde(default)]
+    pub keep_foreign_span_bodies: bool,
 }
 
 impl Suite {
@@ -399,6 +415,9 @@ struct RawMetadata {
     strip_lines: Option<Vec<String>>,
     /// Adopter-defined prefix-match line drops.
     strip_line_prefixes: Option<Vec<String>>,
+    /// Adopter-defined foreign-span body-suppression opt-out.
+    /// Per-suite REPLACE semantics; omission on a named suite gives `false`.
+    keep_foreign_span_bodies: Option<bool>,
     /// `[[package.metadata.lihaaf.suite]]` array entries.
     #[serde(default)]
     suite: Vec<RawSuite>,
@@ -428,6 +447,8 @@ struct RawSuite {
     strip_lines: Option<Vec<String>>,
     /// Per-suite REPLACE semantics.
     strip_line_prefixes: Option<Vec<String>>,
+    /// Per-suite REPLACE semantics.
+    keep_foreign_span_bodies: Option<bool>,
     /// `dylib_crate` is intentionally NOT a per-suite key. Reading any
     /// value here is rejected at validation time so a typo can't be
     /// silently dropped.
@@ -736,6 +757,7 @@ fn build_default_suite(dylib_crate: &str, raw: &RawMetadata) -> Result<Suite, Er
         extra_substitutions,
         strip_lines,
         strip_line_prefixes,
+        keep_foreign_span_bodies: raw.keep_foreign_span_bodies.unwrap_or(false),
     })
 }
 
@@ -878,6 +900,7 @@ fn finalize_named_suite(
         extra_substitutions,
         strip_lines,
         strip_line_prefixes,
+        keep_foreign_span_bodies: raw.keep_foreign_span_bodies.unwrap_or(false),
     })
 }
 
@@ -1681,6 +1704,120 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.suites[0].features, vec!["testing".to_string()]);
         assert!(cfg.suites[1].features.is_empty());
+    }
+
+    #[test]
+    fn config_keep_foreign_span_bodies_defaults_false() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+        "#,
+        )
+        .unwrap();
+        assert!(!cfg.suites[0].keep_foreign_span_bodies);
+    }
+
+    #[test]
+    fn config_keep_foreign_span_bodies_parses_true() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            keep_foreign_span_bodies = true
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.suites[0].keep_foreign_span_bodies);
+    }
+
+    #[test]
+    fn config_keep_foreign_span_bodies_does_not_inherit_on_named_suite() {
+        let cfg = parse_str(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            keep_foreign_span_bodies = true
+
+            [[package.metadata.lihaaf.suite]]
+            name = "spatial"
+            fixture_dirs = ["tests/lihaaf/spatial"]
+        "#,
+        )
+        .unwrap();
+        assert!(cfg.suites[0].keep_foreign_span_bodies);
+        assert!(
+            !cfg.suites[1].keep_foreign_span_bodies,
+            "named suite must NOT inherit; REPLACE scope resolves to false",
+        );
+    }
+
+    #[test]
+    fn config_keep_foreign_span_bodies_non_boolean_is_invalid() {
+        assert_parse_rejects_with(
+            r#"
+            [package.metadata.lihaaf]
+            dylib_crate = "consumer"
+            extern_crates = ["consumer"]
+            keep_foreign_span_bodies = "yes"
+        "#,
+            &[],
+        );
+    }
+
+    #[test]
+    fn serde_deserialize_suite_defaults_keep_foreign_span_bodies_false() {
+        let v = serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [],
+                "strip_line_prefixes": []
+            }]
+        });
+        let cfg: Config = serde_json::from_value(v)
+            .expect("Suite must deserialize with the key omitted");
+        assert!(!cfg.suites[0].keep_foreign_span_bodies);
+    }
+
+    #[test]
+    fn serde_deserialize_suite_rejects_non_boolean_keep_foreign_span_bodies() {
+        let v = serde_json::json!({
+            "dylib_crate": "consumer",
+            "raw_metadata": {},
+            "suites": [{
+                "name": "default",
+                "extern_crates": ["consumer"],
+                "fixture_dirs": ["tests/lihaaf/compile_fail"],
+                "features": [],
+                "edition": "2021",
+                "dev_deps": [],
+                "compile_fail_marker": "compile_fail",
+                "fixture_timeout_secs": 90,
+                "per_fixture_memory_mb": 1024,
+                "allow_lints": [],
+                "extra_substitutions": [],
+                "strip_lines": [],
+                "strip_line_prefixes": [],
+                "keep_foreign_span_bodies": "yes"
+            }]
+        });
+        let result: Result<Config, _> = serde_json::from_value(v);
+        assert!(result.is_err(), "present non-boolean must fail typed decode");
     }
 
     #[test]

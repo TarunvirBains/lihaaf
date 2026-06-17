@@ -898,6 +898,7 @@ mod tests {
             extra_substitutions: vec![],
             strip_lines: vec![],
             strip_line_prefixes: vec![],
+            keep_foreign_span_bodies: false,
         }
     }
 

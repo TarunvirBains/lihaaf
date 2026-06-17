@@ -1226,6 +1226,7 @@ mod tests {
             extra_substitutions: Vec::<Substitution>::new(),
             strip_lines: Vec::new(),
             strip_line_prefixes: Vec::new(),
+            keep_foreign_span_bodies: false,
         }
     }
 
