@@ -898,6 +898,7 @@ mod tests {
             extra_substitutions: vec![],
             strip_lines: vec![],
             strip_line_prefixes: vec![],
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -1117,7 +1118,7 @@ mod tests {
         );
 
         assert_eq!(root, workspace_root);
-        assert!(actual.contains("$WORKSPACE/axum/src/method_routing.rs:167:16"));
+        assert!(actual.contains("$WORKSPACE/axum/src/method_routing.rs"));
         assert!(
             !actual.contains(workspace_root.to_string_lossy().as_ref()),
             "local absolute workspace path leaked through: {actual}"
