@@ -64,6 +64,29 @@ pub struct Substitution {
     pub to: String,
 }
 
+/// Which foreign tree a `-->`/`:::` pointer resolved to. Selects the
+/// kind-matched placeholder token emitted for a suppressed body.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes them
+enum SpanKind {
+    Rust,
+    Cargo,
+    Workspace,
+}
+
+impl SpanKind {
+    /// The placeholder line a collapsed foreign body emits for this kind:
+    /// the canonical gutter frame plus the kind-matched `$<KIND>_SRC` token.
+    #[allow(dead_code)] // removed in Task 8 when the suppression loop consumes them
+    fn placeholder_line(self) -> &'static str {
+        match self {
+            SpanKind::Rust => "   | $RUST_SRC",
+            SpanKind::Cargo => "   | $CARGO_SRC",
+            SpanKind::Workspace => "   | $WORKSPACE_SRC",
+        }
+    }
+}
+
 /// Substring prefixes the normalizer rewrites to placeholders.
 #[derive(Debug, Clone)]
 pub struct NormalizationContext {
@@ -699,6 +722,16 @@ mod tests {
     #[test]
     fn unifies_crlf_and_lone_cr_to_lf() {
         assert_normalizes("a\r\nb\rc\nd\n", "a\nb\nc\nd");
+    }
+
+    #[test]
+    fn span_kind_placeholder_lines_are_kind_matched() {
+        assert_eq!(SpanKind::Rust.placeholder_line(), "   | $RUST_SRC");
+        assert_eq!(SpanKind::Cargo.placeholder_line(), "   | $CARGO_SRC");
+        assert_eq!(
+            SpanKind::Workspace.placeholder_line(),
+            "   | $WORKSPACE_SRC"
+        );
     }
 
     #[test]
