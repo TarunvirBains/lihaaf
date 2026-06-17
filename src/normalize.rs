@@ -126,6 +126,12 @@ pub struct NormalizationContext {
     /// Each entry must be `is_path_like` OR `is_banner_shape` per
     /// config-parse validation.
     pub strip_line_prefixes: Vec<String>,
+    /// Adopter-defined `keep_foreign_span_bodies` (per-suite, REPLACE
+    /// semantics). When `false` (default), foreign `-->`/`:::` span bodies
+    /// collapse to a kind-matched `$*_SRC` placeholder. Set `true` to keep
+    /// them. Governs body content only; the pointer `:LINE:COL` tail is
+    /// stripped regardless. See `docs/spec/lihaaf-v0.1.md` §6.6.
+    pub keep_foreign_span_bodies: bool,
 }
 
 impl NormalizationContext {
@@ -158,6 +164,7 @@ impl NormalizationContext {
             extra_substitutions: Vec::new(),
             strip_lines: Vec::new(),
             strip_line_prefixes: Vec::new(),
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -202,6 +209,16 @@ impl NormalizationContext {
     /// reaching here.
     pub fn with_strip_line_prefixes(mut self, prefixes: Vec<String>) -> Self {
         self.strip_line_prefixes = prefixes;
+        self
+    }
+
+    /// Builder-style mutator to set [`Self::keep_foreign_span_bodies`].
+    ///
+    /// Returns `self` so call sites can chain with other builders. Defaults
+    /// to `false` (= suppress foreign span bodies); pass `true` to preserve
+    /// them. The pointer `:LINE:COL` tail is stripped regardless of this flag.
+    pub fn with_keep_foreign_span_bodies(mut self, enabled: bool) -> Self {
+        self.keep_foreign_span_bodies = enabled;
         self
     }
 }
@@ -640,6 +657,7 @@ mod tests {
             extra_substitutions: Vec::new(),
             strip_lines: Vec::new(),
             strip_line_prefixes: Vec::new(),
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -976,6 +994,7 @@ error: aborting due to 1 previous error
             extra_substitutions: Vec::new(),
             strip_lines: Vec::new(),
             strip_line_prefixes: Vec::new(),
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -988,6 +1007,7 @@ error: aborting due to 1 previous error
             extra_substitutions: Vec::new(),
             strip_lines: Vec::new(),
             strip_line_prefixes: Vec::new(),
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -1070,6 +1090,7 @@ error: aborting due to 1 previous error
             extra_substitutions: extras,
             strip_lines,
             strip_line_prefixes,
+            keep_foreign_span_bodies: false,
         }
     }
 
@@ -1292,6 +1313,7 @@ error: aborting due to 1 previous error
             extra_substitutions: extras,
             strip_lines: vec![],
             strip_line_prefixes: vec![],
+            keep_foreign_span_bodies: false,
         };
         let out = normalize(input, &c, &test_fixture_dir());
         // Short-CARGO post-pass rewrites the registry path to
@@ -1327,5 +1349,13 @@ error: aborting due to 1 previous error
         // of `replace_advancing` doesn't silently change behavior.
         assert!(out.contains("$WORKSPACE/inserted"));
         assert!(out.contains("bad:1:1"));
+    }
+
+    #[test]
+    fn with_keep_foreign_span_bodies_sets_field() {
+        let c = ctx("/p", "/r").with_keep_foreign_span_bodies(true);
+        assert!(c.keep_foreign_span_bodies);
+        let d = ctx("/p", "/r");
+        assert!(!d.keep_foreign_span_bodies, "default is false");
     }
 }

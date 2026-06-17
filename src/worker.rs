@@ -1575,6 +1575,7 @@ plain text line
                 extra_substitutions: Vec::new(),
                 strip_lines: Vec::new(),
                 strip_line_prefixes: Vec::new(),
+                keep_foreign_span_bodies: false,
             },
             sysroot_lib_dir: PathBuf::from("/r/lib"),
             freshness_snapshot: FreshnessSnapshot {

@@ -31,6 +31,7 @@ fn ctx_compat() -> NormalizationContext {
         extra_substitutions: Vec::new(),
         strip_lines: Vec::new(),
         strip_line_prefixes: Vec::new(),
+        keep_foreign_span_bodies: false,
     }
 }
 
@@ -45,6 +46,7 @@ fn ctx_non_compat() -> NormalizationContext {
         extra_substitutions: Vec::new(),
         strip_lines: Vec::new(),
         strip_line_prefixes: Vec::new(),
+        keep_foreign_span_bodies: false,
     }
 }
 
