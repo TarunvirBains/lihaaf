@@ -54,7 +54,7 @@ fn ctx_non_compat() -> NormalizationContext {
 fn compat_mode_emits_short_cargo_for_index_crates_io() {
     let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
     let out = normalize(input, &ctx_compat(), &PathBuf::from("/p/x"));
-    assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+    assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs");
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn compat_mode_emits_short_cargo_for_github_com() {
     let input =
         "  --> /home/u/.cargo/registry/src/github.com-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
     let out = normalize(input, &ctx_compat(), &PathBuf::from("/p/x"));
-    assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+    assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs");
 }
 
 #[test]
@@ -85,9 +85,14 @@ fn non_compat_mode_byte_identical_to_v0_1() {
     // this output.
     let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
     let out = normalize(input, &ctx_non_compat(), &PathBuf::from("/p/x"));
+    // D-3a unconditionally strips the :LINE:COL tail from foreign pointers.
+    // Task 13 (Class K-fix) will additionally collapse the hash segment
+    // to $CARGO_HASH; that combined update replaces this intermediate
+    // expected value with:
+    //   "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
     assert_eq!(
         out,
-        "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1"
+        "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs"
     );
 }
 

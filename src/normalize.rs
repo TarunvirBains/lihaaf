@@ -315,6 +315,13 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         for sub in &ctx.extra_substitutions {
             s = replace_advancing(&s, &sub.from, &sub.to);
         }
+        // D-3a: strip the volatile :LINE:COL tail off every foreign pointer
+        // line, unconditionally (independent of body presence and of
+        // keep_foreign_span_bodies). The full body-suppression stage is added
+        // around this in a later step; this is the unconditional tail strip.
+        if is_foreign_pointer(&s).is_some() {
+            s = strip_pointer_tail(&s);
+        }
         s = rewrite_type_ids(&s);
         // Trailing whitespace.
         let trimmed = s.trim_end_matches([' ', '\t']);
@@ -591,6 +598,30 @@ fn is_foreign_pointer(line: &str) -> Option<SpanKind> {
     }
 }
 
+/// Strip up to two trailing `:<digits>` groups off a foreign pointer line
+/// (the `:LINE:COL` tail), mirroring trybuild's `hide_trailing_numbers`. The
+/// tail is removed from the END of the line. A line with no trailing
+/// `:<digits>` is returned unchanged. Operates on the whole line; the caller
+/// has already confirmed via [`is_foreign_pointer`] that this is a foreign
+/// pointer (so the only `:<digits>:<digits>` at the end is the span tail, not
+/// part of a `$RUST`/`$CARGO`/`$WORKSPACE` path component).
+fn strip_pointer_tail(line: &str) -> String {
+    let mut end = line.len();
+    // Strip up to two `:<digits>` groups from the end.
+    for _ in 0..2 {
+        let slice = &line[..end];
+        let trimmed = slice.trim_end_matches(|c: char| c.is_ascii_digit());
+        // A group is `:` followed by >=1 digit. `trimmed` must be shorter than
+        // `slice` (at least one digit removed) AND end in `:`.
+        if trimmed.len() < slice.len() && trimmed.ends_with(':') {
+            end = trimmed.len() - 1; // drop the `:` too
+        } else {
+            break;
+        }
+    }
+    line[..end].to_string()
+}
+
 /// Rewrite the volatile path inside rustc's "long-type written to"
 /// note to a stable `$LONGTYPE_FILE` placeholder.
 ///
@@ -715,7 +746,7 @@ mod tests {
         let c = ctx("/p", "/home/u/.rustup/x");
         let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
         let out = normalize(input, &c, &dir);
-        let expected = "  --> $DIR/foo.rs:3:1\n  ::: $WORKSPACE/src/lib.rs:1:1";
+        let expected = "  --> $DIR/foo.rs:3:1\n  ::: $WORKSPACE/src/lib.rs";
         assert_eq!(out, expected);
     }
 
@@ -725,7 +756,7 @@ mod tests {
         let c = ctx("/p", "/home/u/.rustup/x");
         let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "  ::: $RUST/lib/core/src/option.rs:1:1");
+        assert_eq!(out, "  ::: $RUST/lib/core/src/option.rs");
     }
 
     #[test]
@@ -791,7 +822,10 @@ mod tests {
         // $DIR is the fixture's own dir — not foreign.
         assert_eq!(is_foreign_pointer("  --> $DIR/foo.rs:3:1"), None);
         // mid-line marker is not a pointer (spec §4.2 anchoring requirement).
-        assert_eq!(is_foreign_pointer("= note: see --> for the closure syntax"), None);
+        assert_eq!(
+            is_foreign_pointer("= note: see --> for the closure syntax"),
+            None
+        );
         assert_eq!(is_foreign_pointer("something ::: some/path"), None);
         assert_eq!(
             is_foreign_pointer("error: bad span --> $RUST/library/core/src/option.rs:1:1 here"),
@@ -800,7 +834,60 @@ mod tests {
         // marker with no trailing space must not match.
         assert_eq!(is_foreign_pointer("  -->$RUST/x"), None);
         // plain text.
-        assert_eq!(is_foreign_pointer("error[E0277]: the trait bound is not satisfied"), None);
+        assert_eq!(
+            is_foreign_pointer("error[E0277]: the trait bound is not satisfied"),
+            None
+        );
+    }
+
+    #[test]
+    fn strip_pointer_tail_removes_line_col() {
+        assert_eq!(
+            strip_pointer_tail("  ::: $RUST/library/alloc/src/vec/mod.rs:438:1"),
+            "  ::: $RUST/library/alloc/src/vec/mod.rs"
+        );
+        assert_eq!(
+            strip_pointer_tail("--> $CARGO/foo-1.0.0/src/lib.rs:3:1"),
+            "--> $CARGO/foo-1.0.0/src/lib.rs"
+        );
+        // single trailing group (line only, no col).
+        assert_eq!(
+            strip_pointer_tail("  ::: $RUST/x.rs:42"),
+            "  ::: $RUST/x.rs"
+        );
+        // no tail — unchanged.
+        assert_eq!(strip_pointer_tail("  ::: $RUST/x.rs"), "  ::: $RUST/x.rs");
+    }
+
+    #[test]
+    fn foreign_span_pointer_line_col_stripped() {
+        let input = "  ::: /home/u/.rustup/x/lib/core/src/option.rs:438:1\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  ::: $RUST/lib/core/src/option.rs");
+    }
+
+    #[test]
+    fn foreign_pointer_without_body_strips_tail() {
+        let input = "  ::: /home/u/.rustup/x/lib/core/src/option.rs:1:1\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  ::: $RUST/lib/core/src/option.rs");
+        assert!(
+            !out.contains("$RUST_SRC"),
+            "no body, so no placeholder; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn dir_span_pointer_keeps_line_col() {
+        let input = "  --> /p/tests/lihaaf/compile_fail/foo.rs:3:1\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/tests/lihaaf/compile_fail");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out, "  --> $DIR/foo.rs:3:1");
     }
 
     #[test]
@@ -1068,7 +1155,7 @@ error: aborting due to 1 previous error
         let c = ctx_compat("/p", "/sysroot");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs");
     }
 
     #[test]
@@ -1077,7 +1164,7 @@ error: aborting due to 1 previous error
         let c = ctx_compat("/p", "/sysroot");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
-        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs:3:1");
+        assert_eq!(out, "  --> $CARGO/foo-1.0.0/src/lib.rs");
     }
 
     #[test]
@@ -1096,18 +1183,19 @@ error: aborting due to 1 previous error
     fn compat_d_flag_off_byte_identical_to_v0_1() {
         // With `compat_short_cargo = false`, the literal-prefix path
         // (`$CARGO/registry`) substitution fires exactly as in v0.1.
-        // Regression bite for the v0.1 stable contract: identical
-        // input must produce byte-identical output regardless of the
-        // compat-short-CARGO opt-in (compat mode flips the flag on;
-        // every other run leaves it off and must match v0.1 byte
-        // for byte).
+        // D-3a unconditionally strips the :LINE:COL tail from every
+        // foreign pointer line, including non-compat $CARGO outputs.
+        // Task 13 (Class K-fix) will additionally collapse the hash
+        // segment to $CARGO_HASH; that combined update replaces this
+        // intermediate expected value with:
+        //   "  --> $CARGO/registry/src/$CARGO_HASH/foo-1.0.0/src/lib.rs"
         let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1\n";
         let c = ctx_non_compat_no_collision("/p", "/sysroot");
         let dir = PathBuf::from("/p/x");
         let out = normalize(input, &c, &dir);
         assert_eq!(
             out,
-            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs:3:1"
+            "  --> $CARGO/registry/src/index.crates.io-1234567890abcdef/foo-1.0.0/src/lib.rs"
         );
     }
 
@@ -1166,7 +1254,7 @@ error: aborting due to 1 previous error
         }];
         let c = ctx_with_extras(extras, vec![], vec![]);
         let out = normalize(input, &c, &test_fixture_dir());
-        assert_eq!(out, "  ::: $RUST/lib/rustlib/std/src/option.rs:1:1");
+        assert_eq!(out, "  ::: $RUST/lib/rustlib/std/src/option.rs");
     }
 
     #[test]
@@ -1189,7 +1277,7 @@ error: aborting due to 1 previous error
         ];
         let c = ctx_with_extras(extras, vec![], vec![]);
         let out = normalize(input, &c, &test_fixture_dir());
-        assert_eq!(out, "  ::: $RUST/std/src/option.rs:1:1");
+        assert_eq!(out, "  ::: $RUST/std/src/option.rs");
     }
 
     #[test]
@@ -1370,7 +1458,7 @@ error: aborting due to 1 previous error
         // Short-CARGO post-pass rewrites the registry path to
         // `$CARGO/foo-1.0.0/...` first; the adopter rule then collapses
         // the version-stamped sub-tree to bare `$CARGO/foo/...`.
-        assert_eq!(out, "  --> $CARGO/foo/src/lib.rs:3:1");
+        assert_eq!(out, "  --> $CARGO/foo/src/lib.rs");
     }
 
     #[test]
@@ -1399,7 +1487,11 @@ error: aborting due to 1 previous error
         // expected (admittedly malformed) outcome so a future tightening
         // of `replace_advancing` doesn't silently change behavior.
         assert!(out.contains("$WORKSPACE/inserted"));
-        assert!(out.contains("bad:1:1"));
+        // The `:1:1` tail that originally followed `/a/b/c` now sits on the
+        // first line as `::: $WORKSPACE/inserted:1:1`. D-3a strips the tail,
+        // and the embedded newline splits the replacement across two lines,
+        // so `bad` lands on its own line without the column suffix.
+        assert!(out.contains("bad"));
     }
 
     #[test]
