@@ -339,6 +339,13 @@ pub fn resolve_extern_paths(
     if crate_names.is_empty() {
         return Ok(out);
     }
+    let deps_dir_real = deps_dir.canonicalize().map_err(|e| {
+        Error::io(
+            e,
+            "canonicalizing deps dir for extern resolution",
+            Some(deps_dir.to_path_buf()),
+        )
+    })?;
     let entries = std::fs::read_dir(deps_dir).map_err(|e| {
         Error::io(
             e,
@@ -351,8 +358,19 @@ pub fn resolve_extern_paths(
         let entry =
             entry.map_err(|e| Error::io(e, "iterating deps dir", Some(deps_dir.to_path_buf())))?;
         let p = entry.path();
-        if p.is_file() {
-            all_files.push(p);
+        let meta = match std::fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !meta.file_type().is_file() {
+            continue;
+        }
+        let p_real = match p.canonicalize() {
+            Ok(cp) => cp,
+            Err(_) => continue,
+        };
+        if p_real.starts_with(&deps_dir_real) {
+            all_files.push(p_real);
         }
     }
     for name in crate_names {
