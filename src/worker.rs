@@ -157,7 +157,8 @@ impl WorkerContext {
                     .iter()
                     .map(|p| p.as_str().to_owned())
                     .collect(),
-            );
+            )
+            .with_keep_foreign_span_bodies(suite.keep_foreign_span_bodies);
         Self {
             crate_root,
             managed_dylib,
