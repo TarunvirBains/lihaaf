@@ -3629,6 +3629,47 @@ fn ensure_path_within_base(base: &Path, candidate: &Path) -> std::io::Result<()>
     }
 }
 
+/// Containment check with parent-canonicalize fallback for non-existing paths.
+///
+/// Canonicalizes both `base` and `candidate`. If `candidate` does not yet
+/// exist, canonicalizes its parent directory and rejoins the final component
+/// (Pattern D: non-existing path containment). Returns an error if the
+/// resulting path is not contained within the canonical base.
+#[allow(dead_code)] // staged for Pattern D integration; tested in unit tests
+fn canonicalize_within_base(base: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
+    let canonical_base = std::fs::canonicalize(base)?;
+
+    let canonical_candidate = match std::fs::canonicalize(candidate) {
+        Ok(path) => path,
+        Err(_) => {
+            let parent = candidate.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!("containment check: no parent for {}", candidate.display()),
+                )
+            })?;
+            let canonical_parent = std::fs::canonicalize(parent)?;
+            canonical_parent.join(candidate.file_name().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    format!(
+                        "containment check: no file_name for {}",
+                        candidate.display()
+                    ),
+                )
+            })?)
+        }
+    };
+
+    if !canonical_candidate.starts_with(&canonical_base) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "path escapes allowed root",
+        ));
+    }
+    Ok(canonical_candidate)
+}
+
 fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
     fn copy_fallback_inner(base_src: &Path, src: &Path, dst: &Path) -> std::io::Result<()> {
         ensure_path_within_base(base_src, src)?;
@@ -8742,6 +8783,91 @@ demo = { path = "." }
                 );
             }
             other => panic!("expected TomlParse, got {other:?}"),
+        }
+    }
+
+    // ── Path containment tests ──────────────────────────────────────
+
+    #[test]
+    fn ensure_path_within_base_normal_containment() {
+        let tmp = tempfile::tempdir().unwrap();
+        let child = tmp.path().join("file.txt");
+        std::fs::write(&child, "data").unwrap();
+
+        assert!(ensure_path_within_base(tmp.path(), &child).is_ok());
+    }
+
+    #[test]
+    fn ensure_path_within_base_dotdot_escape() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Create base as a subdirectory so we can escape with `..`
+        let base_dir = tmp.path().join("base");
+        std::fs::create_dir(&base_dir).unwrap();
+        let nested = base_dir.join("nested");
+        std::fs::create_dir(&nested).unwrap();
+
+        // Create an existing file outside the base (in tmp but not in base_dir)
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "data").unwrap();
+
+        // Construct a path via `..` that resolves to the outside file
+        let candidate = nested.join("..").join("..").join("outside.txt");
+        match ensure_path_within_base(&base_dir, &candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_path_within_base_symlink_escape() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        let outside_file = outside_dir.path().join("outside.txt");
+        std::fs::write(&outside_file, "data").unwrap();
+
+        let symlink = base_dir.path().join("escape_link");
+        std::os::unix::fs::symlink(&outside_file, &symlink).unwrap();
+
+        match ensure_path_within_base(base_dir.path(), &symlink) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn canonicalize_within_base_nonexisting_valid_parent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let nonexist = tmp.path().join("will_be_created.txt");
+
+        let result = canonicalize_within_base(tmp.path(), &nonexist);
+        assert!(
+            result.is_ok(),
+            "expected Ok for non-existing file in valid parent"
+        );
+        let resolved = result.unwrap();
+        assert!(
+            resolved.starts_with(tmp.path().canonicalize().unwrap()),
+            "resolved path must be within base"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonicalize_within_base_symlink_parent_escape() {
+        let base_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+
+        // Create a symlink inside base_dir that points to a dir outside.
+        let escape_link = base_dir.path().join("escape");
+        std::os::unix::fs::symlink(outside_dir.path(), &escape_link).unwrap();
+
+        let target = escape_link.join("target.txt");
+
+        match canonicalize_within_base(base_dir.path(), &target) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => panic!("expected PermissionDenied, got {other:?}"),
         }
     }
 }
