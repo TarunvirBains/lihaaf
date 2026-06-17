@@ -63,9 +63,13 @@ pub fn collect(
     crate_root: &Path,
     filters: &[String],
 ) -> Result<Vec<Fixture>, Error> {
-    let canonical_crate_root = crate_root
-        .canonicalize()
-        .map_err(|e| Error::io(e, "canonicalizing crate_root", Some(crate_root.to_path_buf())))?;
+    let canonical_crate_root = crate_root.canonicalize().map_err(|e| {
+        Error::io(
+            e,
+            "canonicalizing crate_root",
+            Some(crate_root.to_path_buf()),
+        )
+    })?;
 
     let mut existing_dirs: Vec<PathBuf> = Vec::new();
     for dir in &suite.fixture_dirs {
