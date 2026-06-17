@@ -1636,6 +1636,50 @@ error: aborting due to 1 previous error
     }
 
     #[test]
+    fn compat_mode_primary_arrow_suppression_is_deliberate_lihaaf_divergence() {
+        // §8.3a (Form B — two-halves direct assertion, the spec-sanctioned
+        // substitute when no Pass/Fail compat-envelope harness exists; verified at
+        // plan time that tests/compat/ has no verdict harness, only raw-output
+        // assertions). Records that the primary-`-->` compat-mode foreign-span
+        // suppression is the DELIBERATE trybuild-vs-lihaaf divergence (the C-3
+        // carve-out, not `:::`-only), and that the verdict-relevant pointer line is
+        // unaffected.
+        //
+        // Half 1 (lihaaf produces the suppressed shape): the body collapses to the
+        // lihaaf-only `$CARGO_SRC` token.
+        // Half 2 (trybuild would keep the body): verbatim trybuild identity
+        // preservation of the foreign body would emit the literal source line
+        // `42 | pub trait Serialize {` and would NEVER emit `$CARGO_SRC`. So the
+        // presence of `$CARGO_SRC` + the absence of that literal line witness the
+        // divergence point. The verdict is unaffected: the `-->` pointer still
+        // resolves to the same tail-stripped `$CARGO/serde-1.0.0/src/lib.rs`.
+        let input = "  --> /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:9\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx_compat("/p", "/sysroot"); // compat_short_cargo = true, keep_foreign_span_bodies = false
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+
+        // Half 1 — the deliberate lihaaf-side divergence token is present, exactly once.
+        assert_eq!(
+            out.matches("$CARGO_SRC").count(),
+            1,
+            "lihaaf compat output must collapse the foreign body to one $CARGO_SRC; got: {out:?}",
+        );
+        // Half 2 — trybuild verbatim identity would keep this literal body line;
+        // lihaaf does not. The divergence is in the normalized bytes.
+        assert!(
+            !out.contains("42 | pub trait Serialize {"),
+            "the foreign body source line trybuild would preserve must be gone (the divergence point); got: {out:?}",
+        );
+        // Verdict-relevant half — the pointer line a compat verdict keys on is the
+        // same tail-stripped foreign pointer; the divergence is body-only, so the
+        // pass/fail VERDICT still agrees per §9.2.
+        assert!(
+            out.contains("--> $CARGO/serde-1.0.0/src/lib.rs") && !out.contains("lib.rs:42:9"),
+            "pointer resolves to the tail-stripped compat-short form; got: {out:?}",
+        );
+    }
+
+    #[test]
     fn foreign_cargo_registry_span_body_is_suppressed() {
         // §8.1 Class B non-compat: ::: with cargo registry path
         let input = "  ::: /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:1\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
