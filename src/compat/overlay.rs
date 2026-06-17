@@ -1925,10 +1925,28 @@ fn expand_workspace_member_entry(
     // Parent segments cannot be `.` (filtered above) and have been
     // glob-validated by `validate_workspace_member_entry` — the join
     // produces a path without verbatim-preserved `./` artifacts.
-    let mut parent_dir = workspace_root_dir.to_path_buf();
+    let mut lexical_parent = workspace_root_dir.to_path_buf();
     for seg in &parent_segments {
-        parent_dir.push(seg);
+        lexical_parent.push(seg);
     }
+
+    // Validate containment using canonicalize_within_base (Pattern D).
+    // Resolves symlinks in parent segments and ensures the resulting
+    // path stays within the workspace root. If the parent doesn't exist
+    // yet, canonicalizes the nearest existing ancestor and rejoins.
+    let parent_dir = match canonicalize_within_base(workspace_root_dir, &lexical_parent) {
+        Ok(canonical) => canonical,
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => {
+            return Ok(Vec::new());
+        }
+        Err(e) => {
+            return Err(Error::io(
+                e,
+                "workspace member expansion: parent directory containment check",
+                Some(lexical_parent),
+            ));
+        }
+    };
 
     if has_glob_chars(last) {
         // Glob in the last segment — enumerate `parent_dir` and match
@@ -3715,7 +3733,6 @@ fn ensure_path_within_base(base: &Path, candidate: &Path) -> std::io::Result<()>
 /// exist, canonicalizes its parent directory and rejoins the final component
 /// (Pattern D: non-existing path containment). Returns an error if the
 /// resulting path is not contained within the canonical base.
-#[allow(dead_code)] // staged for Pattern D integration; tested in unit tests
 fn canonicalize_within_base(base: &Path, candidate: &Path) -> std::io::Result<PathBuf> {
     let canonical_base = std::fs::canonicalize(base)?;
 
@@ -7283,6 +7300,52 @@ demo = { path = "." }
                     "error context must name containment violation: {context}"
                 );
                 assert!(path.is_some(), "error must carry the escaped path");
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    /// `members = ["crates/*"]` where `crates/` is a symlink pointing
+    /// outside the workspace root → containment guard rejects during
+    /// parent directory expansion (expand_workspace_member_entry).
+    #[test]
+    #[cfg(unix)]
+    fn resolve_workspace_member_manifest_symlinked_parent_dir_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlinked-parent test");
+
+        // External directory with a package, outside the workspace.
+        let external_crates = tmp.path().join("external_crates");
+        std::fs::create_dir_all(&external_crates).expect("creating external_crates/");
+        std::fs::create_dir_all(external_crates.join("some-pkg")).unwrap();
+        std::fs::write(
+            external_crates.join("some-pkg").join("Cargo.toml"),
+            "[package]\nname = \"some-pkg\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing external Cargo.toml");
+
+        // Workspace root with a symlinked parent directory.
+        let ws_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).expect("creating ws/");
+        let ws_manifest = ws_dir.join("Cargo.toml");
+        std::fs::write(&ws_manifest, "[workspace]\nmembers = [\"crates/*\"]\n")
+            .expect("writing workspace Cargo.toml");
+
+        // Symlink: ws/crates -> ../../external_crates (escapes ws/)
+        let link_path = ws_dir.join("crates");
+        symlink(&external_crates, &link_path).expect("creating symlink crates -> external_crates");
+
+        // Resolution must reject the escape during parent-dir expansion.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "some-pkg")
+            .expect_err("symlinked parent dir escaping workspace root must be rejected");
+        match err {
+            Error::Io { context, .. } => {
+                assert!(
+                    context.contains("containment check"),
+                    "error context must mention containment: {context}"
+                );
             }
             other => panic!("expected Io error, got {other:?}"),
         }
