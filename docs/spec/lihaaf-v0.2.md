@@ -1274,7 +1274,7 @@ shape); (6) `extra_substitutions` in declared
 order; (7) foreign-span source-body suppression (default-on; on a
 `-->`/`:::` pointer that resolved to `$RUST` / `$CARGO` / `$WORKSPACE`,
 strips the pointer's `:LINE:COL` tail UNCONDITIONALLY and, when a body
-block follows [public-docs-allow-process-history], collapses it to a single
+block follows, collapses it to a single
 kind-matched placeholder line
 `$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC` — runs AFTER
 `extra_substitutions` so adopter rewrites cannot fire inside a body that
@@ -1317,7 +1317,7 @@ on), so leaving it unset is the no-override behavior.
 
 **Foreign-span body suppression and `keep_foreign_span_bodies`.** By default
 (no adopter config), lihaaf normalizes the source body of any `-->`/`:::`
-span block [public-docs-allow-process-history] whose pointer resolves to a
+span block whose pointer resolves to a
 non-fixture placeholder (`$RUST`,
 `$CARGO`, `$WORKSPACE`): the gutter line number, the quoted source text, and
 the caret/underline collapse to a single kind-matched placeholder line
