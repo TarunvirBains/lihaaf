@@ -187,9 +187,18 @@ pub struct Cli {
     #[arg(short = 'v', long)]
     pub verbose: bool,
 
-    /// Skip the lihaaf-managed dylib copy; create a symbolic link
-    /// instead. Saves ~30 MB disk + ~few hundred ms; the caller asserts
-    /// no concurrent cargo activity will modify `target/`.
+    /// Skip the lihaaf-managed dylib copy; create a symbolic link instead.
+    ///
+    /// Saves ~30 MB disk space per run and several hundred milliseconds by skipping
+    /// the file copy operation.
+    ///
+    /// # Safety Assertion
+    ///
+    /// The caller must ensure that **no concurrent cargo activity** (such as IDE
+    /// background compilation, cargo check/build/test in another terminal, or
+    /// concurrent CI jobs) is modifying the target directory. If cargo rebuilds or
+    /// overwrites the underlying dylib during test execution, parallel rustc workers
+    /// may encounter compilation errors, undefined behavior, or link failures.
     #[arg(long)]
     pub use_symlink: bool,
 

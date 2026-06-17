@@ -161,6 +161,18 @@ You can use the `--filter` flag to select a subset of fixtures to run by path su
   cargo lihaaf --filter parse --list
   ```
 
+## Symlink execution and safety (`--use-symlink`)
+
+By default, `lihaaf` copies the prebuilt dynamic library (dylib) of the consumer crate into a dedicated temporary directory before running the per-fixture test loop. This isolates test execution from concurrent modifications in your target directory.
+
+Setting the `--use-symlink` flag replaces this copy operation with a symbolic link:
+
+- **Disk/Performance Trade-off:** Saves approximately 30 MB of disk space per test session and shaves off a few hundred milliseconds of overhead.
+- **Safety Requirement:** When enabled, the caller guarantees that **no concurrent Cargo activity** (e.g. background IDE compilation, automatic `cargo check` on save, concurrent CI jobs, or manual builds in other terminals) will modify or rebuild items in the `target/` directory.
+
+> [!WARNING]
+> If Cargo modifies the dylib in `target/` while the test loop is actively running, the symbolic link will resolve to a half-compiled or missing library, causing link errors or undefined behavior in parallel worker threads. Do not use `--use-symlink` in environments with active file watchers or concurrent build processes.
+
 ## Blessing snapshots
 
 When you intentionally change a procedural macro's error output—or when a new `rustc` toolchain version alters how compiler diagnostics are formatted—your snapshot tests will fail because your saved `.stderr` files no longer match.

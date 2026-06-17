@@ -300,6 +300,9 @@ cargo lihaaf --manifest-path sassi-macros/Cargo.toml
 cargo lihaaf --manifest-path djogi-macros/Cargo.toml
 ```
 
+> [!TIP]
+> **Performance optimization for large suites:** If you are migrating a large test suite and want to maximize speed and save disk space, you can pass the `--use-symlink` flag. This replaces the default dynamic library copy with a symbolic link, saving ~30 MB and several hundred milliseconds per run. However, ensure that no concurrent cargo builds are running (e.g., IDE background tasks) while this flag is active to avoid linker errors or compiler crashes.
+
 ## Step 6: Verify
 
 Run these three commands in order:
