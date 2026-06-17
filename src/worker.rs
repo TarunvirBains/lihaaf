@@ -347,7 +347,7 @@ pub fn resolve_extern_paths(
             Some(deps_dir.to_path_buf()),
         )
     })?;
-    let entries = std::fs::read_dir(deps_dir).map_err(|e| {
+    let entries = std::fs::read_dir(&deps_dir_real).map_err(|e| {
         Error::io(
             e,
             "reading deps dir for extern resolution",
@@ -358,14 +358,14 @@ pub fn resolve_extern_paths(
     for entry in entries {
         let entry =
             entry.map_err(|e| Error::io(e, "iterating deps dir", Some(deps_dir.to_path_buf())))?;
-        let p = entry.path();
-        let meta = match std::fs::symlink_metadata(&p) {
-            Ok(m) => m,
+        let file_type = match entry.file_type() {
+            Ok(t) => t,
             Err(_) => continue,
         };
-        if !meta.file_type().is_file() {
+        if !file_type.is_file() {
             continue;
         }
+        let p = entry.path();
         let p_real = match util::canonicalize_within_base(&deps_dir_real, &p) {
             Ok(cp) => cp,
             Err(_) => continue,
