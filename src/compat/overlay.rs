@@ -3789,11 +3789,6 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
 /// subdirectory is removed before the copy to honour decision 5 of
 /// the idempotency contract (no merge — destination-only files must
 /// not persist).
-fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
-    let dst_base = dst.parent().unwrap_or_else(|| Path::new("."));
-    copy_fallback_within(src, dst, dst_base)
-}
-
 fn copy_fallback_within(src: &Path, dst: &Path, dst_base: &Path) -> std::io::Result<()> {
     fn copy_fallback_inner(
         base_src: &Path,
@@ -6996,7 +6991,8 @@ demo = { path = "." }
 
         let staged_src = tmp.path().join("staged-src");
         // First copy: both files land in staged.
-        copy_fallback(&upstream_src, &staged_src).expect("first copy must succeed");
+        copy_fallback_within(&upstream_src, &staged_src, tmp.path())
+            .expect("first copy must succeed");
         assert!(staged_src.join("a.rs").exists());
         assert!(staged_src.join("b.rs").exists());
 
@@ -7004,7 +7000,8 @@ demo = { path = "." }
         std::fs::remove_file(upstream_src.join("b.rs")).expect("remove upstream b.rs");
 
         // Second copy: exact-sync must purge b.rs from staged.
-        copy_fallback(&upstream_src, &staged_src).expect("second copy must succeed");
+        copy_fallback_within(&upstream_src, &staged_src, tmp.path())
+            .expect("second copy must succeed");
         assert!(
             staged_src.join("a.rs").exists(),
             "CASE 6 copy-fallback exact-sync: surviving upstream file must remain"
@@ -9224,7 +9221,7 @@ demo = { path = "." }
 
         let staged_dst = tmp.path().join("staged-dst");
 
-        match copy_fallback(&upstream_src, &staged_dst) {
+        match copy_fallback_within(&upstream_src, &staged_dst, tmp.path()) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             other => {
                 panic!("expected PermissionDenied when source contains symlinks, got {other:?}")
