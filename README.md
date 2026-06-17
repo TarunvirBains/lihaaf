@@ -172,6 +172,19 @@ Setting the `--use-symlink` flag replaces this copy operation with a symbolic li
 
 > [!WARNING]
 > If Cargo modifies the dylib in `target/` while the test loop is actively running, the symbolic link will resolve to a half-compiled or missing library, causing link errors or undefined behavior in parallel worker threads. Do not use `--use-symlink` in environments with active file watchers or concurrent build processes.
+## Preserving output for debugging (`--keep-output`)
+
+By default, `lihaaf` removes all temporary compilation work directories and generated staging files as soon as a fixture is evaluated. This prevents cluttering the disk.
+
+If you pass `--keep-output`, `lihaaf` disables this automatic cleanup:
+
+- **What is preserved:**
+  - **Standard Mode:** The temporary compilation directory for each fixture (containing object files, dependency info, and build artifacts) is preserved under the system's temporary directory.
+  - **Compat Mode:** The staged manifest overlay (under `target/lihaaf-overlay/`), sidecar files, and copied/converted test fixtures are preserved in the worktree.
+- **Debugging Use Cases:** If a test fails in an unexpected way, you can navigate to the preserved directories, inspect the compiled outputs, check dependency configurations, or manually copy and execute the `rustc` command-line invocation to diagnose the issue.
+
+> [!CAUTION]
+> `--keep-output` is designed as a local-development escape hatch only. **Never enable `--keep-output` in CI systems or automated scripts**, as it prevents cleanup and will leak temporary files and build artifacts, eventually exhausting disk space.
 
 ## Blessing snapshots
 

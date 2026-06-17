@@ -202,8 +202,25 @@ pub struct Cli {
     #[arg(long)]
     pub use_symlink: bool,
 
-    /// Preserve per-fixture work directories after verdict capture.
-    /// Local-development escape hatch only — never set in CI.
+    /// Preserve per-fixture work directories and generated staging files after verdict capture.
+    ///
+    /// # What is preserved
+    ///
+    /// - **Standard runs:** Preserves the temporary compilation work directories for each
+    ///   fixture (containing compiled artifacts, dependency info, and transient objects)
+    ///   under the session's temporary directory.
+    /// - **Compat-mode runs:** Preserves all generated compat sidecars, staged/converted
+    ///   fixture files, and the generated manifest overlay under `target/lihaaf-overlay/`
+    ///   instead of cleaning them up upon completion or panic.
+    ///
+    /// # Debugging Use Cases
+    ///
+    /// Useful for local development when a fixture fails to compile or links incorrectly,
+    /// allowing developers to inspect intermediate compiler outputs or manually run the
+    /// generated `rustc` command in the preserved work directory.
+    ///
+    /// Note: This is a local-development escape hatch only — never set this flag in CI,
+    /// as it prevents cleanup and will leak directories/files, consuming disk space.
     #[arg(long)]
     pub keep_output: bool,
 

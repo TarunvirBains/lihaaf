@@ -579,6 +579,14 @@ metadata-side dev-dep after adding it to `dev_deps`, opt that suite into
 but they do not inherit `build_targets`, so add the opt-in to each named suite
 that needs the staged dev-dep collector.
 
+## Troubleshooting and Debugging with `--keep-output`
+
+During migration, you might encounter compilation errors, unresolved imports, or unexpected snapshot mismatches. The `--keep-output` flag acts as an escape hatch to help you diagnose these migration-specific scenarios:
+
+- **Inspecting staged manifests:** In compat mode, `lihaaf` generates a staged manifest overlay inside `target/lihaaf-overlay/Cargo.toml`. If a compat run complains about workspace dependencies or ambiguous specifications, you can pass `--keep-output` to inspect this generated file and check if path-dependencies, workspaces, or patches were absolutized correctly.
+- **Investigating failing compiler invocations:** When a fixture fails with unexpected compiler output, you can find its preserved work directory in the system's temporary folder (the exact path will be logged). This directory contains the exact compiled objects, dependency files, and stderr records. You can navigate into the directory and manually run the `rustc` command (print it via `cargo lihaaf -v`) to tweak arguments, isolate failures, or check header linkages.
+- **Reviewing staged/copied fixtures:** If AST-based fixture discovery in compat mode behaves unexpectedly, `--keep-output` preserves the copied test fixture files and their snapshots. This lets you confirm that the AST traversal mapped trybuild's `t.compile_fail(...)` calls to the correct directory structures.
+
 ## Benchmarking your conversion
 
 The anyhow conversion branch includes a reference benchmark workflow at
