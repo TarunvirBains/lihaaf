@@ -1526,8 +1526,27 @@ pub fn resolve_workspace_member_manifest(
     workspace_root_manifest: &Path,
     package_name: &str,
 ) -> Result<(PathBuf, toml::Value), Error> {
-    // Step 1 — read + parse workspace-root manifest.
-    let raw_bytes = std::fs::read(workspace_root_manifest).map_err(|e| {
+    // Canonicalize workspace root manifest at entry — establishes trust anchor.
+    // All derived member paths will be validated against this canonical path.
+    let canonical_root = std::fs::canonicalize(workspace_root_manifest).map_err(|e| {
+        Error::io(
+            e,
+            "canonicalizing workspace-root Cargo.toml",
+            Some(workspace_root_manifest.to_path_buf()),
+        )
+    })?;
+
+    // Canonical workspace root directory — used as both containment anchor
+    // and as the base passed to expand_workspace_member_entry so that all
+    // returned paths are built from a canonical base (prevents mixed
+    // canonical/lexical comparison).
+    let canonical_ws_dir = canonical_root
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    // Step 1 — read + parse workspace-root manifest (use canonical path).
+    let raw_bytes = std::fs::read(&canonical_root).map_err(|e| {
         Error::io(
             e,
             "reading workspace-root Cargo.toml for `--package` resolver",
@@ -1563,10 +1582,7 @@ pub fn resolve_workspace_member_manifest(
         });
     }
 
-    let workspace_root_dir = workspace_root_manifest
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let workspace_root_dir = &canonical_ws_dir; // borrow, not clone — canonical anchor
 
     // Step 3 — read `[workspace.members]`.
     let members_array = value
@@ -1626,7 +1642,7 @@ pub fn resolve_workspace_member_manifest(
             // lexically-normalized PathBufs; the normalize call here
             // is a defense-in-depth idempotent re-normalization.
             let expanded =
-                expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+                expand_workspace_member_entry(normalized, workspace_root_dir, package_name)?;
             for path in expanded {
                 exclude_dirs.insert(lexical_normalize_pathbuf(&path));
             }
@@ -1657,19 +1673,42 @@ pub fn resolve_workspace_member_manifest(
         let normalized = entry_str.trim_end_matches('/');
         validate_workspace_member_entry(normalized, package_name)?;
         scanned_member_names.push(normalized.to_string());
-        let expanded =
-            expand_workspace_member_entry(normalized, &workspace_root_dir, package_name)?;
+        let expanded = expand_workspace_member_entry(normalized, workspace_root_dir, package_name)?;
         for path in expanded {
+            // Canonicalize at entry — resolves symlinks so the
+            // containment check below catches members that redirect
+            // outside the workspace root. Non-existent paths are
+            // skipped here (cargo silently skips missing members).
+            let Ok(canonical_fs) = std::fs::canonicalize(&path) else {
+                continue;
+            };
+
+            // Containment guard: member path must stay within canonical
+            // workspace root directory. Rejects symlinks that escape.
+            if !canonical_fs.starts_with(&canonical_ws_dir) {
+                return Err(Error::io(
+                    std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!(
+                            "member path escapes workspace root: {}",
+                            canonical_fs.display()
+                        ),
+                    ),
+                    "workspace member containment violation",
+                    Some(canonical_fs),
+                ));
+            }
+
             // Lexically normalize for stable map-key + exclude
             // intersection. `expand_workspace_member_entry` already
             // normalizes; the call here is the canonical comparison
             // shape and is idempotent.
-            let canonical = lexical_normalize_pathbuf(&path);
+            let key = lexical_normalize_pathbuf(&path);
             // Apply exclude subtraction here (step 4 / §4.3 step 3.5).
-            if exclude_dirs.contains(&canonical) {
+            if exclude_dirs.contains(&key) {
                 continue;
             }
-            candidate_dirs.insert(canonical, ());
+            candidate_dirs.insert(key, ());
         }
     }
 
@@ -7202,7 +7241,55 @@ demo = { path = "." }
         drop(tmp);
     }
 
-    // ── §7.2 #11: override_workspace_inheritance skips Branch 2 with ctx ─
+    // ── §7.2 #11: symlinked member outside workspace root rejected ─
+
+    /// Workspace declares a member that is a symlink to a directory
+    /// outside the workspace root → containment guard rejects with
+    /// PermissionDenied error rather than reading the external manifest.
+    #[test]
+    #[cfg(unix)]
+    fn resolve_workspace_member_manifest_symlinked_member_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlinked-member test");
+
+        // External directory — lives outside the workspace root.
+        let external_pkg = tmp.path().join("external_pkg");
+        std::fs::create_dir_all(&external_pkg).expect("creating external_pkg/");
+        std::fs::write(
+            external_pkg.join("Cargo.toml"),
+            "[package]\nname = \"evil\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing external Cargo.toml");
+
+        // Workspace root with a member that will be symlinked.
+        let ws_dir = tmp.path().join("ws");
+        std::fs::create_dir_all(&ws_dir).expect("creating ws/");
+        let ws_manifest = ws_dir.join("Cargo.toml");
+        std::fs::write(&ws_manifest, "[workspace]\nmembers = [\"member-link\"]\n")
+            .expect("writing workspace Cargo.toml");
+
+        // Create symlink: ws/member-link -> ../external_pkg (escapes ws/)
+        let link_path = ws_dir.join("member-link");
+        symlink(&external_pkg, &link_path).expect("creating symlink member-link -> external_pkg");
+
+        // Resolution must reject the symlinked member with PermissionDenied.
+        let err = resolve_workspace_member_manifest(&ws_manifest, "evil")
+            .expect_err("symlinked member escaping workspace root must be rejected");
+        match err {
+            Error::Io { context, path, .. } => {
+                assert!(
+                    context.contains("workspace member containment violation"),
+                    "error context must name containment violation: {context}"
+                );
+                assert!(path.is_some(), "error must carry the escaped path");
+            }
+            other => panic!("expected Io error, got {other:?}"),
+        }
+        drop(tmp);
+    }
+
+    // ── §7.2 #12: override_workspace_inheritance skips Branch 2 with ctx ─
 
     /// With `workspace_member_context: Some(_)`, the implicit-ancestor
     /// REJECT (Branch 2) is suppressed and the function succeeds.
