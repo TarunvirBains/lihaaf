@@ -1876,4 +1876,91 @@ plain text line
             "symlinked artifacts escaping deps dir must be ignored"
         );
     }
+
+    // -- §8.4c worker plumbing tests --
+
+    /// Build a WorkerContext via the REAL WorkerContext::new from a Suite, so the
+    /// keep_foreign_span_bodies forwarding code under test actually runs.
+    fn worker_ctx_for_suite(suite: &Suite) -> WorkerContext {
+        WorkerContext::new(
+            PathBuf::from("/p"),
+            PathBuf::from("/p/target/lihaaf/lib.so"),
+            PathBuf::from("/p/target/release/deps"),
+            "consumer",
+            suite,
+            false,
+            false,
+            false,
+            PathBuf::from("/tmp/lihaaf-session"),
+            NormalizationContext::new(PathBuf::from("/p"), PathBuf::from("/r")),
+            Path::new("/r"),
+            FreshnessSnapshot {
+                managed_dylib_path: PathBuf::from("/p/target/lihaaf/lib.so"),
+                original_mtime_unix_secs: 0,
+                original_sha256: "0".repeat(64),
+                original_toolchain: crate::toolchain::Toolchain {
+                    release_line: "rustc 1.95.0 (test 2026-01-01)".into(),
+                    release: "1.95.0".into(),
+                    host: "x86_64-unknown-linux-gnu".into(),
+                    commit_hash: "0".repeat(40),
+                    sysroot: PathBuf::from("/r"),
+                },
+            },
+        )
+    }
+
+    /// Minimal Suite for the worker plumbing tests. extern_crates[0] must equal
+    /// the dylib_crate "consumer" passed to worker_ctx_for_suite.
+    fn plumbing_suite(keep: bool) -> Suite {
+        Suite {
+            name: "default".into(),
+            extern_crates: vec!["consumer".into()],
+            fixture_dirs: vec![PathBuf::from("tests/lihaaf/compile_fail")],
+            features: vec![],
+            edition: "2021".into(),
+            dev_deps: vec![],
+            build_targets: Default::default(),
+            compile_fail_marker: "compile_fail".into(),
+            fixture_timeout_secs: 90,
+            per_fixture_memory_mb: 1024,
+            allow_lints: vec![],
+            extra_substitutions: vec![],
+            strip_lines: vec![],
+            strip_line_prefixes: vec![],
+            keep_foreign_span_bodies: keep,
+        }
+    }
+
+    #[test]
+    fn suite_keep_foreign_span_bodies_reaches_normalization_context() {
+        let suite = plumbing_suite(true);
+        let ctx = worker_ctx_for_suite(&suite);
+        let input = "  ::: $RUST/library/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let out = normalize::normalize(input, &ctx.norm_ctx, &PathBuf::from("/p/tests"));
+        assert!(
+            out.contains("438 | pub struct Vec<T> {"),
+            "opt-out keeps body; got: {out:?}"
+        );
+        assert!(
+            out.contains("::: $RUST/library/alloc/src/vec/mod.rs") && !out.contains("mod.rs:438:1"),
+            "tail stripped even under opt-out; got: {out:?}",
+        );
+    }
+
+    #[test]
+    fn suite_default_suppresses_foreign_span_via_worker() {
+        let suite = plumbing_suite(false);
+        let ctx = worker_ctx_for_suite(&suite);
+        let input = "  ::: $RUST/library/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let out = normalize::normalize(input, &ctx.norm_ctx, &PathBuf::from("/p/tests"));
+        assert_eq!(
+            out.matches("$RUST_SRC").count(),
+            1,
+            "exactly one placeholder; got: {out:?}"
+        );
+        assert!(
+            !out.contains("pub struct Vec"),
+            "body source text must be gone; got: {out:?}"
+        );
+    }
 }

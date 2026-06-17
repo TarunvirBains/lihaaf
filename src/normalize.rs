@@ -391,9 +391,8 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             };
             // 2c: arm ActiveBlock if not opted out AND body exists.
             if !ctx.keep_foreign_span_bodies && body_count > 0 {
-                let min_block = std::cmp::min(body_count, 4);
                 active_block = Some(ActiveBlock {
-                    remaining: min_block,
+                    remaining: body_count,
                     kind,
                     placeholder_emitted: false,
                 });
@@ -1833,6 +1832,212 @@ error: aborting due to 1 previous error
             input,
             "error[E0277]: the trait bound is not satisfied\n  --> $DIR/tests/foo.rs:3:1\n   |\n3 | let x = bad();\n   | ^^^",
         );
+    }
+
+    // -- §8.1 core suppression tests --
+
+    #[test]
+    fn foreign_rust_span_body_is_suppressed() {
+        // §8.1 — close frame PRESENT. Four-line collapsed block.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $RUST/lib/alloc/src/vec/mod.rs\n   |\n   | $RUST_SRC\n   |"
+        );
+        assert!(!out.contains("pub struct Vec"));
+        assert!(!out.contains("438"));
+        assert!(!out.contains("^^^"));
+    }
+
+    #[test]
+    fn foreign_rust_multi_line_body_collapses_to_one_placeholder() {
+        // §8.1 multi-line variant — three content lines collapse to ONE.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n439 |     ptr: NonNull<T>,\n440 | }\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out.matches("$RUST_SRC").count(), 1);
+        assert_eq!(
+            out,
+            "  ::: $RUST/lib/alloc/src/vec/mod.rs\n   |\n   | $RUST_SRC\n   |"
+        );
+    }
+
+    #[test]
+    fn foreign_rust_span_body_without_close_frame_is_suppressed() {
+        // §8.1b — NO close frame (the §1.1 motivating shape). THREE-line block,
+        // blank survives, trailing diagnostic survives byte-for-byte.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n\nerror: aborting due to 1 previous error\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $RUST/lib/alloc/src/vec/mod.rs\n   |\n   | $RUST_SRC\n\nerror: aborting due to 1 previous error"
+        );
+    }
+
+    // -- §8.1c workspace body tests --
+
+    #[test]
+    fn foreign_workspace_span_body_is_suppressed() {
+        // §8.1c — $WORKSPACE body collapses to $WORKSPACE_SRC (NOT $RUST_SRC).
+        let input = "  ::: /p/axum/src/method_routing.rs:167:16\n   |\n167 | pub fn on(filter: MethodFilter, svc: T) -> Self {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(
+            out,
+            "  ::: $WORKSPACE/axum/src/method_routing.rs\n   |\n   | $WORKSPACE_SRC\n   |"
+        );
+        assert!(!out.contains("$RUST_SRC"));
+        assert!(!out.contains("pub fn on"));
+    }
+
+    #[test]
+    fn opt_out_keeps_workspace_span_body() {
+        // §8.1c opt-out variant — body kept, tail still stripped.
+        let input = "  ::: /p/axum/src/method_routing.rs:167:16\n   |\n167 | pub fn on(filter: MethodFilter, svc: T) -> Self {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/r").with_keep_foreign_span_bodies(true);
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("167 | pub fn on(filter: MethodFilter, svc: T) -> Self {"));
+        assert!(out.contains("::: $WORKSPACE/axum/src/method_routing.rs"));
+        assert!(!out.contains("method_routing.rs:167:16"));
+        assert!(!out.contains("$WORKSPACE_SRC"));
+    }
+
+    // -- §8.4 opt-out + pass-through tests --
+
+    #[test]
+    fn opt_out_keeps_foreign_body() {
+        // §8.4 — opt-out keeps the $RUST body content; tail still stripped.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x").with_keep_foreign_span_bodies(true);
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("438 | pub struct Vec<T> {"));
+        assert!(out.contains("::: $RUST/lib/alloc/src/vec/mod.rs"));
+        assert!(!out.contains("mod.rs:438:1"));
+        assert!(!out.contains("$RUST_SRC"));
+    }
+
+    #[test]
+    fn fixture_own_dir_span_keeps_line_numbers() {
+        // §8.4 — $DIR span body passes through with numbers intact.
+        let input = "  --> /p/tests/foo.rs:3:1\n   |\n3 | let x = bad();\n   | ^^^\n";
+        let c = ctx("/p", "/r");
+        let dir = PathBuf::from("/p/tests");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("--> $DIR/foo.rs:3:1"));
+        assert!(out.contains("3 | let x = bad();"));
+        assert!(out.contains("^^^"));
+    }
+
+    #[test]
+    fn primary_diagnostic_text_survives_foreign_span() {
+        // §8.4 — primary message + aborting summary survive; only foreign body suppressed.
+        let input = "error[E0277]: the trait bound is not satisfied\n  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n\nerror: aborting due to 1 previous error\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("error[E0277]: the trait bound is not satisfied"));
+        assert!(out.contains("error: aborting due to 1 previous error"));
+        assert!(out.contains("$RUST_SRC"));
+        assert!(!out.contains("pub struct Vec"));
+    }
+
+    #[test]
+    fn mixed_dir_and_rust_spans() {
+        // §8.4 — $DIR keeps numbers, $RUST suppressed, in one pass; state resets.
+        let input = "  --> /p/tests/foo.rs:3:1\n   |\n3 | let x = bad();\n   | ^^^\n  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/tests");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("--> $DIR/foo.rs:3:1"));
+        assert!(out.contains("3 | let x = bad();"));
+        assert!(out.contains("::: $RUST/lib/alloc/src/vec/mod.rs"));
+        assert!(out.contains("$RUST_SRC"));
+        assert!(!out.contains("pub struct Vec"));
+    }
+
+    // -- §8.4a consecutive blocks + frame tests --
+
+    #[test]
+    fn consecutive_foreign_blocks_each_get_one_placeholder() {
+        // §8.4a — two back-to-back foreign blocks, no blank between; per-block reset.
+        let input = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n  ::: /home/u/.cargo/registry/src/index.crates.io-1234567890abcdef/serde-1.0.0/src/lib.rs:42:1\n   |\n42 | pub trait Serialize {\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out.matches("$RUST_SRC").count(), 1);
+        assert_eq!(out.matches("$CARGO_SRC").count(), 1);
+        assert!(!out.contains("pub struct Vec"));
+        assert!(!out.contains("pub trait Serialize"));
+    }
+
+    #[test]
+    fn interleaved_frame_line_inside_body_does_not_steal_placeholder_slot() {
+        // §8.4a — a bare frame between two content lines; one placeholder only.
+        let input = "  ::: /home/u/.rustup/x/lib/core/src/option.rs:5:1\n   |\n5 | pub enum Option<T> {\n   |\n6 |     None,\n   | ^^^ ...\n   |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert_eq!(out.matches("$RUST_SRC").count(), 1);
+        assert!(!out.contains("None,"));
+        // Every bare frame is the canonical "   |".
+        assert!(out.contains("   |"));
+    }
+
+    // -- §8.4b cross-width canonicalization test --
+
+    #[test]
+    fn foreign_span_frame_lines_canonicalized_across_gutter_width() {
+        // §8.4b — two blocks differing only in gutter width normalize byte-equal.
+        let block3 = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:438:1\n   |\n438 | pub struct Vec<T> {\n   | ^^^ ...\n   |\n";
+        let block4 = "  ::: /home/u/.rustup/x/lib/alloc/src/vec/mod.rs:1438:1\n    |\n1438 | pub struct Vec<T> {\n    | ^^^ ...\n    |\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out3 = normalize(block3, &c, &dir);
+        let out4 = normalize(block4, &c, &dir);
+        assert_eq!(out3, out4, "cross-width outputs must be byte-equal");
+        // canonical frame exactness.
+        assert_eq!(
+            out3,
+            "  ::: $RUST/lib/alloc/src/vec/mod.rs\n   |\n   | $RUST_SRC\n   |"
+        );
+    }
+
+    // -- §8.4 mid-line marker + blank boundary tests --
+
+    #[test]
+    fn contains_but_not_anchored_marker_is_not_a_pointer() {
+        // §8.4 — mid-line markers + body-shaped followers are NOT suppressed.
+        let input = "= note: see --> for the closure syntax\n   |\n438 | pub struct Foo {\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("= note: see --> for the closure syntax"));
+        assert!(
+            out.contains("438 | pub struct Foo {"),
+            "follower not swept; got: {out:?}"
+        );
+        assert!(!out.contains("$RUST_SRC"));
+    }
+
+    #[test]
+    fn foreign_pointer_block_boundary_stops_at_blank_line() {
+        // §8.4 — blank terminates look-ahead; trailing diagnostic survives.
+        let input = "  ::: /home/u/.rustup/x/lib/core/src/option.rs:5:1\n5 | pub enum Option<T> {\n\nerror: aborting due to 1 previous error\n";
+        let c = ctx("/p", "/home/u/.rustup/x");
+        let dir = PathBuf::from("/p/x");
+        let out = normalize(input, &c, &dir);
+        assert!(out.contains("$RUST_SRC"));
+        assert!(out.contains("error: aborting due to 1 previous error"));
+        assert!(!out.contains("pub enum Option"));
     }
 
     // -- count_body_lines look-ahead tests --
