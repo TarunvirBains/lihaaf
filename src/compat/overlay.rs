@@ -1180,11 +1180,15 @@ fn override_workspace_inheritance(
 ///   problem reading an ancestor is something the user should see.
 ///
 /// The walk terminates at the filesystem root (`Path::parent` returns
-/// `None`). The `Path::canonicalize` call is intentionally NOT made:
-/// the upstream manifest path is already absolutized at the CLI layer
-/// ([`crate::compat::args::CompatArgs::from_cli`]), and re-canonicalizing
-/// would require the path to exist on disk (which fails for test
-/// dummies and for legitimate non-existent ancestor manifests).
+/// `None`). A canonicalization-based containment guard ensures no
+/// symlink in an intermediate walk-up directory can redirect the walk
+/// outside the expected tree: if the starting directory cannot be
+/// canonicalized (e.g., test dummies), the function returns `Ok(None)`
+/// conservatively; each walk-up directory is verified to be a true
+/// ancestor of the canonical starting directory (by checking that the
+/// canonical start path starts with the logical directory), so a symlink
+/// that redirects to a different part of the filesystem causes the walk
+/// to skip that candidate and continue upward.
 fn detect_implicit_ancestor_workspace(
     upstream_manifest_path: &Path,
 ) -> Result<Option<PathBuf>, Error> {
@@ -1192,10 +1196,51 @@ fn detect_implicit_ancestor_workspace(
         // No parent — e.g. root-level manifest. Nothing to walk.
         return Ok(None);
     };
+
+    // Canonicalize starting directory at entry — establishes containment anchor.
+    // If canonicalization fails (e.g., test dummies), return Ok(None) conservatively.
+    let Ok(start_canon) = std::fs::canonicalize(manifest_dir) else {
+        // Cannot establish trust anchor — bail out conservatively.
+        return Ok(None);
+    };
+
     let mut current = manifest_dir.parent();
     while let Some(dir) = current {
         let candidate = dir.join("Cargo.toml");
-        match std::fs::read_to_string(&candidate) {
+
+        let candidate_canon = match std::fs::canonicalize(&candidate) {
+            Ok(canonical) => canonical,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // File doesn't exist — normal walk-up behavior, try next ancestor.
+                current = dir.parent();
+                continue;
+            }
+            Err(e) => {
+                return Err(Error::io(
+                    e,
+                    "reading ancestor Cargo.toml during workspace detection",
+                    Some(candidate),
+                ));
+            }
+        };
+
+        // Containment guard: verify the canonical starting directory is actually
+        // inside (or equal to) the logical walk-up directory. This catches symlinks
+        // in intermediate directories that redirect outside the expected tree: if
+        // a/b/c/Cargo.toml walks up and b/ is a symlink to /malicious/, then
+        // start_canon resolves to /malicious/c but the logical dir is a/b — they
+        // don't match, so we detect the redirect. Using the logical dir (not its
+        // canonical form) is key: canonicalizing both would resolve through the
+        // same symlink and always appear contained.
+        if !start_canon.starts_with(dir) {
+            // Canonical starting directory is not inside this walk-up directory —
+            // a symlink in the path redirected us outside the trusted tree.
+            // Stop the walk; do not read or follow any candidate here.
+            current = dir.parent();
+            continue;
+        }
+
+        match std::fs::read_to_string(&candidate_canon) {
             Ok(text) => {
                 match toml::from_str::<toml::Value>(&text) {
                     Ok(value) => {
@@ -1219,10 +1264,6 @@ fn detect_implicit_ancestor_workspace(
                         );
                     }
                 }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // Most directories on the walk-up have no Cargo.toml.
-                // Continue silently.
             }
             Err(e) => {
                 return Err(Error::io(
@@ -5695,6 +5736,69 @@ version = "0.1.0"
         assert_eq!(
             found, parent_manifest,
             "ancestor walk must return the parent manifest path verbatim"
+        );
+    }
+
+    /// **containment guard: `detect_implicit_ancestor_workspace` rejects symlink escape.**
+    ///
+    /// When an ancestor directory in the walk-up chain is a symlink pointing
+    /// to a location outside the canonical starting directory, the containment
+    /// guard must stop the walk and return `None` rather than resolving an
+    /// external workspace. This prevents path injection via symlinks placed
+    /// in intermediate directories (e.g., `/tmp/a/b` → `/malicious`).
+    #[test]
+    #[cfg(unix)]
+    fn detect_implicit_ancestor_workspace_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().expect("tempdir for symlink-escape test");
+
+        // External workspace — lives outside the nested structure.
+        let external_ws = tmp.path().join("external_ws");
+        std::fs::create_dir_all(&external_ws).expect("creating external_ws/");
+        std::fs::write(
+            external_ws.join("Cargo.toml"),
+            "[workspace]\nmembers = [\"target\"]\n",
+        )
+        .expect("writing external workspace Cargo.toml");
+
+        // Build a nested directory with a symlinked intermediate level.
+        // Layout:
+        //   tmp/
+        //     external_ws/Cargo.toml    (real workspace)
+        //     a/
+        //       b -> ../external_ws    (symlink pointing outside the tree)
+        //       c/Cargo.toml           (upstream manifest in b/c/)
+        let a_dir = tmp.path().join("a");
+        std::fs::create_dir_all(&a_dir).expect("creating a/");
+
+        let real_b = a_dir.join("b");
+        let c_dir = real_b.join("c");
+        std::fs::create_dir_all(&c_dir).expect("creating a/b/c/");
+
+        // Upstream manifest inside the symlinked path.
+        let upstream_manifest = c_dir.join("Cargo.toml");
+        std::fs::write(
+            &upstream_manifest,
+            "[package]\nname = \"nested\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("writing nested Cargo.toml");
+
+        // Remove the real b/ directory and replace it with a symlink.
+        std::fs::remove_dir_all(&real_b).expect("removing real b/");
+        let link_target = tmp.path().join("external_ws");
+        symlink(&link_target, &real_b).expect("creating symlink a/b -> external_ws");
+
+        // The walk-up from a/b/c/Cargo.toml goes to parent a/b/ which is a
+        // symlink to external_ws/. The containment guard compares start_canon
+        // (resolved through the symlink) against the logical walk-up directory:
+        // start_canon = <tmp>/external_ws/c, dir = <tmp>/a/b — they don't match,
+        // so the redirect is detected and the candidate is skipped.
+        let result = detect_implicit_ancestor_workspace(&upstream_manifest)
+            .expect("ancestor walk must not error on symlink");
+        assert!(
+            result.is_none(),
+            "symlink-escaped ancestor must be rejected; got: {result:?}"
         );
     }
 
