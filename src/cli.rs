@@ -130,8 +130,13 @@ pub struct Cli {
     pub compat_trybuild_macro: Vec<String>,
 
     /// Run only fixtures whose relative path contains the substring.
-    /// Multiple `--filter` flags are OR'd. Substring match is
-    /// case-sensitive.
+    ///
+    /// Substring match is case-sensitive. Multiple `--filter` flags are OR'd.
+    ///
+    /// # Examples
+    ///
+    /// - `--filter ui` runs fixtures containing `ui` in their relative path.
+    /// - `--filter pass --filter fail` runs fixtures containing either `pass` OR `fail`.
     #[arg(long)]
     pub filter: Vec<String>,
 

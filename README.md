@@ -142,6 +142,24 @@ laptop).
 | `--use-symlink` | Skip the lihaaf-managed dylib copy; symlink instead. Saves disk + time, but unsafe under concurrent cargo activity. |
 | `--keep-output` | Preserve per-fixture work directories after verdict capture. Local-development debugging only — never set in CI. |
 | `--package <NAME>` / `-p <NAME>` | Compat-mode workspace-member selector. Required when `--compat-root` points at a workspace root that declares `[workspace]` without `[package]`. Single package per invocation. |
+## Filtering fixtures
+
+You can use the `--filter` flag to select a subset of fixtures to run by path substring. The filter matches case-sensitively against the relative path of the fixtures.
+
+### Examples
+
+- **Single filter:** Run only fixtures whose path contains `compile_fail`:
+  ```bash
+  cargo lihaaf --filter compile_fail
+  ```
+- **Multiple filters (OR behavior):** Run fixtures whose path contains either `pass` or `fail` (multiple `--filter` flags are OR'd together):
+  ```bash
+  cargo lihaaf --filter pass --filter fail
+  ```
+- **Filter and list:** Combine `--filter` with `--list` to print all matched fixtures without building the dylib or invoking rustc:
+  ```bash
+  cargo lihaaf --filter parse --list
+  ```
 
 ## Blessing snapshots
 

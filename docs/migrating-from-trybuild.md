@@ -319,6 +319,35 @@ If `cargo lihaaf` exits 0 and `git status` shows a clean tree after `--bless`,
 the conversion is complete. Run `cargo test` as well to verify your non-fixture
 unit tests still pass independently.
 
+## Filtering and Test Selection
+
+In a trybuild setup, filtering to run a specific subset of tests or a single test is typically done via the `cargo test` filter:
+```bash
+cargo test --test compile_fail my_specific_fixture
+```
+This performs a substring match on the generated test case name.
+
+With `lihaaf`, there is no integration with `cargo test`'s harness filter because `lihaaf` runs as a standalone CLI tool. Instead, you filter fixtures directly on the command line using the `--filter` flag:
+```bash
+cargo lihaaf --filter my_specific_fixture
+```
+The filter matches case-sensitively against the relative path of the `.rs` fixture file.
+
+### Migration-Specific Filter Patterns
+
+- **Targeting a group of tests:** If you have organized your tests into subdirectories (e.g., `tests/compile_fail/debug_handler/`), you can run only that group:
+  ```bash
+  cargo lihaaf --filter debug_handler
+  ```
+- **Running a single specific test:** To isolate a single failing fixture:
+  ```bash
+  cargo lihaaf --filter bad_attribute.rs
+  ```
+- **OR behavior (combining filters):** You can specify multiple `--filter` flags to run fixtures matching any of the substrings:
+  ```bash
+  cargo lihaaf --filter debug_handler --filter from_ref
+  ```
+
 ## Layout choice: no-infix vs `tests/lihaaf/` infix
 
 The spec's documented default fixture directories are
