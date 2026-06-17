@@ -110,7 +110,18 @@ pub fn collect(
         for entry in entries {
             let entry =
                 entry.map_err(|e| Error::io(e, "iterating fixture_dirs", Some(dir.clone())))?;
+            let file_type = match entry.file_type() {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            if !file_type.is_file() {
+                continue;
+            }
             let p = entry.path();
+            let p = match util::canonicalize_within_base(dir, &p) {
+                Ok(canonical) => canonical,
+                Err(_) => continue,
+            };
             if !p.is_file() {
                 continue;
             }
@@ -278,6 +289,57 @@ mod tests {
             }
             other => panic!("expected ConfigInvalid, got {other:?}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_fixture_dir_outside_crate_root_is_rejected() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let crate_root = tmp.path().join("crate");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&crate_root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("escape.rs"), "").unwrap();
+
+        let linked = crate_root.join("fixtures-link");
+        symlink(&outside, &linked).unwrap();
+
+        let s = suite("default", vec!["fixtures-link"], "compile_fail");
+        let err = collect(&s, &crate_root, &[]).unwrap_err();
+        match err {
+            Error::Session(Outcome::ConfigInvalid { message }) => {
+                assert!(message.contains("zero existing directories"));
+            }
+            other => panic!("expected ConfigInvalid, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_fixture_file_outside_crate_root_is_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let crate_root = tmp.path().join("crate");
+        let fixture_dir = crate_root.join("tests/lihaaf/compile_fail");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&fixture_dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(fixture_dir.join("local.rs"), "").unwrap();
+        fs::write(outside.join("escape.rs"), "").unwrap();
+
+        symlink(
+            outside.join("escape.rs"),
+            fixture_dir.join("linked_escape.rs"),
+        )
+        .unwrap();
+
+        let s = suite("default", vec!["tests/lihaaf/compile_fail"], "compile_fail");
+        let fixtures = collect(&s, &crate_root, &[]).unwrap();
+        let stems: Vec<_> = fixtures.iter().map(|f| f.stem.clone()).collect();
+        assert_eq!(stems, vec!["local".to_string()]);
     }
 
     #[test]
