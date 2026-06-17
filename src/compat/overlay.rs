@@ -602,18 +602,36 @@ fn materialize_overlay_inner<F>(
 where
     F: FnOnce(Option<&str>) -> Option<SyntheticMetadata>,
 {
-    let raw_bytes = std::fs::read(upstream_manifest_path).map_err(|e| {
+    // Validate upstream manifest stays within its parent directory.
+    let upstream_dir = upstream_manifest_path.parent().ok_or_else(|| {
+        Error::io(
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "manifest has no parent"),
+            "upstream manifest path validation",
+            Some(upstream_manifest_path.to_path_buf()),
+        )
+    })?;
+
+    let canonical_upstream_manifest =
+        canonicalize_within_base(upstream_dir, upstream_manifest_path).map_err(|e| {
+            Error::io(
+                e,
+                "validating upstream manifest containment",
+                Some(upstream_manifest_path.to_path_buf()),
+            )
+        })?;
+
+    let raw_bytes = std::fs::read(&canonical_upstream_manifest).map_err(|e| {
         Error::io(
             e,
             "reading upstream Cargo.toml for overlay",
-            Some(upstream_manifest_path.to_path_buf()),
+            Some(canonical_upstream_manifest.clone()),
         )
     })?;
     let raw_text = String::from_utf8(raw_bytes).map_err(|e| {
         Error::io(
             std::io::Error::new(std::io::ErrorKind::InvalidData, e),
             "decoding upstream Cargo.toml as UTF-8",
-            Some(upstream_manifest_path.to_path_buf()),
+            Some(canonical_upstream_manifest.clone()),
         )
     })?;
 
@@ -664,7 +682,7 @@ where
     // absolutization below joins against this so cargo can resolve the
     // overlay's path-bearing keys from the staged manifest dir (which is
     // two directories deeper than the upstream `Cargo.toml`).
-    let upstream_dir: PathBuf = upstream_manifest_path
+    let upstream_dir: PathBuf = canonical_upstream_manifest
         .parent()
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -3720,6 +3738,20 @@ fn create_canonical_mirror(upstream_path: &Path, staged_path: &Path) -> Result<(
             Some(e),
         )
     };
+
+    // Reject upstream symlinks — creating a symlink-to-symlink chain is unsafe
+    // (chain resolution risk: staged → upstream_symlink → external_target).
+    let upstream_meta =
+        std::fs::symlink_metadata(upstream_path).map_err(|e| mirror_err("stat-upstream", e))?;
+    if upstream_meta.file_type().is_symlink() {
+        return Err(mirror_err(
+            "upstream-is-symlink",
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "refusing to mirror symlink from upstream",
+            ),
+        ));
+    }
 
     // Try symlink first; on failure fall back to a recursive copy.
     match symlink_platform(upstream_path, staged_path) {
@@ -9238,5 +9270,36 @@ demo = { path = "." }
                 panic!("expected PermissionDenied when source contains symlinks, got {other:?}")
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_canonical_mirror_rejects_upstream_symlink() {
+        // Verifies that create_canonical_mirror rejects an upstream path
+        // that is itself a symlink (Alert #14: symlink chain prevention).
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Create a real file and a symlink to it.
+        let real_file = tmp.path().join("real.txt");
+        std::fs::write(&real_file, "content").unwrap();
+        let symlink_path = tmp.path().join("link.txt");
+        std::os::unix::fs::symlink(&real_file, &symlink_path).unwrap();
+
+        let staged_dst = tmp.path().join("staged_link.txt");
+
+        match create_canonical_mirror(&symlink_path, &staged_dst) {
+            Err(Error::OverlayMirrorFailed {
+                source: Some(e), ..
+            }) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => {
+                panic!("expected PermissionDenied when upstream is a symlink, got {other:?}")
+            }
+        }
+
+        // Verify no staged file was created.
+        assert!(
+            !staged_dst.exists(),
+            "staged path must not be created when upstream is a symlink"
+        );
     }
 }
