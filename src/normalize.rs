@@ -622,6 +622,23 @@ fn strip_pointer_tail(line: &str) -> String {
     line[..end].to_string()
 }
 
+#[allow(dead_code)] // removed in Task 8 when the suppression loop consumes this
+fn count_body_lines(lines: &[&str], start: usize) -> usize {
+    let mut count = 0;
+    let mut i = start;
+    while i < lines.len() {
+        let rest = lines[i].trim_start_matches([' ', '\t']);
+        match rest.bytes().next() {
+            Some(b'0'..=b'9' | b'|' | b'.') => {
+                count += 1;
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    count
+}
+
 /// Rewrite the volatile path inside rustc's "long-type written to"
 /// note to a stable `$LONGTYPE_FILE` placeholder.
 ///
@@ -1500,5 +1517,47 @@ error: aborting due to 1 previous error
         assert!(c.keep_foreign_span_bodies);
         let d = ctx("/p", "/r");
         assert!(!d.keep_foreign_span_bodies, "default is false");
+    }
+
+    // -- count_body_lines look-ahead tests --
+
+    #[test]
+    fn count_body_lines_counts_frame_and_content_until_blank() {
+        let lines = vec![
+            "   |",                       // open frame
+            "438 | pub struct Vec<T> {",  // gutter/source content
+            "   | ^^^ ...",               // caret content
+            "   |",                       // close frame
+            "",                           // blank — terminates
+            "error: aborting due to 1 previous error",
+        ];
+        assert_eq!(count_body_lines(&lines, 0), 4);
+    }
+
+    #[test]
+    fn count_body_lines_stops_at_note_line() {
+        let lines = vec!["   |", "438 | x", "note: something else"];
+        // `note:` first byte is `n`, not in the body set — stops after 2.
+        assert_eq!(count_body_lines(&lines, 0), 2);
+    }
+
+    #[test]
+    fn count_body_lines_no_close_frame_stops_at_blank() {
+        let lines = vec!["   |", "438 | pub struct Vec<T> {", "   | ^^^ ...", ""];
+        // Open frame + gutter + caret = 3; the blank terminates (no close frame).
+        assert_eq!(count_body_lines(&lines, 0), 3);
+    }
+
+    #[test]
+    fn count_body_lines_zero_when_start_is_not_body() {
+        let lines = vec!["error: something", "   |"];
+        assert_eq!(count_body_lines(&lines, 0), 0);
+    }
+
+    #[test]
+    fn count_body_lines_whitespace_only_line_terminates() {
+        let lines = vec!["   |", "   ", "438 | x"];
+        // Second line is whitespace-only (empty after strip) — terminates at 1.
+        assert_eq!(count_body_lines(&lines, 0), 1);
     }
 }
