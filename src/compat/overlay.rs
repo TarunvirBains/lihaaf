@@ -3447,12 +3447,31 @@ fn mirror_upstream_into_overlay(
     upstream_dir: &Path,
     staged_overlay_dir: &Path,
 ) -> Result<(), Error> {
-    // Per-entry forward pass: reconcile every non-excluded top-level
-    // upstream entry into the staged overlay dir.
-    let upstream_entries = std::fs::read_dir(upstream_dir).map_err(|e| {
+    // Canonicalize both dirs upfront (Alert #10): prevents symlink-based
+    // path confusion so the stale-cleanup pass can validate containment.
+    let canonical_upstream = std::fs::canonicalize(upstream_dir).map_err(|e| {
         Error::overlay_mirror_failed(
             upstream_dir.to_path_buf(),
             staged_overlay_dir.to_path_buf(),
+            "canonicalize-upstream-dir",
+            Some(e),
+        )
+    })?;
+    let canonical_staged = std::fs::canonicalize(staged_overlay_dir).map_err(|e| {
+        Error::overlay_mirror_failed(
+            upstream_dir.to_path_buf(),
+            staged_overlay_dir.to_path_buf(),
+            "canonicalize-staged-dir",
+            Some(e),
+        )
+    })?;
+
+    // Per-entry forward pass: reconcile every non-excluded top-level
+    // upstream entry into the staged overlay dir.
+    let upstream_entries = std::fs::read_dir(&canonical_upstream).map_err(|e| {
+        Error::overlay_mirror_failed(
+            canonical_upstream.clone(),
+            canonical_staged.clone(),
             "read-upstream-dir",
             Some(e),
         )
@@ -3463,8 +3482,8 @@ fn mirror_upstream_into_overlay(
     for entry_res in upstream_entries {
         let entry = entry_res.map_err(|e| {
             Error::overlay_mirror_failed(
-                upstream_dir.to_path_buf(),
-                staged_overlay_dir.to_path_buf(),
+                canonical_upstream.clone(),
+                canonical_staged.clone(),
                 "iter-upstream-dir",
                 Some(e),
             )
@@ -3477,6 +3496,9 @@ fn mirror_upstream_into_overlay(
             // such entries are intentionally not mirrored.
             continue;
         };
+        // Track name before any skip — preserves idempotent stale-cleanup
+        // behavior (R-2): even excluded or symlinked entries count as
+        // "present upstream" so their staged counterparts aren't removed.
         upstream_names.insert(name.to_string());
 
         if MIRROR_EXCLUDED_TOP_LEVEL.contains(&name) {
@@ -3488,19 +3510,34 @@ fn mirror_upstream_into_overlay(
             continue;
         }
 
-        let upstream_path = upstream_dir.join(name);
-        let staged_path = staged_overlay_dir.join(name);
+        let upstream_path = canonical_upstream.join(name);
+        // Reject upstream symlinks — the mirror creates its own canonical
+        // symlinks from staged → upstream. Following an upstream symlink
+        // could read content from outside the trusted source tree.
+        let entry_meta = std::fs::symlink_metadata(&upstream_path).map_err(|e| {
+            Error::overlay_mirror_failed(
+                upstream_path.clone(),
+                canonical_staged.join(name).to_path_buf(),
+                "stat-upstream-entry",
+                Some(e),
+            )
+        })?;
+        if entry_meta.file_type().is_symlink() {
+            continue; // defense-in-depth: skip symlinked upstream entries
+        }
+
+        let staged_path = canonical_staged.join(name);
         reconcile_one_entry(&upstream_path, &staged_path)?;
     }
 
     // Stale-cleanup pass (CASE 9 + CASE 14b): remove staged entries
     // that have no upstream counterpart, plus the must-be-absent
     // entries even if they have an upstream counterpart.
-    if staged_overlay_dir.is_dir() {
-        let staged_iter = std::fs::read_dir(staged_overlay_dir).map_err(|e| {
+    if canonical_staged.is_dir() {
+        let staged_iter = std::fs::read_dir(&canonical_staged).map_err(|e| {
             Error::overlay_mirror_failed(
-                staged_overlay_dir.to_path_buf(),
-                staged_overlay_dir.to_path_buf(),
+                canonical_staged.clone(),
+                canonical_staged.clone(),
                 "read-staged-dir",
                 Some(e),
             )
@@ -3508,8 +3545,8 @@ fn mirror_upstream_into_overlay(
         for entry_res in staged_iter {
             let entry = entry_res.map_err(|e| {
                 Error::overlay_mirror_failed(
-                    staged_overlay_dir.to_path_buf(),
-                    staged_overlay_dir.to_path_buf(),
+                    canonical_staged.clone(),
+                    canonical_staged.clone(),
                     "iter-staged-dir",
                     Some(e),
                 )
@@ -3528,10 +3565,10 @@ fn mirror_upstream_into_overlay(
             // CASE 14b: explicit must-be-absent removal even if the
             // upstream carries one.
             if MIRROR_MUST_REMOVE_IF_PRESENT.contains(&name) {
-                let stale = staged_overlay_dir.join(name);
+                let stale = canonical_staged.join(name);
                 remove_path_any(&stale).map_err(|e| {
                     Error::overlay_mirror_failed(
-                        upstream_dir.join(name),
+                        canonical_upstream.join(name),
                         stale.clone(),
                         "stale-cleanup-must-absent",
                         Some(e),
@@ -3542,10 +3579,14 @@ fn mirror_upstream_into_overlay(
 
             // CASE 9: staged entry without an upstream counterpart.
             if !upstream_names.contains(name) {
-                let stale = staged_overlay_dir.join(name);
+                let stale = canonical_staged.join(name);
+                // Validate stale path stays within staged dir (Alert #11).
+                if ensure_path_within_base(&canonical_staged, &stale).is_err() {
+                    continue; // skip entries that escaped via symlink
+                }
                 remove_path_any(&stale).map_err(|e| {
                     Error::overlay_mirror_failed(
-                        upstream_dir.join(name),
+                        canonical_upstream.join(name),
                         stale.clone(),
                         "stale-cleanup-orphan",
                         Some(e),
@@ -3559,10 +3600,10 @@ fn mirror_upstream_into_overlay(
     // regular file, not a symlink. Type-only structural check; content
     // correctness is `write_file_atomic`'s contract (overlay.rs:527-543
     // bytes-match skip path).
-    let manifest = staged_overlay_dir.join("Cargo.toml");
+    let manifest = canonical_staged.join("Cargo.toml");
     let meta = std::fs::symlink_metadata(&manifest).map_err(|e| {
         Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-stat",
             Some(e),
@@ -3570,7 +3611,7 @@ fn mirror_upstream_into_overlay(
     })?;
     if meta.file_type().is_symlink() {
         return Err(Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-cargo-toml-is-symlink",
             None,
@@ -3578,7 +3619,7 @@ fn mirror_upstream_into_overlay(
     }
     if !meta.file_type().is_file() {
         return Err(Error::overlay_mirror_failed(
-            upstream_dir.join("Cargo.toml"),
+            canonical_upstream.join("Cargo.toml"),
             manifest.clone(),
             "post-condition-cargo-toml-not-regular-file",
             None,
@@ -3799,24 +3840,14 @@ fn copy_fallback(src: &Path, dst: &Path) -> std::io::Result<()> {
             }
             Ok(())
         } else if ftype.is_symlink() {
-            // Resolve the symlink target and copy the dereferenced
-            // content. Build scripts that read package-root files don't
-            // care whether the underlying file came from a symlink; the
-            // dereferenced contents are what they read.
-            let target_meta = std::fs::metadata(src)?;
-            if target_meta.is_file() {
-                std::fs::copy(src, dst)?;
-            } else {
-                // Target is a dir; recurse.
-                std::fs::create_dir_all(dst)?;
-                for entry in std::fs::read_dir(src)? {
-                    let entry = entry?;
-                    let child_src = entry.path();
-                    let child_dst = dst.join(entry.file_name());
-                    copy_fallback_inner(base_src, &child_src, &child_dst)?;
-                }
-            }
-            Ok(())
+            // Reject symlinks: the symlink target may resolve outside
+            // base_src. copy_fallback is a fallback for platforms where
+            // symlink creation fails; on such platforms, rejecting
+            // upstream symlinks is conservative correct.
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "copy-fallback: refusing to follow source symlink (potential containment escape)",
+            ))
         } else {
             // Other (block device, fifo, socket): unrecognised at the
             // Cargo-package level. Surface as an I/O error.
@@ -9122,6 +9153,90 @@ demo = { path = "." }
         match canonicalize_within_base(base_dir.path(), &target) {
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
             other => panic!("expected PermissionDenied, got {other:?}"),
+        }
+    }
+
+    // ── Symlink rejection tests (Alerts #10, #11, R-2) ───────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn mirror_rejects_upstream_symlinks_preserves_staged() {
+        // Verifies that mirror_upstream_into_overlay skips symlinked
+        // upstream entries but does NOT remove their staged counterparts
+        // as orphans (R-2: name tracked before skip).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_dir = tmp.path().join("upstream");
+        let staged_dir = tmp.path().join("staged");
+
+        // Create an outside file and a symlink to it inside upstream.
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside content").unwrap();
+        std::fs::create_dir(&upstream_dir).unwrap();
+        std::os::unix::fs::symlink(&outside_file, upstream_dir.join("linked.txt")).unwrap();
+
+        // Create a regular file upstream (non-symlink, will be reconciled).
+        std::fs::write(upstream_dir.join("real.txt"), "real content").unwrap();
+
+        // Pre-seed staged dir with a regular file for the symlink entry
+        // and a Cargo.toml (required by CASE 15 post-condition).
+        std::fs::create_dir(&staged_dir).unwrap();
+        std::fs::write(staged_dir.join("linked.txt"), "pre-staged").unwrap();
+        std::fs::write(
+            staged_dir.join("Cargo.toml"),
+            "[package]\nname = \"test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+
+        // Run the mirror.
+        let result = mirror_upstream_into_overlay(&upstream_dir, &staged_dir);
+        assert!(result.is_ok(), "mirror should succeed: {result:?}");
+
+        // The symlink entry should NOT have been removed as an orphan
+        // because its name was tracked in upstream_names before the skip.
+        assert!(
+            staged_dir.join("linked.txt").exists(),
+            "staged entry for symlinked upstream file must be preserved (R-2)"
+        );
+
+        // No new symlink should have been created for the skipped entry.
+        let linked_meta = std::fs::symlink_metadata(staged_dir.join("linked.txt")).unwrap();
+        assert!(
+            !linked_meta.file_type().is_symlink(),
+            "staged linked.txt must not be a symlink"
+        );
+
+        // The real file should have been reconciled (symlinked).
+        let real_meta = std::fs::symlink_metadata(staged_dir.join("real.txt")).unwrap();
+        assert!(
+            real_meta.file_type().is_symlink(),
+            "staged real.txt must be a canonical symlink to upstream"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_fallback_rejects_source_symlinks() {
+        // Verifies that copy_fallback returns PermissionDenied when the
+        // source tree contains symlinks (containment escape prevention).
+        let tmp = tempfile::tempdir().unwrap();
+        let upstream_src = tmp.path().join("upstream-src");
+        std::fs::create_dir(&upstream_src).unwrap();
+
+        // Create an outside file and a symlink to it inside the source.
+        let outside_file = tmp.path().join("outside.txt");
+        std::fs::write(&outside_file, "outside content").unwrap();
+        std::os::unix::fs::symlink(&outside_file, upstream_src.join("linked.txt")).unwrap();
+
+        // Also add a regular file so the dir is non-empty.
+        std::fs::write(upstream_src.join("real.txt"), "real content").unwrap();
+
+        let staged_dst = tmp.path().join("staged-dst");
+
+        match copy_fallback(&upstream_src, &staged_dst) {
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+            other => {
+                panic!("expected PermissionDenied when source contains symlinks, got {other:?}")
+            }
         }
     }
 }
