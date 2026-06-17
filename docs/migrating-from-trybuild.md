@@ -38,6 +38,32 @@ The fixtures themselves (`.rs` files) require no changes. The `.stderr` snapshot
 need a one-time re-bless because lihaaf's normalizer applies slightly different
 substitutions.
 
+## Pre-migration validation: Paving the way with Compat Mode
+
+Before doing the actual migration (changing configuration files and moving directories), you can run `cargo lihaaf` in compatibility mode. Compat mode helps you assess how close lihaaf's diagnostic output is to your existing trybuild baseline. 
+
+This is particularly useful for measuring baseline behavior across different Rust compiler versions before making any code modifications.
+
+### What compat mode does
+
+When you run with `--compat`, `lihaaf`:
+1. Executes your existing trybuild suite via `cargo test` to gather baseline results.
+2. Performs a static AST walk of your test files to discover fixture files, copying them and their existing `.stderr` snapshots to a staging directory.
+3. Generates a temporary, staged manifest overlay in the cargo target directory (avoiding any edits to your upstream `Cargo.toml`).
+4. Dispatches the staged fixtures through lihaaf.
+5. Produces a byte-deterministic comparison report (`compat-report.json`) detailing fixture parity, mismatches, and exclusions.
+
+### Example invocation
+
+```bash
+cargo lihaaf \
+  --compat \
+  --compat-root /path/to/target-crate \
+  --compat-report compat-report.json
+```
+
+Use compat mode on your stable and nightly toolchains to confirm that trybuild and lihaaf behave identically on the same source code. This gives you a clear diff of any minor normalizer differences before you fully commit to the migration steps below.
+
 ## Step 1: Add lihaaf's `[package.metadata.lihaaf]` block
 
 lihaaf is driven entirely by `[package.metadata.lihaaf]` in the crate's

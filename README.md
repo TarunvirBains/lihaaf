@@ -159,45 +159,43 @@ cargo lihaaf --bless
 
 ## Compat mode
 
-`cargo lihaaf --compat` is a migration workflow for proc-macro crates that
-already have a [trybuild](https://github.com/dtolnay/trybuild) fixture corpus.
-It runs lihaaf against your existing trybuild fixtures and generates a
-deterministic JSON comparison envelope that captures both the trybuild baseline
-and lihaaf's per-fixture verdicts side by side.
+`cargo lihaaf --compat` is a migration and validation workflow for proc-macro crates that already have a [trybuild](https://github.com/dtolnay/trybuild) fixture corpus.
 
-The typical invocation:
+### What it does
 
-```bash
-cargo lihaaf \
-  --compat \
-  --compat-root <PATH-TO-CRATE-CHECKOUT> \
-  --compat-report compat-report.json
-```
+Compat mode runs both halves of the comparison:
+- **Baseline capture:** It runs the existing trybuild suite via `cargo test` and captures the outcome.
+- **lihaaf execution:** It discovers trybuild fixtures from the AST, copies them to a temporary staging area, creates an overlay manifest under `target/` without touching your code or `Cargo.toml`, runs `cargo lihaaf`, and captures the verdicts.
+- **Parity comparison:** It aggregates the results and outputs a byte-deterministic comparison report (`compat-report.json`) detailing matching outcomes, mismatches, errors, and exclusions.
 
-For workspace-member crates where `--compat-root` points at a workspace root
-(a manifest that declares `[workspace]` without `[package]`), add
-`--package <NAME>` to select the target member:
+### When to use it
 
-```bash
-cargo lihaaf \
-  --compat \
-  --compat-root /path/to/workspace-root \
-  --package my-crate \
-  --compat-report compat-report.json
-```
+- **Pre-migration validation:** Before modifying your codebase, use compat mode to check how closely lihaaf's diagnostic output matches trybuild.
+- **Cross-toolchain validation:** Run the compat comparison across multiple Rust compiler versions (e.g. stable, nightly) to measure and verify diagnostic stability before fully converting.
+- **CI Gating:** Run compat mode in a pull request or CI environment to guarantee that no behavioral or diagnostic changes are introduced during migration.
 
-Key flags:
+### Basic workflow
 
-| Flag | Purpose |
-|---|---|
-| `--compat` | Enable compat mode. Mutually exclusive with normal `--filter` / `--manifest-path` flags. |
-| `--compat-root <PATH>` | Path to the target crate checkout. Required in compat mode. |
-| `--compat-report <PATH>` | Output path for the JSON comparison envelope. Required in compat mode. |
-| `--package <NAME>` / `-p <NAME>` | Workspace-member selector. Required when `--compat-root` is a workspace root without `[package]`. |
-
-The JSON envelope is byte-deterministic: two CI runners at the same commit
-produce identical envelope bytes. It is suitable for committing as a baseline
-artifact and comparing across runs with `diff` or `jq`.
+1. **Invoke the compat runner:** Run `cargo lihaaf` with the `--compat` flag, specifying the root of the target crate and the path where you want the JSON report written:
+   ```bash
+   cargo lihaaf \
+     --compat \
+     --compat-root <PATH-TO-CRATE-CHECKOUT> \
+     --compat-report compat-report.json
+   ```
+2. **Handle workspace members:** If the target crate is a member of a virtual Cargo workspace, you must specify the workspace root as the root, and select the package via the `-p` / `--package` flag:
+   ```bash
+   cargo lihaaf \
+     --compat \
+     --compat-root /path/to/workspace-root \
+     --package my-crate \
+     --compat-report compat-report.json
+   ```
+3. **Inspect the comparison report:** Parse and inspect the generated `compat-report.json`. Check for any entries in `mismatch_examples` or `errors` to see if there are minor formatting differences or unrecognized AST patterns.
+4. **Iterate:** If there are accepted diagnostic differences, you can use the standard `--bless` flag in combination with `--compat` to update or record them:
+   ```bash
+   cargo lihaaf --compat --compat-root . --compat-report compat-report.json --bless
+   ```
 
 See `docs/compatibility-plan.md` for the full compat-mode design.
 

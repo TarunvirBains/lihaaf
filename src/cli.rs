@@ -59,9 +59,22 @@ pub struct Cli {
     #[arg(long)]
     pub bless: bool,
 
-    /// Switch the binary into compat mode. See `docs/compatibility-plan.md` §3.1.
-    /// When set, only the `--compat*` flags govern fixture/manifest selection;
-    /// `--filter` and `--manifest-path` are mode errors.
+    /// Switch the binary into compat mode.
+    ///
+    /// Compat mode is a migration and validation workflow for proc-macro crates
+    /// that already use trybuild. It executes the existing trybuild suite via
+    /// `cargo test` as a baseline, statically discovers fixtures via AST analysis,
+    /// runs them under a staged lihaaf overlay, and aggregates outcomes into a
+    /// byte-deterministic comparison report.
+    ///
+    /// This allows verifying diagnostic output and behavior parity across toolchains
+    /// prior to committing to a full migration.
+    ///
+    /// Under compat mode, only `--compat*` flags (e.g. `--compat-root`, `--compat-report`,
+    /// `--compat-filter`, `--compat-manifest`, etc.) govern manifest and fixture selection.
+    /// Standard flags `--filter` and `--manifest-path` are rejected as mode errors,
+    /// while formatting, caching, and execution flags (`--bless`, `--no-cache`, `-q`,
+    /// `-v`, `--use-symlink`, `--keep-output`, `-j`) remain valid as pass-throughs.
     #[arg(long)]
     pub compat: bool,
 
