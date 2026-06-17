@@ -1166,6 +1166,10 @@ The categories the harness normalizes:
 - **Suggestion text** ("help: there is a method `foo` with a similar
   name") — preserved. Part of a fixture's observable behavior;
   adopters often pin the suggestion shape.
+- Note: a bare `see issue #NNN` reference collapses to `$TYPEID` via the
+  TypeId rule (§6.2); the unstable-attribute form (`#[unstable(... issue =
+  "NNN")]`) inside a foreign source body is removed by foreign-span-body
+  normalization (§6.2).
 
 ### 6.4 The byte-level approach
 
@@ -1192,16 +1196,17 @@ traversal.
 ### 6.5 Determinism contract
 
 For a `(fixture, dylib SHA-256, rustc release, OS, extra_substitutions,
-strip_lines, strip_line_prefixes)` tuple, the normalized stderr is
-byte-deterministic. The normalizer has no hidden state, no
+strip_lines, strip_line_prefixes, keep_foreign_span_bodies)` tuple, the
+normalized stderr is byte-deterministic. The normalizer has no hidden state, no
 env-dependent paths it doesn't capture, and no wall-clock dependency.
 Snapshots survive cross-machine reruns when the toolchain matches and
 the adopter-defined override vectors are stable. The three adopter
-override vectors enter the determinism tuple as the validated, typed
-contents of the resolved `Suite` (per-suite REPLACE semantics — see
-§3.6 and §6.6); two adopters with identical override TOML produce
-identical normalized output for the same fixture, dylib, and
-toolchain.
+override vectors — plus the boolean `keep_foreign_span_bodies` opt-out —
+enter the determinism tuple as the validated, typed contents of the
+resolved `Suite` (per-suite REPLACE semantics — see §3.6 and §6.6); two
+adopters with identical override TOML (and the same `keep_foreign_span_bodies`
+setting) produce identical normalized output for the same fixture, dylib,
+and toolchain.
 
 The OS qualifier is honest: rustc messages can mention `\\` inside
 strings (a fixture containing `\\` in source) and the normalizer
@@ -1222,38 +1227,140 @@ toolchains with non-standard prefixes, CI runner banners, rustc
 trailer lines that adopters in some environments want stripped for
 toolchain-agnostic snapshots.
 
-The three opt-in keys — `extra_substitutions`, `strip_lines`,
+The opt-in vector keys — `extra_substitutions`, `strip_lines`,
 `strip_line_prefixes` — extend the normalizer with adopter-defined
-substitution and line-drop rules.
+substitution and line-drop rules. A fourth opt-in key, the boolean
+`keep_foreign_span_bodies` (described below), opts a suite OUT of the
+default foreign-span body suppression rather than adding rules.
 
 **Composition order.** The normalizer applies categories in this order
 per line: (1) line endings unified to `\n`; (2) backslash→slash on
 path-marker lines; (3) `$LONGTYPE_FILE` placeholder; (4) built-in
 path substitutions (`$DIR`, `$WORKSPACE`, `$RUST`, `$CARGO/registry`)
-length-sorted longest-first; (5) compat-mode short-CARGO post-pass
-(when compat mode is on); (6) `extra_substitutions` in declared
-order; (7) TypeId collapse; (8) trim trailing whitespace. After the
-per-line loop: (9) line-drop by `strip_lines` exact match OR
-`strip_line_prefixes` prefix match; (10) collapse runs of blank
-lines; (11) trim trailing blank lines. Extras run AFTER built-ins so
+length-sorted longest-first — in NON-COMPAT mode the `$CARGO/registry`
+prefix substitution ALSO collapses the volatile registry index hash that
+follows it (the `<host>-<16hex>` segment, for the `index.crates.io` and
+`github.com` hosts) to the stable placeholder token `$CARGO_HASH`
+(Class K-fix). In compat mode step (4) does NOT push the `$CARGO/registry`
+prefix at all (it is gated off), so the raw `<cargo_registry>/src/<host>-<hash>/`
+segment survives step (4) untouched and is collapsed instead by the
+short-CARGO post-pass in step (5); (5) compat-mode short-CARGO post-pass
+(when compat mode is on) — strips the whole raw
+`<cargo_registry>/src/<host>-<hash>/` segment to `$CARGO/<crate>-<ver>/...`,
+which is why `$CARGO_HASH` never appears in compat output (the K-fix's
+retained-shell `$CARGO/registry/src/$CARGO_HASH/...` form is the NON-COMPAT
+shape); (6) `extra_substitutions` in declared
+order; (7) foreign-span source-body suppression (default-on; on a
+`-->`/`:::` pointer that resolved to `$RUST` / `$CARGO` / `$WORKSPACE`,
+strips the pointer's `:LINE:COL` tail UNCONDITIONALLY and, when a body
+block follows [public-docs-allow-process-history], collapses it to a single
+kind-matched placeholder line
+`$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC` — runs AFTER
+`extra_substitutions` so adopter rewrites cannot fire inside a body that
+is about to be suppressed, and so an adopter rule mapping a custom sysroot
+to `$RUST` is itself detected; the pointer `:LINE:COL` tail strip is
+UNCONDITIONAL and always fires, while only the body-content collapse is
+skipped for suites with `keep_foreign_span_bodies = true`. In compat mode
+no adopter suite config is carried, so this stage always runs — see the
+compat-mode-boundary paragraph); (8) TypeId collapse; (9) trim trailing
+whitespace. After the per-line loop: (10) line-drop by `strip_lines` exact
+match OR `strip_line_prefixes` prefix match; (11) collapse runs of blank
+lines; (12) trim trailing blank lines. Extras run AFTER built-ins so
 adopter rules can refer to the placeholders (e.g.,
 `from = "$RUST/lib/rust-1.95.0"` operates on the already-substituted
-`$RUST` prefix). Extras run BEFORE TypeId so an extras-introduced
-`#<digits>` sequence collapses to `$TYPEID`. Line-drop runs after
+`$RUST` prefix). Foreign-span body suppression runs AFTER extras so an
+adopter `extra_substitutions` rule cannot rewrite bytes inside a body that
+is about to be normalized away, and so an adopter rule that maps a custom
+sysroot onto `$RUST` is itself detected as a foreign pointer; it runs
+BEFORE TypeId and the strip/blank-collapse stages. Extras run BEFORE
+TypeId so an extras-introduced `#<digits>` sequence collapses to `$TYPEID`. Line-drop runs after
 per-line trim so strip patterns match logical content, and BEFORE
 blank-line collapse so a stripped line participates in the collapse.
 
-**Per-suite REPLACE.** The three keys do NOT inherit on named
+**Per-suite REPLACE.** The three vector keys do NOT inherit on named
 suites — a named suite that omits any of them gets `[]`, NOT the
-default suite's value. This matches the `features` precedent (§3.6).
-The sharp edge: a named suite that adds even one entry to
+default suite's value. The boolean `keep_foreign_span_bodies` takes the
+same REPLACE scope: a named suite that omits it gets the default `false`,
+NOT the default suite's value. This matches the `features` precedent
+(§3.6). The sharp edge: a named suite that adds even one entry to
 `extra_substitutions` must list every adopter substitution it
 wants (no merge). The default-on-omit rule keeps "feature-isolated"
 suites from accidentally pulling in unrelated overrides.
 
-**Default invariant.** An adopter who does not set any of the three
-keys observes byte-identical output to a run with no adopter overrides.
-The feature is additive and opt-in.
+**Default invariant.** An adopter who does not set any of the four §6.6
+opt-in keys (`extra_substitutions`, `strip_lines`, `strip_line_prefixes`,
+`keep_foreign_span_bodies`) observes byte-identical output to a run with no
+adopter overrides. The three vector keys are additive (empty by default);
+`keep_foreign_span_bodies` defaults to `false` (= the default suppression is
+on), so leaving it unset is the no-override behavior.
+
+**Foreign-span body suppression and `keep_foreign_span_bodies`.** By default
+(no adopter config), lihaaf normalizes the source body of any `-->`/`:::`
+span block [public-docs-allow-process-history] whose pointer resolves to a
+non-fixture placeholder (`$RUST`,
+`$CARGO`, `$WORKSPACE`): the gutter line number, the quoted source text, and
+the caret/underline collapse to a single kind-matched placeholder line
+(`$RUST_SRC`, `$CARGO_SRC`, or `$WORKSPACE_SRC`), and the pointer's trailing
+`:LINE:COL` is stripped (even on a foreign pointer with no body following).
+This keeps snapshots stable when stdlib / registry / workspace source drifts
+across rustc versions and platforms — the situation an adopter cannot otherwise
+predict, because which fixture types trigger a foreign secondary span depends
+on rustc internals. The fixture's own `$DIR` spans are never touched.
+
+Adopters whose purpose is to DETECT upstream source changes (e.g. "fail the
+suite when `Vec`'s signature changes between toolchains") can disable BODY
+suppression per suite with the boolean key `keep_foreign_span_bodies`, which
+defaults to `false` (= suppress). It follows the same per-suite REPLACE
+semantics as the substitution keys — a named suite that omits it gets
+the default `false`, NOT an inherited value (§3.6).
+
+**Scope: this key controls body CONTENT suppression only, not the pointer tail
+and not the rest of the normalization pipeline.** Setting
+`keep_foreign_span_bodies = true` keeps the foreign body's source text, caret
+lines, and frame lines in the output instead of collapsing them to a single
+`$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC` placeholder. It disables the
+foreign-span body-suppression stage ONLY — it is NOT a raw byte bypass: the
+surviving body lines still flow through the normalization stages that run after
+suppression (TypeId collapse, trailing-whitespace trim, and blank-line
+collapse — see the composition order in this section), so for example a
+`#<digit>` sequence inside a kept body line is still rewritten to `$TYPEID`.
+The key also does NOT preserve the `:LINE:COL` tail on the pointer line — that
+volatile line/column is ALWAYS normalized away on a foreign (`$RUST` / `$CARGO`
+/ `$WORKSPACE`) pointer, even with the key set. The reason: a per-release
+stdlib/registry line number would break the snapshot on the next toolchain bump
+even for an adopter who wants to watch the body for drift, so the metadata strip
+is unconditional while the body content is kept. With the key `true`, snapshots
+are expected to require re-blessing whenever the upstream source body changes;
+that is the point. The key joins the determinism tuple (§6.5).
+
+**Interaction with `extra_substitutions` (custom-sysroot / NixOS).** Because
+body suppression runs AFTER `extra_substitutions`, a suite that uses
+`extra_substitutions` to remap a custom sysroot, registry, or workspace path
+onto `$RUST` / `$CARGO` / `$WORKSPACE` (e.g. a NixOS
+`/nix/store/...-rust-*/...` sysroot mapped to `$RUST`) will ALSO have those
+remapped spans' bodies suppressed — the remapped span is detected as foreign.
+If you remap a custom sysroot for upstream-regression detection and need to
+PRESERVE its bodies, set BOTH the `extra_substitutions` remap AND
+`keep_foreign_span_bodies = true` in the same suite.
+
+```toml
+# Default suite: foreign stdlib/registry bodies are normalized away.
+# (No key needed — suppression is the default.)
+
+# A suite that pins upstream source for regression detection:
+[[package.metadata.lihaaf.suite]]
+name = "upstream-watch"
+keep_foreign_span_bodies = true
+
+# A suite that remaps a NixOS sysroot AND keeps its bodies for
+# upstream-drift detection — BOTH keys are required:
+[[package.metadata.lihaaf.suite]]
+name = "nixos-upstream-watch"
+keep_foreign_span_bodies = true
+extra_substitutions = [
+  { from = "/nix/store/abc123-rust-1.95.0/lib/rustlib", to = "$RUST/lib/rustlib" },
+]
+```
 
 **`extra_substitutions` validation — `is_path_like` predicate.**
 Each entry's `from` field must satisfy `is_path_like`:
