@@ -115,8 +115,16 @@ pub struct NormalizationContext {
     /// Compat-mode flag (§3.2.2). When `true`, the normalizer emits
     /// trybuild's shorter `$CARGO/<crate>-<ver>/<rest>` form instead of
     /// the literal-prefix `$CARGO/registry/src/index.crates.io-<hash>/...`
-    /// form. Default `false`; non-compat callers leave it `false` and
-    /// observe byte-identical v0.1 output.
+    /// form — the whole `registry/src/<host>-<hash>/` segment (host name and
+    /// index hash included) is shortened away, so `$CARGO_HASH` does not appear
+    /// in compat output. Default `false`. When `false`, the normalizer keeps
+    /// the `$CARGO/registry/src/.../` shape but collapses the volatile registry
+    /// index hash that follows the prefix — the `<host>-<16hex>` segment, for
+    /// the `index.crates.io` and `github.com` hosts — to the stable placeholder
+    /// token `$CARGO_HASH` so registry-path snapshots are portable across
+    /// machines. The hash-handling differs by mode: `false` collapses the hash
+    /// to `$CARGO_HASH` while keeping the `registry/src/.../` shell; `true`
+    /// removes the shell and the hash together.
     pub compat_short_cargo: bool,
     /// Adopter-defined `extra_substitutions` (per-suite, REPLACE
     /// semantics — see `docs/spec/lihaaf-v0.1.md` §3.6). Applied
@@ -137,10 +145,16 @@ pub struct NormalizationContext {
     /// config-parse validation.
     pub strip_line_prefixes: Vec<String>,
     /// Adopter-defined `keep_foreign_span_bodies` (per-suite, REPLACE
-    /// semantics). When `false` (default), foreign `-->`/`:::` span bodies
-    /// collapse to a kind-matched `$*_SRC` placeholder. Set `true` to keep
-    /// them. Governs body content only; the pointer `:LINE:COL` tail is
-    /// stripped regardless. See `docs/spec/lihaaf-v0.1.md` §6.6.
+    /// semantics — see `docs/spec/lihaaf-v0.1.md` §6.6). When `false` (the
+    /// default), the source body of any `-->`/`:::` span whose pointer
+    /// resolves to a non-fixture placeholder (`$RUST` / `$CARGO` /
+    /// `$WORKSPACE`) is collapsed to a single kind-matched placeholder line
+    /// (`$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC`). Set `true` to PRESERVE
+    /// those bodies (upstream-regression detection — e.g. fail when a stdlib
+    /// signature changes). Governs body CONTENT only: the foreign pointer's
+    /// `:LINE:COL` tail is stripped regardless of this flag, because a
+    /// per-release stdlib/registry line number is volatile whether or not the
+    /// body is kept.
     pub keep_foreign_span_bodies: bool,
 }
 
@@ -151,16 +165,21 @@ impl NormalizationContext {
     /// `compat_short_cargo` is `false` by default. Compat-mode callers
     /// drive the flag via the dedicated [`Self::with_compat_short_cargo`]
     /// builder so the §3.2.2 trybuild short-form rewrite fires for the
-    /// inner session; non-compat callers leave it untouched and observe
-    /// byte-identical v0.1 output.
+    /// inner session; non-compat callers leave it untouched and keep the
+    /// `$CARGO/registry/src/.../` shape with the volatile registry index hash
+    /// (`<host>-<16hex>`, for the `index.crates.io` and `github.com` hosts)
+    /// collapsed to the stable placeholder token `$CARGO_HASH`.
     ///
-    /// The three adopter-defined override fields ([`Self::extra_substitutions`],
-    /// [`Self::strip_lines`], [`Self::strip_line_prefixes`]) default to
-    /// empty `Vec`s. Callers that need to wire per-suite values use the
-    /// dedicated builders ([`Self::with_extra_substitutions`],
-    /// [`Self::with_strip_lines`], [`Self::with_strip_line_prefixes`]).
-    /// When all three are empty, normalizer output matches a run with no
-    /// adopter overrides.
+    /// The four adopter-defined override fields default to their no-override
+    /// values: the three vector fields ([`Self::extra_substitutions`],
+    /// [`Self::strip_lines`], [`Self::strip_line_prefixes`]) default to empty
+    /// `Vec`s, and [`Self::keep_foreign_span_bodies`] defaults to `false`
+    /// (= suppress foreign span bodies). Callers that need to wire per-suite
+    /// values use the dedicated builders ([`Self::with_extra_substitutions`],
+    /// [`Self::with_strip_lines`], [`Self::with_strip_line_prefixes`],
+    /// [`Self::with_keep_foreign_span_bodies`]). With the three vectors empty
+    /// and `keep_foreign_span_bodies` `false`, normalizer output matches a run
+    /// with no adopter overrides.
     pub fn new(workspace_root: PathBuf, sysroot: PathBuf) -> Self {
         let cargo_registry = std::env::var_os("CARGO_HOME")
             .map(PathBuf::from)
@@ -222,11 +241,11 @@ impl NormalizationContext {
         self
     }
 
-    /// Builder-style mutator to set [`Self::keep_foreign_span_bodies`].
-    ///
-    /// Returns `self` so call sites can chain with other builders. Defaults
-    /// to `false` (= suppress foreign span bodies); pass `true` to preserve
-    /// them. The pointer `:LINE:COL` tail is stripped regardless of this flag.
+    /// Set `keep_foreign_span_bodies` (the foreign-span body-suppression
+    /// opt-out). Defaults to `false` (= suppress); pass `true` to preserve
+    /// foreign span source bodies. See the field doc and
+    /// `docs/spec/lihaaf-v0.1.md` §6.6 for the body-content-only scope (the
+    /// pointer `:LINE:COL` tail is stripped regardless of this flag).
     pub fn with_keep_foreign_span_bodies(mut self, enabled: bool) -> Self {
         self.keep_foreign_span_bodies = enabled;
         self
@@ -241,14 +260,31 @@ impl NormalizationContext {
 ///
 /// ## No silent drops
 ///
-/// the policy enumerates the rewrite categories; the policy enumerates
-/// what is explicitly preserved (diagnostic text, span pointers, help
-/// text, suggestions). Neither list authorizes dropping the rustc
-/// summary lines `error: aborting due to N previous error[s]` or
-/// `For more information about this error, try \`rustc --explain ...\``.
-/// Earlier drafts dropped both lines; they are now preserved byte-for-byte.
-/// Adopters with previously blessed snapshots may need one re-bless, but the
-/// output now mirrors rustc’s real messages more closely.
+/// Every line this normalizer removes or rewrites belongs to a documented
+/// normalization category (see `docs/spec/lihaaf-v0.1.md` §6.2). Nothing is
+/// dropped silently. In particular, the rustc summary lines `error: aborting
+/// due to N previous error[s]` and `For more information about this error, try
+/// \`rustc --explain ...\`` are PRESERVED byte-for-byte — they are diagnostic
+/// signal, not noise.
+///
+/// One category IS an intentional drop-and-replace: **foreign span source
+/// bodies** (both primary `-->` and secondary `:::` spans). When a `-->` or
+/// `:::` span pointer resolves to a non-fixture placeholder (`$RUST`, `$CARGO`,
+/// `$WORKSPACE`), the quoted source content beneath it — the gutter line number,
+/// the source text, and the caret/underline — is volatile across rustc versions
+/// and platforms, so it is collapsed to a single kind-matched placeholder line
+/// (`$RUST_SRC` / `$CARGO_SRC` / `$WORKSPACE_SRC`), and the pointer's trailing
+/// `:LINE:COL` is stripped. This applies to both span kinds — a primary `-->`
+/// span (e.g. an error attributed to a dependency macro) and a secondary `:::`
+/// span are treated identically. This is a deliberate, contract-backed
+/// normalization (§6.2), not a silent drop: the placeholder leaves an explicit
+/// marker in the snapshot, and the fixture's own `$DIR` spans are never touched.
+/// Adopters can opt out of the body collapse per suite
+/// (`keep_foreign_span_bodies`); the pointer-tail strip is unconditional.
+///
+/// Adopters with previously blessed snapshots may need one re-bless when a
+/// normalization category changes, but the output mirrors rustc's real messages
+/// as closely as determinism allows.
 pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) -> String {
     // Pre-compute placeholder list, longest prefix first. Adopters may
     // not have one of these (e.g., no CARGO_HOME); skip empties.
@@ -273,7 +309,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
     // Step 1: line endings.
     let unified_le = unify_line_endings(input);
 
-    // Step 2: per-line path substitution + TypeId + trailing space.
+    // Steps 2-6: per-line path substitution, $CARGO_HASH collapse, compat short-CARGO, extra_substitutions.
     // rustc summary and explain-pointer lines are preserved; they pass
     // through like other diagnostic text unless one of the explicit
     // normalization categories applies.
@@ -326,7 +362,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         {
             s = rewrite_cargo_short(&s, reg);
         }
-        // Step 7: adopter-defined `extra_substitutions`. Applied after
+        // Step 6: adopter-defined `extra_substitutions`. Applied after
         // built-in path substitutions and the optional short-CARGO
         // post-pass, so adopter rules can match post-built-in
         // placeholders (for example, `$RUST/lib/rust-1.95.0`). Applied
@@ -337,9 +373,9 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             s = replace_advancing(&s, &sub.from, &sub.to);
         }
 
-        // -- Span body suppression (Step 8) --
+        // -- Span body suppression (Step 7) --
 
-        // Step 1: inside an active block, distinguish frame vs content lines.
+        // Step 7a: inside an active block, distinguish frame vs content lines.
         if let Some(mut block) = active_block.take() {
             // Frame line: pipe-only (optionally preceded by whitespace).
             // Emits canonical "   |" without consuming a placeholder slot.
@@ -350,7 +386,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
                 if block.remaining > 0 {
                     active_block = Some(block);
                 }
-                // Step 3: TypeId + trailing trim for this emitted line.
+                // Steps 8-9: TypeId + trailing trim for this emitted line.
                 s = rewrite_type_ids(&s);
                 let trimmed = s.trim_end_matches([' ', '\t']);
                 intermediate.push(trimmed.to_string());
@@ -364,7 +400,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
                 if block.remaining > 0 {
                     active_block = Some(block);
                 }
-                // Step 3: TypeId + trailing trim.
+                // Steps 8-9: TypeId + trailing trim.
                 s = rewrite_type_ids(&s);
                 let trimmed = s.trim_end_matches([' ', '\t']);
                 intermediate.push(trimmed.to_string());
@@ -379,7 +415,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
             }
         }
 
-        // Step 2: foreign pointer detection (only when not already in a block).
+        // Step 7b: foreign pointer detection (only when not already in a block).
         if let Some(kind) = is_foreign_pointer(&s) {
             // 2a: unconditional :LINE:COL tail strip.
             s = strip_pointer_tail(&s);
@@ -397,12 +433,12 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
                     placeholder_emitted: false,
                 });
             }
-            // Step 3: TypeId + trailing trim for this pointer line.
+            // Steps 8-9: TypeId + trailing trim for this pointer line.
             s = rewrite_type_ids(&s);
             let trimmed = s.trim_end_matches([' ', '\t']);
             intermediate.push(trimmed.to_string());
         } else {
-            // Step 3: non-pointer, non-active line — standard path.
+            // Steps 8-9: non-pointer, non-active line — standard path.
             s = rewrite_type_ids(&s);
             let trimmed = s.trim_end_matches([' ', '\t']);
             intermediate.push(trimmed.to_string());
@@ -422,7 +458,7 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         after_strip.push(line);
     }
 
-    // Step 3: collapse runs of blank lines to a single blank line.
+    // Step 11: collapse runs of blank lines to a single blank line.
     let mut out = String::with_capacity(input.len());
     let mut prev_blank = false;
     for line in after_strip {
@@ -434,9 +470,8 @@ pub fn normalize(input: &str, ctx: &NormalizationContext, fixture_dir: &Path) ->
         out.push('\n');
         prev_blank = is_blank;
     }
-    // Trim trailing blank lines (more than just one newline). Snapshots
-    // shouldn't carry trailing whitespace; the snapshot writer adds the
-    // final newline back.
+    // Step 12: trim trailing blank lines. Snapshots shouldn't carry
+    // trailing whitespace; the snapshot writer adds the final newline back.
     while out.ends_with('\n') {
         out.pop();
     }
