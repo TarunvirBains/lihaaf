@@ -63,6 +63,10 @@ pub fn collect(
     crate_root: &Path,
     filters: &[String],
 ) -> Result<Vec<Fixture>, Error> {
+    let canonical_crate_root = crate_root
+        .canonicalize()
+        .map_err(|e| Error::io(e, "canonicalizing crate_root", Some(crate_root.to_path_buf())))?;
+
     let mut existing_dirs: Vec<PathBuf> = Vec::new();
     for dir in &suite.fixture_dirs {
         let resolved = if dir.is_absolute() {
@@ -70,8 +74,14 @@ pub fn collect(
         } else {
             crate_root.join(dir)
         };
-        if resolved.is_dir() {
-            existing_dirs.push(resolved);
+
+        let canonical_resolved = match resolved.canonicalize() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+
+        if canonical_resolved.is_dir() && canonical_resolved.starts_with(&canonical_crate_root) {
+            existing_dirs.push(canonical_resolved);
         }
     }
 
