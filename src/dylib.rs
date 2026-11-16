@@ -161,10 +161,19 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     // hard-links a copy into `<target>/release/deps/lib<crate>.so`.
     // Fixtures need the deps dir on `-L dependency=` so transitive
     // crates resolve; the path points at deps/ rather than the release/ root.
-    let deps_dir = dylib_path
-        .parent()
-        .map(|p| p.join("deps"))
-        .unwrap_or_else(|| params.target_dir.join("release/deps"));
+    // On Rust 1.100.0+ `filenames[0]` for a dylib points to the copy inside
+    // `deps/` (e.g. `release/deps/libfoo-<hash>.so`) rather than the root
+    // copy (`release/libfoo.so`). Guard against double-appending `deps/deps/`.
+    let deps_dir = {
+        let parent = dylib_path
+            .parent()
+            .unwrap_or_else(|| params.target_dir.as_ref());
+        if parent.file_name().map_or(false, |f| f == "deps") {
+            parent.to_path_buf()
+        } else {
+            parent.join("deps")
+        }
+    };
 
     // Toolchain shape is captured separately for drift checks;
     // recorded on the output for rendering.
