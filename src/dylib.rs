@@ -161,17 +161,28 @@ pub fn build(params: &BuildParams<'_>) -> Result<BuildOutput, Error> {
     // hard-links a copy into `<target>/release/deps/lib<crate>.so`.
     // Fixtures need the deps dir on `-L dependency=` so transitive
     // crates resolve; the path points at deps/ rather than the release/ root.
-    // On Rust 1.100.0+ `filenames[0]` for a dylib points to the copy inside
-    // `deps/` (e.g. `release/deps/libfoo-<hash>.so`) rather than the root
-    // copy (`release/libfoo.so`). Guard against double-appending `deps/deps/`.
+    //
+    // Rust 1.100.0+ cargo with -C prefer-dynamic may not create release/deps/:
+    // the dependency rlibs stay in the main release/ directory when all Rust
+    // stdlib symbols are linked dynamically. Fall back to the dylib's parent
+    // directory when release/deps/ is absent so the -L dependency= path still
+    // resolves against the directory that actually contains the artifacts.
     let deps_dir = {
         let parent = dylib_path
             .parent()
             .unwrap_or_else(|| params.target_dir.as_ref());
         if parent.file_name().map_or(false, |f| f == "deps") {
+            // filenames[0] already points inside deps/ — use as-is.
             parent.to_path_buf()
         } else {
-            parent.join("deps")
+            let d = parent.join("deps");
+            if d.is_dir() {
+                d
+            } else {
+                // release/deps/ was not created (Rust 1.100.0+ prefer-dynamic).
+                // Use the dylib's parent directory as the dependency search path.
+                parent.to_path_buf()
+            }
         }
     };
 
